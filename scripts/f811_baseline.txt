@@ -4,7 +4,6 @@
 # Hand-editing is allowed: sorted, one per line, `#` comments ok.
 # Key: <file_path>::<line>::<name>
 #
-external_llm/agent/execution_spec.py::16::EstimatedScope
 tests/unit/agent/test_context_budget.py::1204::_last_cache_save
 tests/unit/agent/test_context_budget.py::1221::_last_cache_save
-tests/unit/agent/test_insights_manager.py::550::_time
+tests/unit/agent/test_insights_manager.py::553::_time
