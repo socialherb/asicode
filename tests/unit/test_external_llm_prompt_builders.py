@@ -182,7 +182,7 @@ def _run_minimal_generate_patch(
     import os
     import tempfile
 
-    from external_llm.service import ExternalLLMService, normalize_rel_path_fast
+    from external_llm.service import ExternalLLMService
 
     # Create temp repo-like structure.
     tmp = tempfile.mkdtemp()
