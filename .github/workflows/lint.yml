@@ -1,0 +1,39 @@
+name: Lint (F401/F811/F821 baseline-diff)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  baseline-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+
+      - name: Check no NEW F821 undefined names vs baseline
+        # Mirrors the runtime F821 blame model in operation_executor.py:
+        # pre-existing undefined names (scripts/f821_baseline.txt) are ignored;
+        # only names introduced by this PR fail the build.
+        run: python scripts/check_f821_no_new.py
+
+      - name: Check no NEW F401 unused imports vs baseline
+        # Same blame-model extended to unused imports. Baseline key is
+        # file-scoped (<path>::<name>); pre-existing entries in
+        # scripts/f401_baseline.txt are ignored.
+        run: python scripts/check_f401_no_new.py
+
+      - name: Check no NEW F811 redefinitions vs baseline
+        # Same blame-model extended to redefinition-of-unused. Baseline key
+        # is line-scoped (<path>::<line>::<name>) because a file can
+        # legitimately accumulate multiple distinct redefinitions.
+        run: python scripts/check_f811_no_new.py

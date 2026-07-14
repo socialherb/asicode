@@ -1,0 +1,32 @@
+{
+    "_COLD_PRIORS": {
+        "generic_create": {
+            "repair_burden": 0.50,
+            "success_rate": 0.80,
+            "contract_risk": 0.30,
+            "complexity": 0.30,
+            "cost": 0.20
+        },
+        "reference_bound_create": {
+            "repair_burden": 0.30,
+            "success_rate": 0.85,
+            "contract_risk": 0.10,
+            "complexity": 0.40,
+            "cost": 0.25
+        },
+        "symbol_guided_create": {
+            "repair_burden": 0.35,
+            "success_rate": 0.85,
+            "contract_risk": 0.15,
+            "complexity": 0.35,
+            "cost": 0.20
+        },
+        "test_aware_create": {
+            "repair_burden": 0.40,
+            "success_rate": 0.82,
+            "contract_risk": 0.20,
+            "complexity": 0.35,
+            "cost": 0.25
+        }
+    }
+}

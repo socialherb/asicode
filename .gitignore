@@ -1,0 +1,95 @@
+# Environment variables (DO NOT COMMIT! API keys, secrets)
+.env
+.env.*
+# Coverage artifacts
+.coverage
+*.cover
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# venv
+.venv/
+
+# Dev tool caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# asicode runs/artifacts
+.asicode/
+*.bak
+*.bak*
+*.bin
+/foo.py
+foo.txt
+
+# temp dumps
+/tmp/asicode.*
+.aider*
+
+# local junk
+.DS_Store
+asicode_full_clean/
+asicode_full_clean.zip
+ui/static/vendor/hljs/
+**/.DS_Store
+
+# generated game artifacts (system test outputs)
+games/
+
+# zip archives
+*.zip
+
+# dev tool logs (run_dev_tool artifacts)
+runs/dev_tool_logs/
+
+# runtime artifacts (server logs, execution state, model weights)
+runs/
+
+# Stub/test files (not part of project source)
+/codebase_snapshot.py
+/confidence_scorer.py
+/exploration_state.py
+/tetris.py
+# Claude Code internal
+.claude/
+
+# Runtime logs (server logs, session logs)
+logs/
+
+# Auto-generated highscore files
+galaga_highscores.json
+external_llm/server.log
+
+# Debug artifacts
+debug_dump/
+debug_*.py
+keyword_reality_*.txt
+
+# Temporary plan/test artifacts
+plan.json
+node_modules/
+
+# Stub that shadows pip prompt_toolkit
+prompt_toolkit/
+
+# Go binaries
+playground/go-cli-todo/go-cli-todo
+*.log
+
+# Personal scripts (NOT project source — contain plaintext credentials)
+/radio.py
+radio_config.json
+
+# Editor/MCP agent local configs (NOT project source)
+.agents/
+.codex/
+.tenet/
+.mcp.json
+opencode.json

@@ -1,0 +1,18 @@
+/* Small test CSS file */
+.test-class {
+    padding: 10px;
+    margin: 5px;
+}
+
+.another-class {
+    color: red;
+    background: blue;
+}
+
+#special-id {
+    font-size: 14px;
+}
+
+.custom-prop {
+    --my-var: 1em;
+}

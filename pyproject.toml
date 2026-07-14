@@ -1,0 +1,266 @@
+[project]
+name = "asicode"
+version = "0.2.7"
+description = "Autonomous Software Improvement — AST-precise code editing agent with verification gates (CLI + MCP server)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "socialherb", email = "junddory@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Quality Assurance",
+]
+requires-python = ">=3.10"
+dependencies = [
+  "pydantic>=2.0",
+  "requests>=2.31",
+  "rich>=13.7",
+  "libcst>=1.4",  # format-preserving CST transformations for Python
+  "prompt-toolkit>=3.0",  # terminal input handling (IME/wide-char/paste)
+  "httpx>=0.27",  # web_search_tools HTTP client
+  "ruff>=0.6",  # post-edit verification: F821 undefined-name checks (silently skipped when absent)
+  # Tree-sitter grammars for precise AST-based symbol/call/import detection.
+  # tree-sitter-language-pack (~2 MB) bundles 300+ prebuilt grammars with full
+  # platform wheel coverage. Core dependency: without it providers fall back to
+  # regex heuristics, which contradicts the AST-over-regex design principle.
+  # The loader also still resolves individual tree_sitter_<lang> modules.
+  "tree-sitter-language-pack>=1.10",
+  # Dependency-graph analysis (change-impact, import graph). Pure-Python and
+  # light; without it the graph silently degrades to a simplified fallback,
+  # so it is a core dependency rather than an extra.
+  "networkx>=3.0",
+  # PEP 440 version comparison for the update-notice check
+  # (utils/version_check.py). NOT implicitly present in a base install —
+  # only pytest pulled it in dev envs — and the string-inequality fallback
+  # fires bogus notices on downgrades, so declare it explicitly.
+  "packaging>=21",
+]
+
+[project.optional-dependencies]
+# FastAPI webapp (server/UI) — private-repo development only; the published
+# package does not ship the webapp/ package, so this extra is meaningless
+# for installed users and is intentionally NOT part of [all].
+webapp = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "jinja2>=3.1",
+]
+vulture = [
+    "vulture>=2.11",
+]
+# Claude Agent SDK — optional dependency for multi-agent collaboration features
+# (external_llm/repl/collaborate/*). Imported lazily so the core works without it.
+# Install with: pip install '.[collaborate]'
+collaborate = [
+    "claude-agent-sdk>=0.2",
+]
+# RAG (vector search & embedding) — sentence-transformers + faiss + numpy
+# Used by: external_llm/agent/vector_cache.py (lazy import)
+# Install with: pip install '.[rag]'
+rag = [
+    "sentence-transformers>=3.0",
+    "faiss-cpu>=1.8",
+    "numpy>=1.24",
+]
+# Vision (OCR & image processing) — Pillow + pytesseract
+# Used by: providers.py read_image (lazy import)
+# Install with: pip install '.[vision]'
+vision = [
+    "Pillow>=10.0",
+    "pytesseract>=0.3",
+]
+# Browser automation — Playwright
+# Used by: browser_tools.py (lazy import)
+# Install with: pip install '.[browser]'
+browser = [
+    "playwright>=1.40",
+]
+# Config — YAML
+# Used by: multi_planner.py (lazy import)
+# Install with: pip install '.[config]'
+config = [
+    "pyyaml>=6.0",
+]
+# Dev & test
+# Install with: pip install '.[dev]'
+dev = [
+    "pytest>=8.0",
+    "pytest-xdist>=3.6",
+    "pre-commit>=4.0",
+]
+
+# Type-checking. ruff is a core dependency (always installed with the package);
+# mypy + pyright are pulled in by this extra so `pip install '.[lint]'` provides the
+# full Python type-checking toolset. `pyright[nodejs]` ships a pinned Node.js runtime
+# inside the wheel via nodejs-wheel (the upstream-recommended, more reliable path vs.
+# the default nodeenv), so this extra also satisfies the startup semantic-validation
+# tool check (dependency_checker) without requiring a system npm/Node install.
+# tsc has no pip equivalent — install it separately via `npm install -g typescript`.
+# Install with: pip install '.[lint]'
+lint = [
+    "mypy>=1.10",
+    "pyright[nodejs]>=1.1",
+]
+
+# Fast code search. asicode falls back to system `grep` when ripgrep is absent,
+# so this is OPTIONAL, not a hard dependency. Kept out of the core install so a
+# ripgrep install failure (sdist build on platforms without a prebuilt wheel —
+# e.g. Windows, macOS-x86_64, linux-aarch64, musl) cannot break the base install.
+# Install with: pip install '.[search]'
+search = [
+    "ripgrep>=15.0",
+]
+
+# All-in-one — install everything with: pip install '.[all]'
+# (webapp is excluded: the published package does not ship webapp/)
+all = [
+    "asicode[vulture]",
+    "asicode[collaborate]",
+    "asicode[rag]",
+    "asicode[vision]",
+    "asicode[browser]",
+    "asicode[config]",
+    "asicode[lint]",
+    "asicode[search]",
+]
+
+[project.urls]
+Homepage = "https://github.com/socialherb/asicode"
+Repository = "https://github.com/socialherb/asicode"
+Issues = "https://github.com/socialherb/asicode/issues"
+
+[project.scripts]
+asi = "asi:main"
+
+[tool.setuptools]
+py-modules = ["asi", "common", "config", "context_collector", "diff_apply", "patch_synth", "path_security", "plan_compiler"]
+
+# CLI-only distribution: the wheel ships only what the `asi` CLI reaches at
+# runtime. Excluded from the package (still in the repo, used by webapp/dev):
+#   - webapp*  — FastAPI server/UI, not part of the CLI deployment
+#   - tools*   — dev/verification scripts; the only runtime importer of
+#                tools.* is the excluded PLANNER lane (executor_verification)
+#   - external_llm.editor._editor_core.lane* — PLANNER lane, permanently
+#     disabled at routing (task_router always returns MAIN_AGENT); only the
+#     webapp injects Lane.PLANNER. planner_lane_facade degrades to None on
+#     ImportError, so the CLI runs MAIN_AGENT-only without it (129k lines).
+#   - editor.operation_handlers / refactor / safety / semantic_lineage —
+#     lane-only machinery living outside lane/ (operation_handlers top-level
+#     imports lane; sole importers are lane executor mixins). Verified: no
+#     retained module imports these, absolutely or relatively.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["external_llm*", "services*", "utils*"]
+exclude = [
+    "external_llm.editor._editor_core.lane*",
+    "external_llm.editor.operation_handlers*",
+    "external_llm.editor.refactor*",
+    "external_llm.editor.safety*",
+    "external_llm.editor.semantic_lineage*",
+]
+
+[build-system]
+# >=77: PEP 639 SPDX `license = "MIT"` + `license-files` support
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.coverage.run]
+source = ["external_llm", "webapp", "asi"]
+omit = [
+    "*/_editor_core/lane/*",
+]
+concurrency = ["multiprocessing"]
+parallel = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "except ImportError:",
+    "raise NotImplementedError",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "integration: integration tests (require external resources)",
+    "unit: unit tests (isolated, fast)",
+    "slow: slow tests (skip in CI)",
+    "network: tests that require network access",
+]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "--import-mode=importlib",
+]
+# ASICODE_SHOW_WARNINGS=1: show all Python warnings (default: only errors shown via filterwarnings)
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+# === Rule selection ===
+# Stage 1: auto-fixable essentials (low noise, high value)
+# Stage 2+: gradually expand as baseline issues are resolved
+select = [
+    "E",    # pycodestyle errors (all categories)
+    "F",    # pyflakes (undefined names, unused imports)
+    "I",    # isort (import sorting)
+    "N",    # pep8-naming (naming conventions)
+    "UP",   # pyupgrade (modernize for 3.10+)
+    "W",    # pycodestyle warnings (trailing-whitespace, blank-line-whitespace)
+    "B",    # flake8-bugbear (likely bugs)
+    "ASYNC",# flake8-async (async patterns)
+    "RUF",  # ruff-specific rules
+]
+# Rules excluded globally (enable gradually after baseline cleanup):
+ignore = [
+    "E501",         # line-too-long: 16,665 violations — enable after bulk cleanup
+    "N802",         # invalid-function-name: 101 violations (test helpers, legacy)
+    "N806",         # non-lowercase-variable-in-function: 449 violations
+    "N999",         # invalid-module-name: 46 violations (from __init__ re-exports)
+    "UP037",        # quoted-annotation: 902 violations — enable after staged migration
+    "UP045",        # non-pep604-annotation-optional: 2,845 violations — staged migration
+    "B023",         # function-uses-loop-variable: 25 violations (intentional closures)
+    "ASYNC100",     # async-function-with-no-await: too noisy for mixed sync/async
+]
+
+[tool.ruff.format]
+line-ending = "lf"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "N802",   # test function names use snake_case convention differently
+    "N806",   # non-lowercase variable allowed in tests
+    "ASYNC100",
+]
+"tools/*" = [
+    "N802",
+    "N806",
+]
+"__init__.py" = [
+    "N999",   # __init__.py module names match package
+]
