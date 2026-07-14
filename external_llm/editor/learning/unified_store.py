@@ -325,15 +325,6 @@ class UnifiedStore:
         filtered = self._filter(strategy=strategy, language=language)
         return self._weighted_success_rate(filtered)
 
-    def cross_language_success_rate(
-        self,
-        strategy: str,
-        exclude_language: str,
-    ) -> tuple[float, int]:
-        """Get success rate from OTHER languages for a strategy."""
-        filtered = self._filter(strategy=strategy, exclude_language=exclude_language)
-        return self._weighted_success_rate(filtered)
-
     def get_strategy_runs(
         self,
         strategy: str,
@@ -364,31 +355,6 @@ class UnifiedStore:
         same.sort(key=lambda r: r.timestamp, reverse=True)
         cross.sort(key=lambda r: r.timestamp, reverse=True)
         merged = same + cross
-        return merged[:limit]
-
-    def get_runs_by_model(
-        self,
-        planner_model: Optional[str] = None,
-        developer_model: Optional[str] = None,
-        limit: int = 50,
-    ) -> list[UnifiedRunRecord]:
-        """Get runs filtered by model name."""
-        filtered = self._filter(
-            planner_model=planner_model,
-            developer_model=developer_model,
-        )
-        # Same-model records first (both planner and developer match)
-        same = []
-        rest = []
-        for r in reversed(filtered):
-            pm = r.planner_model or ""
-            dm = r.developer_model or ""
-            if (not planner_model or pm == planner_model) and \
-               (not developer_model or dm == developer_model):
-                same.append(r)
-            else:
-                rest.append(r)
-        merged = same + rest
         return merged[:limit]
 
     def get_model_stats(self) -> dict[str, Any]:
@@ -501,29 +467,6 @@ class UnifiedStore:
         }
 
     # ── Tool-specific helpers ─────────────────────────────────────────
-
-    def get_plan_id_outcomes(self) -> dict[str, dict[str, Any]]:
-        """Return ``{plan_id: outcome_row}`` for placement_label_join.
-
-        Only records whose ``metadata`` has a non-empty ``plan_id`` are indexed.
-        When multiple records share a plan_id, the most recent wins.
-        """
-        out: dict[str, dict[str, Any]] = {}
-        for r in self._records:
-            plan_id = r.metadata.get("plan_id") if isinstance(r.metadata, dict) else None
-            if not plan_id or not isinstance(plan_id, str):
-                continue
-            # Most-recent-wins: later records overwrite.
-            out[plan_id] = {
-                "run_id": r.run_id,
-                "timestamp": r.timestamp,
-                "success": 1 if r.success else 0,
-                "final_status": r.final_status or "",
-                "final_failure_class": r.final_failure_class,
-                "completed_ops": r.completed_ops or 0,
-                "failed_ops": r.failed_ops or 0,
-            }
-        return out
 
     def iter_all(self) -> Iterator[UnifiedRunRecord]:
         """Iterate over all records (for tools that need full scan)."""

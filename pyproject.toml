@@ -1,6 +1,6 @@
 [project]
 name = "asicode"
-version = "0.2.8"
+version = "0.2.9"
 description = "Autonomous Software Improvement — AST-precise code editing agent with verification gates (CLI + MCP server)"
 readme = "README.md"
 license = "MIT"

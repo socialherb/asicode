@@ -490,11 +490,6 @@ class ProjectAnalyzer:
 
         return sorted(present, key=lambda lang: counts[lang], reverse=True)
 
-    def _detect_framework(self) -> Optional[str]:
-        """Detect primary project framework (backward compat wrapper)"""
-        frameworks = self._detect_frameworks(self._detect_languages())
-        return frameworks[0] if frameworks else None
-
     def _detect_frameworks(self, languages: Optional[list[str]] = None) -> list[str]:
         """Detect all project frameworks (multi-framework support)
 
@@ -1336,51 +1331,4 @@ class ProjectAnalyzer:
 
         return examples
 
-    def get_structure_summary(self, structure: ProjectStructure) -> str:
-        """Get human-readable summary of project structure"""
-
-        lines = ["# Project Overview"]
-        lines.append("")
-
-        if structure.languages:
-            lines.append(f"**Languages**: {', '.join(structure.languages)}")
-
-        if structure.frameworks:
-            lines.append(f"**Frameworks**: {', '.join(structure.frameworks)}")
-        elif structure.framework:
-            lines.append(f"**Framework**: {structure.framework}")
-
-        if structure.project_types:
-            lines.append(f"**Project Type**: {', '.join(structure.project_types)}")
-
-        if structure.entry_points:
-            lines.append(f"**Entry Points**: {', '.join(structure.entry_points[:5])}")
-
-        if structure.directories:
-            lines.append("**Directory Organization**:")
-            for purpose, dirs in structure.directories.items():
-                if purpose != 'other':
-                    lines.append(f"- {purpose.title()}: {', '.join(dirs)}")
-
-        if structure.file_patterns:
-            lines.append("")
-            lines.append("**File Patterns**:")
-            for pattern_type, template in structure.file_patterns.items():
-                lines.append(f"- {pattern_type}: `{template}`")
-
-        if structure.naming_style:
-            lines.append("")
-            lines.append(f"**Naming Convention**: {structure.naming_style}")
-
-        if structure.common_imports:
-            lines.append("")
-            lines.append(f"**Common Imports**: {', '.join(structure.common_imports[:5])}")
-
-        if structure.example_files:
-            lines.append("")
-            lines.append("**Example Files** (for reference):")
-            for file_type, path in structure.example_files.items():
-                lines.append(f"- {file_type}: `{path}`")
-
-        return "\n".join(lines)
 

@@ -233,40 +233,9 @@ class DependencyGraphBuilder:
 
         return None
 
-    def get_call_chain(self, graph: DependencyGraph, function: str, max_depth: int = 3) -> list[list[str]]:
-        """
-        Get call chains starting from a function
-
-        Args:
-            graph: Dependency graph
-            function: Starting function
-            max_depth: Maximum chain length
-
-        Returns:
-            List of call chains (each chain is a list of function names)
-        """
-        chains = []
-
-        def dfs(current: str, chain: list[str], depth: int):
-            if depth > max_depth:
-                return
-
-            if current in graph.calls:
-                for callee in graph.calls[current]:
-                    new_chain = [*chain, callee]
-                    chains.append(new_chain)
-                    dfs(callee, new_chain, depth + 1)
-
-        dfs(function, [function], 0)
-        return chains
-
     def find_callers(self, graph: DependencyGraph, function: str) -> list[str]:
         """Find all functions that call the given function"""
         return graph.called_by.get(function, [])
-
-    def find_dependencies(self, graph: DependencyGraph, file_path: str) -> list[str]:
-        """Find all files that a file imports"""
-        return graph.file_imports.get(file_path, [])
 
     def format_call_graph(self, graph: DependencyGraph, target_function: str, max_items: int = 10) -> str:
         """

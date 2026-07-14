@@ -312,7 +312,13 @@ def _pip_install(package: str) -> bool:
         combined = (proc.stderr or "") + "\n" + (proc.stdout or "")
         for line in combined.strip().splitlines()[-3:]:
             print(f"      {line}")
-        # PEP 668: externally-managed
+        # PEP 668: externally-managed. NOTE: unlike the import-package
+        # installers (asi / browser_tools, which use
+        # external_llm.pip_env.pip_install_flags \u2192 --user --break-system-packages),
+        # this path installs CLI tools (ruff, pyright) resolved via
+        # shutil.which. --user drops the console script into a user bin dir
+        # usually not on $PATH, so we deliberately install into the system tree
+        # with --break-system-packages (no --user) to keep the script findable.
         if "externally-managed-environment" in combined:
             print(
                 "    \u21b3 Python externally managed (PEP 668) "

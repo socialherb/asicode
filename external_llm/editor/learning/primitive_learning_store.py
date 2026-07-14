@@ -67,19 +67,6 @@ class PrimitiveLearningStore:
         """Get record for exact key."""
         return self._records.get(key.to_str())
 
-    def lookup_by_context(
-        self,
-        context_bucket: str,
-        action_type: str = "",
-    ) -> dict[str, PrimitiveOutcomeRecord]:
-        """Find all records matching context prefix."""
-        result = {}
-        prefix = f"{context_bucket}|{action_type}" if action_type else context_bucket
-        for k, rec in self._records.items():
-            if k.startswith(prefix):
-                result[k] = rec
-        return result
-
     def lookup_by_primitive(self, primitive: str) -> dict[str, PrimitiveOutcomeRecord]:
         """Find all records for a specific primitive across all contexts."""
         result = {}

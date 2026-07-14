@@ -68,13 +68,169 @@ _VULTURE_KIND_MAP: dict[str, str] = {
 # Override via ``exclude_kinds`` (pass an empty collection to keep everything).
 _PUBLIC_DEAD_CODE_OVERLAP_KINDS: frozenset[str] = frozenset({"function", "class"})
 
-# Dunder / protocol names — never dead code (used via implicit protocol)
+# Dunder / protocol names — never dead code (used via implicit protocol).
+# Includes NON-dunder framework-protocol methods that are invoked by the
+# framework with no static caller (vulture cannot see polymorphic dispatch):
+#   _missing_         — Enum metaclass fallback (value lookup)
+#   handle_*          — html.parser.HTMLParser streaming callbacks
 _ALWAYS_LIVE: frozenset[str] = frozenset({
     "__init__", "__new__", "__str__", "__repr__", "__call__",
     "__enter__", "__exit__", "__iter__", "__next__", "__len__",
     "__getitem__", "__setitem__", "__contains__",
     "__post_init__", "__hash__", "__eq__", "__ne__", "__lt__", "__gt__",
+    # Non-dunder framework protocols (no static caller by design):
+    "_missing_",
+    "handle_starttag", "handle_endtag", "handle_data",
 })
+
+# libcst/ast visitor base classes. Subclasses define per-node-type dispatch
+# hooks — ``visit_<Node>``, ``leave_<Node>`` — and lifecycle methods
+# (``on_visit``/``on_leave``/``generic_visit``) that the framework invokes via
+# ``getattr`` with no static caller. Suppression is decided by base-class
+# inheritance (see ``_collect_visitor_hook_linenos``), NOT by name alone, so a
+# coincidentally named business method (e.g. ``visit_url`` in a non-visitor
+# class) is never over-suppressed.
+_VISITOR_BASE_NAMES: frozenset[str] = frozenset({
+    "CSTVisitor", "CSTTransformer",     # libcst
+    "NodeVisitor", "NodeTransformer",   # ast
+})
+_VISITOR_HOOK_PREFIXES: tuple[str, ...] = ("visit_", "leave_")
+_VISITOR_HOOK_EXACT: frozenset[str] = frozenset({"on_visit", "on_leave", "generic_visit"})
+
+
+# ── Test-path & string-dispatch suppression ───────────────────────────────────
+
+def _is_test_path(rel_file: str) -> bool:
+    """True if *rel_file* is a test file (pytest fixtures/parametrize noise).
+
+    Test files produce a large class of false positives (fixtures, parametrize
+    ids, ``conftest`` plugins) that are referenced by the pytest runtime, not by
+    static calls. They are still PARSED (for cross-file reachability of the
+    production symbols they import) — only their own candidates are dropped.
+    """
+    norm = rel_file.replace("\\", "/")
+    parts = norm.split("/")
+    if any(seg == "tests" for seg in parts):
+        return True
+    base = parts[-1]
+    return (
+        base == "conftest.py"
+        or base.startswith("test_")
+        or base.endswith("_test.py")
+    )
+
+
+def _collect_dispatch_live_names(scan_paths: list[str]) -> frozenset[str]:
+    """Identifier-shaped string literals found across *scan_paths*.
+
+    Vulture cannot see string-based dispatch — e.g. a handler map
+    ``{"grep": "_tool_grep"}`` later resolved via ``getattr(self, name)``. A
+    ``method``/``function`` candidate whose name appears as a quoted string
+    literal is plausibly invoked through such dispatch → suppress it.
+
+    Structural rather than prefix-coded: detects the *mechanism* (string → name)
+    instead of hardcoding ``_tool_`` etc., so any registry/getattr pattern is
+    covered without per-registry edits.
+
+    Conservative on both sides: only ``str.isidentifier()``-shaped literals are
+    collected (log/docstring prose won't match), and the resulting set is
+    consulted only for ``method``/``function`` candidates (variables/attributes
+    keep reporting).
+    """
+    import ast
+    import tokenize
+
+    seen: set[str] = set()
+    for path in scan_paths:
+        try:
+            with open(path, "rb") as fh:
+                for tok in tokenize.tokenize(fh.readline):
+                    if tok.type != tokenize.STRING:
+                        continue
+                    try:
+                        val = ast.literal_eval(tok.string)
+                    except Exception:
+                        continue
+                    if isinstance(val, str) and val.isidentifier():
+                        seen.add(val)
+        except (OSError, SyntaxError, tokenize.TokenError):
+            continue
+    return frozenset(seen)
+
+
+def _collect_visitor_hook_linenos(scan_paths: list[str]) -> set[tuple[str, int]]:
+    """``(abs_path, def_lineno)`` pairs of visitor-protocol methods in visitor subclasses.
+
+    ``libcst`` (``CSTVisitor``/``CSTTransformer``) and ``ast``
+    (``NodeVisitor``/``NodeTransformer``) dispatch per-node-type hooks —
+    ``visit_<Node>``, ``leave_<Node>``, and the lifecycle methods
+    ``on_visit``/``on_leave``/``generic_visit`` — via ``getattr`` with no
+    static caller, so vulture reports them as dead.
+
+    Detection is STRUCTURAL: the method's enclosing class must inherit
+    (directly, or via a same-file ancestor chain) from a name in
+    ``_VISITOR_BASE_NAMES``. This is the same "detect the mechanism, not the
+    naming convention" discipline as ``_collect_dispatch_live_names`` — a
+    coincidentally named business method (e.g. ``visit_url`` in a non-visitor
+    class) is NOT collected, so real dead code there is still reported.
+    """
+    import ast
+
+    seen: set[tuple[str, int]] = set()
+    for path in scan_paths:
+        try:
+            tree = ast.parse(open(path, encoding="utf-8").read())
+        except (OSError, SyntaxError):
+            continue
+
+        class_bases: dict[str, list[str]] = {}
+        methods: list[tuple[int, str, str]] = []  # (lineno, name, enclosing_class)
+
+        class _Mapper(ast.NodeVisitor):
+            def __init__(self):
+                self.stack: list[str] = []
+
+            def visit_ClassDef(self, node):
+                self.stack.append(node.name)
+                class_bases[node.name] = [
+                    b.id if isinstance(b, ast.Name)
+                    else (b.attr if isinstance(b, ast.Attribute) else None)
+                    for b in node.bases
+                ]
+                self.generic_visit(node)
+                self.stack.pop()
+
+            def _record(self, node):
+                if self.stack:
+                    methods.append((node.lineno, node.name, self.stack[-1]))
+                self.generic_visit(node)
+
+            visit_FunctionDef = _record
+            visit_AsyncFunctionDef = _record
+
+        _Mapper().visit(tree)
+        if not class_bases:
+            continue
+
+        def _is_visitor(cn: str, _seen: set[str] | None = None) -> bool:
+            _seen = _seen if _seen is not None else set()
+            if cn in _seen or cn not in class_bases:
+                return False
+            _seen.add(cn)
+            return any(
+                b in _VISITOR_BASE_NAMES
+                or (b in class_bases and _is_visitor(b, _seen))
+                for b in class_bases[cn]
+            )
+
+        abs_path = os.path.abspath(path)
+        for lineno, name, cn in methods:
+            if (
+                name in _VISITOR_HOOK_EXACT
+                or name.startswith(_VISITOR_HOOK_PREFIXES)
+            ) and _is_visitor(cn):
+                seen.add((abs_path, lineno))
+    return seen
 
 
 # ── Candidate model ────────────────────────────────────────────────────────────
@@ -281,7 +437,12 @@ def scan_vulture_dead_code(
             ``.venv`` / ``node_modules``.
         min_confidence: Vulture minimum confidence (0–100).
         exclude_patterns: Glob patterns to exclude (e.g. ``["*test*", "*migrations*"]``).
-        max_per_file: Max candidates emitted per file.
+        max_per_file: Max candidates emitted per file. This is a REPORTING cap,
+            not a dead-code-detection threshold: vulture may emit more than this
+            per file, but only the first ``max_per_file`` survive. Any aggregate
+            count (e.g. "N candidates") produced by this scanner is therefore
+            POST-CAP — cite it together with the cap value then in effect, never
+            as a raw vulture output size.
         repo_graph: Optional repository graph facade used for hub/leaf scope
             decision (see ``decide_vulture_scan_scope``).
         exclude_kinds: Candidate kinds to drop from results. Defaults to
@@ -338,6 +499,17 @@ def scan_vulture_dead_code(
         # then restricts reported candidates to the requested targets.
         scan_paths = _collect_project_py_files(repo_root)
 
+    # Names referenced as identifier-shaped string literals → dispatch-live
+    # (handler maps resolved via getattr). Collected once; consulted per
+    # candidate below to suppress string-dispatched callables.
+    _dispatch_live = _collect_dispatch_live_names(scan_paths)
+
+    # Visitor-protocol methods (visit_<Node>/leave_<Node>/on_visit/...) in
+    # libcst/ast visitor subclasses — framework-dispatched via getattr, no
+    # static caller. Detected structurally (base-class inheritance), not by
+    # name alone. Keyed by (abs_path, def_lineno) for precise matching.
+    _visitor_hooks = _collect_visitor_hook_linenos(scan_paths)
+
     # Bump recursion limit — Vulture's scavenge can recurse deeply on large
     # projects and raise RecursionError mid-scan (see git d2582924).
     _prev_rec_limit = sys.getrecursionlimit()
@@ -374,6 +546,13 @@ def scan_vulture_dead_code(
             except ValueError:
                 rel_file = abs_file
 
+            # Drop candidates from test files (pytest fixtures / parametrize ids
+            # / conftest plugins are referenced by the pytest runtime, not by
+            # static calls). Tests are still parsed for reachability; only their
+            # own candidates are suppressed here.
+            if _is_test_path(rel_file):
+                continue
+
             # file_paths whitelist filter
             if file_paths:
                 if not any(
@@ -393,7 +572,26 @@ def scan_vulture_dead_code(
             if kind in _skip_kinds:
                 continue
 
-            # Per-file cap
+            # Suppress string-dispatched callables: a method/function whose name
+            # appears as a quoted identifier (handler map / getattr lookup) is
+            # plausibly invoked through dispatch vulture cannot track. Variables
+            # and attributes are NOT suppressed — a string match there is weaker
+            # evidence and would risk hiding real dead code.
+            if kind in ("method", "function") and name in _dispatch_live:
+                continue
+
+            # Suppress framework-dispatched visitor hooks (visit_<Node>/
+            # leave_<Node>/on_visit/on_leave/generic_visit) in libcst/ast
+            # visitor subclasses. The (abs_file, lineno) match is inherently
+            # precise — it identifies a specific def confirmed to live in a
+            # visitor subclass, so a coincidentally named non-visitor method is
+            # never wrongly dropped.
+            if (abs_file, first_lineno) in _visitor_hooks:
+                continue
+
+            # Per-file reporting cap. This bounds emitted candidates per file; the
+            # raw vulture output may exceed it. Downstream aggregates are post-cap,
+            # NOT raw counts — see the max_per_file docstring.
             count = per_file_counts.get(rel_file, 0)
             if count >= max_per_file:
                 continue

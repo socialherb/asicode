@@ -512,10 +512,6 @@ class CodeContext:
             return sym
         return None
 
-    def get_class_method(self, class_name: str, method_name: str) -> Optional[SymbolDef]:
-        """Find a method within a class by name."""
-        return self.get_symbol(f"{class_name}.{method_name}")
-
     def find_body_range(self, name: str) -> Optional[tuple[int, int]]:
         """Find (body_start_byte, body_end_byte) for a named symbol."""
         sym = self.get_symbol(name)

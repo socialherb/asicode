@@ -2087,26 +2087,3 @@ class OllamaClient(LLMClient):
             except NameError:
                 pass
 
-    def check_model_loaded(self, model: str) -> bool:
-        """
-        Check if a model is available in Ollama.
-
-        Args:
-            model: Model name to check
-
-        Returns:
-            True if model is available, False otherwise
-        """
-        base_url = self.base_url or self.DEFAULT_BASE_URL
-        try:
-            response = self._session.get(
-                f"{base_url.rstrip('/')}/api/tags",
-                timeout=5
-            )
-            if response.status_code == 200:
-                data = response.json()
-                models = [m["name"] for m in data.get("models", [])]
-                return model in models
-            return False
-        except Exception:
-            return False

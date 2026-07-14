@@ -23,7 +23,6 @@ Usage::
 """
 from __future__ import annotations
 
-import ast
 from typing import Any, Optional
 
 from . import tree_sitter_utils as ts_utils
@@ -60,23 +59,6 @@ class SyntaxValidator:
             )
         return SyntaxValidationResult(ok=True, language=lang)
 
-    @staticmethod
-    def _validate_python_ast(content: str) -> SyntaxValidationResult:
-        """Validate Python via ast.parse."""
-        try:
-            ast.parse(content)
-            return SyntaxValidationResult(ok=True, language=LanguageId.PYTHON)
-        except SyntaxError as e:
-            err = SyntaxError_(
-                file="",
-                line=getattr(e, "lineno", 0) or 0,
-                col=getattr(e, "offset", 0) or 0,
-                message=e.msg or str(e),
-            )
-            return SyntaxValidationResult(
-                ok=False, errors=[err], language=LanguageId.PYTHON,
-            )
-
     # ── Symbol range detection ─────────────────────────────────────────
 
     @staticmethod
@@ -95,37 +77,6 @@ class SyntaxValidator:
             return provider.find_symbol_range(content, symbol_name)
         return ts_utils.find_symbol_range(content, symbol_name, lang.value)
 
-    @staticmethod
-    def _python_find_symbol_range(
-        content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
-        """Python AST walk to find symbol line range."""
-        try:
-            tree = ast.parse(content)
-        except SyntaxError:
-            return None
-        bare = symbol_name.split(".")[-1]
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if node.name == bare:
-                    end = getattr(node, "end_lineno", None)
-                    if end is None:
-                        end = node.lineno
-                    return (node.lineno, end)
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == bare:
-                        end = max(
-                            (getattr(t, "end_lineno", None) or t.lineno)
-                            for t in node.targets
-                        ) if node.targets else node.lineno
-                        return (node.lineno, end)
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                if node.target.id == bare:
-                    end = getattr(node, "end_lineno", None) or node.lineno
-                    return (node.lineno, end)
-        return None
-
     # ── All symbols enumeration ────────────────────────────────────────
 
     @staticmethod
@@ -141,31 +92,6 @@ class SyntaxValidator:
             return provider.find_symbols(content)
         return ts_utils.find_all_symbols(content, lang.value)
 
-    @staticmethod
-    def _python_find_symbols(
-        content: str,
-    ) -> list[tuple[str, str, int, int]]:
-        """Python AST walk to enumerate top-level symbols."""
-        try:
-            tree = ast.parse(content)
-        except SyntaxError:
-            return []
-        results: list[tuple[str, str, int, int]] = []
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                end = getattr(node, "end_lineno", None) or node.lineno
-                results.append((node.name, "function", node.lineno, end))
-            elif isinstance(node, ast.ClassDef):
-                end = getattr(node, "end_lineno", None) or node.lineno
-                results.append((node.name, "class", node.lineno, end))
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        results.append((target.id, "variable", node.lineno, node.lineno))
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                results.append((node.target.id, "variable", node.lineno, node.lineno))
-        return results
-
     # ── Symbol body extraction ─────────────────────────────────────────
 
     @staticmethod
@@ -179,25 +105,6 @@ class SyntaxValidator:
             return provider.extract_symbol_body(code, symbol_name)
         return ts_utils.extract_symbol_body(code, symbol_name, lang.value)
 
-    @staticmethod
-    def _python_extract_symbol_body(
-        code: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
-        """Extract function/method body range using Python AST."""
-        try:
-            tree = ast.parse(code)
-        except SyntaxError:
-            return None
-        bare = symbol_name.split(".")[-1]
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if node.name == bare and node.body:
-                    first_stmt = node.body[0]
-                    last_stmt = node.body[-1]
-                    end = getattr(last_stmt, "end_lineno", None) or last_stmt.lineno
-                    return (first_stmt.lineno, end)
-        return None
-
     # ── Dead code detection ────────────────────────────────────────────
 
     @staticmethod
@@ -209,42 +116,6 @@ class SyntaxValidator:
             return provider.is_dead_code_introduced(orig, new)
         # Fallback: conservative — validate syntax of new code
         return not SyntaxValidator.validate_syntax(new, lang).ok
-
-    @staticmethod
-    def _is_dead_code_python(orig: str, new: str) -> bool:
-        """Python AST dead code detection — compare reachable statement count."""
-        try:
-            orig_tree = ast.parse(orig)
-            new_tree = ast.parse(new)
-        except SyntaxError:
-            return False
-
-        def _count_reachable(node: ast.AST) -> int:
-            """Count reachable statements in a function body."""
-            count = 0
-            for stmt in ast.walk(node):
-                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    continue  # Don't descend into nested scopes
-                if isinstance(stmt, (ast.Return, ast.Raise)):
-                    count += 1
-                    break  # Statements after return/raise are dead
-                if isinstance(stmt, ast.stmt):
-                    count += 1
-            return count
-
-        # Compare reachable statements in first function of each tree
-        def _first_func(tree: ast.AST) -> Optional[ast.AST]:
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    return node
-            return None
-
-        orig_func = _first_func(orig_tree)
-        new_func = _first_func(new_tree)
-        if orig_func is None or new_func is None:
-            return False
-
-        return _count_reachable(new_func) < _count_reachable(orig_func)
 
     # ── File-based symbol lookup ──────────────────────────────────────
 
@@ -286,51 +157,6 @@ class SyntaxValidator:
             return None
         # Fallback: tree-sitter direct lookup
         return SyntaxValidator._ts_find_symbol_in_file(file_path, symbol_name, content, lang)
-
-    @staticmethod
-    def _python_find_symbol_in_file(
-        file_path: str, symbol_name: str, source: str,
-    ) -> Optional[dict[str, Any]]:
-        """Python AST-based symbol lookup (replaces _ast_find_symbol_in_file)."""
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            return None
-
-        bare = symbol_name.split(".")[-1] if "." in symbol_name else symbol_name
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if node.name == bare:
-                    return {
-                        "file": file_path,
-                        "line": node.lineno,
-                        "end_line": getattr(node, "end_lineno", None),
-                        "kind": "class" if isinstance(node, ast.ClassDef) else "function",
-                        "name": bare,
-                    }
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == bare:
-                        return {
-                            "file": file_path,
-                            "line": node.lineno,
-                            "end_line": max(
-                                (getattr(t, "end_lineno", None) or t.lineno)
-                                for t in node.targets
-                            ) if node.targets else node.lineno,
-                            "kind": "variable",
-                            "name": bare,
-                        }
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                if node.target.id == bare:
-                    return {
-                        "file": file_path,
-                        "line": node.lineno,
-                        "end_line": getattr(node, "end_lineno", None) or node.lineno,
-                        "kind": "variable",
-                        "name": bare,
-                    }
-        return None
 
     @staticmethod
     def _ts_find_symbol_in_file(

@@ -28,10 +28,9 @@ _WRITE_TOOLS = {
 _COMMAND_TOOLS = {"bash", "run_tests", "run_lint"}
 _SEARCH_TOOLS = {
     "grep", "find_symbol", "find_references", "find_relevant_files",
-    "explore_codebase", "query_dependency_graph", "analyze_change_impact",
-    "find_import_source",
+    "query_dependency_graph", "analyze_change_impact",
     "estimate_change_scope", "run_structural_scan",
-    "analyze_semantic_gap", "suggest_edit_location", "find_tests_for_symbol",
+    "find_tests_for_symbol",
     "search_web", "web_fetch", "search_design_history",
 }
 # Tools with no cross-turn state worth carrying (pure UI / meta)

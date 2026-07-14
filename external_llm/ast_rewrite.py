@@ -174,85 +174,9 @@ class ASTRewriter:
     # fallback anchor replace
     # ---------------------------------------------------------
 
-    def replace_by_anchor(
-        self,
-        file_path: str,
-        before_block: str,
-        after_block: str
-    ) -> RewriteResult:
-
-        path = self.repo_root / file_path
-        source = path.read_text(encoding="utf-8")
-
-        idx = source.find(before_block)
-
-        if idx == -1:
-            raise ValueError("Anchor block not found")
-
-        start = source[:idx].count("\n")
-        end = start + before_block.count("\n")
-
-        new_text = source.replace(before_block, after_block)
-
-        return RewriteResult(
-            old_text=source,
-            new_text=new_text,
-            start_line=start,
-            end_line=end,
-            symbol="anchor_replace"
-        )
-
     # ---------------------------------------------------------
     # fuzzy fallback
     # ---------------------------------------------------------
-
-    def replace_fuzzy(
-        self,
-        file_path: str,
-        before_block: str,
-        after_block: str
-    ) -> RewriteResult:
-
-        path = self.repo_root / file_path
-        source = path.read_text(encoding="utf-8")
-
-        lines = source.splitlines()
-        before_lines = before_block.splitlines()
-
-        best_score = 0
-        best_index = None
-
-        for i in range(len(lines)):
-
-            chunk = "\n".join(lines[i:i+len(before_lines)])
-
-            score = difflib.SequenceMatcher(
-                None,
-                chunk,
-                before_block
-            ).ratio()
-
-            if score > best_score:
-                best_score = score
-                best_index = i
-
-        if best_score < 0.6:
-            raise ValueError("No fuzzy match found")
-
-        start = best_index
-        end = best_index + len(before_lines)
-
-        new_lines = lines[:start] + after_block.splitlines() + lines[end:]
-
-        new_text = "\n".join(new_lines) + "\n"
-
-        return RewriteResult(
-            old_text=source,
-            new_text=new_text,
-            start_line=start,
-            end_line=end,
-            symbol="fuzzy_replace"
-        )
 
     # ---------------------------------------------------------
     # patch generation

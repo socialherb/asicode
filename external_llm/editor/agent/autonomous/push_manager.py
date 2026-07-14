@@ -178,10 +178,6 @@ class PushManager:
             self._wake_client(info)
         return delivered
 
-    def client_count(self) -> int:
-        with self._lock:
-            return len(self._clients)
-
     def cleanup_stale(self) -> int:
         """Remove clients with no activity for > CLIENT_TTL seconds."""
         now = time.time()

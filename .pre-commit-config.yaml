@@ -1,19 +1,35 @@
 # See https://pre-commit.com for installation and usage
-# Install: pip install pre-commit && pre-commit install
+# Install:  pipx install pre-commit && pre-commit install
+#
+# This gate mirrors .github/workflows/lint.yml EXACTLY: the three ruff
+# baseline-diff checks (F821/F401/F811). It catches lint-baseline drift
+# (e.g. the F811 line-scoped key shifting when a baselined file is edited
+# above a redefinition) BEFORE the public CI does.
+#
+# Why not full `ruff` / `ruff-format` / `pyright`? pyproject selects
+# E/F/I/N/UP/W/B/ASYNC/RUF but ~1377 un-baselined lint violations and ~982
+# format violations remain (see the staged `ignore` list in pyproject.toml).
+# Re-enable those hooks only after that backlog is cleared. `language: system`
+# uses the host `python3`/`ruff` — the same binaries the check scripts call via
+# subprocess — so the result is identical to `python3 scripts/check_*.py`.
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.9
+  - repo: local
     hooks:
-      # Run the linter
-      - id: ruff
-        args: [--fix]
-      # Run the formatter
-      - id: ruff-format
-  - repo: https://github.com/RobertCraigie/pyright-python
-    rev: v1.1.410
-    hooks:
-      - id: pyright
-        args: []
-        # Pyright can be slow — uncomment the line below to skip if needed:
-        # verbose: true
-        exclude: ^tests/
+      - id: baseline-f821
+        name: F821 (undefined name) baseline-diff
+        language: system
+        entry: python3 scripts/check_f821_no_new.py
+        pass_filenames: false
+        always_run: true
+      - id: baseline-f401
+        name: F401 (unused import) baseline-diff
+        language: system
+        entry: python3 scripts/check_f401_no_new.py
+        pass_filenames: false
+        always_run: true
+      - id: baseline-f811
+        name: F811 (redefinition of unused) baseline-diff
+        language: system
+        entry: python3 scripts/check_f811_no_new.py
+        pass_filenames: false
+        always_run: true

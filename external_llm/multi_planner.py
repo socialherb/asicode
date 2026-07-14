@@ -325,43 +325,6 @@ class MultiFilePlanner:
 
         return criteria
 
-    def get_plan_summary(self, plan: ExecutionPlan) -> str:
-        """Get human-readable plan summary"""
-
-        lines = ["# Execution Plan"]
-        lines.append("")
-        lines.append(f"**Request**: {plan.original_request}")
-        lines.append(f"**Complexity**: {plan.complexity}")
-        lines.append(f"**Strategy**: {plan.strategy}")
-        lines.append("")
-
-        if plan.operations:
-            lines.append("## Operations")
-            lines.append("")
-            for i, op in enumerate(plan.operations, 1):
-                lines.append(f"### {i}. {op.operation.title()} `{op.file_path}`")
-                lines.append(f"   **Description**: {op.description}")
-                if op.dependencies:
-                    lines.append(f"   **Dependencies**: {', '.join(op.dependencies)}")
-                if op.instructions:
-                    lines.append(f"   **Instructions**: {op.instructions}")
-                lines.append("")
-
-        if plan.success_criteria:
-            lines.append("## Success Criteria")
-            lines.append("")
-            for criterion in plan.success_criteria:
-                lines.append(f"- {criterion}")
-            lines.append("")
-
-        if plan.warnings:
-            lines.append("## Warnings")
-            lines.append("")
-            for warning in plan.warnings:
-                lines.append(f"⚠️  {warning}")
-            lines.append("")
-
-        return "\n".join(lines)
 
 
 class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
@@ -629,9 +592,12 @@ Now, think through the architecture step by step and generate the plan:"""
         """
         import re
 
-        import yaml
-
         try:
+            # PyYAML lives in the optional [config] extra. Importing inside the
+            # try block makes the ``except ImportError`` below actually
+            # reachable (the previous bare import above the try made it dead).
+            import yaml
+
             # Try to extract YAML block from response
             yaml_pattern = r'```(?:yaml|yml)?\s*(.*?)```'
             matches = re.findall(yaml_pattern, llm_content, re.DOTALL)

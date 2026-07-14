@@ -257,10 +257,6 @@ class ProactiveRunner:
 
     # ── Schedule helpers ──────────────────────────────────────────────────────
 
-    def add_schedule(self, interval_seconds: float, label: str) -> None:
-        """Register a recurring scheduled task."""
-        self._engine.schedule(interval_seconds, label)
-
     # ── Test result forwarding ────────────────────────────────────────────────
 
     def notify_test_result(self, ok: bool, details: dict[str, Any]) -> None:

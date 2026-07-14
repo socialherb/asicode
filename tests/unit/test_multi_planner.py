@@ -121,3 +121,20 @@ plan:
     plan = _planner()._parse_llm_plan_response(llm, "req")
     assert plan is not None
     assert all(isinstance(op.dependencies, list) for op in plan.operations)
+
+
+def test_parse_returns_none_when_pyyaml_missing(monkeypatch):
+    """PyYAML is an optional [config] extra; its absence must degrade to
+    None (rule-based fallback), never propagate an ImportError.
+
+    Regression: ``import yaml`` previously sat *outside* the try block, making
+    the ``except ImportError`` handler dead code and relying on the caller's
+    broad ``except Exception`` as the real safety net.
+    """
+    import sys
+
+    # sys.modules[name] = None forces ``import name`` to raise ImportError,
+    # simulating "PyYAML not installed" without touching the environment.
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    plan = _planner()._parse_llm_plan_response(_LLM_NULL_DEPS, "req")
+    assert plan is None, "missing PyYAML must degrade to None, not raise"

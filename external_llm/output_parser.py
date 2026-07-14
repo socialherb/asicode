@@ -649,45 +649,6 @@ class EnhancedOutputParser:
         logger.debug(f"parse_file_blocks returning {len(out)} blocks")
         return out
 
-    def extract_file_hunks(self, diff: str) -> dict[str, list[dict[str, Any]]]:
-        """
-        Utility: parse hunks grouped by file (used by some UI inspectors).
-        """
-        result: dict[str, list[dict[str, Any]]] = {}
-        current_file: Optional[str] = None
-        current_hunk: Optional[dict[str, Any]] = None
-
-        for line in (diff or "").replace("\r\n", "\n").split("\n"):
-            if line.startswith("diff --git"):
-                m = re.search(r"\sb/(.+?)(?:\s|$)", line)
-                if m:
-                    current_file = m.group(1)
-                    result.setdefault(current_file, [])
-                    current_hunk = None
-                continue
-
-            if line.startswith("@@") and current_file:
-                m = self.HUNK_HEADER_RE.match(line)
-                if m:
-                    old_start = int(m.group(1))
-                    old_lines = int(m.group(2) or 1)
-                    new_start = int(m.group(3))
-                    new_lines = int(m.group(4) or 1)
-                    current_hunk = {
-                        "old_start": old_start,
-                        "old_lines": old_lines,
-                        "new_start": new_start,
-                        "new_lines": new_lines,
-                        "header": line,
-                        "content": [],
-                    }
-                    result[current_file].append(current_hunk)
-                continue
-
-            if current_hunk is not None:
-                current_hunk["content"].append(line)
-
-        return result
 
 
 # -----------------------------

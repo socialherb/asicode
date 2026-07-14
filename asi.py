@@ -2467,7 +2467,14 @@ def _pip_install(pkgs: list[str], *, timeout: int = 600, _force_break: bool = Fa
 
     cmd = [sys.executable, "-m", "pip", "install", *pkgs]
     if _force_break:
-        cmd.append("--break-system-packages")
+        # PEP 668 retry — target the user site (never the managed system tree)
+        # via the shared decision helper. These are all import-packages
+        # (tree-sitter / vector / prompt_toolkit / claude SDK), so --user is
+        # safe (contrast dependency_checker, which installs CLI tools). On an
+        # externally-managed env this yields --user --break-system-packages;
+        # elsewhere it degrades to plain (the retry only fires post-PEP-668).
+        from external_llm.pip_env import pip_install_flags
+        cmd += pip_install_flags() or ["--break-system-packages"]
     if not label:
         label = pkgs[0] + (f" (+{len(pkgs) - 1})" if len(pkgs) > 1 else "")
 
@@ -2542,6 +2549,10 @@ def _pip_install(pkgs: list[str], *, timeout: int = 600, _force_break: bool = Fa
     # that re-checks via find_spec right after installing.
     import importlib
 
+    from external_llm.pip_env import ensure_user_site_importable
+    # A --user install may land in a user-site dir absent at startup; make it
+    # importable before the caller re-imports the just-installed package.
+    ensure_user_site_importable()
     importlib.invalidate_caches()
     return True
 
@@ -6683,7 +6694,7 @@ def run_repl(args: argparse.Namespace) -> None:
             # Reasoning models can consume the entire shared budget on reasoning trace,
             # leaving nothing for content — a larger budget gives reasoning+content
             # room to co-exist.
-            _ci_pt_total = _ci_ct_total = _ci_crt_total = _ci_cct_total = 0
+            _ci_pt_total = _ci_ct_total = _ci_crt_total = 0
             _ci_max_attempts = 2  # total attempts (initial + 1 retry on length)
             for _ci_attempt in range(_ci_max_attempts):
                 _ci_resp = _ci_client.chat(
@@ -6696,7 +6707,6 @@ def run_repl(args: argparse.Namespace) -> None:
                 _ci_pt_total += getattr(_ci_resp, "prompt_tokens", 0) or 0
                 _ci_ct_total += getattr(_ci_resp, "completion_tokens", 0) or 0
                 _ci_crt_total += getattr(_ci_resp, "cache_read_input_tokens", 0) or 0
-                _ci_cct_total += getattr(_ci_resp, "cache_creation_input_tokens", 0) or 0
                 if _ci_finish_reason != "length":
                     break  # success or non-truncation failure
                 # finish_reason=length: retry with doubled budget regardless of
@@ -6885,26 +6895,18 @@ def run_repl(args: argparse.Namespace) -> None:
                 f"possible. Manual /insights drop <n> to remove.", _C["yellow"])
         else:
             _print(f"  ✓ design_insights compacted ({_ci_b_n}→{_ci_a_n} entries).", "dim")
-        # ── Token cost accounting (interactive compact) ──────────────────────
+        # ── Token accounting (interactive compact) ───────────────────────────
         # The LLM call consumes real tokens but the interactive path never
-        # accumulated them, making them invisible in the session cost line.
+        # accumulated them, making them invisible in the session cost line;
+        # this log is the only record of what the compact consumed.
         try:
             _ci_pt = _ci_pt_total
             _ci_ct = _ci_ct_total
             _ci_crt = _ci_crt_total
-            _ci_cct = _ci_cct_total
             if _ci_pt or _ci_ct:
-                from external_llm.agent._shared_utils import cache_cost_summary
-                _ci_prov = getattr(_ci_resp, "provider", None) or ""
-                _ci_bu = getattr(getattr(_ci_client, "base_url", None), "__str__", lambda: "")()
-                _ci_cost_full, _ci_cost_actual, _ci_hit = cache_cost_summary(
-                    _ci_prov, _ci_pt, _ci_ct, _ci_crt, _ci_cct,
-                    model=_ci_model, base_url=_ci_bu,
-                )
                 logging.getLogger(__name__).info(
-                    "insights compact: tokens prompt=%d completion=%d cache_read=%d "
-                    "→ cost $%.4f (actual $%.4f)",
-                    _ci_pt, _ci_ct, _ci_crt, _ci_cost_full, _ci_cost_actual,
+                    "insights compact: tokens prompt=%d completion=%d cache_read=%d",
+                    _ci_pt, _ci_ct, _ci_crt,
                 )
         except Exception:
             pass  # non-critical — never block the turn
@@ -7558,7 +7560,7 @@ def run_repl(args: argparse.Namespace) -> None:
                         _print(
                             f"  design_insights: {_ins_stats.count} entries · "
                             f"{_ins_stats.bytes_size:,} bytes"
-                            + (f"  ⚠ over budget" if _ins_over else ""),
+                            + ("  ⚠ over budget" if _ins_over else ""),
                             _C["yellow"] if _ins_over else _C["text"])
                         if _ins_over:
                             _print(_ins_budget_s, _C["yellow"])
@@ -7717,7 +7719,7 @@ def run_repl(args: argparse.Namespace) -> None:
                             try:
                                 _fps_prune_threshold = float(_fps_prune_toks[1])
                             except ValueError:
-                                _print(f"  usage: /failure-patterns prune [threshold]  (threshold default: 1.0)", _C["yellow"])
+                                _print("  usage: /failure-patterns prune [threshold]  (threshold default: 1.0)", _C["yellow"])
                                 continue
                         _fps_prune_count = _fps.prune(threshold=_fps_prune_threshold)
                         if _fps_prune_count > 0:
@@ -7754,7 +7756,7 @@ def run_repl(args: argparse.Namespace) -> None:
                                         _fps_mt = _fps_mp.get("tool", "?")
                                         _fps_mr = (_fps_mp.get("reason", "") or "")[:80]
                                         _print(f"    {_fps_mi}. [{_fps_mt}] {_fps_mr}", _C["muted"])
-                                    _print(f"  (use numeric index or a more specific substring)", _C["muted"])
+                                    _print("  (use numeric index or a more specific substring)", _C["muted"])
                                     continue
                                 _fps_drop_result = _fps.drop_key(_fps_matches[0]["key"])
                             if _fps_drop_result is not None:

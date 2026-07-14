@@ -7,7 +7,6 @@ Security: all file operations are bounded by repo_root.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -777,12 +776,6 @@ class ToolRegistry(
 
     _PATCH_FILE_THRESHOLD = 3
 
-    def _count_patch_files(self, patch_text: str) -> int:
-        return self._safety_manager.count_patch_files(patch_text)
-
-    def _approval_preview(self, tool_name: str, args: dict) -> tuple[str, bool]:
-        return self._safety_manager.approval_preview(tool_name, args)
-
     def _gate_check(self, tool_name: str, args: dict) -> "Optional[ToolResult]":
         rejection = self._safety_manager.gate_check(
             tool_name, args, self.config.approval_callback
@@ -796,60 +789,6 @@ class ToolRegistry(
         )
 
     # Tools that write to files — need per-file locking in multi-agent mode
-    def _check_permission_rules(self, tool_name: str, args: dict) -> Optional[dict[str, Any]]:
-        """Load and evaluate permission rules from JSON.
-
-        Returns:
-            Dict with 'allowed' bool and optional 'reason' string if denied,
-            or None if no rules apply.
-        """
-
-        # Load permission rules
-        permissions_path = Path(self.repo_root) / ".asicode" / "permissions.json"
-        if not permissions_path.exists():
-            return None
-
-        try:
-            with open(permissions_path, encoding='utf-8') as f:
-                rules = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return None
-
-        # Check each rule in the rules array
-        for rule in rules.get("rules", []):
-            # Check if tool matches
-            tool_pattern = rule.get("tool", "*")
-            if tool_pattern != "*" and tool_pattern != tool_name:
-                continue
-
-            # Check if file pattern matches
-            file_pattern = rule.get("file_pattern", "*")
-
-            # Extract file paths from args
-            file_paths = []
-            if "file_path" in args:
-                file_paths.append(args["file_path"])
-            elif "paths" in args:
-                file_paths.extend(args["paths"])
-
-            # If no file paths in args, check if pattern is "*" (matches any)
-            if not file_paths:
-                if file_pattern == "*":
-                    return {"allowed": rule.get("allow", True)}
-                continue
-
-            # Check each file path against the pattern
-            for file_path in file_paths:
-                # Simple pattern matching: * matches anything
-                if file_pattern == "*":
-                    return {"allowed": rule.get("allow", True)}
-
-                # Check if pattern is in file path or file ends with pattern
-                if file_pattern in file_path or file_path.endswith(file_pattern):
-                    return {"allowed": rule.get("allow", True)}
-
-        # No matching rule found
-        return None
     # All write tools get snapshot + syntax verify + rollback safety wrapper
     _WRITE_TOOLS = {"apply_patch", "write_plan", "edit_ast", "edit_file", "edit_text", "modify_symbol", "anchor_edit"}
     # Tools that must NEVER run concurrently. ask_user blocks on human input and

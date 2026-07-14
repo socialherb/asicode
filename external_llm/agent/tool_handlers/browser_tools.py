@@ -24,15 +24,24 @@ Usage:
 from __future__ import annotations
 
 import atexit
+import importlib
+import logging
 import os
+import subprocess
+import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as _FutureTimeout
 from typing import TYPE_CHECKING, Any
 
+from external_llm.pip_env import ensure_user_site_importable, pip_install_flags
+
 if TYPE_CHECKING:
     from ..tool_registry import ToolResult
+
+logger = logging.getLogger(__name__)
+
 # ── Optional Playwright dependency ───────────────────────────────────── #
 try:
     from playwright.sync_api import TimeoutError as _PlaywrightTimeout
@@ -93,13 +102,17 @@ class BrowserActionToolsMixin:
             )
 
         if not HAS_PLAYWRIGHT:
-            return self._make_result(
-                ok=False, content="",
-                error=(
-                    "Playwright is not installed. Install it with:\n"
-                    "  pip install playwright && playwright install chromium"
-                ),
-            )
+            if not self._ensure_playwright_installed():
+                return self._make_result(
+                    ok=False, content="",
+                    error=(
+                        "Playwright is not available — automatic installation was "
+                        "declined or failed.\n"
+                        "Install manually:\n"
+                        "  pip install playwright && playwright install chromium"
+                    ),
+                )
+            # Module-level names updated by _reload_playwright_module; proceed.
 
         _ACTIONS = {
             "navigate": self._browser_navigate,
@@ -154,6 +167,120 @@ class BrowserActionToolsMixin:
                 ),
             )
 
+    # ── On-the-fly Playwright install with user consent ────────────────── #
+
+    def _ensure_playwright_installed(self) -> bool:
+        """Ensure Playwright is available — prompt, install, and reload if needed.
+
+        Returns True if Playwright is now ready (either was already installed
+        after a concurrent call, or was just installed successfully).
+        """
+        if HAS_PLAYWRIGHT:
+            return True
+        # Frozen (PyInstaller / py2exe / etc.) environments cannot run
+        # sys.executable -m pip; skip auto-install and fall through to the
+        # manual-instructions error path.
+        if getattr(sys, "frozen", False):
+            logger.info("browser_action: frozen environment detected, skipping automatic Playwright install")
+            return False
+        if not self._ask_install_playwright():
+            return False
+        if not self._install_playwright():
+            return False
+        return self._reload_playwright_module()
+
+    def _ask_install_playwright(self) -> bool:
+        """Ask the user if they want to install Playwright.
+
+        Uses the agent's ask_user mechanism. Falls back to 'no' if
+        checkpoint/prompting is unavailable.
+        """
+        try:
+            result = self._tool_ask_user({
+                "question": (
+                    "Playwright (browser automation) is needed for the "
+                    "browser_action tool but is not installed.\n\n"
+                    "Install it now?\n"
+                    "  pip install playwright && playwright install chromium"
+                ),
+                "type": "confirm",
+                "options": ["yes", "no"],
+                "default": "no",
+                "reason": "Playwright required for browser_action tool",
+            })
+            answer = result.metadata.get("answer", "no").lower().strip()
+            return answer == "yes"
+        except Exception as e:
+            logger.warning("browser_action: ask_user failed (%s), skipping Playwright install", e)
+            return False
+
+    @staticmethod
+    def _pip_install_flags() -> list[str]:
+        """Extra ``pip install`` flags required for the current environment.
+
+        Thin delegate to the shared :func:`external_llm.pip_env.pip_install_flags`
+        so browser / asi / (import-package) installers make the same PEP 668
+        decision. Kept as a method so tests can patch it per-instance.
+        """
+        return pip_install_flags()
+
+    def _install_playwright(self) -> bool:
+        """Install Playwright Python package + Chromium browser via pip.
+
+        Uses ``_pip_install_flags`` so the pip step works on PEP 668
+        externally-managed environments too. The ``playwright install
+        chromium`` step downloads browser binaries into a cache dir (not a
+        Python package), so it is unaffected by PEP 668 and needs no flags.
+        """
+        flags = self._pip_install_flags()
+        try:
+            logger.info(
+                "Installing playwright package%s...",
+                " into user site (externally-managed env)" if flags else "",
+            )
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "playwright", *flags],
+                check=True, capture_output=True, timeout=120,
+            )
+            logger.info("Installing Chromium for Playwright...")
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                check=True, capture_output=True, timeout=300,
+            )
+            return True
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+            logger.error("Playwright installation failed (rc=%d): %s", e.returncode, stderr)
+            return False
+        except Exception as e:
+            logger.error("Playwright installation failed: %s", e)
+            return False
+
+    def _reload_playwright_module(self) -> bool:
+        """Dynamically import Playwright after install and update module-level refs.
+
+        After ``pip install playwright`` the package becomes importable.
+        Updates ``HAS_PLAYWRIGHT``, ``sync_playwright``, and
+        ``_PlaywrightTimeout`` in the module's global namespace so existing
+        code paths (guard, ``_get_browser``, ``_run`` exception handler) pick
+        up the new values without requiring a process restart.
+        """
+        try:
+            # A just-completed ``--user`` install may land in a user-site dir
+            # that was absent (hence not on sys.path) at interpreter startup;
+            # ensure it is importable now, and drop stale import caches so the
+            # freshly written package files are discovered.
+            ensure_user_site_importable()
+            importlib.invalidate_caches()
+            sync_mod = importlib.import_module("playwright.sync_api")
+            mod = sys.modules[__name__]
+            mod.sync_playwright = sync_mod.sync_playwright
+            mod._PlaywrightTimeout = sync_mod.TimeoutError
+            mod.HAS_PLAYWRIGHT = True
+            return True
+        except ImportError as e:
+            logger.error("Failed to import Playwright after installation: %s", e)
+            return False
     # ── Browser lifecycle helpers ─────────────────────────────────────── #
 
     def _get_browser(self):

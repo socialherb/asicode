@@ -1939,11 +1939,6 @@ class StrategyPolicyLearner:
 
         return result
 
-    def get_all_statuses(self) -> dict[str, str]:
-        """Return {strategy: status} for all known strategies."""
-        with self._lock:
-            return dict(self._strategy_status)
-
     def is_deprecated(self, strategy: str, context_bucket: str = "") -> bool:
         """Check if a strategy is deprecated.
 
@@ -2636,14 +2631,6 @@ class AdaptiveLearnerHub:
         with self._lock:
             self.tool_learner.update(state, tool_name, reward)
 
-    def get_tool_hint(self, phase: str, context_bucket: str = "") -> dict[str, float]:
-        """Return tool preference scores for a given phase."""
-        state = f"{context_bucket}|{phase}" if context_bucket else phase
-        tools = ["apply_patch", "find_symbol",
-                 "find_references", "run_tests", "run_lint"]
-        with self._lock:
-            return self.tool_learner.get_scores(state, tools)
-
     # ── 2. Patch method learning ────────────────────────────────
 
     def record_patch_result(
@@ -2656,27 +2643,6 @@ class AdaptiveLearnerHub:
         state = f"{failure_class}|{file_ext}"
         with self._lock:
             self.patch_learner.update(state, method, reward)
-
-    def get_best_patch_method(
-        self, failure_class: str, file_ext: str, methods: Optional[list[str]] = None,
-    ) -> str:
-        """Return best patch method for this failure/file type."""
-        state = f"{failure_class}|{file_ext}"
-        if methods is None:
-            methods = ["git_apply", "ast_rewrite", "semantic_patch",
-                       "surgical_edit", "python_precise", "synthesis"]
-        with self._lock:
-            return self.patch_learner.get_best(state, methods, default="")
-
-    def get_patch_scores(
-        self, failure_class: str, file_ext: str,
-    ) -> dict[str, float]:
-        """Return all patch method scores."""
-        state = f"{failure_class}|{file_ext}"
-        methods = ["git_apply", "ast_rewrite", "semantic_patch",
-                   "surgical_edit", "python_precise", "synthesis"]
-        with self._lock:
-            return self.patch_learner.get_scores(state, methods)
 
     # ── 3. Context budget learning ──────────────────────────────
 
@@ -2691,16 +2657,6 @@ class AdaptiveLearnerHub:
         reward = _compute_reward(success, plan_quality, base_success=0.8, base_fail=-0.4)
         with self._lock:
             self.context_learner.update(task_type, context_config, reward)
-
-    def get_best_context_config(
-        self, task_type: str, configs: Optional[list[str]] = None,
-    ) -> str:
-        """Return best context configuration for task type."""
-        if configs is None:
-            configs = ["callers=10,depth=1", "callers=20,depth=2",
-                       "callers=5,depth=1", "callers=10,depth=2"]
-        with self._lock:
-            return self.context_learner.get_best(task_type, configs, default="")
 
     # ── 4. Routing learning ─────────────────────────────────────
 
@@ -2718,12 +2674,6 @@ class AdaptiveLearnerHub:
         with self._lock:
             self.routing_learner.update(request_features, lane, reward)
 
-    def get_routing_bias(self, request_features: str) -> dict[str, float]:
-        """Return lane preference scores."""
-        lanes = ["planner", "main_agent", "fast_path"]
-        with self._lock:
-            return self.routing_learner.get_scores(request_features, lanes)
-
     # ── 5. Prompt variant learning ──────────────────────────────
 
     def record_prompt_result(
@@ -2737,23 +2687,6 @@ class AdaptiveLearnerHub:
         reward = _compute_reward(success, plan_quality, base_success=1.0, base_fail=-0.5)
         with self._lock:
             self.prompt_learner.update(strategy, variant, reward)
-
-    def get_best_prompt_variant(
-        self, strategy: str, variants: Optional[list[str]] = None,
-    ) -> str:
-        """Return best prompt variant for a strategy."""
-        if variants is None:
-            variants = ["default", "strict_constraints", "example_driven",
-                        "minimal_instruction"]
-        with self._lock:
-            return self.prompt_learner.get_best(strategy, variants, default="default")
-
-    def get_prompt_scores(self, strategy: str) -> dict[str, float]:
-        """Return prompt variant scores for a strategy."""
-        variants = ["default", "strict_constraints", "example_driven",
-                    "minimal_instruction"]
-        with self._lock:
-            return self.prompt_learner.get_scores(strategy, variants)
 
     # ── Persistence ─────────────────────────────────────────────
 
@@ -2782,16 +2715,6 @@ class AdaptiveLearnerHub:
                 if isinstance(raw, dict):
                     learner.load_dict(raw)
 
-    def get_full_report(self) -> dict[str, Any]:
-        """Return comprehensive report across all 5 domains."""
-        with self._lock:
-            return {
-                "tool_selection": self.tool_learner.get_report(),
-                "patch_method": self.patch_learner.get_report(),
-                "context_budget": self.context_learner.get_report(),
-                "routing": self.routing_learner.get_report(),
-                "prompt_variant": self.prompt_learner.get_report(),
-            }
 
 
 # ---------------------------------------------------------------------------

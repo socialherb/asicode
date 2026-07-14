@@ -95,12 +95,6 @@ class LanguageRegistry:
         caps = provider.capabilities()
         return caps.supports_modify_symbol or caps.supports_insert_after_symbol
 
-    def supports_syntax_validation(self, file_path: str) -> bool:
-        provider = self.get(file_path)
-        if provider is None:
-            return False
-        return provider.capabilities().has_syntax_validator
-
     # ── Aggregate helpers ─────────────────────────────────────────────────
 
     def get_file_pattern(self) -> str:

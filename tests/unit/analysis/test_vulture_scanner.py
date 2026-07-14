@@ -129,6 +129,158 @@ class C:
     assert "__init__" not in names
 
 
+# ── Non-dunder framework protocols are always-live ──────────────────────
+
+
+def test_always_live_includes_framework_protocols():
+    """Non-dunder protocol methods invoked by a framework with no static caller
+    (Enum._missing_, HTMLParser.handle_*) must be filtered like dunders."""
+    from external_llm.analysis.vulture_scanner import _ALWAYS_LIVE
+    assert "_missing_" in _ALWAYS_LIVE
+    assert "handle_starttag" in _ALWAYS_LIVE
+
+
+# ── Test files: parsed for reachability, candidates suppressed ───────────
+
+
+def test_is_test_path_classifies_correctly():
+    from external_llm.analysis.vulture_scanner import _is_test_path
+    # test files
+    assert _is_test_path("tests/unit/test_foo.py")
+    assert _is_test_path("tests/conftest.py")
+    assert _is_test_path("pkg/testing/test_bar.py")
+    assert _is_test_path("something_test.py")
+    # production files (must NOT be suppressed)
+    assert not _is_test_path("external_llm/testing/symbol_aware_test_finder.py")
+    assert not _is_test_path("external_llm/agent/foo.py")
+
+
+def test_test_file_candidates_suppressed(tmp_path):
+    """Test files are parsed for cross-file reachability but their own
+    candidates (fixtures/parametrize) are dropped; a production sibling's
+    candidates survive."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_noise.py").write_text(
+        "unused_fixture_in_test = 123\n"
+    )
+    (tmp_path / "probe.py").write_text(
+        "class C:\n"
+        "    def dead_method(self):\n"
+        "        pass\n"
+    )
+    cands = scan_vulture_dead_code(
+        repo_root=str(tmp_path),
+        file_paths=["probe.py", "tests/test_noise.py"],
+        repo_graph=None, min_confidence=0,
+    )
+    files = {c.file for c in cands}
+    assert not any("test_noise" in f for f in files)
+    assert any("probe.py" in f for f in files)
+
+
+# ── String-dispatched callables are suppressed (handler maps / getattr) ──
+
+
+def test_string_dispatch_live_method_suppressed(tmp_path):
+    """A method referenced as a quoted identifier (handler-map value later
+    resolved via getattr) is plausibly dispatched → suppressed. A truly
+    unreferenced sibling method must STILL be reported (no over-suppression)."""
+    src = (
+        "class Tools:\n"
+        '    HANDLER_MAP = {"a": "_dispatched_handler"}\n\n'
+        "    def _dispatched_handler(self):\n"
+        "        pass\n\n"
+        "    def _truly_dead(self):\n"
+        "        pass\n"
+    )
+    (tmp_path / "probe.py").write_text(src)
+    cands = scan_vulture_dead_code(
+        repo_root=str(tmp_path), file_paths=["probe.py"],
+        repo_graph=None, min_confidence=0,
+    )
+    names = {c.name for c in cands}
+    assert "_dispatched_handler" not in names
+    assert "_truly_dead" in names
+
+
+# ── visitor-protocol suppression (libcst/ast dispatch hooks) ────────────────
+# libcst (CSTVisitor/CSTTransformer) and ast (NodeVisitor/NodeTransformer)
+# dispatch per-node-type hooks (visit_<Node>, leave_<Node>) and lifecycle
+# methods (on_visit/on_leave/generic_visit) via getattr — no static caller, so
+# vulture reports them as dead. Detection is STRUCTURAL (the enclosing class
+# inherits from a known visitor base), not name-based, so a coincidentally
+# named method in a non-visitor class is still reported.
+
+
+def test_visitor_protocol_methods_suppressed(tmp_path):
+    """Framework-dispatched visitor hooks in a visitor subclass are suppressed;
+    a truly dead sibling method must STILL be reported (no over-suppression)."""
+    src = (
+        "class _Probe(CSTTransformer):\n"
+        "    def visit_FunctionDef(self, node):\n"
+        "        x = 1\n\n"
+        "    def leave_ClassDef(self, node):\n"
+        "        x = 1\n\n"
+        "    def on_visit(self, node):\n"
+        "        x = 1\n\n"
+        "    def generic_visit(self, node):\n"
+        "        x = 1\n\n"
+        "    def _truly_dead(self):\n"
+        "        x = 1\n"
+    )
+    (tmp_path / "probe.py").write_text(src)
+    cands = scan_vulture_dead_code(
+        repo_root=str(tmp_path), file_paths=["probe.py"],
+        repo_graph=None, min_confidence=0,
+    )
+    names = {c.name for c in cands}
+    assert "visit_FunctionDef" not in names
+    assert "leave_ClassDef" not in names
+    assert "on_visit" not in names
+    assert "generic_visit" not in names
+    assert "_truly_dead" in names
+
+
+def test_visitor_hook_not_suppressed_in_non_visitor_class(tmp_path):
+    """A method named visit_* in a NON-visitor class is real dead code — the
+    structural base-class check must NOT suppress it (over-suppression guard
+    against a naive name-prefix rule)."""
+    src = (
+        "class HttpClient:\n"            # NOT a visitor subclass
+        "    def visit_url(self, url):\n"  # coincidentally named, truly dead
+        "        x = 1\n"
+    )
+    (tmp_path / "probe.py").write_text(src)
+    cands = scan_vulture_dead_code(
+        repo_root=str(tmp_path), file_paths=["probe.py"],
+        repo_graph=None, min_confidence=0,
+    )
+    names = {c.name for c in cands}
+    assert "visit_url" in names
+
+
+def test_visitor_subclass_via_same_file_ancestor(tmp_path):
+    """A class that inherits a visitor base through a same-file ancestor (not
+    directly) is still recognized — the transitive base-name resolution fires."""
+    src = (
+        "class _Base(NodeVisitor):\n"
+        "    pass\n\n"
+        "class _Derived(_Base):\n"
+        "    def visit_Module(self, node):\n"
+        "        x = 1\n\n"
+        "    def _truly_dead(self):\n"
+        "        x = 1\n"
+    )
+    (tmp_path / "probe.py").write_text(src)
+    cands = scan_vulture_dead_code(
+        repo_root=str(tmp_path), file_paths=["probe.py"],
+        repo_graph=None, min_confidence=0,
+    )
+    names = {c.name for c in cands}
+    assert "visit_Module" not in names
+    assert "_truly_dead" in names
+
+
 # ── full_project must not parse vendored dirs (.venv/node_modules) ─────────
 # Regression for the fix replacing ``scan_paths=[repo_root]`` with an explicit
 # project file list. ``vulture.scavenge([repo_root])`` walks the tree with

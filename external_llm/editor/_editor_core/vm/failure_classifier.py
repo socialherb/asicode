@@ -78,10 +78,6 @@ class BaseFailureClassifier:
     def classify_all(self, errors: list[VerifyError]) -> list[FailureType]:
         return [self._classify_single(e) for e in errors]
 
-    def classify_all_typed(self, errors: list[VerifyError]) -> list[Classification]:
-        """Typed classification for all errors."""
-        return [self._classify_single_typed(e, error_index=i) for i, e in enumerate(errors)]
-
     def _classify_single(self, error: VerifyError) -> FailureType:
         if error.code and error.code in self.error_code_map:
             return self.error_code_map[error.code]

@@ -124,7 +124,7 @@ class TestLoadInsights:
         _save_insight_to_file(tmp_repo, "active insight body", "architecture")
         append_entries_to_archive(tmp_repo, [
             InsightEntry(
-                lines=[f"### [architecture] 2026-06-30 13:18\n", _BODY + "\n\n"],
+                lines=["### [architecture] 2026-06-30 13:18\n", _BODY + "\n\n"],
                 header_line="### [architecture] 2026-06-30 13:18",
                 category="architecture",
             )

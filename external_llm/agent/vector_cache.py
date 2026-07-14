@@ -578,11 +578,6 @@ class VectorCacheManager:
             self.miss_count += 1
             return []
 
-    def get_hit_rate(self) -> float:
-        """Get cache hit rate."""
-        total = self.hit_count + self.miss_count
-        return self.hit_count / total if total > 0 else 0.0
-
     def clear(self):
         """Clear the vector cache."""
         if HAS_NUMPY and HAS_FAISS and self.index is not None:
