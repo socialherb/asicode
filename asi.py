@@ -1166,7 +1166,12 @@ def _undo_run_changes(repo_root: str, baseline: dict) -> tuple[list[str], list[s
 
 
 def _print_session_summary(session_tokens: dict, t0: float) -> None:
-    """세션 종료 직전 한 줄 요약 (경과 · ↑↓ 토큰 · 비용). 사용량 없으면 침묵."""
+    """세션 종료 직전 한 줄 요약 (경과 · ↑↓ 토큰). 사용량 없으면 침묵.
+
+    달러 금액은 의도적으로 제외 — 출구 배너는 환경(ambient) 요약이므로 비용 디테일은
+    요청형 ``/cost``·``/status`` 리포트로만 노출한다. ``ASICODE_HIDE_COST`` 게이트는
+    퍼턴 배너에만 적용된다.
+    """
     pt = session_tokens.get("prompt", 0)
     ct = session_tokens.get("completion", 0)
     if not (pt or ct):
@@ -1174,13 +1179,10 @@ def _print_session_summary(session_tokens: dict, t0: float) -> None:
     mins, secs = divmod(int(time.monotonic() - t0), 60)
     hrs, mins = divmod(mins, 60)
     dur = f"{hrs}h {mins}m" if hrs else (f"{mins}m {secs}s" if mins else f"{secs}s")
-    line = f"  session  {dur}  ·  ↑{_abbrev_tokens(pt)} ↓{_abbrev_tokens(ct)} tokens"
-    # Drop the dollar amount (and its "·" separator) when ASICODE_HIDE_COST is set.
-    if not _hide_cost_display():
-        cost = session_tokens.get("actual_cost") or session_tokens.get("cost") or 0.0
-        if cost:
-            line += f"  ·  ${cost:.4f}"
-    _print(line, _C["muted"])
+    _print(
+        f"  session  {dur}  ·  ↑{_abbrev_tokens(pt)} ↓{_abbrev_tokens(ct)} tokens",
+        _C["muted"],
+    )
 
 
 # ─── Slash commands (interactive utilities) ──────────────────────────────────────

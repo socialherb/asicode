@@ -1,12 +1,11 @@
-"""Behavioral guard: the CLI exit banner (``_print_session_summary``) honors
-``ASICODE_HIDE_COST``.
+"""Behavioral guard: the CLI exit banner (``_print_session_summary``) never shows
+money.
 
-The shared ``_hide_cost_display()`` gate was wired into every turn/status line
-but the *exit summary* forgot it, so ``ASICODE_HIDE_COST=1`` still leaked the
-session dollar amount (e.g. ``session 6h 50m · ↑… ↓… tokens · $9.4463``) on
-quit. This pins the gate to the exit banner so the on-demand ``/cost`` /
-``/status`` reports (intentionally ungated) remain the only surfaces that
-show dollars when the switch is on.
+The exit banner is an *ambient* summary printed automatically on quit, so the
+dollar amount is noise there — cost detail belongs on the on-demand ``/cost`` /
+``/status`` reports (intentionally ungated). This pins that invariant: tokens +
+elapsed time always render when there is usage, money never does, and a
+zero-usage session stays silent.
 """
 
 import asi
@@ -18,45 +17,38 @@ def _capture_print(monkeypatch):
     return recorded
 
 
-class TestSessionSummaryHonorsCostGate:
+class TestSessionSummaryNeverShowsMoney:
     def _tokens(self, cost=12.3456, actual=12.3456):
         return {"prompt": 1000, "completion": 500, "cost": cost, "actual_cost": actual}
 
-    def test_hides_dollar_when_switch_on(self, monkeypatch):
-        monkeypatch.setenv("ASICODE_HIDE_COST", "1")
-        recorded = _capture_print(monkeypatch)
-
-        asi._print_session_summary(self._tokens(), asi.time.monotonic())
-
-        assert recorded, "exit banner should still print tokens/duration"
-        assert "$" not in recorded[0], recorded[0]
-        assert "tokens" in recorded[0]  # token counts are NOT money → kept
-
-    def test_shows_dollar_when_switch_off(self, monkeypatch):
-        monkeypatch.delenv("ASICODE_HIDE_COST", raising=False)
-        recorded = _capture_print(monkeypatch)
-
-        asi._print_session_summary(self._tokens(), asi.time.monotonic())
-
-        assert "$" in recorded[0], recorded[0]
+    def test_no_dollar_regardless_of_env(self, monkeypatch):
+        # Money is excluded from the exit banner unconditionally — neither the
+        # ASICODE_HIDE_COST switch nor a large actual_cost can surface it here.
+        for val in (None, "1", "0", "true", "false", "yes", "no"):
+            monkeypatch.delenv("ASICODE_HIDE_COST", raising=False)
+            if val is not None:
+                monkeypatch.setenv("ASICODE_HIDE_COST", val)
+            recorded = _capture_print(monkeypatch)
+            asi._print_session_summary(self._tokens(), asi.time.monotonic())
+            assert recorded, (val, "exit banner should print tokens/duration")
+            assert "$" not in recorded[0], (val, recorded[0])
+            assert "tokens" in recorded[0], (val, recorded[0])
 
     def test_zero_usage_stays_silent(self, monkeypatch):
         monkeypatch.delenv("ASICODE_HIDE_COST", raising=False)
         recorded = _capture_print(monkeypatch)
 
-        asi._print_session_summary({"prompt": 0, "completion": 0, "cost": 0.0}, asi.time.monotonic())
+        asi._print_session_summary(
+            {"prompt": 0, "completion": 0, "cost": 0.0}, asi.time.monotonic()
+        )
 
         assert recorded == []
 
-    def test_gate_keys_off_truthy_truth_values(self, monkeypatch):
-        # On/off truth set matches _hide_cost_display (1/true/yes/on → hide).
-        for val in ("1", "true", "TRUE", "yes", "on"):
-            monkeypatch.setenv("ASICODE_HIDE_COST", val)
-            recorded = _capture_print(monkeypatch)
-            asi._print_session_summary(self._tokens(), asi.time.monotonic())
-            assert "$" not in recorded[0], (val, recorded[0])
-        for val in ("", "0", "no", "off", "false"):
-            monkeypatch.setenv("ASICODE_HIDE_COST", val)
-            recorded = _capture_print(monkeypatch)
-            asi._print_session_summary(self._tokens(), asi.time.monotonic())
-            assert "$" in recorded[0], (val, recorded[0])
+    def test_duration_and_tokens_still_render(self, monkeypatch):
+        # The ambient summary must keep elapsed time + token counts.
+        recorded = _capture_print(monkeypatch)
+        asi._print_session_summary(self._tokens(), asi.time.monotonic())
+        line = recorded[0]
+        assert "session" in line
+        assert "↑" in line and "↓" in line
+        assert "$" not in line
