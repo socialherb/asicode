@@ -1,4 +1,4 @@
-"""JsonSyntaxProvider 단위 테스트."""
+"""Unit tests for JsonSyntaxProvider."""
 from __future__ import annotations
 
 import pytest
@@ -28,7 +28,7 @@ def test_capabilities_no_symbol_ops(provider):
     assert not caps.supports_insert_after_symbol
 
 
-# ── 유효한 JSON ───────────────────────────────────────────────────────────────
+# ── Valid JSON ───────────────────────────────────────────────────────────────
 
 def test_valid_simple_object(provider):
     result = provider.validate_syntax("test.json", '{"a": 1, "b": true}')
@@ -52,7 +52,7 @@ def test_valid_array(provider):
     assert result.ok is True
 
 
-# ── 유효하지 않은 JSON ────────────────────────────────────────────────────────
+# ── Invalid JSON ────────────────────────────────────────────────────────
 
 def test_invalid_trailing_comma(provider):
     result = provider.validate_syntax("bad.json", '{"a": 1,}')
@@ -79,10 +79,10 @@ def test_language_in_result(provider):
     assert result.language == LanguageId.JSON
 
 
-# ── JSONC (주석 포함 JSON) ────────────────────────────────────────────────────
+# ── JSONC (JSON with comments) ────────────────────────────────────────────────────
 
 def test_jsonc_line_comment_stripped(provider):
-    content = '{\n  // 설명\n  "strict": true\n}'
+    content = '{\n  // description\n  "strict": true\n}'
     result = provider.validate_syntax("tsconfig.jsonc", content)
     assert result.ok is True
 
@@ -101,13 +101,13 @@ def test_jsonc_comment_inside_string_not_stripped(provider):
 
 
 def test_plain_json_comment_is_invalid(provider):
-    # .json 파일에서는 주석을 strip하지 않으므로 파싱 오류
+    # .json files don't strip comments, so this is a parse error
     content = '{"a": 1 // comment\n}'
     result = provider.validate_syntax("plain.json", content)
     assert result.ok is False
 
 
-# ── 파일 글로브 ───────────────────────────────────────────────────────────────
+# ── File globs ───────────────────────────────────────────────────────────────
 
 def test_file_globs(provider):
     globs = provider.get_file_globs()
@@ -115,7 +115,7 @@ def test_file_globs(provider):
     assert "*.jsonc" in globs
 
 
-# ── 미구현 메서드 안전 반환 ───────────────────────────────────────────────────
+# ── Unimplemented methods return safe defaults ───────────────────────────────────────────────────
 
 def test_get_symbol_patterns_returns_empty(provider):
     assert provider.get_symbol_patterns() == []

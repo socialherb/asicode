@@ -1,19 +1,19 @@
-"""Step 3 검증: op.metadata 일관성 불변식
+"""Step 3 verification: op.metadata consistency invariants
 
-Step 3a: guard_ir는 analyze_guard 결과 (fallback _extract_guard_ir 없음)
-Step 3b: guard_statement는 항상 compact 형태로 동기화
-Step 3c: ast_ops[0]["statement"]도 compact와 동일
+Step 3a: guard_ir is the analyze_guard result (no fallback _extract_guard_ir)
+Step 3b: guard_statement is always synced to compact form
+Step 3c: ast_ops[0]["statement"] also matches compact
 """
 
 import pytest
 
 from external_llm.agent.guard_ir import analyze_guard, parse_guard
 
-# ── 테스트: compact 불변식 ──────────────────────────────────────────────────────
+# ── Tests: compact invariant ──────────────────────────────────────────────────────
 
 class TestCompactInvariant:
-    """analyze_guard가 반환하는 ir.compact는 단일 줄이며
-    to_legacy_tuple()과 의미상 동일해야 한다."""
+    """ir.compact returned by analyze_guard must be a single line and
+    semantically equivalent to to_legacy_tuple()."""
 
     CASES = [
         "if not x: continue",
@@ -49,7 +49,7 @@ class TestCompactInvariant:
         assert ir_raw.condition.operands == ir_compact.condition.operands
 
 
-# ── 테스트: op.metadata guard_statement 동기화 ─────────────────────────────────
+# ── Tests: op.metadata guard_statement sync ─────────────────────────────────
 
 _SRC_SIMPLE = """
 def process(items, limit=10):
@@ -74,9 +74,10 @@ def _make_op_metadata(guard_statement, edit_kind="guard_add", symbol="process"):
 
 
 class TestGuardStatementSync:
-    """guard_statement는 analyze_guard 이후 compact 형태여야 한다.
+    """guard_statement must be in compact form after analyze_guard.
 
-    _attach_edit_contracts가 실제로 호출되지 않아도 analyze_guard 자체로 검증.
+    Verified via analyze_guard itself, even when _attach_edit_contracts
+    isn't actually invoked.
     """
 
     def test_block_form_produces_compact(self):
@@ -106,17 +107,17 @@ class TestGuardStatementSync:
             assert gir_dict["control"] in ("continue", "break", "return", "raise")
 
 
-# ── 테스트: ast_ops statement == guard_statement 불변식 ──────────────────────────
+# ── Tests: ast_ops statement == guard_statement invariant ──────────────────────────
 
 class TestAstOpsStatementInvariant:
-    """ast_ops[0]["statement"]과 guard_statement가 같은 compact 형태를 가져야 한다.
+    """ast_ops[0]["statement"] and guard_statement must share the same compact form.
 
-    _attach_edit_contracts에서 Step 3b 이후 _gs가 compact로 갱신되고,
-    ast_ops 빌드에서 그 _gs를 사용하므로 둘이 일치한다.
+    In _attach_edit_contracts, _gs is updated to compact form after Step 3b,
+    and the ast_ops build uses that same _gs, so the two stay in sync.
     """
 
     def test_compact_stable_under_round_trip(self):
-        """compact → parse → compact 가 stable 해야 한다."""
+        """compact → parse → compact must be stable."""
         raw = "if not item: continue"
         ir1 = parse_guard(raw)
         ir2 = parse_guard(ir1.compact)
@@ -130,7 +131,7 @@ class TestAstOpsStatementInvariant:
         assert ir_block.compact == ir_inline.compact
 
     def test_condition_ir_consistent_before_and_after_compact(self):
-        """raw와 compact에서 추출한 guard_ir condition이 동일해야 한다."""
+        """guard_ir condition extracted from raw and from compact must match."""
         cases = [
             "if not value: return",
             "if not error.name: continue",

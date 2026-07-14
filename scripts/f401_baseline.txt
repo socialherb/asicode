@@ -15,17 +15,6 @@ external_llm/editor/verification/__init__.py::external_llm.editor.verification.c
 external_llm/editor/verification/__init__.py::external_llm.editor.verification.code_integrity.verify_scope_integrity
 external_llm/editor/verification/__init__.py::external_llm.editor.verification.code_integrity.verify_target_survived
 tests/unit/agent/test_context_budget.py::external_llm.agent._shared_utils._cjk_aware_tokens
-tests/unit/agent/test_orchestrator.py::external_llm.agent.subagent_ipc
-tests/unit/agent/test_orchestrator.py::unittest.mock.patch
-tests/unit/agent/test_phase_orchestrator.py::unittest.mock.ANY
 tests/unit/agent/test_pre_existing_dirty_filter.py::os
-tests/unit/test_api_key_store.py::fastapi.HTTPException
-tests/unit/test_api_key_store.py::time
 tests/unit/test_resolve_provider_base_url.py::os
-tests/unit/test_streaming_queue.py::json
-tests/unit/test_streaming_queue.py::queue
-tests/unit/test_streaming_queue_concurrent.py::pytest
-tests/unit/test_ui_tools_git_branch.py::pathlib.Path
-tests/unit/test_ui_tools_git_branch.py::pytest
-tests/unit/test_ui_tools_repo_root_allowlist.py::pytest
 tests/unit/test_zai_glm_reasoning_fallback.py::pytest

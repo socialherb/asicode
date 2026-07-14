@@ -263,7 +263,7 @@ class TestExtractContextTags:
 
     Tags must come from spec.request_type (set by SpecResolver LLM or
     structural inference) and matched_semantic_keys.  raw_request / intent
-    natural-language keyword matching is intentionally removed — "추가" can
+    natural-language keyword matching is intentionally removed — "add" can
     mean list-append or entity-create; keyword-based dispatch is ambiguous.
     """
 
@@ -274,15 +274,15 @@ class TestExtractContextTags:
     # ── raw_request is ignored (No Keyword Gate) ──────────────────────────
 
     def test_raw_request_no_longer_drives_tags(self):
- # "log인 API 만들어줘" contains keywords but raw_request is ignored.
+ # "build a login API" contains keywords but raw_request is ignored.
         # Tags must come from spec.request_type or matched_semantic_keys.
-        tags = extract_context_tags(raw_request="로그인 API 만들어줘")
+        tags = extract_context_tags(raw_request="build a login API")
         assert tags == []
 
     def test_raw_request_add_does_not_trigger_create(self):
  # "addition" (add) in raw text must NOT map to "create" entity contract.
         # This was the root cause of lineage PASS_PARTIAL on pure function mods.
-        tags = extract_context_tags(raw_request="is_generic_class_def 함수 추가")
+        tags = extract_context_tags(raw_request="add is_generic_class_def function")
         assert "create" not in tags
 
     # ── spec.request_type is the authoritative structured signal ──────────

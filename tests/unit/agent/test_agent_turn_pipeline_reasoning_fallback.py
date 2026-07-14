@@ -31,13 +31,13 @@ def test_content_present_returns_content():
 
 
 def test_empty_content_falls_back_to_reasoning():
-    reasoning = "## 완료: 커밋 abc123 적용"
+    reasoning = "## Done: commit abc123 applied"
     r = _resp_dict(content="", reasoning=reasoning)
     assert TurnPipelineMixin._effective_final_content(r) == reasoning
 
 
 def test_whitespace_content_falls_back_to_reasoning():
-    reasoning = "  요약 본문  "
+    reasoning = "  summary body  "
     r = _resp_dict(content="   \n  \t  ", reasoning=reasoning)
     # reasoning is stripped on fallback
     assert TurnPipelineMixin._effective_final_content(r) == reasoning.strip()

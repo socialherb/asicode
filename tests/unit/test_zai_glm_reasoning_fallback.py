@@ -56,9 +56,9 @@ def _plain_resp(*, content="", reasoning=""):
 # ── 1. helper: direct unit tests ───────────────────────────────────────────
 
 def test_helper_recovers_reasoning_when_content_empty_no_tools():
-    r = _toolcall_resp(content="", reasoning="## 완료: 작업 적용")
+    r = _toolcall_resp(content="", reasoning="## Done: changes applied")
     out = ZAIClient._apply_glm_reasoning_fallback(r)
-    assert out.content == "## 완료: 작업 적용"
+    assert out.content == "## Done: changes applied"
 
 
 def test_helper_keeps_content_when_present():

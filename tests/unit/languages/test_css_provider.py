@@ -1,4 +1,4 @@
-"""CssSyntaxProvider 단위 테스트."""
+"""Unit tests for CssSyntaxProvider."""
 from __future__ import annotations
 
 import pytest
@@ -22,7 +22,7 @@ def test_capabilities_has_syntax_validator(provider):
     assert provider.capabilities().has_syntax_validator is True
 
 
-# ── 유효한 CSS ────────────────────────────────────────────────────────────────
+# ── Valid CSS ────────────────────────────────────────────────────────────────
 
 def test_valid_simple_rule(provider):
     result = provider.validate_syntax("style.css", "body { color: red; }")
@@ -42,25 +42,25 @@ def test_valid_empty(provider):
 
 
 def test_valid_block_comment(provider):
-    css = "/* 헤더 */ body { margin: 0; }"
+    css = "/* header */ body { margin: 0; }"
     result = provider.validate_syntax("a.css", css)
     assert result.ok is True
 
 
 def test_valid_line_comment_scss(provider):
-    scss = "// 주석\nbody { color: red; }"
+    scss = "// comment\nbody { color: red; }"
     result = provider.validate_syntax("a.scss", scss)
     assert result.ok is True
 
 
 def test_valid_string_with_brace(provider):
-    # content 속성에 중괄호가 있어도 string literal로 처리
+    # even if the content property contains a brace, it's treated as a string literal
     css = 'div::before { content: "{"; }'
     result = provider.validate_syntax("a.css", css)
     assert result.ok is True
 
 
-# ── 무효 CSS: 중괄호 오류 ─────────────────────────────────────────────────────
+# ── Invalid CSS: brace errors ─────────────────────────────────────────────────
 
 def test_unclosed_brace(provider):
     result = provider.validate_syntax("bad.css", "body { color: red;")
@@ -79,25 +79,25 @@ def test_mismatched_braces(provider):
     assert result.ok is False
 
 
-# ── 무효 CSS: 주석/문자열 오류 ───────────────────────────────────────────────
+# ── Invalid CSS: comment/string errors ────────────────────────────────────────
 
 def test_unclosed_block_comment(provider):
-    result = provider.validate_syntax("bad.css", "/* 열린 주석\nbody { color: red; }")
+    result = provider.validate_syntax("bad.css", "/* open comment\nbody { color: red; }")
     assert result.ok is False
     assert any("comment" in e.message.lower() for e in result.errors)
 
 
 def test_unclosed_string_double_quote(provider):
-    result = provider.validate_syntax("bad.css", 'body { content: "열린 문자열; }')
+    result = provider.validate_syntax("bad.css", 'body { content: "open string; }')
     assert result.ok is False
 
 
 def test_unclosed_string_single_quote(provider):
-    result = provider.validate_syntax("bad.css", "body { content: '열린; }")
+    result = provider.validate_syntax("bad.css", "body { content: 'open; }")
     assert result.ok is False
 
 
-# ── 오류 위치 ─────────────────────────────────────────────────────────────────
+# ── Error location ─────────────────────────────────────────────────────────────
 
 def test_error_has_file_path(provider):
     result = provider.validate_syntax("my/path.css", "}")
@@ -116,7 +116,7 @@ def test_language_in_result(provider):
     assert result.language == LanguageId.CSS
 
 
-# ── 파일 글로브 ───────────────────────────────────────────────────────────────
+# ── File globs ───────────────────────────────────────────────────────────────
 
 def test_file_globs(provider):
     globs = provider.get_file_globs()

@@ -404,7 +404,7 @@ def _parse_text_tool_calls(content: str) -> list[dict[str, Any]]:
     # OUTSIDE (even index) / INSIDE (odd index) segments — only odd-indexed
     # segments are actual fenced code blocks. Restricting the scan to them avoids
     # misexecuting a JSON-shaped example written in free text (e.g. a text-mode
- # model that writes '예시: {"name": "edit_text", ...}' outside any fence would
+ # model that writes 'example: {"name": "edit_text", ...}' outside any fence would
     # otherwise be parsed and run as a real call here). Free-text JSON is still
     # recovered by the stage-3 fallback below, but ONLY when no fenced call was
     # found — so a real fenced call takes precedence over a free-text lookalike.
@@ -979,7 +979,7 @@ class DesignChatLoop:
         except AgentCancelled as _ac:
             # User pressed ESC — let the caller pause/cancel, not an error.
             # Attach the partial result so the caller can persist what the agent
- # was doing (keeps a referent for a following "그렇게 하자"(let's do that) confirmation).
+ # was doing (keeps a referent for a following "let's do that" confirmation).
             _ac.partial_result = result
             raise
         except LLMClientError as e:
@@ -1218,7 +1218,7 @@ class DesignChatLoop:
             # result itself (agent_tools._tool_update_plan returns render_plan),
             # so the model always sees the current checklist inline after each
             # status change. Per-iteration re-injection was removed — it
- # redundantly pressured the model into "이어서 진행하겠습니다" narrative
+ # redundantly pressured the model into "continuing now..." narrative
             # preambles on every cycle. The completion gate (below) still catches
             # turns that end with open items.
             _llm_msgs = msgs
@@ -1439,7 +1439,7 @@ class DesignChatLoop:
                     # Nudges exhausted — accept the exit, but surface the
                     # unfinished items so the user always sees honest state.
                     result.content += (
-                        "\n\n---\n⚠️ 완료되지 않은 플랜 항목 (시스템 자동 표기):\n" + _titles
+                        "\n\n---\n⚠️ Unresolved plan items (auto-noted by the system):\n" + _titles
                     )
                 return result
 

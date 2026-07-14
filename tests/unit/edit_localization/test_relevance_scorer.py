@@ -11,7 +11,7 @@ class TestScoreEditRelevance:
     """Integration tests: extract facts + score against request."""
 
     def test_kp6_walk_definitions_scores_higher(self):
-        """KP6 canonical case: 'kind를 통일해줘' should rank _walk_definitions above parse_definitions.
+        """KP6 canonical case: 'unify the kind values' should rank _walk_definitions above parse_definitions.
 
         _walk_definitions has kind="async_function", kind="function", DefinitionInfo(kind=...)
         parse_definitions just delegates to _walk_definitions
@@ -44,7 +44,7 @@ def parse_definitions(source: str):
     results.sort(key=lambda d: d.start_line)
     return results
 '''
-        request = "kind를 통일해줘"
+        request = "unify the kind values"
 
         walk_facts = extract_flow_facts(walk_source)
         parse_facts = extract_flow_facts(parse_source)
@@ -72,7 +72,7 @@ def determine_kind(node):
 def get_all_kinds(tree):
     return [determine_kind(n) for n in ast.walk(tree)]
 '''
-        request = "async 여부를 분리해줘"
+        request = "split out the async flag"
 
         value_facts = extract_flow_facts(value_source)
         wrapper_facts = extract_flow_facts(wrapper_source)
@@ -92,7 +92,7 @@ def build_item(name, kind, line):
 def process_all(items):
     return [build_item(i.name, i.kind, i.line) for i in items]
 '''
-        request = "Item에 end_line 필드를 추가해줘"
+        request = "add an end_line field to Item"
 
         builder_facts = extract_flow_facts(builder_source)
         caller_facts = extract_flow_facts(caller_source)
@@ -109,7 +109,7 @@ def do_thing(x):
     return _actual_do_thing(x)
 '''
         facts = extract_flow_facts(source)
-        score, reason = score_edit_relevance("어떤 작업이든 해줘", facts)
+        score, reason = score_edit_relevance("do whatever needs doing", facts)
 
         assert score < 0.2
         assert "pure_delegation" in reason
@@ -125,7 +125,7 @@ def compute_status(result):
     return Record(status=status, result=result)
 '''
         facts = extract_flow_facts(source)
-        score, _ = score_edit_relevance("status 값을 바꿔줘", facts)
+        score, _ = score_edit_relevance("change the status value", facts)
 
         # Should score high due to: direct mention (status) + value_determiner + flow
         assert score >= 0.4
@@ -134,7 +134,7 @@ def compute_status(result):
         """Empty facts should get moderate score (unknown)."""
         from external_llm.edit_localization.dataflow_extractor import SymbolFlowFacts
         facts = SymbolFlowFacts()
-        score, _ = score_edit_relevance("아무 요청", facts)
+        score, _ = score_edit_relevance("some random request", facts)
         # Should not be very high or very low — unknown
         assert 0.1 <= score <= 0.5
 
@@ -143,7 +143,7 @@ class TestSemanticMatching:
     """Test semantic action-role matching improves scoring."""
 
     def test_unify_prefers_value_determiner_over_delegation(self):
-        """'통일' action should strongly prefer value_determiner over delegation."""
+        """'unify' action should strongly prefer value_determiner over delegation."""
         value_source = '''
 def determine_kind(node):
     if isinstance(node, ast.AsyncFunctionDef):
@@ -156,7 +156,7 @@ def determine_kind(node):
 def get_kind(node):
     return determine_kind(node)
 '''
-        request = "kind를 통일해줘"
+        request = "unify the kind values"
 
         value_facts = extract_flow_facts(value_source)
         deleg_facts = extract_flow_facts(delegation_source)
@@ -169,7 +169,7 @@ def get_kind(node):
         assert value_score - deleg_score > 0.2  # significant gap
 
     def test_add_field_prefers_constructor(self):
-        """'필드 추가' should prefer function with constructor calls."""
+        """'add field' should prefer function with constructor calls."""
         builder_source = '''
 def create_info(name, kind):
     return DefinitionInfo(name=name, kind=kind, start_line=1)
@@ -179,7 +179,7 @@ def process_info(info):
     info.validated = True
     return info
 '''
-        request = "DefinitionInfo에 end_line 필드를 추가해줘"
+        request = "add an end_line field to DefinitionInfo"
 
         builder_facts = extract_flow_facts(builder_source)
         proc_facts = extract_flow_facts(processor_source)
@@ -190,7 +190,7 @@ def process_info(info):
         assert builder_score > proc_score
 
     def test_split_flag_prefers_conditional_logic(self):
-        """'여부 분리' should prefer function with conditional derivation."""
+        """'split flag' should prefer function with conditional derivation."""
         conditional_source = '''
 def categorize(node):
     is_async = isinstance(node, ast.AsyncFunctionDef)
@@ -201,7 +201,7 @@ def categorize(node):
 def format_node(node):
     return str(node)
 '''
-        request = "async 여부를 분리해줘"
+        request = "split out the async flag"
 
         cond_facts = extract_flow_facts(conditional_source)
         simple_facts = extract_flow_facts(simple_source)
@@ -218,7 +218,7 @@ def compute(x):
     result = x * 2
     return result
 '''
-        request = "이 코드 보여줘"  # read-only, no edit action
+        request = "show me this code"  # read-only, no edit action
         facts = extract_flow_facts(source)
         score, _reason = score_edit_relevance(request, facts)
         # Should still work, just without semantic boost
@@ -230,7 +230,7 @@ class TestTokenizeRequest:
 
     def test_basic_korean(self):
         tokens = _tokenize_request("kind를 통일해줘")
- # Korean particle "를" stays attached to "kind" in the new tokenizer
+ # Korean particle "를" stays attached to "kind" in the new tokenizer (functional Korean-tokenizer test, kept in Korean)
         assert "kind를" in tokens
         assert "통일해줘" in tokens
 
@@ -273,8 +273,8 @@ def build_profile():
     return u1
 '''
         # request mentions "1" → matches call_sites["get_user"] = [["1"]]
-        request_with_id = "user 1의 프로필을 가져와"
-        request_without_id = "user의 프로필을 가져와"
+        request_with_id = "fetch user 1's profile"
+        request_without_id = "fetch the user's profile"
 
         facts = extract_flow_facts(source)
         score_with, _ = score_edit_relevance(request_with_id, facts)
@@ -297,7 +297,7 @@ def unrelated():
     x = compute_value()
     return x
 '''
-        request = "email을 업데이트해줘"
+        request = "update the email"
 
         alias_facts = extract_flow_facts(source_with_alias)
         no_alias_facts = extract_flow_facts(source_no_alias)
@@ -316,8 +316,8 @@ def handle():
     return result
 '''
         # request explicitly mentions "get_user"
-        request_callee = "get_user 호출 결과가 잘못됨"
-        request_other = "다른 함수 호출이 잘못됨"
+        request_callee = "the get_user call result is wrong"
+        request_other = "a different function call is wrong"
 
         facts = extract_flow_facts(source)
         score_callee, _ = score_edit_relevance(request_callee, facts)

@@ -44,9 +44,9 @@ class TestResolveModelInteractiveRejectsNaturalLanguage:
     """``_resolve_model_interactive`` must reject natural-language input that
     gets mis-parsed as a model name.
 
-    Regression guard for the bug where ``/model qwen3.7-max 버그/기능/성능 …``
-    was split on ``/`` into ``provider="qwen3.7-max 버그"`` /
-    ``model="기능/성능 …"`` — a provider with spaces is never valid, so the
+    Regression guard for the bug where ``/model qwen3.7-max bug/feature/perf …``
+    was split on ``/`` into ``provider="qwen3.7-max bug"`` /
+    ``model="feature/perf …"`` — a provider with spaces is never valid, so the
     slash path must refuse it instead of silently switching to a garbage model.
     Likewise the space-separated path must reject a multi-token model name.
 

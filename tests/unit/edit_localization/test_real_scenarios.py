@@ -30,7 +30,7 @@ def classify_node(node):
         assert "is_async" in facts.derives_from["kind"]
 
         # Request about "async" should score high via derivation chain
-        score, _ = score_edit_relevance("async 여부를 분리해줘", facts)
+        score, _ = score_edit_relevance("separate out the async flag", facts)
         assert score >= 0.35
 
     def test_multi_step_derivation(self):
@@ -50,7 +50,7 @@ def process_item(raw):
         assert "normalized" in facts.derives_from["category"]
 
         # Request about category should score high
-        score, _ = score_edit_relevance("category 분류 로직을 변경해줘", facts)
+        score, _ = score_edit_relevance("change the category classification logic", facts)
         assert score >= 0.3
 
 
@@ -73,7 +73,7 @@ def _do_parse(source):
             result.append(ParseResult(name=node.name, kind=kind))
     return result
 '''
-        request = "파싱 결과에 kind 정보를 추가해줘"
+        request = "add kind info to the parse result"
 
         wrapper_facts = extract_flow_facts(wrapper_source)
         core_facts = extract_flow_facts(core_source)
@@ -105,7 +105,7 @@ def transform_items(items):
         result.append(transformed)
     return result
 '''
-        request = "status 값을 바꿔줘"
+        request = "change the status value"
 
         orch_facts = extract_flow_facts(orchestrator_source)
         worker_facts = extract_flow_facts(worker_source)
@@ -137,7 +137,7 @@ def validate_user(user):
         raise ValueError("email required")
     return True
 '''
-        request = "User에 phone 필드를 추가해줘"
+        request = "add a phone field to User"
 
         builder_facts = extract_flow_facts(builder_source)
         validator_facts = extract_flow_facts(validator_source)
@@ -169,7 +169,7 @@ def configure(self, options):
 def get_config(self):
     return {"mode": self.mode, "timeout": self.timeout}
 '''
-        request = "timeout 기본값을 변경해줘"
+        request = "change the default timeout value"
 
         setter_facts = extract_flow_facts(setter_source)
         getter_facts = extract_flow_facts(getter_source)
@@ -190,7 +190,7 @@ def placeholder():
     pass
 '''
         facts = extract_flow_facts(source)
-        score, _ = score_edit_relevance("아무 작업", facts)
+        score, _ = score_edit_relevance("some task", facts)
         assert 0.0 <= score <= 1.0
 
     def test_very_long_function(self):
@@ -202,7 +202,7 @@ def placeholder():
         source = "\n".join(lines)
 
         facts = extract_flow_facts(source)
-        score, _ = score_edit_relevance("key_25 값을 변경", facts)
+        score, _ = score_edit_relevance("change the key_25 value", facts)
         assert 0.0 <= score <= 1.0
 
     def test_lambda_in_function(self):
@@ -213,7 +213,7 @@ def process(items):
     return [transform(i) for i in sorted_items]
 '''
         facts = extract_flow_facts(source)
-        score, _ = score_edit_relevance("정렬 기준을 변경", facts)
+        score, _ = score_edit_relevance("change the sort criteria", facts)
         assert 0.0 <= score <= 1.0
 
     def test_nested_function(self):
@@ -225,4 +225,4 @@ def outer(data):
     return [inner(d) for d in data]
 '''
         facts = extract_flow_facts(source)
-        assert 0.0 <= score_edit_relevance("내부 로직 변경", facts)[0] <= 1.0
+        assert 0.0 <= score_edit_relevance("change the internal logic", facts)[0] <= 1.0

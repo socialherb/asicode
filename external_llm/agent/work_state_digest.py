@@ -2,7 +2,7 @@
 
 The design chat tool loop discards all tool call/result messages when a turn
 ends — only the final assistant text survives into the next turn's context.
-That makes follow-up requests ("이어서 그 함수 고쳐줘") re-explore from scratch.
+That makes follow-up requests ("now fix that function") re-explore from scratch.
 
 This module extracts a compact, deterministic digest from the turn's tool
 call records (DesignChatResult.tool_results) WITHOUT any LLM call. The digest

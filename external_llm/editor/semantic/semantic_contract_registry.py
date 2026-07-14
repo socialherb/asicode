@@ -93,10 +93,12 @@ def extract_context_tags(
 
     Tags are derived from STRUCTURED sources only — no keyword matching on
     natural language text (raw_request / intent).  Keyword-based dispatch
-    violates the No-Keyword-Gate principle: "추가" can mean list-append or
-    entity-create; "생성" can mean file-create or object-instantiation.
-    The structured spec.request_type (set by LLM or structural inference in
-    SpecResolver) and matched_semantic_keys are the authoritative signals.
+    violates the No-Keyword-Gate principle: e.g. the Korean word "추가" (add)
+    can mean list-append or entity-create; "생성" (create) can mean
+    file-create or object-instantiation — the same ambiguity exists across
+    other languages' equivalents. The structured spec.request_type (set by
+    LLM or structural inference in SpecResolver) and matched_semantic_keys
+    are the authoritative signals.
     """
     tags: list[str] = []
 

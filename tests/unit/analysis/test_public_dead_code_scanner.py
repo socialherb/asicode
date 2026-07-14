@@ -640,9 +640,10 @@ def test_is_externally_referenced_cross_file():
 
 
 def test_for_iterable_and_rhs_references_are_not_dead():
-    """정의 위치 판정이 부모 노드 타입만 보면 `for x in _TABLE:`의 _TABLE,
-    `alias = _ORIG`의 _ORIG, `with _LOCK:`의 _LOCK이 참조로 안 잡혀
-    dead로 오판된다 (asi._SLASH_COMMANDS 실사례). 모두 사용 중이어야 한다."""
+    """If the definition-position check only looks at the parent node type,
+    `_TABLE` in `for x in _TABLE:`, `_ORIG` in `alias = _ORIG`, and `_LOCK` in
+    `with _LOCK:` fail to register as references and get misjudged as dead
+    (real case: asi._SLASH_COMMANDS). All of these must count as in use."""
     src = _make_py_file("""\
         _TABLE = [("a", 1), ("b", 2)]
         _ORIG = object()
@@ -665,8 +666,9 @@ def test_for_iterable_and_rhs_references_are_not_dead():
 
 
 def test_class_level_assignment_not_scanned_via_tree_sitter():
-    """클래스 레벨 할당은 mixin/instance 속성 접근(self._FOO)이 cross-file이라
-    단일 파일 분석으로 dead 판정 불가 — AST 경로처럼 ts 경로도 제외해야 한다."""
+    """Class-level assignments can't be judged dead via single-file analysis,
+    since mixin/instance attribute access (self._FOO) is cross-file — the ts
+    path must exclude them just like the AST path does."""
     src = _make_py_file("""\
         class SomeMixin:
             _CLASS_TABLE: frozenset = frozenset({"a", "b"})

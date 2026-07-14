@@ -93,7 +93,7 @@ class TestLoadInsights:
         assert "[gotcha]" in result
 
     def test_passes_full_content_when_large(self, tmp_repo):
-        """Verify large insights are no longer truncated (정보를 먼저 버리면 오히려 토큰 낭비)."""
+        """Verify large insights are no longer truncated (discarding information upfront wastes tokens instead)."""
         for i in range(100):
             _save_insight_to_file(tmp_repo, f"Insight number {i} " * 10, "pattern")
 

@@ -324,4 +324,4 @@ class TestKotlinVerifierLive:
 
             # kotlinc is locale-independent: all outputs should be identical
             assert error_c == error_ko == error_j
-            assert "error:" in error_c  # English, not "오류:"
+            assert "error:" in error_c  # English, not the Korean localized "오류:"

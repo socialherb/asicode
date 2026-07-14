@@ -22,8 +22,9 @@ def _write(tmp_path, name: str, src: str) -> str:
     return name
 
 
-# 같은 제어 흐름(가드 → 루프 → 조건 누적 → 반환)이지만 도메인이 전혀 다른 두 함수.
-# 구조 점수는 min_similarity를 넘되 ident_overlap은 바닥이어야 한다.
+# Same control flow (guard -> loop -> condition accumulation -> return) but two
+# functions from entirely different domains. Structural score should exceed
+# min_similarity while ident_overlap should be at the floor.
 _COINCIDENTAL = """
     def collect_retry_hosts(hosts, attempts):
         if not hosts:
@@ -46,8 +47,9 @@ _COINCIDENTAL = """
         return stale
 """
 
-# 전형적 복붙 중복 — 파라미터/지역변수를 개명했지만 같은 함수들을 호출하고
-# 같은 문자열 상수를 쓴다.  게이트를 통과해야 한다.
+# Typical copy-paste duplicate -- parameters/local variables were renamed but
+# they call the same functions and use the same string constants. Should pass
+# the gate.
 _COPY_PASTE = """
     def load_user_config(path, defaults):
         if not path:
@@ -95,7 +97,7 @@ def test_copy_paste_duplicate_survives_gate(tmp_path):
 
 
 def test_forced_pair_bypasses_gate(tmp_path):
-    """사용자가 명시한 forced pair는 게이트와 무관하게 항상 결과에 포함된다."""
+    """A user-specified forced pair is always included in the result, regardless of the gate."""
     fname = _write(tmp_path, "coincidental.py", _COINCIDENTAL)
     cands = scan_similarity_candidates(
         str(tmp_path), [fname],
@@ -105,7 +107,7 @@ def test_forced_pair_bypasses_gate(tmp_path):
     assert len(forced) == 1
     assert {forced[0].symbol_a, forced[0].symbol_b} == {
         "collect_retry_hosts", "collect_stale_caches"}
-    # 관측 신호로 ident_overlap이 기록된다 (게이트 미적용이어도)
+    # ident_overlap is still recorded as an observational signal (even though the gate wasn't applied)
     assert "ident_overlap" in forced[0].shadow_overlaps
 
 

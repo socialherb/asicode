@@ -48,17 +48,18 @@ Completion = None      # type: ignore[assignment,misc]   # used by _SlashCommand
 KeyBindings = None     # type: ignore[assignment,misc]   # used when configuring _collect_input session
 InMemoryHistory = None  # type: ignore[assignment,misc]
 _PtStyle = None        # type: ignore[assignment,misc]   # (previously missing fallback — latent NameError fixed)
+patch_stdout = None    # type: ignore[assignment,misc]   # used by _collect_input to coordinate background writes with the live prompt
 
 
 def _load_prompt_toolkit() -> bool:
     """Lazy-import prompt_toolkit and bind module globals.
 
     Called once on first entry into REPL or _collect_input. On success,
-    _PROMPT_TOOLKIT_AVAILABLE becomes True and PromptSession/Completion/KeyBindings/InMemoryHistory/_PtStyle
+    _PROMPT_TOOLKIT_AVAILABLE becomes True and PromptSession/Completion/KeyBindings/InMemoryHistory/_PtStyle/patch_stdout
     globals are filled with real classes. On failure, False (callers fall back to input()).
     Idempotent — returns True immediately if already loaded.
     """
-    global _PROMPT_TOOLKIT_AVAILABLE, PromptSession, Completion, KeyBindings, InMemoryHistory, _PtStyle
+    global _PROMPT_TOOLKIT_AVAILABLE, PromptSession, Completion, KeyBindings, InMemoryHistory, _PtStyle, patch_stdout
     if _PROMPT_TOOLKIT_AVAILABLE:
         return True
     try:
@@ -66,6 +67,7 @@ def _load_prompt_toolkit() -> bool:
         from prompt_toolkit.completion import Completion as _Cmpl
         from prompt_toolkit.history import InMemoryHistory as _IMH
         from prompt_toolkit.key_binding import KeyBindings as _KB
+        from prompt_toolkit.patch_stdout import patch_stdout as _PatchStdout
         from prompt_toolkit.styles import Style as _Style
     except ModuleNotFoundError:
         return False
@@ -74,6 +76,7 @@ def _load_prompt_toolkit() -> bool:
     KeyBindings = _KB
     InMemoryHistory = _IMH
     _PtStyle = _Style
+    patch_stdout = _PatchStdout
     _PROMPT_TOOLKIT_AVAILABLE = True
     return True
 # prompt_toolkit session reused across prompts for persistent history
@@ -258,11 +261,25 @@ def _seq_pad(plain_tag: str) -> str:
 
 
 class _MarginIO:
-    """Stream wrapper that prepends `margin` spaces at the start of each line."""
-    def __init__(self, stream, margin: int = _CONSOLE_MARGIN):
-        self._s = stream
+    """Stream wrapper that prepends `margin` spaces at the start of each line.
+
+    Looks up ``sys.<stream_name>`` fresh on every write instead of capturing
+    the stream object at construction time. This matters because
+    prompt_toolkit's ``patch_stdout()`` works by reassigning the ``sys.stdout``/
+    ``sys.stderr`` *names* to a proxy for the duration of an active prompt —
+    a wrapper that captured the original stream object at import time would
+    keep writing straight past that proxy, silently defeating patch_stdout
+    for every _print()/log call made from a background thread while a prompt
+    is being read.
+    """
+    def __init__(self, stream_name: str, margin: int = _CONSOLE_MARGIN):
+        self._stream_name = stream_name
         self._pad = " " * margin
         self._bol = True  # beginning-of-line flag
+
+    @property
+    def _s(self):
+        return getattr(sys, self._stream_name)
 
     def reset_bol(self) -> None:
         """Force beginning-of-line state (call after spinner/live display stops)."""
@@ -305,7 +322,7 @@ try:
     # _log_console: for RichHandler only — wrapped in _margin_stderr(MarginIO) to align INFO logs
     # from col 0 → col _LOG_MARGIN. Unlike spinner/Live, it does not use cursor-movement escapes,
     # so left-margin injection is safe. (_margin_stderr.reset_bol() on spinner→log transition.)
-    _margin_stderr = _MarginIO(sys.stderr, _LOG_MARGIN)
+    _margin_stderr = _MarginIO("stderr", _LOG_MARGIN)
     _log_console = Console(file=_margin_stderr, width=_log_console_width, force_terminal=True)
 except ImportError:
     _RICH = False
@@ -552,6 +569,22 @@ class _RowSafeEmitMixin:
     If an in-flight ○/spinner row is drawn without a trailing newline (row_pending),
     break the row first, then emit the log — all inside _TERM_WRITE_LOCK so the ticker
     cannot interleave. The broken row is redrawn by the ticker on its next tick (≤0.25s).
+
+    Also coordinates with a *third* rendering surface: the main
+    prompt_toolkit input prompt. ``_collect_input`` wraps its
+    ``PromptSession.prompt()`` calls in ``patch_stdout()``, which redirects
+    ``sys.stdout``/``sys.stderr`` to a proxy that prints cleanly above the
+    live prompt and reflows it. But a background thread's log record can
+    still land in the brief window between prompt draws, or via a handler
+    whose stream reference was captured before the swap (the non-Rich
+    ``logging.StreamHandler`` fallback stores ``self.stream`` at
+    construction). ``self.stream = sys.stderr`` re-targets that fallback on
+    every emit so it always honors whichever stream is currently installed
+    (patched or not) — the Rich path doesn't need this because its console
+    writes through ``_MarginIO``, which already looks up ``sys.stderr``
+    dynamically. As insurance beyond patch_stdout, explicitly invalidate the
+    running prompt_toolkit Application (if any) after emit, forcing a clean
+    redraw instead of relying solely on the proxy's own scheduling.
     """
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -574,7 +607,22 @@ class _RowSafeEmitMixin:
             _sp = _active_spinner_printer
             if _sp is not None:
                 _sp._suspend_live_for_log()
+            if hasattr(self, "stream"):
+                # non-Rich StreamHandler fallback: re-target to the current
+                # sys.stderr (may be patch_stdout's proxy) instead of the
+                # object captured at handler-construction time.
+                self.stream = sys.stderr  # type: ignore[attr-defined]
             super().emit(record)  # type: ignore[misc]
+            # Insurance beyond patch_stdout's own redraw scheduling: force the
+            # active prompt (if the user is currently at one) to redraw now
+            # rather than leaving a possibly-stale frame on screen.
+            _sess = _prompt_session
+            _app = getattr(_sess, "app", None) if _sess is not None else None
+            if _app is not None and getattr(_app, "is_running", False):
+                try:
+                    _app.invalidate()
+                except Exception:
+                    pass
 
 # The printer currently showing a spinner — exposed at module level so _cli_checkpoint_cb can
 # stop the spinner before outputting a question (stream callback and checkpoint cb are called
@@ -591,6 +639,13 @@ class _TerminalInfoFilter(logging.Filter):
     the terminal handler — file handlers are NOT affected. The progress printer
     already renders all important events visually, so the duplicate INFO lines
     add noise without adding information.
+
+    "torch.*" is included because torch (pulled in by sentence-transformers)
+    registers an atexit handler in torch._subclasses.fake_tensor that emits
+    log.info("FakeTensor cache stats: ...") at interpreter shutdown — otherwise
+    printed on the terminal right after "session ended.". Filtering here (rather
+    than raising the torch logger level at startup) is robust regardless of
+    when/whether torch re-inits its own logger; the file handler still records it.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -601,6 +656,8 @@ class _TerminalInfoFilter(logging.Filter):
             name == "asi.progress"
             or name.startswith("external_llm.")
             or name.startswith("asicode.")
+            or name == "torch"
+            or name.startswith("torch.")
         )
 
 
@@ -643,10 +700,10 @@ class _SafeRichFormatter(logging.Formatter):
             record.msg = original_msg
             record.args = original_args
 def _setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
-    """Python 루트 로거를 설정.
+    """Configure the Python root logger.
 
-    - 터미널(stderr): 항상 출력 (RichHandler 또는 StreamHandler)
-    - 파일(log_file): 지정 시 plain-text로 추가 저장. 파일명에 {date}, {time} 사용 가능.
+    - Terminal (stderr): always output (RichHandler or StreamHandler)
+    - File (log_file): when given, also append plain-text logs. {date}, {time} usable in the filename.
     """
     global _LOG_FILE_HANDLER
     log_level = getattr(logging, level.upper(), logging.INFO)
@@ -742,13 +799,15 @@ def _setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
     # ── Suppress third-party library logs ──
     # faiss.loader: prints logger.info("Loading faiss.") / "Successfully loaded faiss." on import
     logging.getLogger("faiss").setLevel(logging.WARNING)
+    # (torch's atexit FakeTensor-cache-stats INFO is suppressed on the terminal
+    # by _TerminalInfoFilter — emit-time, ordering-immune; file logs keep it.)
 
 
 # ─── Output helpers (uses stdout-only console) ────────────────────────────────────
 
 if _RICH:
     from rich.theme import Theme as _RichTheme
-    _out_console = Console(file=_MarginIO(sys.stdout), width=_console_width, force_terminal=True, theme=_RichTheme({
+    _out_console = Console(file=_MarginIO("stdout"), width=_console_width, force_terminal=True, theme=_RichTheme({
         # headings — blue/sky/teal series, purple removed
         "markdown.h1":          f"bold {_C['blue']}",
         "markdown.h1.border":   _C["border"],
@@ -782,9 +841,9 @@ def _patch_rich_md_tables_wrap() -> None:
     default ``overflow="ellipsis"`` applies: a cell whose content exceeds its
     (proportionally-sized) column is truncated mid-content with "…" and the rest
     is permanently lost. This most visibly breaks the ✦ design-chat final-response
-    panel when the LLM emits structured data as a markdown table (e.g. 사주/명리
-    십성·의미 rows) — long Korean/CJK cells get cut at the right edge regardless
-    of terminal width. (Reproduced: every other markdown element — paragraph,
+    panel when the LLM emits structured data as a markdown table (e.g. rows of
+    CJK terminology and definitions) — long Korean/CJK cells get cut at the right
+    edge regardless of terminal width. (Reproduced: every other markdown element — paragraph,
     heading, list, blockquote — already wraps; only tables ellipsize.)
 
     Wrap ``TableElement.__rich_console__`` so each yielded ``Table`` has its
@@ -818,7 +877,7 @@ if _RICH:
 
 
 def _strip_ansi(text: str) -> str:
-    """터미널 ANSI 이스케이프 시퀀스 제거 (grep/bash 출력 preview 정리용) — string ops instead of regex."""
+    """Strip terminal ANSI escape sequences (for cleaning up grep/bash output previews) — string ops instead of regex."""
     out: list[str] = []
     i = 0
     n = len(text)
@@ -1077,7 +1136,7 @@ def _render_run_diff(
 def _run_changed_stats(
     repo_root: str, baseline: Optional[dict], max_files: int = 20,
 ) -> list[tuple[str, int, int, bool]]:
-    """런이 바꾼 파일별 (path, added, removed, is_new) 요약 통계.
+    """Per-file (path, added, removed, is_new) summary stats of what the run changed.
 
     Uses ``git diff --numstat -z`` for a single batch call instead of
     per-file ``git diff`` calls (was N+1, now 2 at most).
@@ -1115,10 +1174,10 @@ def _run_changed_stats(
 
 
 def _print_run_change_summary(repo_root: str, baseline: Optional[dict]) -> bool:
-    """런이 바꾼 파일별 한 줄 stat(+N −M)을 출력. 변경 없으면 False.
+    """Print a one-line stat (+N −M) per file the run changed. Returns False if nothing changed.
 
-    전체 diff(RUN_DIFF)가 꺼져 있어도 무엇이 바뀌었는지는 항상 보이도록
-    가벼운 요약만 찍는다 — 상세는 /diff, 되돌리기는 /undo.
+    Prints only this lightweight summary so it's always visible even when the
+    full diff (RUN_DIFF) is off — details via /diff, revert via /undo.
     """
     stats = _run_changed_stats(repo_root, baseline)
     if not stats:
@@ -1140,12 +1199,13 @@ def _print_run_change_summary(repo_root: str, baseline: Optional[dict]) -> bool:
 
 
 def _undo_run_changes(repo_root: str, baseline: dict) -> tuple[list[str], list[str]]:
-    """런이 바꾼 파일들을 baseline(런 직전) 상태로 되돌린다.
+    """Revert files the run changed back to their baseline (pre-run) state.
 
-    - baseline ref 에 있던 파일 → `git restore --source` (인덱스는 건드리지 않음;
-      구버전 git 이면 checkout 폴백 — 이 경우 인덱스도 함께 복원됨).
-    - baseline 에 없던 새 파일 → 삭제가 곧 복원.
-    Returns (되돌린 경로들, 실패한 경로들).
+    - Files present in the baseline ref → `git restore --source` (leaves the
+      index untouched; falls back to checkout on older git, which also
+      restores the index).
+    - New files not present in the baseline → deletion is the revert.
+    Returns (reverted paths, failed paths).
     """
     undone: list[str] = []
     failed: list[str] = []
@@ -1166,11 +1226,13 @@ def _undo_run_changes(repo_root: str, baseline: dict) -> tuple[list[str], list[s
 
 
 def _print_session_summary(session_tokens: dict, t0: float) -> None:
-    """세션 종료 직전 한 줄 요약 (경과 · ↑↓ 토큰). 사용량 없으면 침묵.
+    """One-line summary right before session end (elapsed · ↑↓ tokens). Silent if no usage.
 
-    달러 금액은 의도적으로 제외 — 출구 배너는 환경(ambient) 요약이므로 비용 디테일은
-    요청형 ``/cost``·``/status`` 리포트로만 노출한다. ``ASICODE_HIDE_COST`` 게이트는
-    퍼턴 배너에만 적용된다.
+    Dollar amounts are intentionally excluded — cost is an estimate, not an exact
+    bill, so it is never surfaced on any CLI-facing surface (only logged to the
+    debug _log line). Token counts / elapsed time are objective usage metrics, so
+    they're kept. This principle applies uniformly to every run-summary token line
+    and the session-end summary.
     """
     pt = session_tokens.get("prompt", 0)
     ct = session_tokens.get("completion", 0)
@@ -1193,7 +1255,6 @@ _SLASH_COMMANDS: list[tuple[str, tuple[str, ...], str, str]] = [
     ("/diff",    (),              "",       "re-show the last run's file changes"),
     ("/undo",    (),              "",       "revert files changed by the last run to their pre-run state"),
     ("/status",  ("/info",),      "",       "repo · model · mode · session usage"),
-    ("/cost",    ("/tokens",),    "",       "session token + cost summary"),
     ("/model",   (),              "[name]",  "show or switch model: /model <name> · /model <provider>/<name> · /model <provider> <name>"),
     ("/helper",  (),              "[name]",  "model for context-compression: /helper <name> or /helper off (= use main model)"),
     ("/clear",   ("/cls",),       "",       "clear screen + compact conversation into summary"),
@@ -1205,7 +1266,7 @@ _SLASH_COMMANDS: list[tuple[str, tuple[str, ...], str, str]] = [
     ("/code",    (),              "[msg]",  "switch to Code Chat (full context)"),
     ("/general", (),              "[msg]",  "switch to General Chat (no code context)"),
     ("/think",   ("/thinking",),  "[mode]", "toggle thinking/reasoning mode (tab for suggestions)"),
-    ("/claude",  (),              "[--fresh] <task>", "ask Claude Code Agent (--fresh: 대화 맥락 미공유)"),
+    ("/claude",  (),              "[--fresh] <task>", "ask Claude Code Agent (--fresh: don't share conversation context)"),
     ("/orchestrate", ("/orch",), "<task>", "enter Orchestrator mode (persistent — inherits session context; /code to exit)"),
     ("/quit",    (":q", "/exit"), "",       "end the session"),
 ]
@@ -1219,7 +1280,7 @@ _FAILURE_PATTERNS_SUBCOMMANDS: list[str] = ["list", "clear", "drop", "prune"]
 # Section groups for /help rendering — a flat list of 15 is slow to scan. Commands not listed here
 # are gathered into the "other" section by _render_help, so omissions still display.
 _SLASH_GROUPS: list[tuple[str, tuple[str, ...]]] = [
-    ("session", ("/help", "/status", "/cost", "/clear", "/quit")),
+    ("session", ("/help", "/status", "/clear", "/quit")),
     ("model",   ("/model", "/helper", "/think")),
     ("mode",    ("/code", "/general", "/orchestrate", "/claude")),
     ("output",  ("/diff", "/undo", "/copy")),
@@ -1416,7 +1477,7 @@ def _resolve_model_interactive(
                 _C["yellow"],
             )
             _print(
-                f"  (자연어가 섞인 것 같습니다 — {usage_hint} <provider>/<model> 형식으로만 입력하세요)",
+                f"  (looks like natural language got mixed in — use only the {usage_hint} <provider>/<model> format)",
                 _C["muted"],
             )
             return None
@@ -1437,7 +1498,7 @@ def _resolve_model_interactive(
                     _C["yellow"],
                 )
                 _print(
-                    f"  (자연어가 섞인 것 같습니다 — {usage_hint} {prov_cand}/<model> 형식으로만 입력하세요)",
+                    f"  (looks like natural language got mixed in — use only the {usage_hint} {prov_cand}/<model> format)",
                     _C["muted"],
                 )
                 return None
@@ -1517,11 +1578,11 @@ def _prompt_auth_retry_key(
     _emsg = (error_message or "").lower()
     if "not supported" in _emsg or "is not supported" in _emsg:
         _print(
-            f"\n  ⚡ {provider} 서버가 현재 모델({svc.model})을 지원하지 않는다고 응답했습니다.",
+            f"\n  ⚡ {provider} server responded that it does not support the current model ({svc.model}).",
             _C["yellow"],
         )
         _print(
-            "  API 키 문제가 아닙니다 — /model 로 지원되는 모델로 전환하세요.",
+            "  This isn't an API key problem — switch to a supported model with /model.",
             _C["muted"],
         )
         return False
@@ -1529,13 +1590,13 @@ def _prompt_auth_retry_key(
     env_var = _API_KEY_ENV_MAP.get(provider.lower(), "")
     hint = f" (${env_var})" if env_var else ""
     _print(
-        f"\n  ⚡ {provider} API key가 만료되었거나 잘못되었습니다.{hint}",
+        f"\n  ⚡ {provider} API key is expired or invalid.{hint}",
         _C["yellow"],
     )
-    _print("  새 API key를 입력하세요 (빈 줄 = 건너뛰기):", _C["muted"])
+    _print("  Enter a new API key (empty line = skip):", _C["muted"])
     new_key = input("  ▸ ").strip()
     if not new_key:
-        _print("  ↪ 건너뜀 — 기존 에러를 표시합니다.", _C["muted"])
+        _print("  ↪ skipped — showing the original error.", _C["muted"])
         return False
     if env_var:
         os.environ[env_var] = new_key
@@ -1545,7 +1606,7 @@ def _prompt_auth_retry_key(
         new_client = _mk_client(provider=provider, api_key=new_key)
         svc.llm_service.client = new_client
         _print(
-            f"  ✅ {provider} 클라이언트가 재생성되었습니다.",
+            f"  ✅ {provider} client recreated.",
             _C["green"],
         )
         # ── Persist to .env (auto-loaded on next run) ──
@@ -1556,7 +1617,7 @@ def _prompt_auth_retry_key(
             pass  # non-critical — env var is already set
         return True
     except Exception as exc:
-        _print(f"  ❌ 클라이언트 재생성 실패: {exc}", _C["red"])
+        _print(f"  ❌ client recreation failed: {exc}", _C["red"])
         return False
 
 
@@ -1664,19 +1725,33 @@ def _create_llm_client_for(provider: str, api_key: str = ""):
     if not api_key and provider.lower() != "ollama":
         ak_var = _API_KEY_ENV_MAP.get(provider.lower())
         api_key = os.getenv(ak_var, "") if ak_var else ""
-    return _create_llm(
-        provider=provider,
-        api_key=api_key or None,
-        base_url=resolve_provider_base_url(provider),
-    )
+    try:
+        return _create_llm(
+            provider=provider,
+            api_key=api_key or None,
+            base_url=resolve_provider_base_url(provider),
+        )
+    except Exception as _exc:
+        # Honor the "None on failure" contract so callers' fail-open paths
+        # (compress-helper → fall back to main model; /helper → error line)
+        # actually trigger instead of the exception crashing the REPL. This
+        # notably covers ModuleNotFoundError from create_llm_client's lazy
+        # per-provider imports (`from .openai_client import ...`) — a corrupt
+        # or partial install missing an optional provider module must degrade
+        # gracefully, not abort startup in _get_compress_llm.
+        logging.getLogger(__name__).warning(
+            "LLM client creation failed for provider %r: %s", provider, _exc,
+        )
+        return None
 
 
 def _copy_to_clipboard(text: str) -> str:
-    """텍스트를 시스템 클립보드에 복사한다.
+    """Copy text to the system clipboard.
 
-    macOS pbcopy → Linux wl-copy/xclip/xsel → Windows clip 순으로 네이티브
-    도구를 시도하고, 모두 없으면 OSC 52 이스케이프 시퀀스로 폴백한다 (SSH/tmux
-    환경에서도 동작). 성공 시 사용한 방법 라벨을, 실패 시 빈 문자열을 반환한다.
+    Tries native tools in order — macOS pbcopy → Linux wl-copy/xclip/xsel →
+    Windows clip — and falls back to the OSC 52 escape sequence if none are
+    available (also works over SSH/tmux). Returns the method label used on
+    success, or an empty string on failure.
     """
     if not text:
         return ""
@@ -1710,8 +1785,8 @@ def _copy_to_clipboard(text: str) -> str:
 def _get_think_suggestions(provider: str, model: str) -> list[str]:
     """Return /think argument completions based on provider and model.
 
-    각 제공사별 thinking/reasoning effort 값이 다르므로 현재 모델에 맞는
-    후보 목록을 반환한다.
+    Each provider has different thinking/reasoning effort values, so this
+    returns the candidate list matching the current model.
     """
     p = (provider or "").strip().lower()
     m = (model or "").strip().lower()
@@ -1753,20 +1828,24 @@ def _get_think_suggestions(provider: str, model: str) -> list[str]:
 
 
 class _SlashCommandCompleter:
-    """프롬프트 맨 앞 '/' 입력 시 슬래시 커맨드 자동완성.
+    """Slash-command autocomplete when '/' is typed at the start of the prompt.
 
-    duck-typed completer — prompt_toolkit의 Completer를 상속하지 않는다.
-    PromptSession은 completer를 isinstance 검사하지 않고 get_completions
-    만 호출하므로, 이 클래스 정의는 prompt_toolkit import에 의존하지 않는다
-    (→ 비대화형 경로 콜드스타트 절약). Completion 심볼은 _load_prompt_toolkit()
-    가 REPL 진입 시 모듈 글로벌에 바인딩하므로 메서드 실행 시점엔 사용 가능.
+    Duck-typed completer — does not subclass prompt_toolkit's Completer.
+    PromptSession doesn't isinstance-check the completer, it only calls
+    get_completions, so this class definition doesn't depend on the
+    prompt_toolkit import (→ saves cold-start time on the non-interactive
+    path). The Completion symbol is bound to the module globals by
+    _load_prompt_toolkit() on REPL entry, so it's available by the time
+    the methods run.
 
-    일반 텍스트 입력에는 끼어들지 않는다 — 커서 앞 버퍼 전체가 '/'로 시작하는
-    단일 토큰(공백/줄바꿈 없음)일 때만 후보를 낸다. '/Users/...' 같은 경로는
-    두 번째 '/'가 나오는 순간 어떤 커맨드와도 prefix가 안 맞아 메뉴가 닫힌다.
+    Doesn't interfere with plain text input — candidates are only offered
+    when the entire buffer before the cursor is a single token starting
+    with '/' (no spaces/newlines). A path like '/Users/...' stops matching
+    any command's prefix the moment the second '/' appears, closing the menu.
 
-    '/model ' 이후에는 _KNOWN_MODELS의 provider/name 목록에서 자동완성한다.
-    '/think ' 이후에는 현재 모델에 맞는 thinking/reasoning 값 목록에서 자동완성한다.
+    After '/model ' it autocompletes from the provider/name list in
+    _KNOWN_MODELS. After '/think ' it autocompletes from the thinking/reasoning
+    value list matching the current model.
     """
 
     def __init__(self, get_provider_fn=None, get_model_fn=None, get_dev_models_fn=None):
@@ -1812,7 +1891,7 @@ class _SlashCommandCompleter:
             yield item
 
     def _try_arg_completions(self, text):
-        """커맨드 인자 자동완성 — /model(모델명) /think(thinking 값)."""
+        """Command-argument autocomplete — /model (model name), /think (thinking value)."""
         cmd_part, _, after = text.partition(" ")
         cmd_low = cmd_part.lower()
         # Identify which command
@@ -1842,11 +1921,11 @@ class _SlashCommandCompleter:
             yield from self._yield_subcommand_completions(after, _INSIGHTS_SUBCOMMANDS)
 
     def _yield_model_completions(self, prefix):
-        """/model 명령어의 모델명 자동완성.
+        """Model-name autocomplete for the /model command.
 
-        /model dev_N <model>: 서브에이전트 슬롯 모델 지정.
-          - "dev" / "dev_1"   → dev_1..dev_8 슬롯 토큰 제안 (설정 여부 표시)
-          - "dev_1 qwen"      → 모델명 제안 (off 포함)
+        /model dev_N <model>: assign a model to a sub-agent slot.
+          - "dev" / "dev_1"   → suggest dev_1..dev_8 slot tokens (shows whether set)
+          - "dev_1 qwen"      → suggest model names (including off)
         """
         # ── /model dev_N <model>: per-subagent slot ──
         # (1) Slot token completion: "dev" / "dev_" / "dev_1" → suggest dev_1..dev_8
@@ -1918,7 +1997,7 @@ class _SlashCommandCompleter:
                 )
 
     def _yield_think_completions(self, prefix):
-        """/think 명령어의 thinking 값 자동완성 (현재 모델 기반)."""
+        """Thinking-value autocomplete for /think, based on the current model."""
         provider = self._get_provider()
         model = self._get_model()
         suggestions = _get_think_suggestions(provider, model)
@@ -1933,7 +2012,7 @@ class _SlashCommandCompleter:
 
 
 def _grouped_slash_commands() -> list[tuple[str, list[tuple]]]:
-    """_SLASH_GROUPS 순서대로 (섹션명, 커맨드 튜플 목록). 그룹 미지정은 other."""
+    """(section name, command tuples) in _SLASH_GROUPS order. Ungrouped commands go to "other"."""
     by_name = {c[0]: c for c in _SLASH_COMMANDS}
     grouped: list[tuple[str, list[tuple]]] = []
     seen: set[str] = set()
@@ -1993,10 +2072,9 @@ def _render_status(repo_root: str, provider: str, model: str, mode: str,
     """Render a compact session status block."""
     pt = session_tokens.get("prompt", 0)
     ct = session_tokens.get("completion", 0)
-    actual_cost = session_tokens.get("actual_cost", 0.0)
+    # Cost (dollars) is an estimate, not an exact bill, so it's not shown in /status.
+    # Token count is an objective usage metric, so it's kept.
     _session_str = f"↑{_abbrev_tokens(pt)}  ↓{_abbrev_tokens(ct)} tokens"
-    if actual_cost:
-        _session_str += f"  ·  ${actual_cost:.4f}"
     mode_label = "General Chat" if mode == "general" else "Code Chat"
     if thinking_state is True:
         think_label = "thinking ON"
@@ -2037,9 +2115,11 @@ _BAR_BOX = None
 
 
 def _bar_box():
-    """좌측 거터 바(▌)만 그리는 Rich Box — 사방 테두리 대신 콘텐츠 좌측에
-    얇은 색 바 하나만 둬, 무거운 패널 대신 가볍고 모던한 블록을 만든다.
-    (8줄 × 4글자 규약: 각 줄 [left, fill, divider, right] — 좌측만 ▌, 나머지 공백)"""
+    """A Rich Box that draws only a left gutter bar (▌) — instead of a border on
+    all four sides, a single thin colored bar sits to the left of the content,
+    making a light, modern block instead of a heavy panel.
+    (8-line × 4-char convention: each line is [left, fill, divider, right] —
+    only the left side gets ▌, the rest is blank)"""
     global _BAR_BOX
     if _BAR_BOX is None:
         from rich.box import Box
@@ -2057,7 +2137,7 @@ def _bar_box():
 
 
 def _bar_panel(content, title=None, color: str = "", padding=(0, 2)):
-    """_bar_box 기반 거터 바 패널 — title 은 상단(바 없는 줄)에 좌측 정렬."""
+    """Gutter-bar panel based on _bar_box — title is left-aligned on the top (barless) line."""
     from rich.panel import Panel
     return Panel(
         content, box=_bar_box(),
@@ -2123,6 +2203,14 @@ def _print_banner(repo_root: str = "") -> None:
             try:
                 with Live(_title_at(0.0),
                           console=_out_console, refresh_per_second=24,
+                          # Rich's redirect_stdout/stderr swaps sys.stdout for a
+                          # FileProxy(_out_console); since _MarginIO (this console's
+                          # file) now resolves sys.stdout dynamically, that proxy
+                          # points straight back here → infinite recursion. Disable
+                          # the redirect: margin-console writes always went to the
+                          # real stream anyway, and log/spinner interleaving is
+                          # coordinated via _TERM_WRITE_LOCK, not Rich's reflow.
+                          redirect_stdout=False, redirect_stderr=False,
                           transient=False) as live:
                     _t0 = _bt.monotonic()
                     while True:
@@ -2816,10 +2904,11 @@ _SILENT_EVENTS = {
 
 
 def _relativize_repo_paths(text: str) -> str:
-    """레포 루트 절대경로를 상대경로로 축약 — 한 줄 힌트의 가용 폭 확보.
+    """Shorten the repo root's absolute path to a relative one — reclaims width for the one-line hint.
 
-    'cd <repo> && ' 프리픽스는 통째로 제거(모든 명령이 레포 루트에서 실행),
-    그 외 '<repo>/' 출현은 빈 문자열로, 단독 '<repo>'는 '.'으로 치환.
+    The 'cd <repo> && ' prefix is stripped entirely (every command already runs
+    from the repo root); other occurrences of '<repo>/' become empty, and a
+    bare '<repo>' becomes '.'.
     """
     rr = _REPO_ROOT.rstrip("/")
     if not rr or rr == "/":
@@ -2833,7 +2922,7 @@ def _relativize_repo_paths(text: str) -> str:
 
 
 def _extract_tool_cmd(args: dict) -> str:
-    """design_tool_call args에서 CLI 표시용 명령어 힌트 추출."""
+    """Extract a CLI-displayable command hint from design_tool_call args."""
     if not args:
         return ""
     # shell_exec / bash / git_* series
@@ -2876,10 +2965,11 @@ _THREE_LINE_PREVIEW_TOOLS = frozenset({
 
 
 def _select_preview_lines(tool: str, lines: list) -> list:
-    """툴별 미리보기 라인 선택 — 각 결과에서 정보량이 가장 높은 라인을 고른다.
+    """Select preview lines per tool — pick the most informative line(s) from each result.
 
-    기본 2줄, 항목 나열형 툴은 3줄. write 툴은 결과 끝의 [POST-EDIT DIFF]
-    블록(경로별 +N/-M, NO CHANGE 경고)을 우선 표시한다.
+    2 lines by default, 3 for listing-style tools. Write tools prioritize the
+    [POST-EDIT DIFF] block at the end of the result (per-path +N/-M, NO CHANGE
+    warnings).
     """
     # grep-type noise: remove pycache and other binary match lines
     lines = [ln for ln in lines if not ln.strip().startswith("Binary file ")]
@@ -2931,7 +3021,7 @@ _PAUSED_HINT = "⏸ paused — to resume, just ask naturally in your next input 
 
 
 def _abbrev_tokens(n: int) -> str:
-    """토큰 수 축약 표시: 690 → '690', 43,606 → '43.6K', 11,377,708 → '11.38M'."""
+    """Abbreviate token counts for display: 690 → '690', 43,606 → '43.6K', 11,377,708 → '11.38M'."""
     if n < 1000:
         return str(n)
     if n < 1_000_000:
@@ -2939,27 +3029,17 @@ def _abbrev_tokens(n: int) -> str:
     return f"{n/1_000_000:.2f}M"
 
 
-def _hide_cost_display() -> bool:
-    """``ASICODE_HIDE_COST`` 설정 시 턴/요약 상태줄의 달러 금액을 숨긴다 (일시적 스위치).
-
-    토큰 수와 캐시 적중률은 금액이 아니므로 유지되며, 요청형 ``/cost`` 리포트와
-    디버그 ``_log`` 줄은 사용자 표시가 아니므로 영향받지 않는다.
-    ``1``/``true``/``yes``/``on`` (대소문자 무관) 으로 켜고, 빈 값/미설정이면 표시.
-    """
-    return os.environ.get("ASICODE_HIDE_COST", "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
-
-
 def _build_interrupt_note(partial_res) -> str:
-    """ESC 중단 시 세션에 남길 assistant interrupt note 생성.
+    """Build the assistant interrupt note to leave in the session when ESC interrupts a turn.
 
-    노트 본문에는 부분 응답과 재개 지시만 담는다 — 툴루프 결과의 *풀 디테일*은
-    add_turn의 tool_results 인자로 별도 영속되며, build_context_messages가
-    예산 캡 내에서 풀 렌더한다 (아래 _TOOL_RESULTS_HEADER 참조). 따라서 이
-    함수가 300자 요약을 본문에 넣으면 풀 렌더와 중복되므로, 대신 툴 개수만
-    가이드로 남긴다. tool_results 영속이 실패한 레거시/엣지 케이스를 위해
-    짧은 요약 폴백을 함께 제공한다 (full render가 비어있을 때만 의미 있음).
+    The note body carries only the partial response and resume instructions —
+    the *full detail* of the tool-loop results is persisted separately via
+    add_turn's tool_results argument, and build_context_messages fully renders
+    it within the budget cap (see _TOOL_RESULTS_HEADER below). So if this
+    function put a 300-char summary in the body, it would duplicate the full
+    render; instead it leaves only the tool count as a guide. A short summary
+    fallback is also provided for legacy/edge cases where tool_results
+    persistence fails (only meaningful when the full render is empty).
     """
     content = (getattr(partial_res, "content", "") or "").strip()
     tool_results = list(getattr(partial_res, "tool_results", None) or [])
@@ -2980,7 +3060,7 @@ def _build_interrupt_note(partial_res) -> str:
 
 
 class _ProgressPrinter:
-    """stream_callback 이벤트를 터미널에 출력하는 간단한 핸들러."""
+    """Simple handler that prints stream_callback events to the terminal."""
 
     def __init__(self, verbose: bool = False) -> None:
         self._verbose = verbose
@@ -3041,9 +3121,10 @@ class _ProgressPrinter:
     def _spinner_safe(msg: str, max_cols: int) -> str:
         """Collapse newlines and truncate to max_cols visual columns (CJK = 2 cols each).
 
-        절단 시 말줄임표 "…"(1칸)까지 포함해 결과가 max_cols를 넘지 않도록
-        뒤에서부터 자리를 비운다 — 박스 테두리 정렬처럼 폭이 정확해야 하는
-        렌더에서 1칸 초과가 우측 테두리를 다음 줄로 흘려 줄을 깨뜨리지 않게.
+        When truncating, frees up space from the end — including the ellipsis
+        "…" (1 cell) — so the result never exceeds max_cols. This keeps a
+        1-cell overflow from pushing the right border onto the next line and
+        breaking renders where the width must be exact, like box-border alignment.
         """
         import unicodedata as _ud
         if max_cols <= 0:
@@ -3065,7 +3146,7 @@ class _ProgressPrinter:
         return "".join(out)
 
     def _start_tool_ticker(self) -> None:
-        """현재 실행 중인 툴의 ○ 라인을 스피너+경과시간으로 주기 재렌더하는 ticker 시작."""
+        """Start the ticker that periodically re-renders the currently running tool's ○ line with a spinner + elapsed time."""
         if not sys.stdout.isatty():
             return
         if self._ticker_thread is not None and self._ticker_thread.is_alive():
@@ -3084,14 +3165,16 @@ class _ProgressPrinter:
         self._ticker_thread = None
 
     def _render_live_line(self, marker: str) -> str:
-        """실행 중(in-flight)인 툴들을 나타내는 단일 live 라인 문자열을 만든다.
+        """Build a single live-line string representing the currently in-flight tools.
 
-        - 진행 중에는 완료 seq 가 미정이라 번호 자리를 **비워 둔다**(과거의 "[·]"
-          placeholder 미노출). 비운 폭은 완료 라인 "  [N]…✓ tool" 의 아이콘 열과
-          동일하게 맞춰, 완료 시 같은 자리에 번호/✓ 가 자연스럽게 채워지도록 한다.
-        - 가장 먼저 시작한(=가장 오래 기다린) 툴을 대표로 보여주고, 동시에 여러
-          개가 떠 있으면 `(+N)` 로 나머지 개수를 표기한다. 경과시간은 대표 툴의
-          시작 시각 기준.
+        - While in progress the completion seq is unknown, so the number slot is
+          **left empty** (the old "[·]" placeholder is no longer shown). The
+          empty width matches the icon column of the completion line
+          "  [N]…✓ tool" exactly, so the number/✓ fills that same spot naturally
+          on completion.
+        - Shows the tool that started first (= waited longest) as the
+          representative; if several are in flight at once, `(+N)` notes the
+          rest. Elapsed time is based on the representative tool's start time.
         """
         if not self._inflight:
             return ""
@@ -3116,14 +3199,18 @@ class _ProgressPrinter:
         return f"{_base}{_suffix}{_extra}{_tail}"
 
     def _pop_inflight(self, call_id: Optional[str]) -> Optional[dict]:
-        """완료/에러 이벤트를 in-flight 항목과 매칭해 꺼낸다.
+        """Match a completion/error event to an in-flight entry and pop it.
 
-        - call_id 정확 매칭 우선 (provider가 tool-call id를 주는 정상 경로).
-        - call_id 가 None 이면(=id 없는 provider) 가장 오래된 anon-키 항목을 FIFO로
-          꺼낸다 — id가 없어 정확 매칭이 불가능한 동시 실행에서 두 완료가 한 슬롯으로
-          합쳐지거나(완료 유실) live 라인이 영영 남는 것을 막는다.
-        - call_id 가 있는데 매칭이 안 되면(running 못 본 내부 툴 등) 다른 툴 슬롯을
-          가로채지 않고 None 을 돌려준다 — 호출부는 그래도 새 seq로 ✓/✗를 찍는다.
+        - Exact call_id match takes priority (the normal path, when the
+          provider supplies a tool-call id).
+        - If call_id is None (a provider with no id), pop the oldest anon-key
+          entry FIFO — this prevents two completions from collapsing into one
+          slot (a lost completion) or a live line lingering forever, in
+          concurrent runs where exact matching is impossible without an id.
+        - If call_id is present but doesn't match anything (e.g. an internal
+          tool whose "running" event was never seen), return None instead of
+          stealing another tool's slot — the caller still stamps ✓/✗ with a
+          fresh seq regardless.
         """
         if call_id is not None and call_id in self._inflight:
             return self._inflight.pop(call_id)
@@ -3136,11 +3223,12 @@ class _ProgressPrinter:
         return None
 
     def _refresh_live_line(self) -> None:
-        """확정된 ✓/✗ 라인(+preview)을 모두 출력한 *뒤에* 호출한다.
+        """Call this *after* all finalized ✓/✗ lines (+preview) have been printed.
 
-        in-flight 가 남아 있으면 live 라인을 화면의 마지막 줄로 다시 그리고,
-        아무것도 안 남았으면 터미널 로그 억제를 풀고 live 상태를 내린다.
-        'live 라인은 항상 마지막, 항상 개행 안 됨' 불변식을 유지하는 진입점."""
+        If in-flight tools remain, redraws the live line as the last line on
+        screen; if none remain, lifts the terminal-log suppression and drops
+        the live state. The entry point that maintains the invariant 'the live
+        line is always last, and never has a trailing newline'."""
         with _TERM_WRITE_LOCK:
             if self._inflight:
                 sys.stdout.write(f"\r\x1b[2K{self._shimmer_row(self._fit_row(self._render_live_line('○')), time.perf_counter())}")
@@ -3158,12 +3246,15 @@ class _ProgressPrinter:
                 self._live_drawn = False
 
     def _tool_ticker_worker(self, stop: threading.Event) -> None:
-        """0.25초마다 live 라인을 ◴◷◶◵ 스피너와 경과시간으로 다시 그린다.
+        """Re-render the live line every 0.25s with a ◴◷◶◵ spinner and elapsed time.
 
-        - 대표(가장 오래된) 툴이 1초 미만이면 그리지 않음 — 짧은 툴은 ○→✓로 깔끔하게.
-        - _esc_watcher_pause 동안(ask_user 체크포인트가 stdin 읽는 중)은 출력 정지.
-        - self._lock 안에서만 쓰므로 complete/error 핸들러의 ✓ 덮어쓰기와 경합 없음
-          (live 라인이 내려가면 _live_drawn=False라 더 이상 그리지 않는다).
+        - Doesn't draw if the representative (oldest) tool has run under 1s —
+          keeps short tools clean as a plain ○→✓.
+        - Suppressed while _esc_watcher_pause is set (an ask_user checkpoint is
+          reading stdin).
+        - Only writes inside self._lock, so there's no race with the ✓
+          overwrite done by the complete/error handlers (once the live line
+          goes down, _live_drawn=False stops further redraws).
         """
         i = 0
         while not stop.wait(0.25):
@@ -3185,10 +3276,11 @@ class _ProgressPrinter:
                     _tool_running_filter.row_pending = True
 
     def _start_thinking_ticker(self) -> None:
-        """LLM 호출 시작 — 스피너를 "<spinner> thinking · Ns" 로 매 0.1초 갱신해
-        생각 중임을 라이브 경과시간과 함께 보여준다. 호출이 끝나면
-        _stop_spinner()(→ _stop_thinking_ticker)에서 멈추고, design_thinking
-        핸들러가 'thought for Ns' 패널로 확정 전환한다."""
+        """Start of an LLM call — updates the spinner to "<spinner> thinking · Ns"
+        every 0.1s to show it's thinking, along with the live elapsed time.
+        When the call finishes, _stop_spinner() (→ _stop_thinking_ticker) stops
+        it, and the design_thinking handler finalizes it into a
+        'thought for Ns' panel."""
         self._stop_thinking_ticker()
         # Spinner may have been stopped when the last tool line was printed — re-spawn if needed.
         if not self._spinner_running:
@@ -3221,21 +3313,25 @@ class _ProgressPrinter:
             self._update_spinner(f"thinking{_t}")
 
     def _consume_llm_tokens_str(self) -> str:
-        """직전 LLM 호출 1회의 '전체 입력 컨텍스트 크기' + cache hit% 표시 (1회 소비, dim).
+        """Display the last LLM call's 'total input context size' + cache hit% (consumed once, dim).
 
-        provider별 회계(_CACHE_TOKENS_SEPARATE)를 반영한 전체 input 크기를 표시한다 —
-        캐시 hit 여부와 무관하게 '현재 점유 중인 컨텍스트 창 크기'이므로 턴이 갈수록
-        단조증가한다. 과금 청구량(누적 합)은 턴 종료 요약 라인에서 별도로 표시된다.
+        Shows the total input size accounting for provider-specific billing
+        (_CACHE_TOKENS_SEPARATE) — this is the 'context window currently
+        occupied' regardless of cache hits, so it monotonically increases
+        across turns. The billed amount (cumulative sum) is shown separately
+        on the turn-end summary line.
 
-        주의: ``_pending_llm_tokens``는 과금 회계용 '캐시 미스 처리분'이다. 이 값을
-        그대로 ↑로 표시하면 캐시 hit율이 높아질수록 작아지는 착시가 생긴다 (로그에서
-        'Z.AI cache: N cached (5116% of prompt)' 가 정확히 이 상태). 따라서 표시는
-        ``total_input_tokens()``로 미스+hit를 합산(zai/anthropic)하거나 미스만
-        (openai/deepseek subset) 사용한다.
+        Note: ``_pending_llm_tokens`` is the 'cache-miss portion' for billing
+        accounting. Displaying this value directly as ↑ would create the
+        illusion that ↑ shrinks as the cache hit rate rises (this is exactly
+        what 'Z.AI cache: N cached (5116% of prompt)' in the logs reflects).
+        So the display uses ``total_input_tokens()`` to sum miss+hit
+        (zai/anthropic), or miss only (openai/deepseek subset).
 
-        한 호출이 툴 여러 개를 발행하면 첫 ✓ 라인에만 붙는다 — 같은 호출 시점의
-        토큰을 툴마다 반복 표시하면 합산으로 오독되기 때문. 컨텍스트 크기 옆에
-        캐시 적중률을 'N% cached'로 표시한다 (예: ↑48k · 84% cached).
+        If one call issues multiple tools, this is attached only to the first
+        ✓ line — repeating the same call's tokens per tool would misread as a
+        sum. Next to the context size, cache hit rate is shown as 'N% cached'
+        (e.g. ↑48k · 84% cached).
         """
         n = self._pending_llm_tokens        # Cache miss tokens (billing accounting)
         crt = self._pending_llm_cache_read  # Cache hit portion
@@ -3296,12 +3392,14 @@ class _ProgressPrinter:
 
     @classmethod
     def _style_row(cls, s: str, icon_hex: Optional[str] = None) -> str:
-        """이미 _fit_row 로 폭이 맞춰진 plain 라인에 색만 입힌다(폭 불변).
+        """Colorize a plain line already width-fitted by _fit_row (width unchanged).
 
-        선두 "[…]" 토큰을 dim 처리하고, 그 뒤 첫 비공백 글자(아이콘)를 icon_hex
-        색으로 칠한다. "]" 뒤에 _seq_pad 패딩 공백이 여러 칸 올 수 있으므로 공백을
-        모두 건너뛴 뒤의 글자를 아이콘으로 본다. ANSI 는 절단 이후에 주입하므로
-        폭 계산을 깨지 않는다. (선두 토큰/아이콘은 절대 잘리지 않는 위치)
+        Dims the leading "[…]" token, then colors the first non-space
+        character after it (the icon) with icon_hex. Since several _seq_pad
+        padding spaces may follow "]", the character after skipping all
+        spaces is treated as the icon. ANSI is injected after truncation, so
+        it doesn't break the width calculation. (The leading token/icon is
+        never a position that gets truncated.)
         """
         i = s.find("[")
         j = s.find("]", i) if i >= 0 else -1
@@ -3320,12 +3418,14 @@ class _ProgressPrinter:
 
     @classmethod
     def _shimmer_row(cls, s: str, elapsed: float) -> str:
-        """실행 중 live 툴 라인("◴ bash …")에 Claude Code 식 beam shimmer 를 입힌다.
+        """Apply a Claude Code-style beam shimmer to the running live tool line ("◴ bash …").
 
-        선두 인덴트 + 회전 글리프 + 한 칸 공백은 그대로 두고, 그 뒤 본문(툴 레이블 +
-        명령/경과)만 per-char 보간 색으로 칠한다. _style_row 와 동일하게 ANSI 는
-        _fit_row 절단 *이후* 주입하므로 폭 계산을 깨지 않는다(완료 ✓ 라인의 _style_row
-        와 대칭). _shimmer_beam/_shimmer_style_for 는 thinking 스피너와 공유."""
+        Leaves the leading indent + rotating glyph + one space untouched, and
+        colors only the body after it (tool label + command/elapsed) with a
+        per-char interpolated color. As with _style_row, ANSI is injected
+        *after* _fit_row truncation, so it doesn't break the width calculation
+        (symmetric with the completed ✓ line's _style_row). _shimmer_beam /
+        _shimmer_style_for are shared with the thinking spinner."""
         if not s:
             return s
         k = 0
@@ -3352,9 +3452,9 @@ class _ProgressPrinter:
 
     def _event(self, elapsed: float, icon: str, msg: str,
                color: str = "text", icon_color: Optional[str] = None) -> None:
-        """관측 라인 한 줄 출력: dim [경과] · 컬러 아이콘 · 본문.
+        """Print one observation line: dim [elapsed] · colored icon · body.
 
-        color/icon_color 는 _C 팔레트 키이거나 그대로 쓸 스타일/hex 문자열.
+        color/icon_color are either _C palette keys or a style/hex string to use as-is.
         """
         _style = _C.get(color, color)
         _istyle = _C.get(icon_color or color, color)
@@ -3377,12 +3477,13 @@ class _ProgressPrinter:
 
     @staticmethod
     def _make_spinner(text: str, style: str):
-        """Claude Code 스타일 shimmer spinner 를 만든다.
+        """Build a Claude Code-style shimmer spinner.
 
-        툴 ticker(◴◷◶◵ circle quadrants)와 동일 계열의 회전 글리프에, 본문 텍스트 위를 빔이
-        좌↔우로 스캔하는 shimmer 조명 효과를 더한다(_ShimmerSpinner.render 참조).
-        회전 글리프는 Rich Spinner 의 frames/interval 을 사용하고, 본문은 매
-        프레임 beam 보간 색상으로 per-char 칠해진다.
+        Adds a shimmer lighting effect — a beam scanning left↔right over the
+        body text — to the same family of rotating glyphs as the tool ticker
+        (◴◷◶◵ circle quadrants); see _ShimmerSpinner.render. The rotating
+        glyph uses Rich Spinner's frames/interval, and the body is colored
+        per-char with an interpolated beam color every frame.
         """
         return _ShimmerSpinner(text, style, frames=["◴", "◷", "◶", "◵"], interval=130)
 
@@ -3416,30 +3517,35 @@ class _ProgressPrinter:
             print("  " + "".join(_txt for _txt, _ in parts))
 
     def _render_plan_update(self, plan: dict, prev_statuses: Optional[dict]) -> None:
-        """update_plan ✓ 라인 아래에 플랜 전체를 테두리 박스로 렌더.
+        """Render the full plan as a bordered box below the update_plan ✓ line.
 
-        레이아웃 (대화 흐름과 시각적으로 분리되는 프레임):
+        Layout (a frame visually separated from the conversation flow):
           ╭─ Plan ──────────────── done/total ─╮
-          │ Goal  <goal>                        │   (goal 있을 때만 + 구분선)
+          │ Goal  <goal>                        │   (only when goal is set + divider)
           ├─────────────────────────────────────┤
           │ ✓ <item>                            │
           │ ▸ <item>                            │
           ╰─ ▰▰▱▱… pct% · open·skipped·… ──────╯
 
-        - 상태별 아이콘/색: ✓ done · ▸ in_progress · ○ pending · ⊘ skipped · ✖ blocked
-        - 변경점은 텍스트 주석 대신 색으로 표현: done 항목은 항상 green 본문으로
-          렌더하되, 이번 업데이트에서 막 바뀐(또는 새로 추가된) 항목만 더 밝은
-          bold 톤으로 강조해 "방금 바뀐 것"을 구분한다. (skipped=muted)
-          삭제된 항목은 세션 동안 누적 추적하되 개별 줄로 나열하지 않고, 하단
-          테두리의 '· N removed' 카운트로만 노출한다(분모가 조용히 줄어 완료율이
-          부풀려지는 것을 카운트로만 알리고, 목록 노이즈는 만들지 않는다).
-        - items 16개 이상이면 변경 없는 done 항목을 한 줄로 접어 노이즈를 줄인다
-          (이번에 막 바뀐 건 유지).
-        - 하단 테두리: 세그먼트 진행률 바(done=green▰·skipped=peach▰·blocked=red✖·
-          open=▱) + pct% + open·skipped·blocked·removed 분해 카운트. 전부 done일
-          때만 바가 완전히 초록으로 찬다.
-        - 우측 테두리 정렬은 각 행을 표시폭(_cjk_width, CJK=2칸) 기준으로 content_w에
-          패딩해 맞춘다. 박스 폭 초과 시 본문/카운트는 표시폭 기준으로 절단된다.
+        - Per-status icon/color: ✓ done · ▸ in_progress · ○ pending · ⊘ skipped · ✖ blocked
+        - Changes are expressed via color instead of text annotations: done
+          items always render with a green body, but only items that just
+          changed (or were just added) in this update get a brighter bold tone
+          to distinguish "what just changed" (skipped=muted).
+          Removed items are tracked cumulatively across the session but not
+          listed individually — they surface only as the '· N removed' count
+          in the bottom border (this signals, via count alone, that the
+          denominator quietly shrank — inflating the completion percentage —
+          without adding list noise).
+        - At 16+ items, unchanged done items collapse into a single line to
+          cut noise (items that just changed are still shown individually).
+        - Bottom border: a segmented progress bar (done=green▰·skipped=peach▰·
+          blocked=red✖·open=▱) + pct% + a breakdown count of
+          open·skipped·blocked·removed. The bar fills fully green only when
+          everything is done.
+        - Right-border alignment pads each row to content_w based on display
+          width (_cjk_width, CJK=2 cells). Body/counts are truncated by
+          display width if they exceed the box width.
         """
         import shutil as _sh_pl
         items = [it for it in plan.get("items", []) if isinstance(it, dict)]
@@ -3470,9 +3576,9 @@ class _ProgressPrinter:
         content_w = box_w - 4  # "│ " (2) + content + " │" (2)
 
         def _box_row(inner: list) -> None:
-            """inner=[(text,color)...] 을 좌우 테두리로 감싸 content_w에 맞춰 패딩.
+            """Wrap inner=[(text,color)...] with left/right borders, padded to content_w.
 
-            폭은 표시폭(_cjk_width) 기준으로 재므로 CJK가 섞여도 우측 │ 가 정렬된다.
+            Width is measured via display width (_cjk_width), so the right │ stays aligned even with CJK mixed in.
             """
             w = sum(_cjk_width(_t) for _t, _ in inner)
             pad = max(0, content_w - w)
@@ -3610,12 +3716,13 @@ class _ProgressPrinter:
         self._log(f"plan: {_log_tail}")
 
     def _spinner_indent(self) -> str:
-        """스피너 글리프를 완료 라인 "  [N]…✓ tool" 의 ✓ 열에 맞추기 위한 선두 공백.
+        """Leading whitespace to align the spinner glyph with the ✓ column of the completed line "  [N]…✓ tool".
 
-        아이콘은 "]" 뒤 리터럴 공백 없이 _seq_pad 만으로 정렬되므로 아이콘 열은
-        "  " + "[…]"(_SEQ_W+2) = 2 + (_SEQ_W+2) 로 고정된다. _ShimmerSpinner.render
-        가 이 선두 공백을 회전 글리프 앞으로 옮겨, 글리프가 아이콘(✓/○) 열에 정확히
-        위치하고 본문은 그 우측(툴 이름 열)으로 자연스럽게 밀린다.
+        The icon column is fixed at "  " + "[…]"(_SEQ_W+2) = 2 + (_SEQ_W+2),
+        since the icon is aligned purely by _seq_pad with no literal space
+        after "]". _ShimmerSpinner.render moves this leading whitespace in
+        front of the rotating glyph, so the glyph lands exactly on the icon
+        (✓/○) column and the body naturally shifts to its right (the tool-name column).
         """
         return " " * (2 + (_SEQ_W + 2))
 
@@ -3636,8 +3743,9 @@ class _ProgressPrinter:
             self._spinner_thread.start()
 
     def _spawn_rich_live(self, safe_msg: str) -> None:
-        """Rich Live 스피너 객체를 생성/시작한다. _start_spinner 의 최초 생성과
-        _update_spinner 의 재생성(로그 emit 이 Live 를 내린 뒤 복귀)이 공유한다."""
+        """Create/start the Rich Live spinner object. Shared by _start_spinner's
+        initial creation and _update_spinner's re-creation (recovery after a
+        log emit brings the Live down)."""
         from rich.live import Live
         _indent = self._spinner_indent()
         _spin_text = f"{_indent}{safe_msg}" if safe_msg else ""
@@ -3647,16 +3755,22 @@ class _ProgressPrinter:
             _spinner,
             console=_console,
             refresh_per_second=12,
+            # See banner Live: dynamic _MarginIO + Rich's default stream redirect
+            # form a self-referential FileProxy loop. Interleaving with log emits
+            # is handled by _suspend_live_for_log/_TERM_WRITE_LOCK, not Rich reflow.
+            redirect_stdout=False, redirect_stderr=False,
             transient=True,
         )
         self._spinner_live.start()
 
     def _suspend_live_for_log(self) -> None:
-        """로그 emit 직전(_RowSafeEmitMixin, _TERM_WRITE_LOCK 안에서 호출) Rich
-        Live 스피너 행을 내려, 로그가 스피너 행에 겹치지 않게 한다. Live.stop() 은
-        refresh 스레드를 join(동시 쓰기 경합 제거)하고 transient=True 라 행을
-        지운다. _spinner_running 은 그대로 둬서 thinking ticker 가 다음 틱에
-        _update_spinner→_spawn_rich_live 로 재생성하게 한다(스피너 복귀)."""
+        """Bring down the Rich Live spinner row right before a log emit
+        (called from _RowSafeEmitMixin, inside _TERM_WRITE_LOCK), so the log
+        doesn't overlap the spinner row. Live.stop() joins the refresh thread
+        (removing the concurrent-write race) and, since transient=True, erases
+        the row. _spinner_running is left as-is so the thinking ticker
+        recreates it on the next tick via _update_spinner→_spawn_rich_live
+        (spinner returns)."""
         if _RICH and self._spinner_live is not None:
             try:
                 self._spinner_live.stop()
@@ -3751,9 +3865,10 @@ class _ProgressPrinter:
             i += 1
 
     def mute(self) -> None:
-        """이후 모든 이벤트 무시 — ESC로 사용자는 프롬프트로 복귀했지만 워커
-        스레드가 백그라운드에서 진행 중인 LLM 응답을 마저 받는 동안, 그 출력이
-        새 프롬프트/입력 화면에 끼어들지 않게 한다."""
+        """Ignore all events from here on — ESC returned the user to the prompt,
+        but while the worker thread keeps receiving the in-flight LLM response
+        in the background, this keeps its output from bleeding into the new
+        prompt/input screen."""
         self._muted = True
         self._stop_spinner()
 
@@ -4093,9 +4208,8 @@ class _ProgressPrinter:
                 cost_display = f"${tcost:.4f}"
                 if actual_cost is not None and abs(actual_cost - tcost) > 0.000001:
                     cost_display = f"${tcost:.4f} (actual: ${actual_cost:.4f}, cache savings)"
-                # Print-scoped: drop the dollar amount (and its "·" separator) when
-                # ASICODE_HIDE_COST is set. Debug _log keeps the full amount.
-                _cost_seg = "" if _hide_cost_display() else f"  ·  {cost_display}"
+                # Dollar amount intentionally omitted from the user-facing token line
+                # (cost is an estimate, not a precise charge). Debug _log keeps it.
                 # Per-turn + session cumulative cache hit% (DeepSeek-style)
                 _hit_suffix = ""
                 if _prov and (crt or tcrt):
@@ -4119,7 +4233,7 @@ class _ProgressPrinter:
                 if ipt is not None and ict is not None:
                     _print(
                         f"  tok ↑{_abbrev_tokens(pt)} ↓{_abbrev_tokens(ct)}  ·  planner ↑{_abbrev_tokens(ipt)} ↓{_abbrev_tokens(ict)}  ·  "
-                        f"session ↑{_abbrev_tokens(tpt)} ↓{_abbrev_tokens(tct)}{_cost_seg}{_hit_suffix}",
+                        f"session ↑{_abbrev_tokens(tpt)} ↓{_abbrev_tokens(tct)}{_hit_suffix}",
                         _C["muted"],
                     )
                     self._log(
@@ -4130,7 +4244,7 @@ class _ProgressPrinter:
                     )
                 else:
                     _print(
-                        f"  tok ↑{_abbrev_tokens(pt)} ↓{_abbrev_tokens(ct)}  ·  total ↑{_abbrev_tokens(tpt)} ↓{_abbrev_tokens(tct)}{_cost_seg}{_hit_suffix}",
+                        f"  tok ↑{_abbrev_tokens(pt)} ↓{_abbrev_tokens(ct)}  ·  total ↑{_abbrev_tokens(tpt)} ↓{_abbrev_tokens(tct)}{_hit_suffix}",
                         _C["muted"],
                     )
                     _log_hit = ""
@@ -4701,6 +4815,14 @@ def _cli_checkpoint_cb(question_data: dict) -> dict:
             _saved_tio = _copy.deepcopy(_termios.tcgetattr(_fd))
             _restored = _termios.tcgetattr(_fd)
             _restored[3] |= _termios.ECHO | _termios.ICANON
+            # Restoring ICANON|ECHO (c_lflag) alone is not enough: prompt_toolkit's
+            # raw mode / the ESC watcher can leave ICRNL cleared in c_iflag. Without
+            # CR→NL translation, Enter delivers a bare \r — which canonical mode does
+            # NOT treat as a line terminator, so readline() never completes and each
+            # Enter echoes as a literal ^M (ECHOCTL). Force ICRNL on (and clear IGNCR
+            # so CR isn't dropped entirely) to guarantee Enter submits the line.
+            _restored[0] |= _termios.ICRNL
+            _restored[0] &= ~_termios.IGNCR
             _termios.tcsetattr(_fd, _termios.TCSADRAIN, _restored)
     except Exception:
         pass
@@ -4851,12 +4973,12 @@ def _build_engine(
     reasoning_effort: Optional[str] = None,
     scoped_verification: bool = True,
 ):
-    """AgentLoop 인스턴스를 생성해 반환.
+    """Build and return an AgentLoop instance.
 
-    선택적으로 기존 svc(LLM 서비스)와 route_decision을 재사용 가능.
-    implementation_spec이 있으면 design-chat 분석 결과를 prebuilt_spec으로 주입해
-    SpecResolver/grounding을 스킵한다.
-    제공하지 않으면 새로 생성 (기존 동작과 호환).
+    Optionally reuses an existing svc (LLM service) and route_decision.
+    If implementation_spec is given, injects the design-chat analysis result
+    as prebuilt_spec, skipping SpecResolver/grounding.
+    If not given, creates a new one (compatible with the prior behavior).
     """
     from external_llm.agent.task_router import TaskRouter
     from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
@@ -4941,10 +5063,10 @@ def _build_engine(
 def _run_with_cancel(loop, request: str, context: str, cancel_event: threading.Event,
                      esc_watcher_stop: Optional[threading.Event] = None,
                      stream_callback: Optional[Callable] = None):
-    """별도 스레드에서 loop.run()을 실행하고 결과를 반환.
+    """Run loop.run() in a separate thread and return the result.
 
-    ESC watcher가 동작 중이면 esc_watcher_stop을 통해 종료 신호를 보낸다.
-    stream_callback이 주어지면 실행 완료 후 "done" 이벤트를 emit한다 (spinner 종료용).
+    If the ESC watcher is running, sends a stop signal via esc_watcher_stop.
+    If stream_callback is given, emits a "done" event after execution completes (to end the spinner).
     """
     result_box: list = [None]
     exc_box: list = [None]
@@ -4983,11 +5105,11 @@ def _run_with_cancel(loop, request: str, context: str, cancel_event: threading.E
 
 
 def _run_esc_watcher(cancel_event: threading.Event, stop_event: threading.Event) -> None:
-    """백그라운드 ESC 키 감지 스레드.
+    """Background ESC-key detection thread.
 
-    stdin을 non-canonical 모드로 전환해 ESC(\x1b) 입력을 감지하면
-    cancel_event.set()을 호출한다. 터미널 설정은 종료 시 반드시 복원한다.
-    ISIG 플래그는 유지하므로 Ctrl+C(SIGINT)는 정상 동작한다.
+    Switches stdin to non-canonical mode; when ESC (\x1b) input is detected,
+    calls cancel_event.set(). Terminal settings are always restored on exit.
+    ISIG is kept, so Ctrl+C (SIGINT) still works normally.
     """
     import copy as _copy
     import termios as _termios
@@ -5032,16 +5154,17 @@ def _run_esc_watcher(cancel_event: threading.Event, stop_event: threading.Event)
 
 
 def _split_work_state(content: str) -> tuple[str, str]:
-    """최종 응답에서 [WORK STATE …] 블록(과 그 이후 전부)을 분리한다.
+    """Split off the [WORK STATE …] block (and everything after it) from the final response.
 
-    모델이 컨텍스트의 work-state 다이제스트 관례를 따라 응답 끝에 [WORK STATE …]
-    블록을 직접 쓰는 경우가 있다 — 본문이 아니라 작업 메타데이터이므로
-    표시할 때 dim 처리 대상.
+    Sometimes the model follows the context's work-state digest convention
+    and writes a [WORK STATE …] block directly at the end of its response —
+    since this is work metadata rather than body content, it's a candidate
+    for dim styling when displayed.
 
-    [WORK STATE …] 블록은 항상 응답의 *맨 끝*에 위치하며, 반드시 줄의
-    *시작*에서 시작한다 (문장 중간에 등장하는 언급이 아니다).
-    따라서 뒤에서부터 줄 단위로 검사해 [WORK STATE로 시작하는 마지막 줄을
-    찾아 분리한다. 반환: (본문, work_state 블록 — 없으면 "").
+    The [WORK STATE …] block is always at the *very end* of the response and
+    must start at the *beginning* of a line (not a mention appearing mid-sentence).
+    So this checks lines from the end and finds the last line starting with
+    [WORK STATE to split there. Returns: (body, work_state block — "" if none).
     """
     text = (content or "").strip()
     lines = text.splitlines(keepends=False)
@@ -5059,11 +5182,12 @@ def _split_work_state(content: str) -> tuple[str, str]:
 
 
 def _build_turn_digest(chat_result) -> str:
-    """DesignChatResult의 tool loop 기록에서 작업 상태 다이제스트 생성.
+    """Build a work-state digest from a DesignChatResult's tool-loop record.
 
-    툴 메시지는 턴 종료 시 버려지므로, 어떤 파일을 읽고/고치고 어떤 명령을
-    실행했는지를 결정론적으로 요약해 세션 턴에 함께 보존한다 (LLM 호출 없음).
-    실패해도 턴 기록 자체는 막지 않는다 — 다이제스트는 부가 정보.
+    Tool messages are discarded at turn end, so this deterministically
+    summarizes which files were read/edited and which commands ran, and
+    preserves that alongside the session turn (no LLM call). Failure never
+    blocks the turn record itself — the digest is supplementary information.
     """
     if chat_result is None:
         return ""
@@ -5075,13 +5199,14 @@ def _build_turn_digest(chat_result) -> str:
 
 
 def _build_orchestrator_digest(orch_result) -> str:
-    """OrchestratorResult에서 작업 상태 다이제스트 생성.
+    """Build a work-state digest from an OrchestratorResult.
 
-    오케스트레이터 턴을 영속화할 때 design-chat 턴과 동일한 [WORK STATE]
-    메타데이터를 붙인다. OrchestratorResult는 DesignChatResult와 구조가
-    달라 tool_results 대신 subtask_results(각 AgentResult) + summary를
-    가지므로, 여기서는 sub-agent들의 상태/패치/요약을 결정론적으로 추려
-    간결한 다이제스트로 만든다 (LLM 호출 없음). 실패해도 턴 기록은 막지 않는다.
+    Attaches the same [WORK STATE] metadata used for design-chat turns when
+    persisting an orchestrator turn. OrchestratorResult differs structurally
+    from DesignChatResult — instead of tool_results it has
+    subtask_results (each an AgentResult) + summary — so this deterministically
+    extracts each sub-agent's status/patches/summary into a concise digest
+    (no LLM call). Failure never blocks the turn record.
     """
     if orch_result is None:
         return ""
@@ -5181,17 +5306,18 @@ def _validate_next_suggestion(text: str, user_request: str) -> Optional[str]:
 
 
 def _invalidate_next_suggestion() -> None:
-    """새 턴 시작 시 호출 — 표시 중인 제안을 지우고 in-flight 생성 결과를 무효화."""
+    """Called on new turn start — clears the displayed suggestion and invalidates any in-flight generation result."""
     global _next_prompt_suggestion, _next_suggestion_gen
     _next_suggestion_gen += 1
     _next_prompt_suggestion = ""
 
 
 def _deliver_next_suggestion(text: str, gen: int) -> None:
-    """생성된 제안을 저장하고, 프롬프트가 이미 떠 있으면 즉시 ghost 렌더.
+    """Store the generated suggestion, and render it as a ghost immediately if the prompt is already showing.
 
-    워커 스레드에서 호출된다 — prompt_toolkit app 조작은 app 의 event loop 로
-    call_soon_threadsafe 를 통해 넘긴다. gen 불일치(그 사이 새 턴 시작)면 폐기.
+    Called from a worker thread — prompt_toolkit app operations are handed
+    off to the app's event loop via call_soon_threadsafe. Discarded on a gen
+    mismatch (a new turn started in the meantime).
     """
     global _next_prompt_suggestion
     if gen != _next_suggestion_gen:
@@ -5221,11 +5347,12 @@ def _deliver_next_suggestion(text: str, gen: int) -> None:
 
 def _kick_next_prompt_suggestion(llm_client, model: str, user_request: str,
                                  final_message: str, digest: str) -> None:
-    """턴 종료 후 '다음 작업' 제안을 백그라운드로 생성 (fire-and-forget).
+    """Generate a "next task" suggestion in the background after turn end (fire-and-forget).
 
-    실패/지연은 조용히 무시한다 — 부가 기능이 본 흐름을 막으면 안 된다.
-    호출 동안 external_llm INFO/WARNING 로그는 배경 compress 와 동일하게
-    억제해 프롬프트 화면에 끼어들지 않게 한다.
+    Failures/delays are silently ignored — a supplementary feature must never
+    block the main flow. While this call runs, external_llm INFO/WARNING logs
+    are suppressed the same way as for background compress, so they don't
+    bleed into the prompt screen.
     """
     gen = _next_suggestion_gen
 
@@ -5277,16 +5404,18 @@ def _kick_next_prompt_suggestion(llm_client, model: str, user_request: str,
 
 
 def _finalize_pending_design_chat(pending: dict, session_mgr, session_id: str, model: str) -> None:
-    """ESC로 백그라운드에 남긴 design chat 워커를 회수해 세션에 기록한다.
+    """Reclaim a design-chat worker left running in the background by ESC and record it to the session.
 
-    UX 정책: ESC 시 사용자는 즉시 프롬프트로 복귀하지만, 내부적으로는 진행 중이던
-    LLM 호출을 끊지 않고 응답 수신까지 기다린 뒤 체크포인트에서 중단한다.
-    이 함수는 다음 사용자 turn이 세션에 추가되기 *전에* 호출되어야 한다 —
-    interrupt note(또는 완주한 응답)가 새 user turn보다 먼저 기록되어야
-    세션 컨텍스트의 대화 순서가 유지된다.
+    UX policy: on ESC the user returns to the prompt immediately, but
+    internally the in-flight LLM call is not cut off — it waits for the
+    response and stops at the next checkpoint. This function must be called
+    *before* the next user turn is added to the session — the interrupt note
+    (or the completed response) must be recorded before the new user turn to
+    preserve conversation order in the session context.
 
-    워커가 아직 응답 수신 중이면 완료까지 대기한다 (보통 사용자가 다음 입력을
-    타이핑하는 사이에 끝나 있어 대기는 발생하지 않는다).
+    If the worker is still receiving its response, this waits for completion
+    (usually it has already finished by the time the user types their next
+    input, so no wait actually happens).
     """
     t = pending["thread"]
     if t.is_alive():
@@ -5364,18 +5493,10 @@ def _format_result(result, elapsed: float) -> tuple[str, str]:
         total = t.get("total", pt + ct)
         lpt = t.get("last_call_prompt", 0)
         lct = t.get("last_call_completion", 0)
-        cost = t.get("cost_usd", 0)
-        actual_cost = t.get("cache_adjusted_cost_usd")
-        cost_str = f"${cost:.4f}"
-        if actual_cost is not None and abs(actual_cost - cost) > 0.000001:
-            _s = cost - actual_cost
-            cost_str = f"${cost:.4f}  (cache -${_s:.4f} → ${actual_cost:.4f})"
-        # Drop the dollar amount (and its "·" separator) when ASICODE_HIDE_COST is set.
-        _cost_seg = "" if _hide_cost_display() else f"  ·  {cost_str}"
         if lpt:
-            token_line = f"  tok ↑{_abbrev_tokens(pt)} ↓{_abbrev_tokens(ct)}  ·  last ↑{_abbrev_tokens(lpt)} ↓{_abbrev_tokens(lct)}{_cost_seg}"
+            token_line = f"  tok ↑{_abbrev_tokens(pt)} ↓{_abbrev_tokens(ct)}  ·  last ↑{_abbrev_tokens(lpt)} ↓{_abbrev_tokens(lct)}"
         else:
-            token_line = f"  tok ↑{_abbrev_tokens(pt)} ↓{_abbrev_tokens(ct)}  ·  total {_abbrev_tokens(total)}{_cost_seg}"
+            token_line = f"  tok ↑{_abbrev_tokens(pt)} ↓{_abbrev_tokens(ct)}  ·  total {_abbrev_tokens(total)}"
 
     lines = [f"[{elapsed:.1f}s] {status}  ·  {patches} patches  ·  {turns} turns"]
     if msg:
@@ -5722,9 +5843,24 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
                 pass
 
         _prompt_kwargs["pre_run"] = _seed_suggestion
+    # patch_stdout coordinates writes from other threads (LLM-retry warnings,
+    # background compress notices, etc.) with the live prompt: while active,
+    # sys.stdout/sys.stderr are proxied so such writes print cleanly above
+    # the prompt and the prompt redraws afterward, instead of landing at the
+    # terminal's raw cursor position and desyncing prompt_toolkit's redraw
+    # (see _MarginIO / _RowSafeEmitMixin — logging/print already look up
+    # sys.stdout/stderr dynamically so they pick up this proxy).
+    # raw=True: our output (rich _print, RichHandler logs) is already rendered
+    # to VT100/ANSI (Console force_terminal=True). patch_stdout's default
+    # raw=False routes writes through output.write(), which *sanitizes* escape
+    # sequences — showing e.g. the muted-gray "press Ctrl+C again to exit" hint
+    # as a literal "?[38;2;…m …?[0m". raw=True uses write_raw() so those escapes
+    # are passed through and interpreted (color preserved), still reflowed above
+    # the live prompt.
     try:
         if not _ev_loop_running:
-            text = _prompt_session.prompt(prompt, **_prompt_kwargs)
+            with patch_stdout(raw=True):
+                text = _prompt_session.prompt(prompt, **_prompt_kwargs)
         else:
             # prompt_toolkit internally calls asyncio.run() which fails
             # when a loop is already active — run in a dedicated thread.
@@ -5743,7 +5879,13 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
 
             def _prompt_in_thread() -> None:
                 try:
-                    _done_q.put(("ok", _prompt_session.prompt(prompt, **_prompt_kwargs)))
+                    # patch_stdout must be entered on the thread that owns the
+                    # event loop prompt_toolkit's asyncio.run() creates (see
+                    # its docstring warning) — that's this worker thread, not
+                    # the caller, so the context manager is opened here too.
+                    # raw=True: pass pre-rendered ANSI through (see sync path).
+                    with patch_stdout(raw=True):
+                        _done_q.put(("ok", _prompt_session.prompt(prompt, **_prompt_kwargs)))
                 except BaseException as _exc:  # incl. KeyboardInterrupt/EOFError
                     _done_q.put(("err", _exc))
 
@@ -5924,7 +6066,7 @@ async def _run_collaborate_session(
 
 
 def _save_key_to_dotenv(repo_root: str, key: str, value: str) -> None:
-    """``.env`` 파일에 ``KEY=VALUE``를 기록한다 (이미 있으면 업데이트)."""
+    """Write ``KEY=VALUE`` to the ``.env`` file (updates it if the key already exists)."""
     dotenv_path = os.path.join(repo_root, ".env")
     try:
         with open(dotenv_path, encoding="utf-8") as f:
@@ -5954,10 +6096,10 @@ def _save_key_to_dotenv(repo_root: str, key: str, value: str) -> None:
 
 
 def _list_provider_model_choices() -> list[tuple[str, str]]:
-    """``/model``에서 보여주는 provider/model 조합을 평탄한 목록으로 반환한다.
+    """Return a flat list of provider/model combos shown by ``/model``.
 
-    ``_KNOWN_MODELS``의 모든 조합에, 사용 가능하다면 ollama 로컬 모델을 덧붙인다.
-    각 항목은 ``(provider, model)`` 튜플이다.
+    Appends local ollama models, if available, to every combination in
+    ``_KNOWN_MODELS``. Each entry is a ``(provider, model)`` tuple.
     """
     choices: list[tuple[str, str]] = []
     for _prov, _models in _KNOWN_MODELS.items():
@@ -5978,14 +6120,15 @@ def _list_provider_model_choices() -> list[tuple[str, str]]:
 
 
 def _interactive_provider_setup(repo_root: Optional[str]) -> Optional[tuple[str, str]]:
-    """provider가 설정되지 않았을 때 provider/model을 대화형으로 선택한다.
+    """Interactively pick a provider/model when none is configured.
 
-    ``/model``과 동일한 provider/model 조합을 번호 매긴 목록으로 보여주고
-    사용자가 하나를 고르게 한다. 선택값은 ``EXTERNAL_LLM_PROVIDER`` /
-    ``EXTERNAL_LLM_MODEL`` 환경변수와 ``.env`` 파일에 기록해 다음 실행 때 다시
-    묻지 않는다. TTY가 아니거나 취소하면 ``None``을 반환한다.
+    Shows the same provider/model combinations as ``/model`` as a numbered
+    list and lets the user pick one. The selection is written to the
+    ``EXTERNAL_LLM_PROVIDER`` / ``EXTERNAL_LLM_MODEL`` env vars and the
+    ``.env`` file, so it won't be asked again on the next run. Returns
+    ``None`` if not a TTY or cancelled.
 
-    반환: 선택한 ``(provider, model)`` 또는 ``None``.
+    Returns: the selected ``(provider, model)``, or ``None``.
     """
     if not sys.stdin.isatty():
         _print("  no LLM provider configured.", _C["yellow"])
@@ -6037,9 +6180,9 @@ def _retry_create_svc_with_api_key_prompt(
     api_key: Optional[str] = None,
     repo_root: Optional[str] = None,
 ) -> Any:
-    """LLM 서비스 생성 — API 키가 없으면 사용자에게 입력 프롬프트 후 재시도.
+    """Create the LLM service — if no API key is set, prompt the user and retry.
 
-    성공 시 해당 API 키를 ``.env`` 파일에도 저장하여 다음 실행 시 다시 묻지 않는다.
+    On success, also saves the API key to the ``.env`` file so it isn't asked again on the next run.
     """
     svc = factory(provider, model, api_key=api_key)
     if svc is not None:
@@ -6335,12 +6478,12 @@ def run_repl(args: argparse.Namespace) -> None:
     _notifications_lock = threading.Lock()
 
     def _deferred_notify(msg: str) -> None:
-        """Background compress 완료 메시지를 큐에 저장."""
+        """Queue a background-compress completion message."""
         with _notifications_lock:
             _pending_notifications.append(msg)
 
     def _drain_notifications() -> None:
-        """프롬프트 입력 전에 지연 메시지 일괄 출력."""
+        """Flush all queued deferred messages before showing the prompt."""
         with _notifications_lock:
             msgs = list(_pending_notifications)
             _pending_notifications.clear()
@@ -6382,7 +6525,7 @@ def run_repl(args: argparse.Namespace) -> None:
                 pass
 
     def _persist_helper(provider: str, model: str) -> None:
-        """``/helper`` 설정을 config.json에 영속화 (CLI 재시작시 복원)."""
+        """Persist the ``/helper`` setting to config.json (restored on CLI restart)."""
         if provider and model:
             _update_terminal_config({"helper_provider": provider, "helper_model": model})
         else:
@@ -6768,20 +6911,23 @@ def run_repl(args: argparse.Namespace) -> None:
         return True
 
     def _maybe_auto_compact_insights(chat_result) -> None:
-        """design-chat turn 종료 후: save_insight가 예산 초과시켰으면 자동 compact.
+        """After a design-chat turn ends: auto-compact if save_insight pushed the file over budget.
 
-        왜 handler 내부가 아닌 run() 종료 후인가 — save_insight handler
-        (design_chat_loop.py)는 agent turn 안에서 실행되므로, 거기서 또 LLM을
-        동기 호출하면 agent turn 내 LLM 재호출이 된다. 대신 여기서(turn 밖)
-        기존 ``_compact_insights_interactive``(spinner·sanity gates·atomic write
-        캡슐화한 단일 진실 공급원)를 재사용한다.
+        Why after run() ends rather than inside the handler — the save_insight
+        handler (design_chat_loop.py) runs inside an agent turn, so a
+        synchronous LLM call there would become a re-entrant LLM call within
+        the agent turn. Instead, this reuses the existing
+        ``_compact_insights_interactive`` (the single source of truth
+        encapsulating spinner · sanity gates · atomic write) here, outside the turn.
 
-        이중 게이트로 비용을 0에 가깝게 유지:
-          1. ``chat_result.tool_calls_made``에 ``save_insight`` 없으면 즉시 return
-             (compute_stats 파일 읽기조차 스킵).
-          2. 있어도 파일이 예산(``COMPACT_BUDGET_BYTES``) 이하면 스킵.
-        save_insight는 design-chat 전용 tool이므로 일반 code/general turn엔 영향 없음.
-        절대 raise하지 않는다 — compact 실패가 turn을 막아서는 안 된다.
+        Kept near-zero cost via a double gate:
+          1. If ``chat_result.tool_calls_made`` has no ``save_insight``, return
+             immediately (skips even the compute_stats file read).
+          2. Even if present, skip if the file is still within budget
+             (``COMPACT_BUDGET_BYTES``).
+        save_insight is a design-chat-only tool, so this has no effect on
+        regular code/general turns. Never raises — a compact failure must
+        never block the turn.
         """
         if chat_result is None:
             return
@@ -7044,7 +7190,7 @@ def run_repl(args: argparse.Namespace) -> None:
             _print_session_summary(_session_tokens, _session_t0)
             _print("session ended.", "")
             break
-        if _cmd_name in ("/help", "/diff", "/undo", "/status", "/cost", "/model", "/helper", "/clear", "/insights", "/copy"):
+        if _cmd_name in ("/help", "/diff", "/undo", "/status", "/model", "/helper", "/clear", "/insights", "/copy"):
             _cur_mode = _current_chat_mode
             if _cmd_name == "/help":
                 _render_help()
@@ -7304,17 +7450,6 @@ def run_repl(args: argparse.Namespace) -> None:
                         _C["green"],
                     )
                     _print("  (context compression will use this model instead of the main model)", _C["muted"])
-            elif _cmd_name == "/cost":
-                _cost_line = (
-                    f"  session  ↑{_abbrev_tokens(_session_tokens['prompt'])}  ↓{_abbrev_tokens(_session_tokens['completion'])} tokens"
-                )
-                _sc = _session_tokens.get("cost", 0.0)
-                _sa = _session_tokens.get("actual_cost", 0.0)
-                if _sc:
-                    _cost_line += f"  ·  ${_sc:.4f}"
-                    if abs(_sa - _sc) > 0.000001:
-                        _cost_line += f" (actual ${_sa:.4f}, cache savings)"
-                _print(_cost_line, _C["muted"])
             elif _cmd_name == "/status":
                 _helper_str = f"{_helper_provider_str} / {_helper_model_str}" if _helper_model_str else ""
                 _render_status(repo_root, _provider_str, _model_str, _cur_mode, _session_tokens, _thinking_state, _reasoning_effort, helper=_helper_str)
@@ -8282,21 +8417,15 @@ def run_repl(args: argparse.Namespace) -> None:
                     _groups.append(f"ctx {_lpt/1000:.1f}K / {_ctx_budget/1_000_000:.0f}M ({_ctx_pct}%)")
                 else:
                     _groups.append(f"ctx {_lpt/1000:.1f}K / {_ctx_budget//1000}K ({_ctx_pct}%)")
-            # Hide the per-turn dollar amounts ("$X.XXXX" and "→ $Y.YYYY") when
-            # ASICODE_HIDE_COST is set — token counts and the cache-hit ratio are
-            # kept (they are not "cost"). The on-demand /cost report is unaffected.
-            # Temporary switch: unset the var (or leave empty) to restore.
-            _hide_cost = _hide_cost_display()
+            # Per-turn ambient status line — money is intentionally excluded: the
+            # dollar amount is an estimate, not exact billing, so it is not shown on
+            # any CLI surface (debug _log only). Token counts and the cache-hit ratio
+            # are kept (usage/efficiency, not "cost"). _cost/_actual are still
+            # accumulated into _session_tokens (below) for debug logging.
             if _pt or _ct:
-                _groups.append(
-                    f"tok ↑{_abbrev_tokens(_pt)}  ↓{_abbrev_tokens(_ct)}"
-                    + ("" if _hide_cost else f"  ${_cost:.4f}")
-                )
+                _groups.append(f"tok ↑{_abbrev_tokens(_pt)}  ↓{_abbrev_tokens(_ct)}")
             if _crt and _pt:
-                _groups.append(
-                    f"cache {_hit_pct:.0f}%"
-                    + ("" if _hide_cost else f" → ${_actual:.4f}")
-                )
+                _groups.append(f"cache {_hit_pct:.0f}%")
             # Session on separate line — wrapping past 80 chars breaks left alignment
             if _groups:
                 _print(f"  {' │ '.join(_groups)}", _C["muted"])
@@ -8324,7 +8453,7 @@ def run_repl(args: argparse.Namespace) -> None:
                         svc.llm_service.client, design_registry, svc.model
                     )
                     _retry_cb = _ProgressPrinter(verbose=args.verbose)
-                    _retry_cb._start_spinner("  🔄 새 API 키로 재시도 중")
+                    _retry_cb._start_spinner("  🔄 retrying with new API key")
                     try:
                         chat_result = design_loop.respond(
                             _messages_for_llm,
@@ -8338,7 +8467,7 @@ def run_repl(args: argparse.Namespace) -> None:
                         )
                     except Exception as _retry_exc:
                         chat_result = DesignChatResult(
-                            content=f"⚠️ 재시도 실패: {_retry_exc}",
+                            content=f"⚠️ retry failed: {_retry_exc}",
                             is_error=True,
                         )
         else:
@@ -8699,7 +8828,7 @@ def _run_orchestrate_single_shot(
 
 
 def run_once(args: argparse.Namespace, prompt: str) -> int:
-    """단일 요청 실행 후 exit code 반환."""
+    """Execute a single request and return the exit code."""
     global _REPO_ROOT
     repo_root = _resolve_repo_root(args.repo)
     _REPO_ROOT = repo_root

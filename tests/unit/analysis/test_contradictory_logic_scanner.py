@@ -800,9 +800,10 @@ def test_mutation_barrier_prevents_false_duplicate():
 def test_no_mutation_between_checks_is_duplicate():
     """Directly adjacent identical checks: IS a duplicate (merge candidate).
 
-    Adjacency gate (2026-06-12): 두 if 사이에 문장이 하나라도 끼면 — 비변이
-    문장이라도 — 의도적 phase boundary로 간주해 플래그하지 않는다. 따라서
-    플래그 대상은 직접 인접한 `if x: A / if x: B` 쌍뿐이다.
+    Adjacency gate (2026-06-12): if even a single statement is inserted between
+    two ifs — even a non-mutating one — it is treated as an intentional phase
+    boundary and not flagged. So only directly adjacent `if x: A / if x: B`
+    pairs are flagged.
     """
     src = _make_py_file("""\
         def check(x):
@@ -818,7 +819,7 @@ def test_no_mutation_between_checks_is_duplicate():
 
 
 def test_intervening_statement_is_phase_boundary_not_duplicate():
-    """비변이 문장이 사이에 끼면 adjacency gate가 플래그를 막는다."""
+    """When a non-mutating statement is inserted between, the adjacency gate suppresses the flag."""
     src = _make_py_file("""\
         def check(x):
             if x > 0:

@@ -14,7 +14,7 @@ import asi
 class _FakeSvc:
     """Minimal stand-in for ExternalLLMService — only ``.model`` is read."""
 
-    def __init__(self, model: str = "qwen3.7-max 버그/기능/성능 개선점을 제안하자"):
+    def __init__(self, model: str = "qwen3.7-max suggest bug/feature/performance improvements"):
         self.model = model
         self.llm_service = type("S", (), {"client": None, "provider": "opencode"})()
 

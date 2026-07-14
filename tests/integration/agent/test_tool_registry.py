@@ -439,7 +439,7 @@ def test_diff_apply_hunk_only(temp_repo_root):
 
 
 class TestBashOutputCap:
-    """bash 대량 출력 truncation — 컨텍스트 토큰 폭증 방지 (BASH_OUTPUT_MAX_CHARS).
+    """bash large-output truncation — prevents context token blowup (BASH_OUTPUT_MAX_CHARS).
 
     Self-contained: builds its own ToolRegistry so it does not depend on a
     module-level fixture/helper.

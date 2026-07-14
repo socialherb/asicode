@@ -5,50 +5,51 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$REPO_DIR/.venv"
 
 echo "========================================"
-echo "  asicode 설치 스크립트"
+echo "  asicode installer"
 echo "========================================"
 
-# 1. Python >= 3.10 확인
-command -v python3 &>/dev/null || { echo "❌ python3 가 필요합니다."; exit 1; }
+# 1. Check Python >= 3.10
+command -v python3 &>/dev/null || { echo "❌ python3 is required."; exit 1; }
 PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 if python3 -c "import sys; exit(0 if sys.version_info >= (3,10) else 1)"; then
     echo "  ✓ Python $PY_VER"
 else
-    echo "❌ Python 3.10+ 필요합니다 (현재: $PY_VER)"
+    echo "❌ Python 3.10+ required (found: $PY_VER)"
     exit 1
 fi
 
-# 2. venv 생성
+# 2. Create venv
 if [ -d "$VENV_DIR" ]; then
-    echo "  ✓ 가상환경 있음: $VENV_DIR"
+    echo "  ✓ venv already exists: $VENV_DIR"
 else
-    echo "  → 가상환경 생성 중 ..."
+    echo "  → creating venv ..."
     python3 -m venv "$VENV_DIR"
-    echo "  ✓ 가상환경 생성 완료"
+    echo "  ✓ venv created"
 fi
 
-# 3. pip install (--break-system-packages 자동 대응)
-echo "  → 의존성 설치 중 ..."
+# 3. pip install (auto-fallback to --break-system-packages)
+echo "  → installing dependencies ..."
 "$VENV_DIR/bin/python3" -m pip install --quiet -e "$REPO_DIR" 2>/dev/null \
     || "$VENV_DIR/bin/python3" -m pip install --quiet --break-system-packages -e "$REPO_DIR" \
-    || { echo "❌ pip install 실패"; exit 1; }
-echo "  ✓ 의존성 설치 완료"
+    || { echo "❌ pip install failed"; exit 1; }
+echo "  ✓ dependencies installed"
 
-# 4. 심볼릭 링크 — ~/.local/bin (PATH 에 거의 항상 있음)
+# 4. Symlink — ~/.local/bin (almost always on PATH)
 TARGET_DIR="$HOME/.local/bin"
 mkdir -p "$TARGET_DIR"
 ln -sf "$VENV_DIR/bin/asi" "$TARGET_DIR/asi"
-echo "  ✓ 심볼릭 링크: $TARGET_DIR/asi"
+ln -sf "$VENV_DIR/bin/asicode" "$TARGET_DIR/asicode"
+echo "  ✓ symlinked: $TARGET_DIR/asi, $TARGET_DIR/asicode"
 
-# 5. PATH 확인
+# 5. Check PATH
 if [[ ":$PATH:" != *":$TARGET_DIR:"* ]]; then
     echo ""
-    echo "  ⚠  $TARGET_DIR 이 PATH 에 없습니다."
-    echo "     셸 설정 파일에 추가:"
+    echo "  ⚠  $TARGET_DIR is not on your PATH."
+    echo "     Add it to your shell config:"
     echo "       echo 'export PATH=\"\$PATH:$TARGET_DIR\"' >> ~/.zshrc"
 fi
 
 echo ""
 echo "========================================"
-echo "  ✅ 설치 완료! 터미널에서 'asi' 입력"
+echo "  ✅ Install complete! Run 'asi' in your terminal"
 echo "========================================"

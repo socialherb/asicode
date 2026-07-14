@@ -92,6 +92,12 @@ def main() -> int:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / rel, dst)
 
+        # Prune excluded-path entries from lint baselines so the public
+        # snapshot stays self-consistent (no dangling references to excluded
+        # modules). Mirrors export_public.main(); without this, baselines
+        # copied verbatim still reference modules that don't ship.
+        export_public.prune_baseline_files(tmp, shipped)
+
         # ── 2) Sync into public working tree (delete + overwrite) ──────────
         removed = 0
         for p in sorted(public.rglob("*"), reverse=True):

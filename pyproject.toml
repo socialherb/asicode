@@ -1,6 +1,6 @@
 [project]
 name = "asicode"
-version = "0.2.7"
+version = "0.2.8"
 description = "Autonomous Software Improvement — AST-precise code editing agent with verification gates (CLI + MCP server)"
 readme = "README.md"
 license = "MIT"
@@ -144,6 +144,7 @@ Issues = "https://github.com/socialherb/asicode/issues"
 
 [project.scripts]
 asi = "asi:main"
+asicode = "asi:main"
 
 [tool.setuptools]
 py-modules = ["asi", "common", "config", "context_collector", "diff_apply", "patch_synth", "path_security", "plan_compiler"]

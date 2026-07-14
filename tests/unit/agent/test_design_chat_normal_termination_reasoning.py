@@ -56,11 +56,11 @@ def _make_loop_with_reasoning_only_final(reasoning: str) -> DesignChatLoop:
 def test_normal_termination_falls_back_to_reasoning_content():
     """When the final turn has empty content but reasoning_content, the closing
     summary must surface from reasoning_content — not be silently dropped."""
-    reasoning = "## 완료: 커밋 5149a67c로 digest 오프로드 + confidence 정규화 중앙화 적용"
+    reasoning = "## Done: applied digest offload + centralized confidence normalization in commit 5149a67c"
     loop = _make_loop_with_reasoning_only_final(reasoning)
 
     result = DesignChatResult()
-    msgs = [LLMMessage(role="user", content="개선하자")]
+    msgs = [LLMMessage(role="user", content="let's improve this")]
 
     with mock.patch("external_llm.agent.design_chat_loop._evict_for_loop", return_value=msgs), \
          mock.patch("external_llm.agent.design_chat_loop._apply_context_hard_cap", return_value=msgs):

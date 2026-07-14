@@ -3210,7 +3210,7 @@ class OrchestratorAgent:
 
         # Batch tracked determination: one `git ls-files -z -- <files>` prints
         # exactly the tracked subset. `-z` is REQUIRED — without it git C-quotes
- # non-ASCII paths ("\355\225\234..." for Korean characters like 한글), which then fail the
+ # non-ASCII paths ("\355\225\234..." for Korean characters), which then fail the
         # `in tracked` membership test and get misclassified as untracked →
         # deleted by unlink instead of restored by checkout (data loss + a
         # falsely-"reverted" report). `-z` emits NUL-separated raw bytes with no

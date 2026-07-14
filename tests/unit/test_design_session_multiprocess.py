@@ -1,14 +1,15 @@
-"""멀티 터미널(멀티 프로세스) 공유 세션 동작 검증.
+"""Verify multi-terminal (multi-process) shared session behavior.
 
-두 asi 프로세스가 같은 세션 파일을 공유할 때:
-1. 한쪽의 add_turn이 다른 쪽 턴을 덮어쓰지 않는다 (flock + reload-merge).
-2. 처리 중(in_progress)인 다른 프로세스의 user 턴은 컨텍스트에서
-   [IN-PROGRESS IN ANOTHER TERMINAL] system 라벨로 렌더된다.
-3. 해당 프로세스가 assistant 턴을 기록하면 플래그가 해제되고,
-   다른 프로세스도 다음 동기화에서 이를 흡수한다.
+When two asi processes share the same session file:
+1. One side's add_turn does not overwrite the other side's turns
+   (flock + reload-merge).
+2. Another process's in-progress user turn is rendered in the context as a
+   [IN-PROGRESS IN ANOTHER TERMINAL] system label.
+3. Once that process records an assistant turn, the flag clears, and the
+   other process absorbs this on its next sync.
 
-두 DesignSessionManager 인스턴스는 각각 독립 인메모리 캐시를 가지므로
-실제 두 프로세스와 동일한 경로(디스크 경유 동기화)를 탄다.
+The two DesignSessionManager instances each have independent in-memory
+caches, so this follows the same path as two real processes (sync via disk).
 """
 import pytest
 
@@ -39,11 +40,12 @@ def _turn_contents(mgr, sid=SID):
 
 
 def _seed_session_file(tmp_path, sid: str, turns: list[dict]) -> None:
-    """디스크에 세션 JSON을 직접 기록하여 죽은 프로세스가 남긴 상태를 시뮬레이션.
+    """Write session JSON directly to disk to simulate state left behind by a dead process.
 
-    좀비 복구 테스트는 "이미 디스크에 in_progress 턴이 존재"하는 상태에서
-    시작해야 한다 — 인메모리 변조 후 _save를 호출하면 _adopt_from_disk가 디스크
-    원본으로 되돌리므로 변조가 사라진다. 디스크에 직접 쓰는 것이 진짜 시나리오.
+    Zombie-recovery tests must start from a state where an in_progress turn
+    already exists on disk — if we tamper with the in-memory session and then
+    call _save, _adopt_from_disk would revert to the on-disk original and undo
+    the tampering. Writing directly to disk is the real scenario.
     """
     import json
     sessions_dir = tmp_path / ".asicode" / "design_sessions"
@@ -102,7 +104,7 @@ class TestInProgressLabeling:
         mgr_a.add_turn(SID, "user", "request A", in_progress=True)
         mgr_b.add_turn(SID, "user", "request B", in_progress=True)
         mgr_a.add_turn(SID, "assistant", "answer A")
-        # A의 플래그 해제가 디스크를 거쳐 B에도 반영된다
+        # A's flag clearing is reflected to B via disk
         mgr_b.add_turn(SID, "assistant", "answer B")
         msgs = mgr_b.build_context_messages(mgr_b.get_or_create(SID))
         assert not any(m["content"].startswith("(turn ") and _LABEL in m["content"]
@@ -112,7 +114,7 @@ class TestInProgressLabeling:
     def test_assistant_clears_only_own_turn(self, mgr_a, mgr_b):
         mgr_a.add_turn(SID, "user", "request A", in_progress=True)
         mgr_b.add_turn(SID, "user", "request B", in_progress=True)
-        # B의 응답은 B의 턴만 해제한다 — A의 턴은 여전히 처리 중
+        # B's response only clears B's own turn — A's turn is still in progress
         mgr_b.add_turn(SID, "assistant", "answer B")
         turns = mgr_b.get_or_create(SID).turns
         flags = {t["content"]: t.get("in_progress", False) for t in turns}
@@ -130,68 +132,69 @@ class TestCurrentRequestAnchor:
 
 
 class TestZombieInProgressReap:
-    """비정상 종료된 터미널이 남긴 좀비 in_progress 턴의 자가 회복.
+    """Self-recovery of zombie in_progress turns left by an abnormally terminated terminal.
 
-    시나리오: 프로세스 A가 user 턴을 in_progress=True로 기록한 뒤 SIGKILL/OOM/
-    터미널 강제종료로 assistant 턴을 기록하지 못하고 죽는다. A 재시작 시 새 PID가
-    되어 _clear_in_progress(owner==self._owner)로는 자기 턴인데도 해제 불가.
-    다른 터미널 B는 A의 좀비 턴을 영구적으로 [IN-PROGRESS]로 렌더한다.
+    Scenario: process A records a user turn with in_progress=True, then dies
+    to SIGKILL/OOM/terminal force-close before it can record the assistant
+    turn. When A restarts, it gets a new PID, so
+    _clear_in_progress(owner==self._owner) can't clear its own old turn.
+    Another terminal B keeps rendering A's zombie turn as [IN-PROGRESS] forever.
 
-    복구: add_turn/_save 직전 _reap_zombie_in_progress가 owner PID가 죽었으면
-    (또는 age >= 1h 이면) 플래그를 해제한다.
+    Recovery: right before add_turn/_save, _reap_zombie_in_progress clears
+    the flag if the owner PID is dead (or age >= 1h).
     """
 
     def test_dead_owner_pid_is_reaped_on_next_add_turn(self, mgr_b, tmp_path):
-        """A(owner=죽은 PID)가 디스크에 남긴 좀비 턴이 B의 add_turn에서 해제된다."""
+        """A zombie turn left on disk by A (owner=dead PID) is cleared on B's add_turn."""
         import time
         _seed_session_file(tmp_path, SID, [
             {"role": "user", "content": "zombie request A", "timestamp": time.time(),
-             "in_progress": True, "owner": "pid:999999"},  # 살아있지 않을 것이 거의 확실
+             "in_progress": True, "owner": "pid:999999"},  # almost certainly not alive
         ])
         mgr_b.add_turn(SID, "user", "request B")
         turns = mgr_b.get_or_create(SID).turns
         assert not any(t.get("in_progress") for t in turns), \
-            "dead owner의 좀비 턴이 해제되지 않음"
+            "zombie turn of a dead owner was not reaped"
 
     def test_alive_owner_pid_is_not_reaped(self, mgr_b, tmp_path):
-        """살아있는 owner PID의 턴은 좀비로 취급하지 않는다."""
+        """A turn owned by a live PID is not treated as a zombie."""
         import os
         import time
         _seed_session_file(tmp_path, SID, [
             {"role": "user", "content": "alive request A", "timestamp": time.time(),
-             "in_progress": True, "owner": f"pid:{os.getpid()}"},  # 현재 프로세스 = 살아있음
+             "in_progress": True, "owner": f"pid:{os.getpid()}"},  # current process = alive
         ])
         mgr_b.add_turn(SID, "user", "request B")
         turns = mgr_b.get_or_create(SID).turns
         assert any(t.get("in_progress") for t in turns), \
-            "살아있는 owner의 턴이 잘못 해제됨"
+            "a live owner's turn was incorrectly reaped"
 
     def test_self_pid_excluded_from_reap(self, mgr_a):
-        """자기 PID 소유 턴은 현재 처리 중일 수 있으므로 reap에서 제외."""
+        """A turn owned by our own PID may still be in progress, so it's excluded from reap."""
         import os
         mgr_a._owner = f"pid:{os.getpid()}"
         mgr_a.add_turn(SID, "user", "my in-progress request", in_progress=True)
-        # 자기 add_turn은 좀비로 취급하지 않는다 (다음 add_turn에서도)
+        # Our own add_turn is not treated as a zombie (nor on the next add_turn)
         mgr_a.add_turn(SID, "assistant", "my answer")
         turns = mgr_a.get_or_create(SID).turns
-        # assistant 턴 기록 시 _clear_in_progress로 정상 해제되었어야 함
+        # Should have been cleared normally by _clear_in_progress when the assistant turn was recorded
         assert not any(t.get("in_progress") for t in turns)
 
     def test_legacy_arbitrary_owner_uses_age_fallback(self, mgr_b, tmp_path):
-        """owner가 pid: 형태가 아니면 age >= MAX_AGE로만 해제 (테스트용 임의 owner)."""
+        """If owner isn't in pid: form, only age >= MAX_AGE triggers reap (arbitrary test owner)."""
         import time
         old_ts = time.time() - mgr_b._IN_PROGRESS_MAX_AGE - 1
         _seed_session_file(tmp_path, SID, [
             {"role": "user", "content": "legacy zombie A", "timestamp": old_ts,
-             "in_progress": True, "owner": "pid:A"},  # 비표준 owner → age fallback
+             "in_progress": True, "owner": "pid:A"},  # non-standard owner → age fallback
         ])
         mgr_b.add_turn(SID, "user", "request B")
         turns = mgr_b.get_or_create(SID).turns
         assert not any(t.get("in_progress") for t in turns), \
-            "age 기반 fallback이 오래된 legacy 좀비를 해제하지 못함"
+            "age-based fallback failed to reap an old legacy zombie"
 
     def test_recent_legacy_owner_not_reaped(self, mgr_b, tmp_path):
-        """age < MAX_AGE이면 비표준 owner여도 해제하지 않는다 (conservative)."""
+        """If age < MAX_AGE, don't reap even with a non-standard owner (conservative)."""
         import time
         _seed_session_file(tmp_path, SID, [
             {"role": "user", "content": "recent legacy A", "timestamp": time.time(),
@@ -200,29 +203,29 @@ class TestZombieInProgressReap:
         mgr_b.add_turn(SID, "user", "request B")
         turns = mgr_b.get_or_create(SID).turns
         assert any(t.get("in_progress") for t in turns), \
-            "최근 턴이 age fallback으로 잘못 해제됨"
+            "a recent turn was incorrectly reaped by the age fallback"
 
     def test_reaped_turns_persisted_to_disk(self, tmp_path):
-        """좀비 해제가 디스크에 반영되어 다른 프로세스 재시작 시에도 보인다."""
+        """A zombie reap is persisted to disk, so it's visible even after another process restarts."""
         import os
         import time
         _seed_session_file(tmp_path, SID, [
             {"role": "user", "content": "zombie A", "timestamp": time.time(),
              "in_progress": True, "owner": "pid:999998"},
         ])
-        # B가 add_turn 트리거 → 좀비 해제가 디스크에 반영됨
+        # B triggers add_turn → the zombie reap is persisted to disk
         b = DesignSessionManager(str(tmp_path))
         b._owner = f"pid:{os.getpid()}"
         b.add_turn(SID, "assistant", "answer B")
-        # 완전히 새 매니저(재시작 시뮬레이션)가 디스크에서 읽었을 때 좀비 해제됨
+        # A brand-new manager (simulating a restart) reads from disk and sees the reap
         fresh = DesignSessionManager(str(tmp_path))
         fresh._owner = f"pid:{os.getpid()}"
         session = fresh.get_or_create(SID)
         assert not any(t.get("in_progress") for t in session.turns), \
-            "좀비 해제가 디스크에 영속되지 않음"
+            "the zombie reap was not persisted to disk"
 
     def test_dead_pid_cached_permanently(self, mgr_b, tmp_path):
-        """한 번 죽었다고 판정된 PID는 영구 캐시된다 (PID 재사용 방어)."""
+        """Once a PID is determined dead, it's cached permanently (defense against PID reuse)."""
         import time
         _seed_session_file(tmp_path, SID, [
             {"role": "user", "content": "zombie A", "timestamp": time.time(),
@@ -230,7 +233,7 @@ class TestZombieInProgressReap:
         ])
         mgr_b.add_turn(SID, "user", "trigger reap")
         assert 999997 in mgr_b._dead_pids
-        # 같은 PID의 두 번째 좀비 턴도 캐시 히트로 즉시 해제
+        # A second zombie turn from the same PID is also reaped immediately via a cache hit
         _seed_session_file(tmp_path, SID, [
             {"role": "user", "content": "zombie A", "timestamp": time.time(),
              "in_progress": True, "owner": "pid:999997"},

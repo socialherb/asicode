@@ -47,8 +47,8 @@ def test_effective_content_present_returns_content():
 
 
 def test_effective_content_empty_falls_back_to_reasoning():
-    r = _resp(content="", reasoning="## 요약: 인증 버그 수정 완료")
-    assert effective_content(r) == "## 요약: 인증 버그 수정 완료"
+    r = _resp(content="", reasoning="## Summary: auth bug fix complete")
+    assert effective_content(r) == "## Summary: auth bug fix complete"
 
 
 def test_effective_content_whitespace_falls_back_to_reasoning():
@@ -112,7 +112,7 @@ def test_compress_recovers_summary_from_reasoning_content():
     left stale — yet ``compressed_up_to`` still advances below, silently losing
     the compressed turns. With the fix the summary is recovered.
     """
-    response = _resp(content="", reasoning="## 요약: 인증 버그 수정 완료")
+    response = _resp(content="", reasoning="## Summary: auth bug fix complete")
     cm = SessionCompressionContext("/tmp/nonexistent-repo")
     turns = [
         {"role": "user", "content": "fix the auth bug"},
@@ -123,7 +123,7 @@ def test_compress_recovers_summary_from_reasoning_content():
     session = _make_session(turns)
     cm.compress_old_turns(session, _FakeClient(response), "glm-5.2", recent_keep=2)
 
-    assert session.compressed_summary == "## 요약: 인증 버그 수정 완료"
+    assert session.compressed_summary == "## Summary: auth bug fix complete"
     # and the pointer advanced (turns were folded into the recovered summary)
     assert session.compressed_up_to == 2
 

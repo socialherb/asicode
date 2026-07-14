@@ -2,10 +2,10 @@
 money.
 
 The exit banner is an *ambient* summary printed automatically on quit, so the
-dollar amount is noise there — cost detail belongs on the on-demand ``/cost`` /
-``/status`` reports (intentionally ungated). This pins that invariant: tokens +
-elapsed time always render when there is usage, money never does, and a
-zero-usage session stays silent.
+dollar amount is noise there — the cost estimate is not surfaced on any CLI
+surface (debug _log only). This pins that invariant: tokens + elapsed time
+always render when there is usage, money never does, and a zero-usage session
+stays silent.
 """
 
 import asi

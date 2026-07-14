@@ -14,6 +14,11 @@ Excluded from the public snapshot:
   - tests that import lane/webapp/tools (recomputed on every export, so
     newly added coupled tests are excluded automatically)
 
+Lint-baseline files (scripts/*_baseline.txt) are copied then pruned: any
+entry keyed by ``<path>::...`` whose path is itself excluded from the
+export (e.g. a lane/ module, or a coupled test) is dropped, so the public
+snapshot's baseline never references or names a file that isn't there.
+
 Usage:
     python3 scripts/export_public.py <target-dir>          # export
     python3 scripts/export_public.py <target-dir> --list   # dry-run listing
@@ -98,6 +103,42 @@ def is_excluded(rel: str) -> str | None:
     return None
 
 
+def _prune_baseline_file(path: Path) -> int:
+    """Drop ``<excluded-path>::...`` entries from a copied lint-baseline file.
+
+    Baseline entries are keyed ``<file_path>::...``; flag-only baselines
+    (e.g. config_flag_unreachable_baseline.txt) have no ``::`` and pass
+    through untouched. Returns the number of entries dropped.
+    """
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=False)
+    kept: list[str] = []
+    dropped = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "::" not in stripped:
+            kept.append(line)
+            continue
+        ref_path = stripped.split("::", 1)[0]
+        if is_excluded(ref_path):
+            dropped += 1
+            continue
+        kept.append(line)
+    if dropped:
+        newline = "\n" if text.endswith("\n") else ""
+        path.write_text("\n".join(kept) + newline, encoding="utf-8")
+    return dropped
+
+
+def prune_baseline_files(target: Path, shipped: list[str]) -> None:
+    for rel in shipped:
+        if not (rel.startswith("scripts/") and rel.endswith("_baseline.txt")):
+            continue
+        dropped = _prune_baseline_file(target / rel)
+        if dropped:
+            print(f"pruned {dropped} excluded-path entries from {rel}", file=sys.stderr)
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print(__doc__)
@@ -125,6 +166,7 @@ def main() -> int:
             dst = target / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / rel, dst)
+        prune_baseline_files(target, shipped)
 
     print(f"\nshipped: {len(shipped)} files -> {target}", file=sys.stderr)
     for reason, n in sorted(excluded.items(), key=lambda kv: -kv[1]):

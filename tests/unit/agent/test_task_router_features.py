@@ -114,26 +114,26 @@ class TestFeatureExtraction:
     def test_korean_symbol_detection(self, dc):
         # Korean-only symbol names are not detected by the current symbol pattern
         f = dc.extract_features("함수명 바꿔줘")
-        assert not f.has_explicit_symbol  # 의도: 한글 심볼명은 패턴 미매칭
+        assert not f.has_explicit_symbol  # intent: Korean-only symbol names don't match the pattern
 
     def test_propagation_signal(self, dc):
-        # IntentResult 없이 propagation_signal은 감지 안 됨 (LLM-derived)
+        # Without an IntentResult, propagation_signal is not detected (LLM-derived)
         f = dc.extract_features("함수명 바꾸고 호출부 전부 업데이트해줘")
         assert not f.has_propagation_signal
         assert not f.is_multi_file
 
-        # IntentResult로 scope_hint=PROJECT_WIDE 전달 시 활성화
+        # Activated when IntentResult passes scope_hint=PROJECT_WIDE
         self.intent.scope_hint = Scope.PROJECT_WIDE
         f2 = dc.extract_features("함수명 바꾸고 호출부 전부 업데이트해줘", intent_result=self.intent)
         assert f2.has_propagation_signal
         assert f2.is_multi_file
 
     def test_cross_file_signal(self, dc):
-        # IntentResult 없이 cross_file_signal은 감지 안 됨 (LLM-derived)
+        # Without an IntentResult, cross_file_signal is not detected (LLM-derived)
         f = dc.extract_features("모든 곳에서 이 함수를 변경해줘")
         assert not f.has_cross_file_signal
 
-        # IntentResult로 scope_hint=MULTI_FILE 전달 시 활성화
+        # Activated when IntentResult passes scope_hint=MULTI_FILE
         self.intent.scope_hint = Scope.MULTI_FILE
         f2 = dc.extract_features("모든 곳에서 이 함수를 변경해줘", intent_result=self.intent)
         assert f2.has_cross_file_signal

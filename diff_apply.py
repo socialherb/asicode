@@ -854,8 +854,8 @@ def _rollback_warning(report: dict[str, Any]) -> str:
         return ""
     dirty = report.get("remaining_dirty", [])
     if dirty:
-        return f" [WARNING: 저장소가 더러운 상태로 남았습니다. 남은 파일: {len(dirty)}개]"
-    return " [WARNING: 저장소가 더러운 상태로 남았습니다 (확인 불가)]"
+        return f" [WARNING: repository was left in a dirty state. Remaining files: {len(dirty)}]"
+    return " [WARNING: repository was left in a dirty state (unable to verify)]"
 
 
 def _try_3way_fallback(

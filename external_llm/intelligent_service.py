@@ -1648,7 +1648,7 @@ class IntelligentLLMService:
 
         # Enhance instructions for main.py modifications
         if operation.file_path == 'main.py' and operation.operation == 'modify':
-            if 'main.py에 대한 수정' not in instructions:  # Avoid duplication
+            if '**Important for main.py modifications**' not in instructions:  # Avoid duplication
                 instructions += "\n\n**Important for main.py modifications**:"
                 instructions += "\n- Find the correct location in the existing main.py file"
                 instructions += "\n- Maintain existing imports and structure"

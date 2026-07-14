@@ -507,45 +507,45 @@ class TestTaskRouter:
 
     def test_python_edit_to_planner(self):
         decision = self.router.route(
-            "user_service.py에서 get_user 함수의 docstring을 추가해줘"
+            "add a docstring to the get_user function in user_service.py"
         )
         assert decision.lane == Lane.PLANNER
 
     def test_typescript_edit_to_planner(self):
         decision = self.router.route(
-            "api/user.ts에서 UserRepository 클래스에 findAll 메서드를 추가해줘"
+            "add a findAll method to the UserRepository class in api/user.ts"
         )
         assert decision.lane == Lane.PLANNER
 
     def test_javascript_edit_to_planner(self):
         decision = self.router.route(
-            "utils/helpers.js에서 formatDate 함수를 locale 파라미터를 받도록 수정해줘"
+            "modify the formatDate function in utils/helpers.js to accept a locale parameter"
         )
         assert decision.lane == Lane.PLANNER
 
     def test_tsx_edit_to_planner(self):
         decision = self.router.route(
-            "ui/Button.tsx에서 Button 컴포넌트에 size prop을 추가해줘"
+            "add a size prop to the Button component in ui/Button.tsx"
         )
         assert decision.lane == Lane.PLANNER
 
     def test_css_edit_to_planner(self):
         decision = self.router.route(
-            "styles.css에서 body의 background-color를 변경해줘"
+            "change the background-color of body in styles.css"
         )
         # All requests go through PLANNER (universal lane)
         assert decision.lane == Lane.PLANNER
 
     def test_json_edit_to_planner(self):
         decision = self.router.route(
-            "config.json에서 version 값을 2.0으로 변경해줘"
+            "change the version value to 2.0 in config.json"
         )
         # All requests go through PLANNER (universal lane)
         assert decision.lane == Lane.PLANNER
 
     def test_mixed_ts_js_to_planner(self):
         decision = self.router.route(
-            "api/user.ts와 utils/helpers.js에서 User 타입 관련 함수를 수정해줘"
+            "modify the functions related to the User type in api/user.ts and utils/helpers.js"
         )
         assert decision.lane == Lane.PLANNER
 
@@ -1021,7 +1021,7 @@ class TestGoProvider:
     @pytest.mark.xfail(reason="TaskRouter now requires llm_client and model params", strict=False)
     def test_go_router_planner(self):
         router = TaskRouter()
-        decision = router.route("server/main.go에서 GetUser 함수를 수정해줘")
+        decision = router.route("modify the GetUser function in server/main.go")
         assert decision.lane == Lane.PLANNER
 
     def test_go_lint_dispatch(self, multilang_project):
@@ -1102,7 +1102,7 @@ class TestJavaProvider:
     @pytest.mark.xfail(reason="TaskRouter now requires llm_client and model params", strict=False)
     def test_java_router_planner(self):
         router = TaskRouter()
-        decision = router.route("src/UserRepository.java에서 delete 메서드를 수정해줘")
+        decision = router.route("modify the delete method in src/UserRepository.java")
         assert decision.lane == Lane.PLANNER
 
     def test_java_lint_dispatch(self, multilang_project):

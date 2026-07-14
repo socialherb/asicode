@@ -81,7 +81,7 @@ class TestStreamingDisplay:
 
 
 class TestToolInputFormatting:
-    """read_file 라인 범위 표기 + MCP 도구명 정리 검증."""
+    """Verify read_file line-range notation + MCP tool name cleanup."""
 
     def test_display_name_strips_mcp_prefix(self):
         assert _display_name("mcp__asr__read_file") == "read_file"
@@ -131,7 +131,7 @@ class TestToolInputFormatting:
 
 
 class TestMarkdownRendering:
-    """최종 답변 마크다운 렌더 검증."""
+    """Verify final-answer markdown rendering."""
 
     def test_markdown_strips_syntax_markers(self):
         md = "### Heading\n\n**bold** and `code`\n\n- item one\n\n---"
@@ -139,15 +139,18 @@ class TestMarkdownRendering:
         assert lines is not None
         import re
         plain = "\n".join(re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in lines)
-        # 리터럴 마크다운 기호가 렌더되어 사라진다
+        # Literal markdown symbols are rendered away
         assert "###" not in plain
         assert "**bold**" not in plain
         assert "`code`" not in plain
         assert "Heading" in plain and "bold" in plain and "code" in plain
-        assert "•" in plain  # 불릿 렌더
+        assert "•" in plain  # bullet rendered
 
     def test_markdown_lines_fit_width(self):
-        # 모든 물리 행이 width 셀 이내여야 gutter가 깨지지 않는다
+        # Every physical line must fit within `width` cells or the gutter breaks.
+        # Uses Korean text on purpose: east_asian_width() must classify these
+        # characters as double-width ("W"/"F") for the wrap-width check below
+        # to be meaningful.
         import re
         import unicodedata
         md = "긴 한국어 텍스트가 " * 20
@@ -163,7 +166,8 @@ class TestMarkdownRendering:
         assert _markdown_lines("   \n  ", width=80) is None
 
     def test_verdict_details_render_no_literal_fences(self):
-        # E2E: verdict details에 코드블록이 있어도 ```python 펜스가 화면에 안 보인다
+        # E2E: even if verdict details contain a code block, the ```python
+        # fence itself must not show up on screen.
         display = StreamingDisplay()
         buf = io.StringIO()
         old = sys.stdout
@@ -172,8 +176,8 @@ class TestMarkdownRendering:
             display.handle_event(SessionEvent(
                 type="verdict", content="",
                 metadata={"verdict": {
-                    "status": "needs_review", "summary": "리뷰", "confidence": 0.9,
-                    "details": "## 제목\n\n```python\nx = 1\n```\n",
+                    "status": "needs_review", "summary": "review", "confidence": 0.9,
+                    "details": "## Title\n\n```python\nx = 1\n```\n",
                 }},
             ))
             display.stop()
@@ -182,20 +186,22 @@ class TestMarkdownRendering:
         import re
         plain = re.sub(r"\x1b\[[0-9;]*m", "", buf.getvalue())
         assert "```python" not in plain
-        assert "## 제목" not in plain  # 헤더 기호 렌더됨
-        assert "x = 1" in plain        # 코드 본문은 보존
+        assert "## Title" not in plain  # header symbol gets rendered away
+        assert "x = 1" in plain         # code body is preserved
 
 
 class TestTickerConcurrency:
-    """P1 회귀 가드 — _start_ticker의 check-and-start 직렬화."""
+    """P1 regression guard — check-and-start serialization of _start_ticker."""
 
     def test_concurrent_start_ticker_creates_single_thread(self):
-        """N개 스레드가 동시에 _start_ticker를 호출해도 ticker는 정확히 1개.
+        """Exactly one ticker is created even when N threads call
+        _start_ticker concurrently.
 
-        handle_event(asyncio 콜백 스레드)와 print_header(orchestrator 스레드)가
-        서로 다른 스레드에서 _start_ticker를 호출한다. _ticker_launch_lock이
-        없으면 두 스레드 모두 "ticker 없음"을 관찰해 각각 스레드를 생성하고,
-        두 번째가 _ticker_thread를 덮어써 첫 번째 ticker를 orphan 시킨다.
+        handle_event (asyncio callback thread) and print_header (orchestrator
+        thread) call _start_ticker from different threads. Without
+        _ticker_launch_lock, both threads could observe "no ticker yet",
+        each spawn its own thread, and the second one would overwrite
+        _ticker_thread, orphaning the first ticker.
         """
         import threading
         from external_llm.repl.collaborate import streaming_display as mod
@@ -203,7 +209,7 @@ class TestTickerConcurrency:
         RealThread = threading.Thread
         created: list = []
 
-        class RecordingThread(RealThread):  # 패치 전 실제 스레드 상속
+        class RecordingThread(RealThread):  # subclasses the real thread before patching
             def __init__(self, *a, **kw):
                 super().__init__(*a, **kw)
                 created.append(self)
@@ -223,13 +229,13 @@ class TestTickerConcurrency:
                 barrier.wait()
                 disp._start_ticker()
 
-            # 호출자는 실제 스레드(캡처) 사용 — RecordingThread에 기록되지 않음
+            # Callers use real threads (captured) — not recorded by RecordingThread
             callers = [RealThread(target=go) for _ in range(n)]
             for t in callers:
                 t.start()
             for t in callers:
                 t.join()
-            # 8개의 동시 호출에도 ticker는 정확히 1개만 생성
+            # Exactly one ticker is created even with 8 concurrent calls
             assert len(created) == 1
             assert disp._ticker_thread is created[0]
         finally:
@@ -241,7 +247,7 @@ class TestTickerConcurrency:
             t.join(timeout=1.0)
 
     def test_start_ticker_idempotent_sequential(self):
-        """같은 스레드에서 연속 호출해도 두 번째는 새 스레드를 만들지 않는다."""
+        """Consecutive calls from the same thread don't create a second thread."""
         import threading
         from external_llm.repl.collaborate import streaming_display as mod
 
@@ -265,7 +271,7 @@ class TestTickerConcurrency:
             first = disp._ticker_thread
             disp._start_ticker()
             disp._start_ticker()
-            assert disp._ticker_thread is first  # 교체 안 됨
+            assert disp._ticker_thread is first  # not replaced
             assert len(created) == 1
         finally:
             if disp is not None:
@@ -277,11 +283,11 @@ class TestTickerConcurrency:
 
 
 class TestVerdictConfidenceGuard:
-    """P2 회귀 가드 — _print_verdict의 confidence 타입 가드."""
+    """P2 regression guard — confidence type guard in _print_verdict."""
 
     def test_print_verdict_string_confidence_does_not_crash(self):
-        # from_result_message을 거치지 않은 raw dict(미래 emitter 경로)도
-        # ':.0%' ValueError 없이 렌더되어야 한다.
+        # Even a raw dict that skipped from_result_message (a future emitter
+        # path) must render without a ':.0%' ValueError.
         display = StreamingDisplay()
         buf = io.StringIO()
         old = sys.stdout

@@ -1,10 +1,10 @@
-"""Tests for indent-visibility feedback: read_file gutter (A안) + write-tool
-indent metadata (E안).
+"""Tests for indent-visibility feedback: read_file gutter (Option A) + write-tool
+indent metadata (Option E).
 
-A안: ``read_file`` prefixes each line with an indent gutter ``│N│`` so the
+Option A: ``read_file`` prefixes each line with an indent gutter ``│N│`` so the
 leading-whitespace column count is a readable number (no space-counting).
 
-E안: ``edit_text``/``modify_symbol`` success metadata surfaces the *actual*
+Option E: ``edit_text``/``modify_symbol`` success metadata surfaces the *actual*
 indent at the edit site (``matched_indent`` / ``symbol_def_indent``), mirroring
 the gutter — so the LLM can self-verify it matched the file's depth without a
 read_file round-trip.

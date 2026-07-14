@@ -29,27 +29,27 @@ class TestAnalyzeRequest:
         assert "calculate_total" in sem.code_identifiers
 
     def test_korean_with_code_identifier(self):
-        sem = analyze_request("end_line 필드를 추가해줘")
+        sem = analyze_request("please add the end_line field")
         assert "end_line" in sem.code_identifiers
 
     def test_no_code_identifiers(self):
-        sem = analyze_request("이 코드 보여줘")
+        sem = analyze_request("show me this code")
         assert not sem.code_identifiers
 
     def test_actions_always_empty(self):
         """Action detection has been removed — actions is always empty."""
-        sem = analyze_request("kind를 통일해줘")
+        sem = analyze_request("please unify kind")
         assert not sem.actions
 
     def test_target_roles_always_empty(self):
         """Role detection has been removed — target_roles is always empty."""
-        sem = analyze_request("async 여부를 분리해줘")
+        sem = analyze_request("please separate out the async flag")
         assert not sem.target_roles
 
     def test_natural_language_no_false_identifiers(self):
         """Natural language words should not be extracted as code identifiers."""
-        sem = analyze_request("이 함수를 리팩토링해줘")
-        assert "함수" not in sem.code_identifiers
+        sem = analyze_request("please refactor this function")
+        assert "function" not in sem.code_identifiers
 
     def test_single_quoted_identifier(self):
         sem = analyze_request("Change 'is_async' to a different check")

@@ -1,7 +1,8 @@
-"""Step 1 검증: parse_guard() GuardIR 불변식
+"""Step 1 verification: parse_guard() GuardIR invariants
 
-parse_guard()가 다양한 입력에 대해 올바른 GuardIR을 생성하는지 검증한다.
-_extract_guard_ir은 Step 8에서 삭제됐으므로 parse_guard 자체 불변식을 검증한다.
+Verifies that parse_guard() produces the correct GuardIR for a variety of
+inputs. _extract_guard_ir was removed in Step 8, so this verifies the
+invariants of parse_guard itself.
 """
 
 import pytest
@@ -9,11 +10,11 @@ import pytest
 from external_llm.agent.guard_ir import parse_guard
 
 # ──────────────────────────────────────────────────────────────────────────────
-# parse_guard 픽스처 — 기존 _extract_guard_ir 케이스를 그대로 재사용
+# parse_guard fixtures — reuse the existing _extract_guard_ir cases as-is
 # ──────────────────────────────────────────────────────────────────────────────
 
 # (description, raw_guard_string, expected_condition_op, expected_control)
-# expected_condition_op=None / expected_control="" → parse 실패 or no control flow
+# expected_condition_op=None / expected_control="" → parse failure or no control flow
 GUARD_CASES = [
     ("simple not + continue",    "if not x: continue",                    "Not",     "continue"),
     ("not name continue",        "if not name: continue",                  "Not",     "continue"),
@@ -69,7 +70,7 @@ def test_parse_guard_empty_returns_none(desc: str, raw: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# GuardIR 필드 기본 불변식
+# Basic GuardIR field invariants
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestGuardIRFields:
@@ -134,7 +135,7 @@ class TestGuardIRFields:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# canonical / compact 형태 검증
+# canonical / compact form verification
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestCanonicalCompact:

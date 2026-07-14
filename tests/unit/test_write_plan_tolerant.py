@@ -459,7 +459,7 @@ class TestBeforeTextIndentEnrichment:
                 "path": str(indent_repo / "ui.js"),  # absolute path → gets stripped
                 "blocks": [{
                     "before": "const cancelBtn = document.getElementById('btn');",
-                    "after": "const cancelBtn = document.getElementById('btn'); // 취소",
+                    "after": "const cancelBtn = document.getElementById('btn'); // cancel",
                 }],
             }]
         }})
@@ -475,12 +475,12 @@ class TestBeforeTextIndentEnrichment:
                 "path": str(indent_repo / "ui.js"),  # absolute path → gets stripped
                 "blocks": [{
                     "before": "    const cancelBtn = document.getElementById('btn');",
-                    "after": "    const cancelBtn = document.getElementById('btn'); // 취소",
+                    "after": "    const cancelBtn = document.getElementById('btn'); // cancel",
                 }],
             }]
         }})
         assert result_ok.ok, f"write_plan failed: {result_ok.error}"
-        assert "// 취소" in (indent_repo / "ui.js").read_text()
+        assert "// cancel" in (indent_repo / "ui.js").read_text()
 
 
 # ── Regression: existing correct formats still work ───────────────────────────

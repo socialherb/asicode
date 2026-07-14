@@ -78,17 +78,17 @@ class TestOrchestratorDigest:
         registry = ToolRegistry(repo_root=".", config=AgentConfig())
         config = CollaborationOrchestratorConfig()
         orch = CollaborationOrchestrator(registry, config)
-        # 실제 도구를 돌리지 않고 빈 결과를 반환 — 속도/부작용 격리.
+        # Returns an empty result without running the real tool — isolates speed/side-effects.
         registry.dispatch = lambda name, args: SimpleNamespace(ok=True, content="")
 
         out = orch._generate_digest_sync("find bugs")
         assert isinstance(out, str)
 
     def test_generate_digest_offloads_to_worker_thread(self):
-        # _generate_digest (async) 는 dispatch 호출을 asyncio.to_thread 로
-        # worker thread 에 오프로드해야 한다 — 그래야 Phase 1 동안 이벤트 루프가
-        # 막히지 않고 interrupt() 가 응답한다. dispatch 가 이벤트 루프 스레드가
-        # 아닌 별도 스레드에서 실행됨을 검증한다.
+        # _generate_digest (async) must offload the dispatch call to a worker
+        # thread via asyncio.to_thread — otherwise the event loop stays
+        # blocked during Phase 1 and interrupt() can't respond. Verifies
+        # dispatch runs on a separate thread, not the event-loop thread.
         import asyncio
         import threading
         from types import SimpleNamespace
@@ -128,7 +128,7 @@ class TestOrchestratorDigest:
         assert "# Context" not in prompt  # No digest section when empty
 
     def test_static_instructions_in_system_prompt(self):
-        """정적 협업 지시문이 system preset append에 캐시-안정 형태로 들어간다."""
+        """Static collaboration instructions land in the system preset append in a cache-stable form."""
         pytest.importorskip("claude_agent_sdk")  # get_restricted_options needs the SDK
         from external_llm.repl.collaborate.asi_mcp_adapter import (
             get_restricted_options,
@@ -171,7 +171,7 @@ class TestOrchestratorDigest:
 
 
 class TestSessionHandoff:
-    """asicode 세션 → Claude Code 핸드오프 조립 검증."""
+    """Verify assembly of the asicode session → Claude Code handoff."""
 
     def _fake_session(self, **kw):
         from types import SimpleNamespace
@@ -190,43 +190,43 @@ class TestSessionHandoff:
     def test_summary_and_recent_turns(self):
         from external_llm.repl.collaborate import build_session_handoff
         session = self._fake_session(
-            compressed_summary="과거 대화: UI 구조 논의",
+            compressed_summary="past conversation: discussed the UI structure",
             compressed_up_to=2,
             archived_count=0,
             turns=[
                 {"role": "user", "content": "old1"},
                 {"role": "assistant", "content": "old2"},
-                {"role": "user", "content": "이 구조 어떻게 생각해?"},
-                {"role": "assistant", "content": "A" * 2000},  # 비-최근 턴 → 절단 대상
-                {"role": "user", "content": "최근 질문"},        # 가장 최근 턴
+                {"role": "user", "content": "what do you think of this structure?"},
+                {"role": "assistant", "content": "A" * 2000},  # non-recent turn → truncation candidate
+                {"role": "user", "content": "recent question"},  # the most recent turn
             ],
         )
         out = build_session_handoff(session, per_turn_chars=100)
-        assert "과거 대화: UI 구조 논의" in out
-        # compressed_up_to 이전 턴은 verbatim 영역에서 제외
+        assert "past conversation: discussed the UI structure" in out
+        # Turns before compressed_up_to are excluded from the verbatim region
         assert "old1" not in out
-        assert "이 구조 어떻게 생각해?" in out
-        assert "…(truncated)" in out  # 비-최근 긴 턴은 결정적 절단
+        assert "what do you think of this structure?" in out
+        assert "…(truncated)" in out  # non-recent long turns are deterministically truncated
 
     def test_recent_turn_not_truncated(self):
-        """가장 최근 턴(분석 결론/소견)은 per_turn_chars로 잘리지 않는다."""
+        """The most recent turn (analysis conclusion/finding) is not truncated by per_turn_chars."""
         from external_llm.repl.collaborate import build_session_handoff
-        conclusion = "결론입니다 " + "Z" * 2000
+        conclusion = "here is the conclusion " + "Z" * 2000
         session = self._fake_session(
             turns=[
-                {"role": "user", "content": "B" * 2000},   # 이전 턴 → 절단
-                {"role": "assistant", "content": conclusion},  # 최근 턴 → 온전 보존
+                {"role": "user", "content": "B" * 2000},   # previous turn → truncated
+                {"role": "assistant", "content": conclusion},  # recent turn → preserved intact
             ],
         )
         out = build_session_handoff(session, per_turn_chars=100)
-        # 최근 턴은 통째로 들어가고 "…(truncated)" 마커가 붙지 않는다
+        # The recent turn goes in whole, with no "…(truncated)" marker attached
         assert conclusion in out
-        # 이전 긴 턴은 잘렸다
+        # The previous long turn was truncated
         assert "…(truncated)" in out
 
     def test_max_chars_cap_preserves_recent_tail(self):
         from external_llm.repl.collaborate import build_session_handoff
-        # summary(오래됨)는 앞쪽에서 깎이고, 최근 턴의 끝(소견)은 남아야 한다.
+        # The (old) summary should be trimmed from the front, and the end of the recent turn (the finding) must survive.
         session = self._fake_session(
             compressed_summary="S" * 1500,
             turns=[{"role": "user", "content": "x" * 400} for _ in range(7)]
@@ -234,7 +234,7 @@ class TestSessionHandoff:
         )
         out = build_session_handoff(session, max_chars=1000)
         assert len(out) <= 1000
-        # 앞쪽(오래된 summary)부터 깎으므로 가장 최근 턴 끝의 소견이 보존된다
+        # Trimming happens from the front (old summary), so the finding at the end of the most recent turn is preserved
         assert "FINAL_VERDICT" in out
 
     def test_summary_exceeds_1500_chars_keeps_tail(self):
@@ -255,25 +255,26 @@ class TestSessionHandoff:
 
 
 class TestVerdictForSession:
-    """Claude verdict → asicode 세션 주입 텍스트 검증."""
+    """Verify the Claude verdict → asicode session injection text."""
 
     def test_format_includes_provenance_label(self):
         from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
         from external_llm.repl.collaborate.claude_session import SessionResult
         result = SessionResult(verdict=CollaborationVerdict(
-            status="success", summary="UI는 ui/에 위치", details="상세 내용",
-            confidence=0.97, suggestions=["라우터 확인"],
+            status="success", summary="the UI lives in ui/", details="detailed content",
+            confidence=0.97, suggestions=["check the router"],
         ))
-        out = format_verdict_for_session(result, "UI 파일 위치는?")
+        out = format_verdict_for_session(result, "where is the UI located?")
         assert "[Claude Code external analysis" in out  # source provenance label
         assert "status: completed" in out
         assert "97%" in out
-        assert "UI는 ui/에 위치" in out
-        assert "- 라우터 확인" in out
+        assert "the UI lives in ui/" in out
+        assert "- check the router" in out
 
     def test_details_not_truncated(self):
-        # 회귀 가드: 예전 char cap이 분석 본문(제안 목록)을 잘라 디자인 LLM이
-        # "마지막 제안이 분량 초과로 잘렸다"고 오인했다. 본문은 온전히 실린다.
+        # Regression guard: the old char cap truncated the analysis body (suggestion
+        # list), causing the design LLM to mistake it for "the last suggestion got
+        # cut off due to length." The body is now carried in full.
         from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
         from external_llm.repl.collaborate.claude_session import SessionResult
         big = "D" * 10000
@@ -281,10 +282,10 @@ class TestVerdictForSession:
             status="success", summary="s", details=big,
         ))
         out = format_verdict_for_session(result, "task")
-        assert big in out  # 본문 전체 보존 — 절단 없음
+        assert big in out  # entire body preserved — no truncation
 
     def test_all_suggestions_preserved(self):
-        # 회귀 가드: 예전 suggestions[:5]가 6개째부터 버려 "Imp N"을 누락시켰다.
+        # Regression guard: the old suggestions[:5] dropped everything from the 6th onward, losing "Imp N".
         from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
         from external_llm.repl.collaborate.claude_session import SessionResult
         sugg = [f"Imp {i}" for i in range(1, 9)]
@@ -293,7 +294,7 @@ class TestVerdictForSession:
         ))
         out = format_verdict_for_session(result, "task")
         for s in sugg:
-            assert f"- {s}" in out  # 모든 제안 보존
+            assert f"- {s}" in out  # every suggestion preserved
 
 
 class TestOrchestratorSdkGate:

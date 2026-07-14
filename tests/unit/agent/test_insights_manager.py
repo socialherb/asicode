@@ -5,7 +5,7 @@ The load-bearing invariant is **round-trip losslessness**:
 the /insights commands and the LLM compactor both trust that parsing never
 silently alters or drops content. Both on-disk shapes are covered: the
 ``### [category] timestamp`` blocks emitted by ``_save_insight_to_file`` and the
-hand-edited ``#`` title + ``>`` blockquote "원칙" preamble that coexists in the
+hand-edited ``#`` title + ``>`` blockquote "principle" preamble that coexists in the
 wild.
 """
 from __future__ import annotations
@@ -55,9 +55,9 @@ def tmp_repo(tmp_path):
 HAND_EDITED = (
     "# Design Chat Insights (.asicode/design_insights.md)\n"
     "\n"
-    "> **원칙**: 구조적/일반적 접근 (AST/graph/enum/typed policy 기반). "
-    "키워드/regex 매칭 지양.\n"
-    "> 핵심 설계 패턴/제약만 유지. 구현 전투 기록은 보관하지 않음.\n"
+    "> **Principle**: structural/general approach (AST/graph/enum/typed policy based). "
+    "Avoid keyword/regex matching.\n"
+    "> Keep only core design patterns/constraints. Don't retain implementation battle records.\n"
 )
 
 # Shape B: machine-emitted blocks (what _save_insight_to_file writes).
@@ -302,7 +302,10 @@ def test_compact_messages_structure():
 def test_compact_messages_preserve_preamble_instruction():
     msgs = build_compact_messages(HAND_EDITED)
     system = msgs[0]["content"]
-    # The compactor must be told to keep the '원칙' preamble verbatim.
+    # The compactor must be told to keep the '원칙' (principle) preamble verbatim.
+    # NOTE: the system prompt template (external_llm/agent/insights_manager.py)
+    # hardcodes the literal Korean word "원칙" itself, so this assertion must
+    # keep matching that exact word rather than an English translation.
     assert "VERBATIM" in system or "verbatim" in system
     assert "원칙" in system
 
@@ -333,7 +336,7 @@ def test_compact_messages_addresses_superseded():
 def test_compact_messages_drops_implementation_narrative():
     """KEEP entries must be stripped of implementation/debug battle records
     (step-by-step troubleshooting, commit-hash chasing, ad-hoc verification).
-    Aligns with the file's 원칙: '구현 전투 기록은 보관하지 않음'."""
+    Aligns with the file's principle: "don't retain implementation battle records"."""
     system = build_compact_messages("x")[0]["content"].lower()
     assert "narrative" in system or "troubleshooting" in system
     assert "battle records" in system
@@ -515,7 +518,7 @@ def test_age_reference_block_lists_ages_and_marks_do_not_copy():
 
 
 def test_age_reference_block_empty_when_no_entries():
-    assert _age_reference_block("# preamble only\n> 원칙\n") == ""
+    assert _age_reference_block("# preamble only\n> principle\n") == ""
 
 
 def test_compact_messages_include_age_reference_when_timestamped():

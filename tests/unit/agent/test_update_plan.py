@@ -272,7 +272,7 @@ class TestPlanGate:
 
         assert len(client.calls) == 2  # initial + 1 nudge
         assert "stopping here" in result.content
-        assert "완료되지 않은 플랜 항목" in result.content
+        assert "Unresolved plan items" in result.content
         assert "item 0" in result.content and "item 1" in result.content
 
     def test_all_terminal_exits_clean(self):
@@ -285,7 +285,7 @@ class TestPlanGate:
         client = _FakeClient([finish])
         result = _run_loop(client, registry)
         assert len(client.calls) == 1
-        assert "완료되지 않은 플랜 항목" not in result.content
+        assert "Unresolved plan items" not in result.content
 
     def test_stale_plan_reset_at_turn_start(self):
         registry = _FakeRegistry()

@@ -10,7 +10,7 @@ to interpret it correctly:
 * cancelled-> ``{"status": "cancelled"}`` (NO answer key -> tool ``default`` applies)
 
 Regression guard: returning an empty-string ``answer`` key on timeout/cancel
-would shadow the tool's own ``default`` (config note: "초과 시 default로 자율 진행").
+would shadow the tool's own ``default`` (config note: "on timeout, proceed autonomously with default").
 """
 import pytest
 

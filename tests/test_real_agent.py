@@ -17,8 +17,8 @@ from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 from external_llm.providers import OllamaClient
 
 
-@pytest.mark.skip(reason="직접 실행 전용 — pytest fixture 없는 필수 파라미터(model_name, user_request). "
-                          "실행: python3 tests/test_real_agent.py <model> <request>")
+@pytest.mark.skip(reason="Direct-run only — requires positional params (model_name, user_request) with no pytest fixture. "
+                          "Run: python3 tests/test_real_agent.py <model> <request>")
 def test_real_agent(model_name: str, user_request: str):
     """Test actual AgentLoop execution with a small model."""
     print(f"Testing REAL AgentLoop with model: {model_name}")

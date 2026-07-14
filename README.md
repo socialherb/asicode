@@ -4,13 +4,18 @@
 
 ## Features
 
+- **Context economy**: recent turns stay verbatim while older turns are compressed in the background, and superseded tool outputs are dropped from the window — long sessions stay focused and cheap instead of accumulating until a context cliff
+- **Parallel sub-agents, mixed models**: orchestration (`--orchestrate`) dispatches sub-tasks to worker processes — each opens its own terminal window on macOS — and every worker slot can run a different provider/model (`/model dev_1 …`)
+- **Multi-terminal, one repo**: run several `asi` sessions on the same repository at once — cross-process file locks, per-turn ownership markers, and stale-worker reaping keep agents from duplicating or clobbering each other's work
+- **Claude Code collaboration**: pair with the Claude Agent SDK for division of labor — Claude analyzes the codebase through asicode's MCP tools (read-only in analysis mode), asicode executes the edits, Claude optionally reviews the result (`pip install 'asicode[collaborate]'`)
 - **Multi-language code editing**: Python, TypeScript, JavaScript, Go, Java, Kotlin, Rust, and more via tree-sitter AST parsing
 - **AST-precise modifications**: Edit symbols by name, insert/delete lines by anchor, apply typed AST operations (Python)
 - **Vector search & RAG**: Semantic code search with FAISS + sentence-transformers embedding
 - **Structural analysis**: Dead code detection, duplicate finding, unused import scanning, contradictory logic detection
 - **Interactive CLI**: Rich terminal interface with prompt-toolkit, command history, completion, and multi-line editing
-- **Headless & automation modes**: single-shot runs (`asi -p`), JSON/NDJSON output, and multi-agent orchestration (`--orchestrate`)
-- **Design chat**: Persistent conversation session with auto-compression and insight management
+- **Headless & automation modes**: single-shot runs (`asi -p`), JSON/NDJSON output
+- **Self-searchable history**: sessions persist to disk and survive `/clear` and CLI restarts — the model can search its own past conversations (`search_design_history`, cross-session) to recall decisions and file paths instead of re-discovering them
+- **Design chat**: Persistent conversation session with insight management
 - **Shell shim layer**: macOS/Linux compatibility layer for BSD-style command-line tools
 
 ## Quick Start
@@ -71,6 +76,54 @@ searches, and edits the repository through typed tools, and each write is
 followed by verification. Headless mode (`asi -p`) and orchestration mode
 (`--orchestrate`, which decomposes a request and dispatches it to parallel
 sub-agent workers) drive the same loop.
+
+### Context Economy
+Most agent CLIs let every turn and tool result pile up until the context
+window forces a lossy compaction. asicode manages the window continuously:
+
+- The most recent turns are always kept verbatim; older turns are summarized
+  by a background pass that never blocks the conversation.
+- Tool outputs feed the turn that requested them; once superseded, stale
+  results are dropped from the window (originals persist on disk).
+- Durable facts are promoted to a session insight store, so they survive
+  compression instead of living in the transcript.
+- Compressed and `/clear`-ed turns aren't gone — they're archived to disk, and
+  the model can search back through them (and past sessions) with
+  `search_design_history` whenever it needs a decision or file path that
+  fell out of the active window.
+
+The result: the model sees a focused window instead of a scrolling log —
+better attention on the task at hand, and materially fewer tokens per turn.
+
+### Parallel & Concurrent by Design
+`--orchestrate` decomposes a request into sub-tasks and runs them in parallel
+worker processes over a file-based IPC protocol with heartbeats (a hung worker
+is distinguishable from a busy one). Worker slots are independently
+configurable, so a cheap fast model can handle mechanical edits while a
+stronger model plans.
+
+Concurrency is also safe across *your own* terminals: session state is
+guarded by cross-process locks, each in-flight turn carries an owner marker so
+other sessions see "being handled elsewhere" instead of re-doing the work, and
+turns from crashed processes are detected and reaped.
+
+### Division of Labor with Claude Code
+`asi collaborate --task "…"` runs a four-phase pipeline with the Claude Agent
+SDK, pairing each agent with what it does best:
+
+1. **Preprocess** — asicode's cheap engine generates a codebase digest
+   (structure, relevant files) so the expensive model never burns tokens on
+   raw discovery.
+2. **Analyze** — the Claude agent receives the digest and explores through
+   asicode's in-process MCP tools; its own file tools are disabled and, in
+   analysis mode, destructive tools are excluded — a read-only investigation
+   by construction.
+3. **Execute** — asicode applies the planned edits through its verified
+   editing pipeline.
+4. **Review** — optionally, the Claude agent reviews the execution and
+   returns a verdict.
+
+Requires the optional extra: `pip install 'asicode[collaborate]'`.
 
 ### Deterministic Editing
 All code modifications are validated through multiple layers:
