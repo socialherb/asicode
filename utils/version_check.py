@@ -179,8 +179,8 @@ def _default_fetch(url: str, timeout: float) -> Optional[str]:
 # ─── notice formatting ───────────────────────────────────────────────────────
 def _format_notice(latest: str, current: str) -> str:
     return (
-        f"[{PACKAGE_NAME}] update available: {latest} (current: {current})\n"
-        f"           pip install --upgrade {PACKAGE_NAME}"
+        f"[{PACKAGE_NAME}] update available: {latest} (current: {current})"
+        f" · pip install --upgrade {PACKAGE_NAME}"
     )
 
 

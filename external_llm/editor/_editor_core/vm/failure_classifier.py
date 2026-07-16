@@ -299,6 +299,14 @@ _KOTLIN_KEYWORD_MAP = [
     ("a return is required", FailureType.MISSING_RETURN),
     ("type mismatch", FailureType.TYPE_MISMATCH),
     ("inferred type", FailureType.TYPE_MISMATCH),
+    # kotlinc emits "cannot infer type for (type parameter|value parameter)"
+    # as a cascade when cross-file/SDK types are absent in isolated compile
+    # (e.g. an Android ViewModel without the SDK). It is semantically a type
+    # error, NOT a syntax error → TYPE_MISMATCH so it soft-fails in dispatch
+    # instead of hard-fail-rollback. NOTE: the general guard for this whole
+    # class is the origin-skip in _should_soft_fail_verify; this keyword only
+    # fixes the classification when the pre-edit origin happened to parse OK.
+    ("cannot infer type", FailureType.TYPE_MISMATCH),
     ("duplicate", FailureType.DUPLICATE_IDENTIFIER),
     ("conflicting overloads", FailureType.DUPLICATE_IDENTIFIER),
 ]

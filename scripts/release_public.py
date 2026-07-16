@@ -11,6 +11,13 @@ The private repo (this one) stays the single source of truth. This script is
 the ONLY sanctioned path to publish: never push the private repo itself to a
 public remote — its history contains lane/, webapp/, tools/.
 
+PyPI publishing is automatic: the `.github/workflows/release.yml` workflow
+triggers on the `v*` tag push and uploads to PyPI via Trusted Publishing (OIDC)
+— no API token is stored anywhere. After the one-time publisher registration
+(https://pypi.org/manage/project/asicode/settings/publishing/), the entire
+release is: bump version → commit → `release_public.py <pub> --tag --push`.
+The tag push both publishes the snapshot and drives the PyPI upload.
+
 Usage:
     python3 scripts/release_public.py <public-repo-path> [--tag] [--push] [--allow-dirty]
 

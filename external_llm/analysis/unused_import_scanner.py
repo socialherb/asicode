@@ -48,6 +48,41 @@ _TYPING_MODULE_SYMBOLS: frozenset = frozenset({
 _TYPING_MODULES: frozenset = frozenset({"typing", "typing_extensions"})
 
 
+def _has_noqa_comment(line_text: str, codes: set[str] | None = None) -> bool:
+    """Check if *line* carries a # noqa comment, optionally for specific codes.
+
+    Supports standard formats (flake8 semantics):
+        "noqa"                       → suppresses EVERY code
+        "noqa: F401"
+        "noqa: F401, F841"
+        "noqa: F401 — descriptive text"   (non-code suffix after the code)
+
+    Code matching parses only the comma-separated code list and stops at the
+    first non-code token — free prose after the codes must never match (a
+    comment like "noqa: E501 …mentions F401…" does NOT suppress F401).
+    """
+    idx = line_text.find("#")
+    if idx == -1:
+        return False
+    rest = line_text[idx + 1 :].strip()
+    if not rest.lower().startswith("noqa"):
+        return False
+    if codes is None:
+        return True
+    codes_part = rest[4:].lstrip()  # after "noqa"
+    if not codes_part.startswith(":"):
+        return True  # bare "# noqa" suppresses every code (flake8 semantics)
+    found: set[str] = set()
+    for chunk in codes_part[1:].split(","):
+        words = chunk.split()
+        tok = words[0] if words else ""
+        if re.fullmatch(r"[A-Z]+\d+", tok):
+            found.add(tok)
+        else:
+            break  # prose begins — stop parsing
+    return bool(codes & found)
+
+
 @dataclass
 class UnusedImportCandidate:
     """One unused import statement."""
@@ -140,6 +175,21 @@ def _collect_type_checking_ranges(tree: ast.Module) -> list[tuple[int, int]]:
     return ranges
 
 
+def _import_block_has_noqa(
+    lines: list[str], start_lineno: int, end_lineno: int | None, codes: set[str] | None = None
+) -> bool:
+    """Check if any line in an import block carries a # noqa comment.
+
+    Handles multi-line imports where ``# noqa`` may appear on a continuation
+    line (the alias line) rather than the ``from`` or ``import`` line.
+    """
+    end = end_lineno or start_lineno
+    for ln in range(start_lineno, min(end, len(lines)) + 1):
+        if _has_noqa_comment(lines[ln - 1], codes):
+            return True
+    return False
+
+
 def _collect_import_info(tree: ast.Module, lines: list[str]) -> list:
     """Collect (local_name, line_text, lineno, module) for each import.
 
@@ -158,7 +208,8 @@ def _collect_import_info(tree: ast.Module, lines: list[str]) -> list:
                     continue  # PEP 484 re-export idiom
                 local_name = alias.asname or alias.name
                 line_text = lines[node.lineno - 1].strip() if node.lineno <= len(lines) else ""
-                import_info.append((local_name, line_text, node.lineno, node.module))
+                end_lineno = getattr(node, "end_lineno", node.lineno) or node.lineno
+                import_info.append((local_name, line_text, node.lineno, node.module, end_lineno))
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.asname is not None and alias.asname == alias.name:
@@ -168,7 +219,8 @@ def _collect_import_info(tree: ast.Module, lines: list[str]) -> list:
                 # "util", which never appears as a standalone Name → false unused report.
                 local_name = alias.asname or alias.name.split(".")[0]
                 line_text = lines[node.lineno - 1].strip() if node.lineno <= len(lines) else ""
-                import_info.append((local_name, line_text, node.lineno, None))
+                end_lineno = getattr(node, "end_lineno", node.lineno) or node.lineno
+                import_info.append((local_name, line_text, node.lineno, None, end_lineno))
     return import_info
 
 
@@ -333,7 +385,10 @@ def scan_unused_imports(
             used_names = load_names
 
         emitted = 0
-        for local_name, line_text, lineno, module in import_info:
+        for local_name, line_text, lineno, module, end_lineno in import_info:
+            # ── noqa(F401) suppression — checks all lines of multi-line imports ──
+            if _import_block_has_noqa(lines, lineno, end_lineno, {"F401"}):
+                continue
             if local_name not in used_names and local_name != "*":
                 # Skip __all__ re-exports
                 if local_name in all_names:

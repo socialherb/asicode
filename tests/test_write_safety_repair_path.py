@@ -216,6 +216,7 @@ class TestAllFilesRepairContract:
 
             def validate_syntax(self, path, content):
                 import ast as _ast
+
                 from external_llm.languages.models import SyntaxError_ as _SE
                 try:
                     _ast.parse(content, filename=path)
@@ -256,8 +257,8 @@ class TestAllFilesRepairContract:
         )
 
         # Stub the registry/classifier so file_a is repairable, file_b is not.
-        import external_llm.editor._editor_core.vm.repair_registry as _rr
         import external_llm.editor._editor_core.vm.failure_classifier as _fc
+        import external_llm.editor._editor_core.vm.repair_registry as _rr
 
         monkeypatch.setattr(_fc, "create_failure_classifier", lambda lang: _FakeClassifier())
 
@@ -354,6 +355,7 @@ class TestAllFilesRepairContract:
 
             def validate_syntax(self, path, content):
                 import ast as _ast
+
                 from external_llm.languages.models import SyntaxError_ as _SE
                 try:
                     _ast.parse(content, filename=path)
@@ -383,8 +385,8 @@ class TestAllFilesRepairContract:
             "external_llm.languages.LanguageRegistry", _FakeLR, raising=False,
         )
 
-        import external_llm.editor._editor_core.vm.repair_registry as _rr
         import external_llm.editor._editor_core.vm.failure_classifier as _fc
+        import external_llm.editor._editor_core.vm.repair_registry as _rr
 
         monkeypatch.setattr(_fc, "create_failure_classifier", lambda lang: _FakeClassifier())
 
@@ -536,3 +538,291 @@ class TestEditTextLanguageNeutralGate:
         assert result.ok, "Go soft-fail (undefined) must be kept, not refused"
         with open(path) as f:
             assert "helperFunc()" in f.read()
+
+
+# ── 5. Origin-skip guard + Kotlin "cannot infer type" + Bug B ────────────────
+#
+# Regression: modify_symbol on a non-Python file whose pre-edit content ALSO
+# fails isolated-compile (e.g. an Android ViewModel without the SDK, Kotlin
+# without coroutines) triggered a spurious rollback. The isolated-compile
+# errors are environmental cascade noise, not caused by the edit. The fix
+# mirrors edit_text's ``_et_orig_ok`` gate: when the pre-edit origin also
+# fails validate_syntax, soft-fail (keep the edit).
+#
+# Also covers:
+#   - Kotlin "cannot infer type" classified as TYPE_MISMATCH (was UNKNOWN →
+#     hard fail-rollback) so it soft-fails even when origin parses OK.
+#   - Bug B: on a genuine rollback, dispatch must undo the handler's
+#     _text_edited_files recording, else a later apply_patch to the file is
+#     wrongly refused with "already edited this session".
+
+
+class _FakeValResult:
+    def __init__(self, ok, message="err"):
+        self.ok = ok
+        self.errors = [type("_E", (), {"file": "", "line": 1, "col": 1, "message": message})()]
+
+
+class _FakeCaps:
+    has_syntax_validator = True
+
+
+class _FakeProvider:
+    """validate_syntax fails iff content contains the marker 'MISSING_DEP'."""
+    _lang = "kotlin"
+
+    def language_id(self):
+        return type("_L", (), {"value": self._lang})()
+
+    def capabilities(self):
+        return _FakeCaps()
+
+    def validate_syntax(self, path, content):
+        return _FakeValResult(ok="MISSING_DEP" not in content, message="cannot infer type")
+
+
+class _FakeLangRegistry:
+    """Stand-in for LanguageRegistry.instance().get() during the unit test."""
+    @classmethod
+    def instance(cls):
+        class _Inst:
+            def get(self, path):
+                return _FakeProvider() if str(path).endswith(".kt") else None
+        return _Inst()
+
+
+class TestOriginSkipGuard:
+    def test_kotlin_cannot_infer_type_is_type_mismatch(self):
+        """Keyword fix: 'cannot infer type' → TYPE_MISMATCH (was UNKNOWN → hard
+        fail-rollback). TYPE_MISMATCH soft-fails so the edit is kept."""
+        from external_llm.editor._editor_core.vm.failure_classifier import (
+            FailureType,
+            create_failure_classifier,
+        )
+        from external_llm.editor._editor_core.vm.models import VerifyError
+        c = create_failure_classifier("kotlin")
+        ft = c.classify([VerifyError(
+            message="cannot infer type for type parameter 'T'. Specify it explicitly.",
+            line=0, column=0)])
+        assert ft == FailureType.TYPE_MISMATCH
+
+    def test_origin_skip_keeps_edit_when_origin_also_broken(self, monkeypatch):
+        """Origin-skip (the general root-cause guard): when the pre-edit content
+        ALSO fails isolated-compile, the verify errors are environmental cascade
+        noise → soft-fail (keep the edit). Before the fix this hard-fail-rolled
+        back a correct modify_symbol on an Android/Kotlin file without its deps."""
+        monkeypatch.setattr("external_llm.languages.LanguageRegistry", _FakeLangRegistry)
+        snapshots = {"/repo/Foo.kt": "class Foo { val x: MISSING_DEP = TODO() }"}
+        assert ToolRegistry._should_soft_fail_verify(
+            "/repo/Foo.kt:1:1: cannot infer type for type parameter 'T'", snapshots,
+        ) is True
+
+    def test_origin_skip_does_not_mask_genuine_syntax_error(self, monkeypatch):
+        """Negative case: origin parses OK, edit introduces a genuine syntax
+        error → hard fail (return False, roll back). The origin-skip must NOT
+        fire here because the origin validated clean."""
+        monkeypatch.setattr("external_llm.languages.LanguageRegistry", _FakeLangRegistry)
+        snapshots = {"/repo/Foo.kt": "class Foo { fun bar() {} }"}  # origin OK
+        assert ToolRegistry._should_soft_fail_verify(
+            "/repo/Foo.kt:1:1: expecting '}'", snapshots,
+        ) is False
+
+    def test_origin_skip_skipped_for_new_file_snapshot(self, monkeypatch):
+        """A new-file snapshot holds the _MISSING_SNAP sentinel (not str) — no
+        origin to validate. The origin-skip must be skipped, falling through to
+        the normal classifier so a genuine syntax error in a NEW file still
+        hard-fails."""
+        from external_llm.agent.tool_safety import _MISSING_SNAP
+        monkeypatch.setattr("external_llm.languages.LanguageRegistry", _FakeLangRegistry)
+        snapshots = {"/repo/New.kt": _MISSING_SNAP}
+        assert ToolRegistry._should_soft_fail_verify(
+            "/repo/New.kt:1:1: expecting '}'", snapshots,
+        ) is False
+
+    # ── Bug #1: multi-file snapshot origin-skip ────────────────────────────────
+    # _should_soft_fail_verify must use the FILE THAT PRODUCED THE ERROR for
+    # origin-skip + classification, not the FIRST snapshot file. These tests
+    # prove the fix by constructing a multi-file snapshot where first-file
+    # origin differs from the error's-file origin.
+
+    def test_multi_file_first_file_broken_uses_detail_path_origin(self, monkeypatch):
+        """Multi-file snapshot: first file origin broken, verify error from
+        second file (clean origin). MUST NOT origin-skip — the second file's
+        origin is clean, so the error is a genuine syntax error → hard fail.
+        Before the fix the origin-skip fired on the first file's broken origin
+        and incorrectly returned True (soft-fail)."""
+        monkeypatch.setattr("external_llm.languages.LanguageRegistry", _FakeLangRegistry)
+        snapshots = {
+            "/repo/A.kt": "class Foo { val x: MISSING_DEP = TODO() }",  # broken
+            "/repo/B.kt": "class Bar {}",  # clean
+        }
+        result = ToolRegistry._should_soft_fail_verify(
+            "/repo/B.kt:1:1: expecting '}'", snapshots,
+        )
+        assert result is False, (
+            "origin from B.kt (clean) must not trigger origin-skip; "
+            "expecting '}' is SYNTAX_ERROR → hard fail"
+        )
+
+    def test_multi_file_second_file_origin_broken_triggers_origin_skip(self, monkeypatch):
+        """Multi-file snapshot: first file origin clean, verify error from
+        second file (broken origin). MUST origin-skip even though the first
+        file's origin is clean — the error is from a file whose baseline was
+        already broken (cascade noise)."""
+        monkeypatch.setattr("external_llm.languages.LanguageRegistry", _FakeLangRegistry)
+        snapshots = {
+            "/repo/A.kt": "class Foo {}",  # clean
+            "/repo/B.kt": "class Bar { val x: MISSING_DEP = TODO() }",  # broken
+        }
+        result = ToolRegistry._should_soft_fail_verify(
+            "/repo/B.kt:1:1: expecting '}'", snapshots,
+        )
+        assert result is True, (
+            "origin from B.kt (broken) must trigger origin-skip → soft fail"
+        )
+
+
+class TestRollbackRestoresTextEditedFiles:
+    """Bug B: on a genuine rollback, dispatch must restore _text_edited_files to
+    its pre-handler state. A non-excluded write tool (modify_symbol) records the
+    edited path from INSIDE its handler (before dispatch's verify); without the
+    restore, the stale entry makes a later apply_patch refuse with 'already
+    edited this session'."""
+
+    def test_rollback_undoes_handler_recording(
+        self, tool_registry: ToolRegistry, temp_repo_root: str, monkeypatch,
+    ):
+        original = "x = 1\n"
+        path = os.path.join(temp_repo_root, "mod_b.py")
+        with open(path, "w") as f:
+            f.write(original)
+
+        recorded = {"path": os.path.join(temp_repo_root, "mod_b.py")}
+        _edited_before = set(tool_registry._text_edited_files)
+
+        def _fake_modify_symbol(args):
+            # Mirror write_tools.py:5078 — records the path BEFORE dispatch verify
+            with open(path, "w") as f:
+                f.write("x === broken\n")
+            tool_registry._record_text_edit(os.path.join(temp_repo_root, "mod_b.py"))
+            recorded["path"] = os.path.join(temp_repo_root, "mod_b.py")
+            return ToolResult(ok=True, content="written")
+
+        monkeypatch.setattr(tool_registry, "_tool_modify_symbol", _fake_modify_symbol)
+        monkeypatch.setattr(
+            tool_registry, "_verify_after_write",
+            lambda snaps: (False, f"{path}:1:3: Syntax error: invalid syntax"),
+        )
+        monkeypatch.setattr(
+            tool_registry, "_repair_verify_failure", lambda snapshots: False,
+        )
+        # Force hard fail: no soft-fail, no origin-skip
+        monkeypatch.setattr(
+            ToolRegistry, "_should_soft_fail_verify", staticmethod(lambda d, s: False),
+        )
+
+        result = tool_registry.dispatch("modify_symbol", {"path": "mod_b.py"})
+
+        # (a) dispatch rolled back the working tree
+        assert result.ok is False
+        with open(path) as f:
+            assert f.read() == original
+        # (b) Bug B: the handler's _text_edited_files recording was undone
+        assert tool_registry._text_edited_files == _edited_before, (
+            "rollback must restore _text_edited_files so a later apply_patch "
+            "is not refused with 'already edited this session'"
+        )
+        assert recorded["path"] not in tool_registry._text_edited_files
+
+
+# ── 6. anchor_edit language-neutral gate: soft-fail + origin-skip ─────────────
+# Regression (Finding #1): anchor_edit's syntax gate was a hardcoded
+# ``if not _sv.ok: refuse`` with NO origin-skip and NO soft-fail classification
+# — unlike edit_text/dispatch/apply_patch/modify_symbol which all keep edits
+# whose pre-edit content also fails isolated-compile (cascade noise) or whose
+# errors are cross-file-resolvable. For a non-Python file whose original already
+# fails parse (e.g. a pre-broken .ts, or an Android Kotlin file without the SDK),
+# anchor_edit refused EVERY edit. The fix mirrors edit_text: soft-fail via
+# _should_soft_fail_verify, and keep the strict refuse for Python (compile() is
+# self-contained) + genuine syntax errors on a valid baseline.
+
+class TestAnchorEditLanguageNeutralGate:
+    """anchor_edit must refuse genuine syntax errors but keep origin-skip /
+    soft-fail edits — matching edit_text/dispatch, not the old hardcoded gate."""
+
+    def _write(self, repo_root, name, content):
+        path = os.path.join(repo_root, name)
+        with open(path, "w") as f:
+            f.write(content)
+        return path
+
+    def test_refuses_broken_typescript_insert(self, tool_registry, temp_repo_root):
+        """A .ts anchor_edit that introduces a genuine parse error must be
+        refused and the file left untouched (anchor_edit has no rollback, so
+        the in-handler gate is the only safety net — see insight A68)."""
+        original = (
+            "function add(a: number, b: number): number {\n"
+            "  return a + b;\n"
+            "}\n"
+        )
+        path = self._write(temp_repo_root, "app.ts", original)
+        result = tool_registry.dispatch("anchor_edit", {
+            "file_path": "app.ts",
+            "anchor_pattern": "  return a + b;",
+            "edit_mode": "insert_after",
+            "code_snippet": "  return a + ;",
+        })
+        assert result.ok is False
+        with open(path) as f:
+            assert f.read() == original  # disk preserved
+
+    def test_skips_gate_when_original_already_broken(self, tool_registry, temp_repo_root):
+        """The core Finding #1 fix: when the ORIGINAL file already fails to
+        parse, anchor_edit must NOT refuse the edit (we never block an edit on a
+        pre-broken baseline). The old hardcoded gate refused every such edit."""
+        pre_broken = "function f() {\n  return 1 + ;\n}\n"
+        path = self._write(temp_repo_root, "broken.ts", pre_broken)
+        result = tool_registry.dispatch("anchor_edit", {
+            "file_path": "broken.ts",
+            "anchor_pattern": "  return 1 + ;",
+            "edit_mode": "replace_line",
+            "code_snippet": "  return 2 + ;",
+        })
+        assert result.ok, "origin-skip must keep edits on a pre-broken baseline"
+        with open(path) as f:
+            assert "return 2 +" in f.read()
+
+    def test_applies_valid_typescript_insert(self, tool_registry, temp_repo_root):
+        """A valid .ts anchor_edit must still apply — the gate must not over-fire
+        on a clean baseline."""
+        original = (
+            "function add(a: number, b: number): number {\n"
+            "  return a + b;\n"
+            "}\n"
+        )
+        path = self._write(temp_repo_root, "app.ts", original)
+        result = tool_registry.dispatch("anchor_edit", {
+            "file_path": "app.ts",
+            "anchor_pattern": "  return a + b;",
+            "edit_mode": "insert_after",
+            "code_snippet": "  console.log(a);",
+        })
+        assert result.ok
+        with open(path) as f:
+            assert "console.log(a)" in f.read()
+
+    def test_python_gate_still_refuses_broken(self, tool_registry, temp_repo_root):
+        """Regression guard: Python keeps the strict refuse (compile() is
+        self-contained — no cascade noise). The non-Python soft-fail path must
+        not weaken the Python gate."""
+        original = "def f():\n    return 1\n"
+        path = self._write(temp_repo_root, "mod.py", original)
+        result = tool_registry.dispatch("anchor_edit", {
+            "file_path": "mod.py",
+            "anchor_pattern": "    return 1",
+            "edit_mode": "replace_line",
+            "code_snippet": "    return 1 +",
+        })
+        assert result.ok is False
+        with open(path) as f:
+            assert f.read() == original

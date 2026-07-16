@@ -12,7 +12,9 @@ import logging
 import os
 import tempfile
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
+
+from external_llm.languages.tree_sitter_utils import grammar_key_for_ext
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +64,6 @@ def _python_decl_sets(source: str):
                 imports.add(a.asname or a.name)
     return symbols, imports
 
-
-_EXT_TO_TS_LANGUAGE: dict[str, str] = {
-    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
-    ".ts": "typescript", ".tsx": "typescript",
-    ".go": "go", ".java": "java", ".kt": "kotlin",
-}
 
 
 def _treesitter_symbol_set(source: str, language: str):
@@ -119,7 +115,7 @@ def summarize_decl_losses(original: str, current: str, suffix: str = ".py") -> s
         pre_syms, post_syms = pre[0], post[0]
         removed_imps = sorted(pre[1] - post[1])
     else:
-        language = _EXT_TO_TS_LANGUAGE.get(suffix)
+        language = grammar_key_for_ext(suffix)
         if not language:
             return ""
         pre_syms = _treesitter_symbol_set(original, language)
@@ -147,7 +143,7 @@ class WriteSafetyManager:
     after writes, and rollback on failure.  Also handles approval gating."""
 
     # Tools that get snapshot + syntax verify + rollback safety wrapper
-    WRITE_TOOLS_WITH_SAFETY = {"apply_patch", "write_plan"}
+    WRITE_TOOLS_WITH_SAFETY: ClassVar[set[str]] = {"apply_patch", "write_plan"}
 
     _PATCH_FILE_THRESHOLD = 3
 
@@ -268,11 +264,11 @@ class WriteSafetyManager:
                 # headers present. "+++ b/…" captures new-file targets (--- /dev/null).
                 for _line in patch.splitlines():
                     if _line.startswith('--- a/') or _line.startswith('--- b/'):
-                        _path = _line[6:].strip()
+                        _path = _line[6:].split('\t')[0].strip()
                         if _path and _path != "/dev/null":
                             targets.append(_path)
                     elif _line.startswith('+++ b/'):
-                        _path = _line[6:].strip()
+                        _path = _line[6:].split('\t')[0].strip()
                         if _path and _path != "/dev/null":
                             targets.append(_path)
                 # For write_plan with dict plan: extract paths from ops
@@ -316,19 +312,30 @@ class WriteSafetyManager:
             pass
         return snapshots
 
-    def verify_after_write(self, snapshots: dict) -> tuple[bool, str]:
+    def verify_after_write(self, snapshots: dict, _post_contents: dict | None = None) -> tuple[bool, str]:
         """Basic syntax check on files that were modified.
 
         Returns (True, "") if all files pass syntax validation (or have no validator),
         or (False, "error detail") with the first syntax error message.
+
+        When *_post_contents* is provided (path → post-write content), the file
+        is validated from memory instead of being re-read from disk — an I/O
+        optimisation for call sites that already hold the just-written content.
         """
-        from ..languages import LanguageRegistry as _LR2
+        from ..languages import LanguageRegistry
         for path in snapshots:
-            _vaw_provider = _LR2.instance().get(path)
+            _vaw_provider = LanguageRegistry.instance().get(path)
             if _vaw_provider and _vaw_provider.capabilities().has_syntax_validator and os.path.isfile(path):
                 try:
-                    with open(path, encoding="utf-8", errors="replace") as f:
-                        _val = _vaw_provider.validate_syntax(path, f.read())
+                    _content = (
+                        _post_contents.get(path)
+                        if _post_contents
+                        else None
+                    )
+                    if _content is None:
+                        with open(path, encoding="utf-8", errors="replace") as f:
+                            _content = f.read()
+                    _val = _vaw_provider.validate_syntax(path, _content)
                     if not _val.ok:
                         # A single structural break (e.g. an unbalanced brace)
                         # makes the parser emit a long cascade of follow-on
@@ -357,13 +364,16 @@ class WriteSafetyManager:
         return True, ""
 
     @staticmethod
-    def restore_snapshots(snapshots: dict) -> None:
+    def restore_snapshots(snapshots: dict) -> list[str]:
         """Restore files from pre-write snapshot.
+
+        Returns list of file paths whose restoration failed (empty on success).
 
         Uses mkstemp + os.replace for atomic writes (crash-safe — no partial
         truncation). Files that did not exist before (``_MISSING_SNAP`` sentinel)
         are removed.
         """
+        _failed: list[str] = []
         for path, content in snapshots.items():
             try:
                 if content is _MISSING_SNAP:
@@ -392,7 +402,12 @@ class WriteSafetyManager:
                         pass
                     raise
             except OSError:
-                pass
+                logger.error(
+                    "Write safety: rollback failed for %s — file may be corrupted",
+                    path, exc_info=True,
+                )
+                _failed.append(path)
+        return _failed
 
     # ------------------------------------------------------------------
     # Deterministic post-write change summary (no intent inference)

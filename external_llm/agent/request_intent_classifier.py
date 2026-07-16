@@ -49,7 +49,8 @@ def normalize_routing_label(label: str) -> str:
     "read_only". Unrecognized labels are logged (as a drift signal) and
     returned as-is so the caller can apply its own fallback.
     """
-    _key = label.lower().replace("-", "_").replace(" ", "_").strip()
+    from external_llm.languages._normalize import normalize_key
+    _key = normalize_key(label)
     _canonical = _ROUTING_INTENT_NORMALIZE.get(_key)
     if _canonical is not None:
         return _canonical

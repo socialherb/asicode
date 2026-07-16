@@ -5,7 +5,6 @@ one provider (e.g. opencode's host) was injected into EVERY provider's client,
 pointing it at the wrong host (zai key → opencode endpoint → HTTP 401 →
 misleading "Invalid API key" prompt) and disabling zai's endpoint-failover.
 """
-import os
 
 import pytest
 

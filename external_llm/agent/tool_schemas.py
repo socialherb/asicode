@@ -1026,7 +1026,9 @@ SCHEMA_BROWSER_ACTION = {
         "★ Use instead of web_fetch when: the page is a JavaScript SPA (React/Vue), "
         "you need to interact (click/type), or you need a screenshot.\n"
         "★ The browser stays open between calls — navigate once, then click/extract repeatedly.\n"
-        "★ Call action='close' when done to free memory."
+        "★ Call action='close' when done to free memory.\n"
+        "★ Heavy SPAs (YouTube/React/ad-heavy): keep default 30s timeout; for faster returns use "
+        "wait_until='domcontentloaded', not a shorter timeout."
     ),
     "parameters": {
         "type": "object",
@@ -1056,7 +1058,11 @@ SCHEMA_BROWSER_ACTION = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Timeout in milliseconds for navigation/click/wait (default: 30000).",
+                "description": (
+                    "Timeout in milliseconds for navigation/click/wait (default: 30000). "
+                    "Failure ceiling, not a target — keep the default for heavy SPAs. "
+                    "To return faster, use wait_until='domcontentloaded', NOT a shorter timeout."
+                ),
                 "default": 30000,
             },
             "max_chars": {

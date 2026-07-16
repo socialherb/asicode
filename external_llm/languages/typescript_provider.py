@@ -12,7 +12,15 @@ import os
 import re
 import subprocess
 
-from .base import SyntaxProvider, _replace_last_cmd_path, _tempfile_for_content, detect_project_root
+from .base import (
+    SyntaxProvider,
+    _replace_last_cmd_path,
+    _tempfile_for_content,
+    detect_project_root,
+    find_brace_block_end,
+    find_brace_block_end_offset,
+    tree_sitter_syntax_fallback,
+)
 from .models import (
     LanguageCapabilities,
     LanguageId,
@@ -119,8 +127,8 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                     cwd=os.path.dirname(_tmp_path) or ".",
                 )
             except FileNotFoundError:
-                logger.debug("tsc not installed; skipping validation")
-                return SyntaxValidationResult(ok=True, language=LanguageId.TYPESCRIPT)
+                logger.debug("tsc not installed; falling back to tree-sitter")
+                return tree_sitter_syntax_fallback(content, LanguageId.TYPESCRIPT, file_path)
             except subprocess.TimeoutExpired:
                 logger.debug("tsc timed out for %s", file_path)
                 return SyntaxValidationResult(ok=True, language=LanguageId.TYPESCRIPT)
@@ -528,26 +536,13 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
 
     @staticmethod
     def _find_block_end(content: str, offset: int) -> int:
-        """Heuristic: find the matching closing brace from *offset*."""
-        depth = 0
-        started = False
-        line = content[:offset].count("\n") + 1
-        i = offset
-        length = len(content)
-        while i < length:
-            ch = content[i]
-            if ch == "\n":
-                line += 1
-            elif ch == "{":
-                depth += 1
-                started = True
-            elif ch == "}":
-                depth -= 1
-                if started and depth == 0:
-                    return line
-            i += 1
-        # Fallback: couldn't find matching brace, return start + 20
-        return content[:offset].count("\n") + 21
+        """Heuristic: find the matching closing brace from *offset*.
+
+        Delegates to the shared :func:`find_brace_block_end` (C-family SSOT)
+        which skips string/char/template literals and ``//`` / ``/* */``
+        comments so braces inside them do not corrupt the depth counter.
+        """
+        return find_brace_block_end(content, offset)
 
     # ── Definition keywords ───────────────────────────────────────────────
 
@@ -589,19 +584,13 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
 
     @staticmethod
     def _find_block_end_offset(content: str, offset: int) -> int:
-        """Find offset of matching closing brace."""
-        depth = 0
-        started = False
-        for i in range(offset, len(content)):
-            ch = content[i]
-            if ch == "{":
-                depth += 1
-                started = True
-            elif ch == "}":
-                depth -= 1
-                if started and depth == 0:
-                    return i + 1
-        return len(content)
+        """Offset (exclusive) of matching ``}`` for the class-body range.
+
+        Delegates to :func:`base.find_brace_block_end_offset` (the shared SSOT) so
+        braces inside string/char/template literals or comments cannot corrupt the
+        depth counter. See base.py for the full contract.
+        """
+        return find_brace_block_end_offset(content, offset)
 
     def _find_class_methods_regex(
         self, content: str, class_name: str,

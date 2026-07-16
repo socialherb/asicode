@@ -3,6 +3,8 @@
 Focuses on symbol detection and API contracts that don't require
 external toolchains (go, tsc, kotlinc, javac).
 """
+from typing import ClassVar
+
 import pytest
 
 from external_llm.languages.bash_provider import BashSyntaxProvider
@@ -401,3 +403,202 @@ class TestBashProvider:
     def test_find_symbol_in_file_not_supported(self, provider):
         # Provider index path is used; per-file lookup returns None.
         assert provider.find_symbol_in_file("foo.sh", "bar", "bar() {}") is None
+
+
+# ── find_brace_block_end: shared SSOT across all C-family providers ────────────
+# Regression for the two systemic bugs in the regex-fallback _find_block_end:
+#   (2a) naive brace counting corrupted depth on braces inside string/char/
+#        template literals and // / /* */ comments (only c_provider had the
+#        _skip_quoted helper; go/java/kotlin/typescript were naive).
+#   (2b) unterminated-block fallback returned start+20 (`+ 21`) instead of the
+#        start line — symbol end_line drifted 20 lines past the real block.
+# All five providers now delegate to base.find_brace_block_end, so each must
+# pass the SAME literal/comment/fallback contract that c_provider already had.
+
+class TestFindBlockEndSharedSSOT:
+    """Every brace-delimited C-family provider shares one brace scanner."""
+
+    @pytest.mark.parametrize("provider_cls", [
+        GoSyntaxProvider,
+        JavaSyntaxProvider,
+        KotlinSyntaxProvider,
+        TypeScriptSyntaxProvider,
+    ])
+    def test_brace_in_string_does_not_corrupt_depth(self, provider_cls):
+        # Pre-fix (naive): the '}' inside the string ended the block on line 2.
+        src = "void f() {\n    s = \"}\";\n}\n"          # close on line 3
+        end = provider_cls._find_block_end(src, src.index("void"))
+        assert end == 3, f"{provider_cls.__name__}: {end}"
+
+    @pytest.mark.parametrize("provider_cls", [
+        GoSyntaxProvider,
+        JavaSyntaxProvider,
+        KotlinSyntaxProvider,
+        TypeScriptSyntaxProvider,
+    ])
+    def test_brace_in_block_comment_does_not_corrupt_depth(self, provider_cls):
+        src = "void f() {\n    /* } */\n}\n"             # close on line 3
+        end = provider_cls._find_block_end(src, src.index("void"))
+        assert end == 3, f"{provider_cls.__name__}: {end}"
+
+    @pytest.mark.parametrize("provider_cls", [
+        GoSyntaxProvider,
+        JavaSyntaxProvider,
+        KotlinSyntaxProvider,
+        TypeScriptSyntaxProvider,
+    ])
+    def test_brace_in_line_comment_does_not_corrupt_depth(self, provider_cls):
+        src = "void f() {\n    // {\n}\n"                # close on line 3
+        end = provider_cls._find_block_end(src, src.index("void"))
+        assert end == 3, f"{provider_cls.__name__}: {end}"
+
+    @pytest.mark.parametrize("provider_cls", [
+        GoSyntaxProvider,
+        JavaSyntaxProvider,
+        KotlinSyntaxProvider,
+        TypeScriptSyntaxProvider,
+    ])
+    def test_typescript_template_literal_braces_skipped(self, provider_cls):
+        # Template literal `${...}` braces must not affect depth. (Primary TS
+        # concern; the shared scanner handles backticks for all.)
+        src = "void f() {\n    x = `${a.b}`;\n}\n"       # close on line 3
+        end = provider_cls._find_block_end(src, src.index("void"))
+        assert end == 3, f"{provider_cls.__name__}: {end}"
+
+    @pytest.mark.parametrize("provider_cls", [
+        GoSyntaxProvider,
+        JavaSyntaxProvider,
+        KotlinSyntaxProvider,
+        TypeScriptSyntaxProvider,
+    ])
+    def test_unterminated_block_fallback_is_start_line(self, provider_cls):
+        # Regression for bug 2b: the old fallback was `+ 21` (start + 20). The
+        # correct conservative fallback is the start line itself.
+        src = "void f() {\n    bar()\n"                  # no closing brace
+        end = provider_cls._find_block_end(src, src.index("void"))
+        assert end == 1, f"{provider_cls.__name__}: expected start line 1, got {end}"
+
+    @pytest.mark.parametrize("provider_cls", [
+        GoSyntaxProvider,
+        JavaSyntaxProvider,
+        KotlinSyntaxProvider,
+        TypeScriptSyntaxProvider,
+    ])
+    def test_multiline_backtick_literal_newlines_counted(self, provider_cls):
+        # Bug #1 regression: old line-based scanner under-counted newlines inside
+        # backtick/template literals, returning line 4 instead of 6 for a 3-line block.
+        src = "package main\nfunc f() {\n    s := `hello\n    world\n    !`\n}\n"
+        end = provider_cls._find_block_end(src, src.index("{"))
+        assert end == 6, f"{provider_cls.__name__}: expected 6, got {end}"
+
+    @pytest.mark.parametrize("provider_cls", [
+        GoSyntaxProvider,
+        JavaSyntaxProvider,
+        KotlinSyntaxProvider,
+        TypeScriptSyntaxProvider,
+    ])
+    def test_go_raw_string_backslash_does_not_escape_backtick(self, provider_cls):
+        # Bug #2 regression: Go raw strings have NO escape sequences. A backslash
+        # before the closing backtick (e.g. `C:\`) must NOT swallow the backtick.
+        # Only GoSyntaxProvider actually uses raw strings, but the shared scanner
+        # must handle it correctly for all.
+        src = 'package main\nfunc f() {\n    s := `C:\\`\n}\n'
+        end = provider_cls._find_block_end(src, src.index("{"))
+        assert end == 4, f"{provider_cls.__name__}: expected 4, got {end}"
+
+    @pytest.mark.xfail(reason="Known limitation: backtick always escapes=False "
+                              "(Go compat) — TS escaped backtick inside template "
+                              "literal may close prematurely. See _find_closing_brace docstring.")
+    @pytest.mark.parametrize("provider_cls", [
+        GoSyntaxProvider,
+        JavaSyntaxProvider,
+        KotlinSyntaxProvider,
+        TypeScriptSyntaxProvider,
+    ])
+    def test_ts_escaped_backtick_premature_close(self, provider_cls):
+        # TS template literal with escaped backtick (\`) — the shared scanner
+        # treats backtick as escapes=False (Go raw string compat), so the \`
+        # is not recognised as an escaped backtick and the literal closes early.
+        # Ideal end_line is 4; current behaviour (premature close) is 2.
+        src = "void f() {\n    x = `hello\\` world`;\n}\n"
+        end = provider_cls._find_block_end(src, src.index("{"))
+        # Known xfail: current result is ~2 (premature close on the \`).
+        # Update this assertion when the limitation is fixed.
+        assert end == 4, f"{provider_cls.__name__}: expected 4, got {end}"
+
+
+# ── find_brace_block_end_offset: SSOT for class-body ranges (java/kotlin/ts) ──
+# Regression for the SECOND brace scanner: _find_block_end_offset was a separate
+# naive implementation (no quote/comment skipping) in java/kotlin/typescript. It
+# served the regex-fallback *class-body* range (slicing the class body to scan for
+# methods), while _find_block_end served *method-body* ranges. Both now share the
+# same quote/comment-aware scan via base.find_brace_block_end_offset.
+
+class TestFindBlockEndOffsetSharedSSOT:
+    """The class-body range brace scanner shares the literal/comment skip."""
+
+    OFFSET_PROVIDERS: ClassVar[list] = [JavaSyntaxProvider, KotlinSyntaxProvider, TypeScriptSyntaxProvider]
+
+    @pytest.mark.parametrize("provider_cls", OFFSET_PROVIDERS)
+    def test_offset_returns_one_past_closing_brace(self, provider_cls):
+        # Returns offset (exclusive) — content[start:end] is exactly the block.
+        src = "class A {\n    void f() {}\n}\n"
+        start = src.index("{")
+        end = provider_cls._find_block_end_offset(src, start)
+        assert src[start:end].rstrip().endswith("}"), f"{provider_cls.__name__}: block={src[start:end]!r}"
+
+    @pytest.mark.parametrize("provider_cls", OFFSET_PROVIDERS)
+    def test_brace_in_string_does_not_close_block(self, provider_cls):
+        # Pre-fix (naive): the '}' inside the string closed the class early,
+        # truncating the class body so methods after it were lost.
+        src = 'class A {\n    String s = "}";\n    void real() {}\n}\n'
+        start = src.index("{")
+        end = provider_cls._find_block_end_offset(src, start)
+        body = src[start:end]
+        assert "void real()" in body, f"{provider_cls.__name__}: method lost, body={body!r}"
+
+    @pytest.mark.parametrize("provider_cls", OFFSET_PROVIDERS)
+    def test_brace_in_comment_does_not_close_block(self, provider_cls):
+        src = "class A {\n    /* } */\n    void real() {}\n}\n"
+        start = src.index("{")
+        end = provider_cls._find_block_end_offset(src, start)
+        body = src[start:end]
+        assert "void real()" in body, f"{provider_cls.__name__}: method lost, body={body!r}"
+
+    @pytest.mark.parametrize("provider_cls", OFFSET_PROVIDERS)
+    def test_unterminated_fallback_is_len_content(self, provider_cls):
+        # Conservative fallback: len(content) (whole tail), matching prior behaviour.
+        src = "class A {\n    void f() {\n        x = 1\n"   # no closing braces
+        start = src.index("{")
+        end = provider_cls._find_block_end_offset(src, start)
+        assert end == len(src), f"{provider_cls.__name__}: expected {len(src)}, got {end}"
+
+    @pytest.mark.parametrize("provider_cls", OFFSET_PROVIDERS)
+    def test_offset_scanner_lives_in_base_ssot(self, provider_cls):
+        # The per-provider method must delegate to the shared base function —
+        # guards against a future copy-paste re-divergence.
+        from external_llm.languages.base import find_brace_block_end_offset
+        src = 'class A {\n    String s = "}";\n    void real() {}\n}\n'
+        start = src.index("{")
+        direct = find_brace_block_end_offset(src, start)
+        delegated = provider_cls._find_block_end_offset(src, start)
+        assert direct == delegated, f"{provider_cls.__name__}: not delegating to base SSOT"
+
+    @pytest.mark.parametrize("provider_cls", OFFSET_PROVIDERS)
+    def test_multiline_backtick_literal_offset(self, provider_cls):
+        # Bug #1: multi-line backtick literals must not truncate the class body.
+        src = 'class A {\n    String s = `hello\n    world`;\n    void real() {}\n}\n'
+        start = src.index("{")
+        end = provider_cls._find_block_end_offset(src, start)
+        body = src[start:end]
+        assert "void real()" in body, f"{provider_cls.__name__}: method lost, body={body!r}"
+
+    @pytest.mark.parametrize("provider_cls", OFFSET_PROVIDERS)
+    def test_raw_string_backslash_backtick_offset(self, provider_cls):
+        # Bug #2: raw string backslash before backtick must not break the scanner.
+        src = 'class A {\n    String s = `C:\\`;\n    void real() {}\n}\n'
+        start = src.index("{")
+        end = provider_cls._find_block_end_offset(src, start)
+        body = src[start:end]
+        assert "void real()" in body, f"{provider_cls.__name__}: method lost, body={body!r}"
+

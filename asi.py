@@ -89,6 +89,11 @@ _ctrlc_armed: bool = False  # True after 1st Ctrl+C on empty prompt — reset by
 # ── Ghost suggestion for next action (filled by background LLM after turn end) ──
 _next_prompt_suggestion: str = ""  # Suggestion text shown dimmed on empty prompt
 _next_suggestion_gen: int = 0      # Incremented each new turn — invalidates stale suggestions
+# ── Auto-continue (/auto): countdown-submit the ghost suggestion (self-improve loop) ──
+_auto_continue_state: dict = {"on": False, "cap": 5, "depth": 0}
+_auto_submit_gen: int = 0           # Incremented to cancel a pending countdown (typing/Esc/new turn)
+_auto_countdown_active: bool = False  # True while a countdown is pending (Enter = run now)
+_last_input_was_auto: bool = False  # Set by the countdown submit; read+cleared by run_repl
 _REPO_ROOT: str = ""  # Set by run_repl/run_once — shortens absolute paths to relative for tool hints
 
 # Current provider/model for /think /model autocompletion (set by run_repl)
@@ -1266,6 +1271,7 @@ _SLASH_COMMANDS: list[tuple[str, tuple[str, ...], str, str]] = [
     ("/code",    (),              "[msg]",  "switch to Code Chat (full context)"),
     ("/general", (),              "[msg]",  "switch to General Chat (no code context)"),
     ("/think",   ("/thinking",),  "[mode]", "toggle thinking/reasoning mode (tab for suggestions)"),
+    ("/auto",    (),              "[N|off]", "auto-continue: countdown-run the suggested next step after each turn (N = max consecutive steps)"),
     ("/claude",  (),              "[--fresh] <task>", "ask Claude Code Agent (--fresh: don't share conversation context)"),
     ("/orchestrate", ("/orch",), "<task>", "enter Orchestrator mode (persistent — inherits session context; /code to exit)"),
     ("/quit",    (":q", "/exit"), "",       "end the session"),
@@ -1282,7 +1288,7 @@ _FAILURE_PATTERNS_SUBCOMMANDS: list[str] = ["list", "clear", "drop", "prune"]
 _SLASH_GROUPS: list[tuple[str, tuple[str, ...]]] = [
     ("session", ("/help", "/status", "/clear", "/quit")),
     ("model",   ("/model", "/helper", "/think")),
-    ("mode",    ("/code", "/general", "/orchestrate", "/claude")),
+    ("mode",    ("/code", "/general", "/orchestrate", "/claude", "/auto")),
     ("output",  ("/diff", "/undo", "/copy")),
     ("project", ("/insights", "/failure-patterns")),
 ]
@@ -2573,7 +2579,7 @@ def _install_tree_sitter_grammars(pkgs: list[str]) -> None:
 
     # If core is present, grammar is live-reflected via cache invalidation
     try:
-        _ts_utils._LANG_CACHE.clear()
+        _ts_utils.invalidate_caches()
         now_available = _ts_utils.get_available_languages()
     except Exception:
         now_available = set()
@@ -5269,6 +5275,75 @@ _NEXT_SUGGEST_SYSTEM = (
     "- If there is no clearly useful next step, reply with exactly: NONE"
 )
 
+# Auto-continue variant: the suggestion is not a hint the user may accept — it is
+# fed back as the next turn's instruction without a human reading it first. So the
+# contract is deliberately asymmetric: NONE is the default, and a continuation is
+# only allowed for REQUIRED follow-up work, stated self-contained (the next turn
+# starts with fresh context — no "it/that" references to this conversation).
+_AUTO_NEXT_SUGGEST_SYSTEM = (
+    "You decide whether an autonomous coding loop should run one more step, and with\n"
+    "what instruction. Given the user's last request, the assistant's final answer,\n"
+    "and a work log:\n"
+    "- Reply with the next instruction ONLY IF the final answer shows follow-up work\n"
+    "  is REQUIRED: unfinished steps, changes not yet verified, failing checks, or an\n"
+    "  explicitly stated mandatory next step.\n"
+    "- Optional ideas, nice-to-haves, and speculative improvements are NOT required\n"
+    "  follow-up — reply with exactly: NONE\n"
+    "- If the work is complete and verified, reply with exactly: NONE\n"
+    "- The instruction is executed in a fresh session: make it self-contained (name\n"
+    "  the files/symbols/commands), and start with verifying the previous step's\n"
+    "  result when it was not verified yet.\n"
+    "- One line, imperative, under 250 characters, same language as the user\n"
+    "  (Korean request → Korean instruction).\n"
+    "- Reply with the instruction text only — no quotes, no preamble, no numbering."
+)
+
+# Countdown before an auto-continue submit fires (seconds). The window exists so a
+# watching user can veto (typing/Esc) — too short removes the veto, too long makes
+# the loop crawl when unattended.
+try:
+    _AUTO_CONTINUE_DELAY: float = max(
+        2.0, float(os.environ.get("ASICODE_AUTO_CONTINUE_DELAY", "8")))
+except ValueError:
+    _AUTO_CONTINUE_DELAY = 8.0
+# Auto instructions must be self-contained, so they get a longer budget than the
+# 100-char display hint (system prompt says 250; buffer for tokenization overshoot).
+_AUTO_SUGGESTION_MAX_LEN = 300
+
+
+def _parse_auto_arg(arg: str, cur_on: bool) -> tuple[Optional[bool], Optional[int], Optional[str]]:
+    """Parse the ``/auto`` argument → ``(new_on, new_cap, error)``.
+
+    ``new_cap`` is ``None`` when the cap is unchanged. Pure — unit-tested in
+    ``tests/unit/test_auto_continue.py``.
+    """
+    a = arg.strip().lower()
+    if not a:
+        return (not cur_on, None, None)
+    if a in ("off", "stop", "no"):
+        return (False, None, None)
+    if a in ("on", "yes"):
+        return (True, None, None)
+    if a.isdigit() and int(a) > 0:
+        return (True, int(a), None)
+    return (None, None, "usage: /auto [N | on | off]  (N = max consecutive auto steps)")
+
+
+def _auto_continue_should_arm(on: bool, depth: int, cap: int, suggestion: str) -> tuple[bool, str]:
+    """Decide whether a countdown auto-submit may be armed. Pure.
+
+    Returns ``(arm, reason)`` where ``reason`` names the blocking condition
+    (``"off" | "no_suggestion" | "cap_reached"``) — callers use it to notify
+    the cap stop exactly once instead of silently going quiet.
+    """
+    if not on:
+        return (False, "off")
+    if not suggestion:
+        return (False, "no_suggestion")
+    if depth >= cap:
+        return (False, "cap_reached")
+    return (True, "")
+
 
 def _text_has_hangul(s: str) -> bool:
     """Return True if *s* contains a Hangul syllable or Jamo.
@@ -5284,7 +5359,8 @@ def _text_has_hangul(s: str) -> bool:
     return False
 
 
-def _validate_next_suggestion(text: str, user_request: str) -> Optional[str]:
+def _validate_next_suggestion(text: str, user_request: str,
+                              max_len: int = 140) -> Optional[str]:
     """Enforce the rules stated in ``_NEXT_SUGGEST_SYSTEM`` structurally.
 
     The system prompt already tells the model: one short imperative line, same
@@ -5292,6 +5368,10 @@ def _validate_next_suggestion(text: str, user_request: str) -> Optional[str]:
     those rules must not leak noise onto the prompt (e.g. an English
     restatement of a Korean request). Returns the cleaned text, or ``None`` to
     suppress. Character-class based — no keyword/regex heuristics.
+
+    ``max_len``: 140 for the display-hint contract ("under 100 characters" +
+    tokenization-overshoot buffer); auto-continue instructions pass
+    ``_AUTO_SUGGESTION_MAX_LEN`` (self-contained → longer budget).
     """
     # Self-contained: don't rely on the caller having stripped.
     text = text.strip()
@@ -5299,9 +5379,7 @@ def _validate_next_suggestion(text: str, user_request: str) -> Optional[str]:
         return None
     if re.match(r"(?i)^none[.!?]?$", text):
         return None
-    # System prompt says "under 100 characters"; allow a modest buffer for
-    # tokenization overshoot, reject anything unfit for a one-line ghost.
-    if len(text) > 140:
+    if len(text) > max_len:
         return None
     # Language/script guard: a Korean request (Hangul) must yield a Korean
     # suggestion. All-ASCII reply to Hangul input == rule violation
@@ -5321,6 +5399,106 @@ def _invalidate_next_suggestion() -> None:
     global _next_prompt_suggestion, _next_suggestion_gen
     _next_suggestion_gen += 1
     _next_prompt_suggestion = ""
+    _cancel_auto_submit()
+
+
+def _cancel_auto_submit() -> None:
+    """Cancel any pending auto-continue countdown (typing / Esc / new turn / mode off)."""
+    global _auto_submit_gen, _auto_countdown_active
+    _auto_submit_gen += 1
+    _auto_countdown_active = False
+
+
+def _maybe_arm_auto_submit() -> None:
+    """Arm the countdown auto-submit for the currently displayed suggestion.
+
+    Called from inside the prompt app context (``_deliver_next_suggestion``'s
+    apply, or ``_collect_input``'s pre_run seeding), only for the main prompt
+    (``_input_underline``). A ``threading.Timer`` fires after
+    ``_AUTO_CONTINUE_DELAY``; the submit re-checks every liveness condition at
+    fire time, so cancellation is generation-based — no timer bookkeeping.
+    """
+    global _auto_submit_gen, _auto_countdown_active
+    st = _auto_continue_state
+    arm, reason = _auto_continue_should_arm(
+        st["on"], st["depth"], st["cap"], _next_prompt_suggestion)
+    if not arm:
+        if reason == "cap_reached":
+            # Notify once, then stand down until the user re-anchors (manual
+            # input resets depth) or re-arms via /auto.
+            st["depth"] = 0
+            _notify_above_prompt(
+                f"  🔁 auto-continue: cap reached ({st['cap']} consecutive steps) — "
+                "paused until your next input", _C["yellow"])
+        return
+    _auto_submit_gen += 1
+    _auto_countdown_active = True
+    gen = _auto_submit_gen
+    sug_gen = _next_suggestion_gen
+    _notify_above_prompt(
+        f"  🔁 auto-continue {st['depth'] + 1}/{st['cap']} in "
+        f"{_AUTO_CONTINUE_DELAY:.0f}s — type/Esc to cancel · Enter to run now",
+        _C["muted"])
+
+    def _fire() -> None:
+        _sess = _prompt_session
+        _app = getattr(_sess, "app", None) if _sess is not None else None
+        if _app is None or not _app.is_running:
+            return
+        _loop = getattr(_app, "loop", None)
+        if _loop is None:
+            return
+        _loop.call_soon_threadsafe(lambda: _auto_submit_now(gen, sug_gen))
+
+    _t = threading.Timer(_AUTO_CONTINUE_DELAY, _fire)
+    _t.daemon = True
+    _t.start()
+
+
+def _auto_submit_now(gen: int, sug_gen: int) -> None:
+    """Submit the ghost suggestion as this prompt's input (runs in the app loop).
+
+    Every condition is re-validated here — a stale timer must be a no-op:
+    countdown cancelled (gen), a new turn started (sug_gen), auto turned off,
+    an auxiliary y/N prompt is showing (``_input_underline`` off), or the user
+    started typing (non-empty buffer).
+    """
+    global _last_input_was_auto, _auto_countdown_active
+    if gen != _auto_submit_gen or sug_gen != _next_suggestion_gen:
+        return
+    if not _auto_continue_state["on"] or not _input_underline:
+        return
+    _sess = _prompt_session
+    _app = getattr(_sess, "app", None) if _sess is not None else None
+    if _app is None or not _app.is_running:
+        return
+    try:
+        _buf = _app.current_buffer
+        if _buf.text or not _next_prompt_suggestion:
+            return
+        _auto_countdown_active = False
+        _last_input_was_auto = True
+        _buf.insert_text(_next_prompt_suggestion)
+        _buf.validate_and_handle()
+    except Exception:
+        _last_input_was_auto = False
+        logging.getLogger(__name__).debug("auto-continue submit failed", exc_info=True)
+
+
+def _notify_above_prompt(text: str, color: str) -> None:
+    """Print a one-line notice above the live prompt without corrupting it.
+
+    A plain ``_print`` suffices: the live prompt always runs inside
+    ``patch_stdout(raw=True)``, whose proxy reflows writes from ANY thread
+    above the prompt. ``run_in_terminal`` must NOT be used here — it calls
+    ``ensure_future()`` and this is reached from the suggestion worker thread,
+    which has no running event loop (RuntimeError + a leaked never-awaited
+    coroutine warning).
+    """
+    try:
+        _print(text, color)
+    except Exception:
+        pass
 
 
 def _deliver_next_suggestion(text: str, gen: int) -> None:
@@ -5347,6 +5525,7 @@ def _deliver_next_suggestion(text: str, gen: int) -> None:
                         and _next_prompt_suggestion):
                     _buf.suggestion = Suggestion(_next_prompt_suggestion)
                     _app.invalidate()
+                    _maybe_arm_auto_submit()
             except Exception:
                 pass
         _loop = getattr(_app, "loop", None)
@@ -5357,8 +5536,14 @@ def _deliver_next_suggestion(text: str, gen: int) -> None:
 
 
 def _kick_next_prompt_suggestion(llm_client, model: str, user_request: str,
-                                 final_message: str, digest: str) -> None:
+                                 final_message: str, digest: str,
+                                 auto_mode: bool = False) -> None:
     """Generate a "next task" suggestion in the background after turn end (fire-and-forget).
+
+    ``auto_mode``: the suggestion will be countdown-submitted as the next turn's
+    instruction (``/auto``), so use the stricter ``_AUTO_NEXT_SUGGEST_SYSTEM``
+    contract (required-follow-up only, self-contained, NONE default) and the
+    longer length budget. A NONE reply is the loop's natural stop — notify it.
 
     Failures/delays are silently ignored — a supplementary feature must never
     block the main flow. While this call runs, external_llm INFO/WARNING logs
@@ -5393,16 +5578,26 @@ def _kick_next_prompt_suggestion(llm_client, model: str, user_request: str,
                 return
             resp = llm_client.chat(
                 messages=[
-                    LLMMessage(role="system", content=_NEXT_SUGGEST_SYSTEM),
+                    LLMMessage(role="system", content=(
+                        _AUTO_NEXT_SUGGEST_SYSTEM if auto_mode
+                        else _NEXT_SUGGEST_SYSTEM)),
                     LLMMessage(role="user", content="\n\n".join(parts)),
                 ],
                 model=model, temperature=0.3, max_tokens=1024,
             )
             _lines = effective_content(resp).strip().strip('"\'`').splitlines()
             text = _validate_next_suggestion(
-                _lines[0].strip() if _lines else "", user_request)
+                _lines[0].strip() if _lines else "", user_request,
+                max_len=_AUTO_SUGGESTION_MAX_LEN if auto_mode else 140)
             # System prompt rule (language match·length·preamble forbid·NONE) violations are suppressed
             if text is None:
+                if auto_mode and gen == _next_suggestion_gen and _auto_continue_state["on"]:
+                    # NONE (or rule violation) = the loop's natural stop — say so
+                    # instead of going silent at the prompt.
+                    _d = _auto_continue_state["depth"]
+                    _notify_above_prompt(
+                        "  🔁 auto-continue: no required follow-up — stopped"
+                        + (f" after {_d} auto step(s)" if _d else ""), _C["muted"])
                 return
             _deliver_next_suggestion(text, gen)
         except Exception:
@@ -5628,7 +5823,14 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
         kb = KeyBindings()
         @kb.add('escape')
         def _handle_escape(event):
-            pass  # Silently ignore lone ESC (matches current behavior)
+            # Lone ESC: veto a pending auto-continue countdown (this turn only —
+            # /auto mode itself stays on). Otherwise silently ignored (matches
+            # previous behavior).
+            if _auto_countdown_active:
+                _cancel_auto_submit()
+                _notify_above_prompt(
+                    "  🔁 auto-continue: cancelled this step (mode stays on — /auto off to disable)",
+                    _C["muted"])
         # Ctrl+C: clear buffer only if input is in progress, require double press on empty prompt
         # to propagate KeyboardInterrupt (session exit) — prevents accidental
         # loss of a long session from a habitual single Ctrl+C (paste cancel, etc.). Ctrl+D exits immediately.
@@ -5662,9 +5864,18 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
         #  requires an extra press in Korean, so submit stays as single Enter.)
         @kb.add('enter')
         def _handle_enter(event):
-            global _ctrlc_armed
+            global _ctrlc_armed, _last_input_was_auto
             _ctrlc_armed = False
-            event.current_buffer.validate_and_handle()
+            _buf = event.current_buffer
+            # Enter on an empty buffer while an auto-continue countdown is
+            # pending = "run now": accept the ghost as this auto step (still
+            # counted against the depth cap).
+            if (_auto_countdown_active and not _buf.text
+                    and _next_prompt_suggestion and _input_underline):
+                _cancel_auto_submit()
+                _last_input_was_auto = True
+                _buf.insert_text(_next_prompt_suggestion)
+            _buf.validate_and_handle()
         # Option(Alt)+Enter: insert newline
         @kb.add('escape', 'enter')
         def _force_newline_meta_enter(event):
@@ -5737,6 +5948,11 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
         def _disarm_ctrlc(_buf):
             global _ctrlc_armed
             _ctrlc_armed = False
+            # Typing vetoes a pending auto-continue countdown (the auto submit
+            # itself inserts text, but it deactivates the countdown first, so
+            # this only fires for real user keystrokes).
+            if _auto_countdown_active:
+                _cancel_auto_submit()
         _prompt_session.default_buffer.on_text_changed += _disarm_ctrlc
         # ── Input underline layout ────────────────────────────
         # Default bottom_toolbar is always fixed at screen bottom (large gap of cursor-above margin),
@@ -5850,6 +6066,7 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
                 _buf = _prompt_session.app.current_buffer
                 if not _buf.text and _next_prompt_suggestion:
                     _buf.suggestion = _Sugg(_next_prompt_suggestion)
+                    _maybe_arm_auto_submit()
             except Exception:
                 pass
 
@@ -6388,7 +6605,7 @@ def _dropped_entries(orig_ents: list, result_ents: list) -> list:
 
 
 def run_repl(args: argparse.Namespace) -> None:
-    global _prompt_history_path, _REPO_ROOT
+    global _prompt_history_path, _REPO_ROOT, _last_input_was_auto
     repo_root = _resolve_repo_root(args.repo)
     _REPO_ROOT = repo_root
     _prompt_history_path = str(Path(repo_root) / ".asicode" / "cli_history")
@@ -7117,7 +7334,24 @@ def run_repl(args: argparse.Namespace) -> None:
                 _think_label = f"think ON ({_reasoning_effort})"
             _key_hints = "Alt+Enter new line"
             _status_bits = [f"{_provider_str} / {_model_str}", _think_label]
+            if _auto_continue_state["on"]:
+                # Persistent mode indicator — the countdown fires turns later,
+                # so the user must be able to see the mode is armed.
+                _status_bits.append(
+                    f"🔁 auto {_auto_continue_state['depth']}/{_auto_continue_state['cap']}")
             user_input = _prompt_input(chat_mode=_current_mode, status="  ·  ".join([*_status_bits, _key_hints]))
+            # ── Auto-continue depth bookkeeping ──
+            # Countdown-submitted input deepens the chain (capped); any manual
+            # input re-anchors the loop (depth reset) — the user took over.
+            _was_auto_input = _last_input_was_auto
+            _last_input_was_auto = False
+            if _was_auto_input:
+                _auto_continue_state["depth"] += 1
+                _print(
+                    f"  🔁 auto-continue step {_auto_continue_state['depth']}/{_auto_continue_state['cap']}",
+                    _C["muted"])
+            else:
+                _auto_continue_state["depth"] = 0
 
             # ── Image file drag/clipboard/Data URL detection → base64 conversion ──
             _current_user_images: list[dict[str, str]] = []
@@ -8048,6 +8282,33 @@ def run_repl(args: argparse.Namespace) -> None:
             _print(f"  thinking/reasoning → {_state_label}", _C["sky"])
             continue
 
+        # ── /auto [N|on|off] — auto-continue the suggested next step (self-improve loop) ──
+        if _cmd_name == "/auto":
+            _auto_arg = _cmd_tok[1].strip() if len(_cmd_tok) > 1 else ""
+            _new_on, _new_cap, _auto_err = _parse_auto_arg(
+                _auto_arg, _auto_continue_state["on"])
+            if _auto_err:
+                _print(f"  {_auto_err}", _C["yellow"])
+                continue
+            _auto_continue_state["on"] = _new_on
+            if _new_cap is not None:
+                _auto_continue_state["cap"] = _new_cap
+            _auto_continue_state["depth"] = 0  # every /auto re-anchors the loop
+            if _new_on:
+                _print(
+                    f"  🔁 auto-continue ON — after each turn, a REQUIRED next step is "
+                    f"auto-run after {_AUTO_CONTINUE_DELAY:.0f}s (max {_auto_continue_state['cap']} "
+                    "consecutive; type/Esc cancels, Enter runs now, /auto off disables)",
+                    _C["sky"])
+                if not _cfg.display.NEXT_SUGGEST:
+                    _print("  ▲ next-step suggestion is disabled in config "
+                           "(display.NEXT_SUGGEST) — auto-continue will never fire.",
+                           _C["yellow"])
+            else:
+                _cancel_auto_submit()
+                _print("  🔁 auto-continue OFF", _C["sky"])
+            continue
+
         # Pure mode switch with no message → wait for next input
         if _mode_switched and not user_input:
             continue
@@ -8067,7 +8328,7 @@ def run_repl(args: argparse.Namespace) -> None:
             # build_context_messages picks it up as the current request (same
             # contract as the design-chat path).  in_progress guards parallel
             # terminals sharing this session.
-            _session_mgr.add_turn(_session_id, "user", _orch_task, in_progress=True)
+            _session_mgr.add_turn(_session_id, "user", _orch_task, in_progress=True, auto=_was_auto_input)
             from external_llm.agent.orchestrator import (
                 OrchestratorAgent, OrchestratorConfig,
             )
@@ -8204,6 +8465,7 @@ def run_repl(args: argparse.Namespace) -> None:
                         _session_id, "assistant", _orch_summary,
                         model=svc.model or "",
                         digest=_build_orchestrator_digest(_orch_result),
+                        auto=_was_auto_input,
                     )
                     # Schedule background compression so orchestrator history does
                     # not grow unbounded (same safeguard as design-chat).
@@ -8220,6 +8482,7 @@ def run_repl(args: argparse.Namespace) -> None:
                     _session_mgr.add_turn(
                         _session_id, "assistant", "[Orchestration produced no result.]",
                         model=svc.model or "",
+                        auto=_was_auto_input,
                     )
                 except Exception:
                     pass
@@ -8239,7 +8502,7 @@ def run_repl(args: argparse.Namespace) -> None:
             # in_progress: marks this request as being processed until tool-loop ends and assistant turn recorded
             # — prevents other terminals sharing the same session from
             # mistaking it for their own request and duplicating execution
-            _session_mgr.add_turn(_session_id, "user", _store_content, in_progress=True)
+            _session_mgr.add_turn(_session_id, "user", _store_content, in_progress=True, auto=_was_auto_input)
             _ds = _session_mgr.get_or_create(_session_id)
             _context_msgs = _session_mgr.build_context_messages(_ds, current_model=svc.model or "", mode=_current_chat_mode)
             # Attach images to the LAST USER message — the context builder may
@@ -8360,6 +8623,7 @@ def run_repl(args: argparse.Namespace) -> None:
                 _print("  ▲ design chat returned no result — please retry.", _C["yellow"])
                 _session_mgr.add_turn(
                     _session_id, "assistant", "[No result — please retry.]", model=svc.model or "",
+                    auto=_was_auto_input,
                 )
                 continue
         except KeyboardInterrupt:
@@ -8374,6 +8638,7 @@ def run_repl(args: argparse.Namespace) -> None:
                 _tb.print_exc()
             _session_mgr.add_turn(
                 _session_id, "assistant", f"[Error: {_de}]", model=svc.model or "",
+                auto=_was_auto_input,
             )
             continue
         # Design chat token display (design chat + cache + session cumulative on one line)
@@ -8508,6 +8773,7 @@ def run_repl(args: argparse.Namespace) -> None:
         _session_mgr.add_turn(
             _session_id, "assistant", chat_result.content, model=svc.model or "",
             digest=_turn_digest,
+            auto=_was_auto_input,
         )
         if not chat_result.is_error:
             _comp_client, _comp_model = _get_compress_llm()
@@ -8548,9 +8814,14 @@ def run_repl(args: argparse.Namespace) -> None:
                 _sug_client, _sug_model = _get_compress_llm()
                 _kick_next_prompt_suggestion(
                     _sug_client, _sug_model, user_input,
-                    chat_result.content or "", _turn_digest)
+                    chat_result.content or "", _turn_digest,
+                    auto_mode=_auto_continue_state["on"])
             except Exception:
                 pass  # suggestion is supplementary — failure does not block turn completion
+        elif chat_result.is_error and _auto_continue_state["on"]:
+            # An error turn generates no suggestion, so the auto loop stops here —
+            # say so instead of going silent at the prompt.
+            _print("  🔁 auto-continue: turn ended with an error — stopped", _C["yellow"])
 
         _print("")  # blank line
         # Auto compact if save_insight exceeded budget (after run ends, outside agent turn)

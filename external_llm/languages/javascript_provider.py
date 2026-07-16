@@ -13,7 +13,13 @@ import re
 import subprocess
 from typing import Optional
 
-from .base import SyntaxProvider, _replace_last_cmd_path, _tempfile_for_content, detect_project_root
+from .base import (
+    SyntaxProvider,
+    _replace_last_cmd_path,
+    _tempfile_for_content,
+    detect_project_root,
+    tree_sitter_syntax_fallback,
+)
 from .models import (
     LanguageCapabilities,
     LanguageId,
@@ -84,8 +90,8 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
                     cwd=os.path.dirname(_tmp_path) or ".",
                 )
             except FileNotFoundError:
-                logger.debug("node not installed; skipping JS validation")
-                return SyntaxValidationResult(ok=True, language=LanguageId.JAVASCRIPT)
+                logger.debug("node not installed; falling back to tree-sitter")
+                return tree_sitter_syntax_fallback(content, LanguageId.JAVASCRIPT, file_path)
             except subprocess.TimeoutExpired:
                 return SyntaxValidationResult(ok=True, language=LanguageId.JAVASCRIPT)
             except Exception:

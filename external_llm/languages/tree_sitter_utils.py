@@ -8,7 +8,10 @@ so callers can fall back to regex-based heuristics.
 from __future__ import annotations
 
 import logging
+import os
+import re
 import threading
+from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional
@@ -39,12 +42,32 @@ _PARSER_TLS = threading.local()
 
 # Sentinel distinguishing "no entry yet" from a cached None (negative cache
 # from a failed language-binding load). A module-level object is identity-safe
-# across threads.
+# across threads. Used by the parser TLS cache AND the compiled-query cache
+# (_compile_query) — the single sentinel serves both.
 _MISS = object()
+
+# Memoised UTF-8 encoding: the same content is encoded by query_captures,
+# query_matches, extract_import_names, and find_anchor_node.  Caching avoids
+# re-encoding a 300 KB file 4 times per scan pipeline.
+@lru_cache(maxsize=128)
+def _encode_content(content: str) -> bytes:
+    """Memoised UTF-8 encoding of *content*."""
+    return content.encode("utf-8")
+
+
+# Leading import-keyword prefix stripped from an @source capture that spans
+# the whole import declaration.  Scala's grammar inlines the dotted path into
+# separate identifier nodes, so we capture the declaration node and drop the
+# keyword here.  No-op for languages whose @source capture is already the bare
+# module path (identifier / qualified_name / string literal).  Scala only uses
+# `import` (never `using`) for imports, so that is the only keyword handled.
+_IMPORT_KW_RE = re.compile(r"^import\s+")
+
 
 # Map our language ids to the tree-sitter language module import path
 _LANG_MODULE_MAP = {
     "typescript": "tree_sitter_typescript",
+    "tsx": "tree_sitter_typescript",  # same package exports language_tsx()
     "javascript": "tree_sitter_javascript",
     "go": "tree_sitter_go",
     "java": "tree_sitter_java",
@@ -64,13 +87,81 @@ _LANG_MODULE_MAP = {
     "lua": "tree_sitter_lua",
     "bash": "tree_sitter_bash",
 }
+# JS/TS file-extension → tree-sitter grammar key mapping.
+# Single source of truth so that code_integrity.py, base.py, and other callers
+# don't duplicate this logic.
+_EXT_TO_GRAMMAR_KEY: dict[str, str] = {
+    # JS/TS
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".mts": "typescript",
+    ".cts": "typescript",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    # Go / Java / Kotlin / Python
+    ".go": "go",
+    ".java": "java",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".py": "python",
+    ".pyi": "python",
+    # C / C++ family
+    ".c": "c",
+    ".h": "c",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".hpp": "cpp",
+    ".hh": "cpp",
+    # Other full-AST languages (symbol / call / import queries available)
+    ".rs": "rust",
+    ".rb": "ruby",
+    ".php": "php",
+    ".cs": "c_sharp",
+    ".swift": "swift",
+    ".scala": "scala",
+    ".sc": "scala",
+    ".lua": "lua",
+    ".sh": "bash",
+    ".bash": "bash",
+}
+
+
+def grammar_key_for_path(file_path: str) -> str | None:
+    """Return tree-sitter grammar key for *file_path*, or ``None`` for unknown extensions.
+
+    Single canonical mapping for file extension → tree-sitter grammar key.
+    Covers all languages with full AST query support (symbol, call, import, reference queries).
+
+    ``None`` tells the caller to use its own default (typically ``"typescript"``
+    or ``lang_id.value``), so this function stays a pure extension-to-key mapper
+    without imposing a fallback policy.
+    """
+    if not file_path:
+        return None
+    return _EXT_TO_GRAMMAR_KEY.get(os.path.splitext(file_path)[1].lower())
+
+
+def grammar_key_for_ext(ext: str) -> str | None:
+    """Return tree-sitter grammar key for a file *ext* (including leading dot), or ``None``.
+
+    Same canonical mapping as :func:`grammar_key_for_path` but takes a bare extension
+    (e.g. ``.tsx``, ``.go``) instead of a full file path.  Use when the caller already
+    has the extension and wants to avoid constructing a dummy path.
+    """
+    return _EXT_TO_GRAMMAR_KEY.get(ext.lower())
+
+
 # ── tree-sitter-language-pack fallback ───────────────────────────────────────
 # language-pack bundles 300+ prebuilt grammars behind a unified get_language()
 # API (1.9 MB, full platform wheel coverage). It is used as a FALLBACK when the
 # individual tree_sitter_<lang> modules are not installed. Resolved lazily so
-# the module loads fine without it. Re-probed on every miss until it succeeds,
-# so a freshly `pip install`ed pack is picked up live (after _LANG_CACHE.clear())
-# without a process restart.
+# the module loads fine without it.  _resolve_lang_pack() re-probes on every call
+# (no negative cache), but _get_language() DOES cache failures (None) — after a
+# miss, subsequent calls return None without re-probing.  Live pickup after a late
+# pip-install works because the dependency checker calls _LANG_CACHE.clear() first.
 _LANG_PACK_GET_LANGUAGE = None
 
 
@@ -128,7 +219,6 @@ _SYMBOL_NODE_TYPES = {
     # Java / Kotlin
     "constructor_declaration",
     "object_declaration",
-    "companion_object",
     # Python
     "function_definition",
     "class_definition",
@@ -161,7 +251,6 @@ _SYMBOL_NODE_TYPES = {
     "delegate_declaration",
     # Swift
     "protocol_declaration",
-    "import_declaration",
     # Scala
     "object_definition",
     "trait_definition",
@@ -302,6 +391,7 @@ _SYMBOL_QUERIES: dict[str, str] = {
 }
 
 
+_SYMBOL_QUERIES["tsx"] = _SYMBOL_QUERIES["typescript"]
 # Per-language queries for extracting call expressions.
 # Captures:
 #   @call  — the call expression node itself
@@ -366,6 +456,7 @@ _CALL_QUERIES: dict[str, str] = {
 """,
 }
 
+_CALL_QUERIES["tsx"] = _CALL_QUERIES["typescript"]
 # Per-language queries for extracting import statements.
 # Captures:
 #   @import — the import statement node
@@ -412,11 +503,31 @@ _IMPORT_QUERIES: dict[str, str] = {
 (import_declaration (identifier) @source) @import
 """,
     "scala": """
-(import_declaration) @import
+(import_declaration) @source
+""",
+    # Ruby: require/require_relative "<gem>" — @source is the string argument.
+    "ruby": """
+(call (identifier) @_fn (#match? @_fn "^(require|require_relative)$") (argument_list (string) @source))
+""",
+    # Lua: require "mod" / require("mod") — @source is the string argument.
+    "lua": """
+(function_call (identifier) @_fn (#eq? @_fn "require") (arguments (string) @source))
+""",
+    # Bash: source file / . file — @source is the word *or* string argument.
+    # Bare words (source ./script.sh) parse as (word); quoted strings
+    # (source "$dir/script.sh") parse as (string).  Both must be captured.
+    "bash": """
+(command (command_name) @_cmd (#match? @_cmd "^(source|\\.)$")
+  [
+    (word) @source
+    (string) @source
+  ]
+)
 """,
 }
 
 
+_IMPORT_QUERIES["tsx"] = _IMPORT_QUERIES["typescript"]
 # Per-language queries for extracting identifier references.
 # Captures:
 #   @ref — an identifier node in a potentially-referencing context
@@ -452,10 +563,11 @@ _REFERENCE_QUERIES: dict[str, str] = {
     "swift": "(simple_identifier) @ref",
     "scala": "(identifier) @ref",
     "lua": "(identifier) @ref",
-    "bash": "(word) @ref",
+    "bash": "(variable_name) @ref",
 }
 
 
+_REFERENCE_QUERIES["tsx"] = _REFERENCE_QUERIES["typescript"]
 def get_available_languages() -> set[str]:
     """Return set of language names whose tree-sitter bindings are installed."""
     available = set()
@@ -491,6 +603,8 @@ def _get_language(language: str) -> object | None:
             # tree-sitter-typescript exposes .language_typescript() and .language_tsx()
             if language == "typescript":
                 raw = mod.language_typescript()
+            elif language == "tsx":
+                raw = mod.language_tsx()
             else:
                 # Standard convention: module.language()
                 try:
@@ -571,7 +685,7 @@ def get_parser(language: str):
 
 # ── Query API ─────────────────────────────────────────────────────────────────
 
-# Compiled Query cache: (language, query_string) → tree_sitter.Query (thread-safe).
+# Compiled Query cache: (language_name, query_string) → tree_sitter.Query | None (thread-safe).
 # Query objects are immutable once compiled and are safe to share across threads
 # (only QueryCursor, which is created fresh per call, carries per-match state).
 # Query strings come from a small finite set of module constants (_SYMBOL_QUERIES,
@@ -581,21 +695,46 @@ def get_parser(language: str):
 _QUERY_CACHE: dict[tuple[str, str], object] = {}
 _QUERY_CACHE_LOCK = threading.RLock()
 
+# _MISS sentinel is defined at module level (see above) — reused here for
+# the query cache's absence-check pattern.
 
-def _compile_query(lang_obj, query_string: str):
+def invalidate_caches() -> None:
+    """Atomically clear all tree-sitter caches (language, parse, query).
+
+    Called by the dependency checker after a late pip-install so that newly
+    installed grammars take effect without a process restart.
+    All three caches are cleared under the ``_LANG_CACHE_LOCK`` (an RLock) to
+    prevent interleaved reads from seeing a partially-invalidated state.
+    ``_QUERY_CACHE_LOCK`` is also acquired in the correct lock order
+    (``_LANG_CACHE_LOCK`` → ``_QUERY_CACHE_LOCK``, matching ``_get_language``)
+    to avoid deadlock.
+    """
+    with _LANG_CACHE_LOCK:
+        _LANG_CACHE.clear()
+        parse_to_tree.cache_clear()
+        with _QUERY_CACHE_LOCK:
+            _QUERY_CACHE.clear()
+
+
+def _compile_query(language: str, lang_obj, query_string: str):
     """Compile (or fetch a cached) tree-sitter Query for *lang_obj*.
 
     Returns a ``tree_sitter.Query`` or None if the query string is invalid.
     Thread-safe: Query objects are immutable, so a shared cache guarded by
     ``_QUERY_CACHE_LOCK`` is sufficient.
+
+    Cache keyed by ``(language, query_string)`` — the language name string,
+    not ``id(lang_obj)``, to avoid stale hits after a GC reuses an address.
+    Failed compilations (None) are also cached via a sentinel so that an
+    invalid query string does not trigger re-compilation on every call.
     """
     if not _HAS_TREE_SITTER:
         return None
 
-    cache_key = (id(lang_obj), query_string)
+    cache_key = (language, query_string)
     with _QUERY_CACHE_LOCK:
-        cached = _QUERY_CACHE.get(cache_key)
-        if cached is not None:
+        cached = _QUERY_CACHE.get(cache_key, _MISS)
+        if cached is not _MISS:
             return cached
 
     try:
@@ -604,10 +743,10 @@ def _compile_query(lang_obj, query_string: str):
         try:
             query = _ts.Query(lang_obj, query_string)
         except Exception:
-            return None
+            query = None
     except Exception:
         # Invalid query string (QueryError) or other issue
-        return None
+        query = None
 
     with _QUERY_CACHE_LOCK:
         _QUERY_CACHE[cache_key] = query
@@ -636,7 +775,7 @@ def query_captures(
     if tree is None:
         return []
 
-    query = _compile_query(lang_obj, query_string)
+    query = _compile_query(language, lang_obj, query_string)
     if query is None:
         return []
 
@@ -646,7 +785,7 @@ def query_captures(
     except Exception:
         return []
 
-    code_bytes = content.encode("utf-8")
+    code_bytes = _encode_content(content)
     results: list[QueryCapture] = []
 
     for capture_name, nodes in captures_raw.items():
@@ -687,7 +826,7 @@ def query_matches(
     if tree is None:
         return []
 
-    query = _compile_query(lang_obj, query_string)
+    query = _compile_query(language, lang_obj, query_string)
     if query is None:
         return []
 
@@ -697,7 +836,7 @@ def query_matches(
     except Exception:
         return []
 
-    code_bytes = content.encode("utf-8")
+    code_bytes = _encode_content(content)
     results: list[dict[str, list[QueryCapture]]] = []
 
     for (_pattern_idx, captures_dict) in matches_raw:
@@ -736,16 +875,17 @@ def has_error(content: str, language: str) -> Optional[bool]:
     if tree is None:
         return None
 
-    # Iterative DFS: avoids Python recursion-limit blow-up on deep trees.
-    stack = [tree.root_node]
-    while stack:
-        node = stack.pop()
-        if node.type == "ERROR" or node.is_missing:
-            return True
-        # Extend in place; node.children is a read-only sequence view.
-        stack.extend(node.children)
+    # Fast-path: root_node.has_error is an O(1) cached flag maintained by
+    # tree-sitter internally, covering both ERROR and MISSING descendant nodes.
+    # Benchmarked ~99,000x faster than a full DFS for a 2000-line valid file.
+    if not tree.root_node.has_error:
+        return False
 
-    return False
+    # has_error is definitionally equivalent to "any descendant is ERROR or
+    # MISSING" — verified empirically across C/Java/Go error variants (see
+    # test_tree_sitter_utils.py for exhaustive coverage).  The remaining DFS
+    # would always yield the same True, so we short-circuit to the return.
+    return True
 
 
 @dataclass(frozen=True)
@@ -885,8 +1025,20 @@ def extract_imports(
     for c in caps:
         if c.capture_name != "source":
             continue
-        # Clean module path: strip quotes, semicolons, whitespace
+        # Clean module path: strip surrounding whitespace, quotes, and semicolons.
         module = c.text.strip().strip('\"\';')
+        # Scala captures the whole import_declaration node, which includes the
+        # leading `import`/`using` keyword; strip it.  Every other language's
+        # @source capture is a child node that already excludes the keyword, so
+        # the strip is a no-op there — but scope it to Scala to avoid corrupting
+        # a pathological module path such as lua `require("import foo")`.
+        if language == "scala":
+            module = _IMPORT_KW_RE.sub("", module)
+            # Strip namespace selectors and wildcard suffixes from module path.
+            # tree-sitter-scala has no scoped_identifier node, so @source captures
+            # the entire declaration including selectors like `{c, d}` / `_` / `*`.
+            #   e.g., "a.b.{c, d}" → "a.b",  "a.b._" → "a.b",  "a.b.*" → "a.b"
+            module = re.sub(r"\.(?:\{[^}]*\}|_|\*)\s*$", "", module)
         key = (module, c.start_line)
         if key in seen:
             continue
@@ -914,12 +1066,12 @@ def extract_import_names(
     TypeScript/JavaScript only.  Returns an empty list for other languages
     or when tree-sitter is unavailable.
     """
-    if language not in ("typescript", "javascript"):
+    if language not in ("typescript", "javascript", "tsx"):
         return []
     tree = parse_to_tree(content, language)
     if tree is None:
         return []
-    code_bytes = content.encode("utf-8")
+    code_bytes = _encode_content(content)
     results: list[tuple[str, str]] = []
 
     def _text(n) -> str:
@@ -944,7 +1096,12 @@ def extract_import_names(
                     if alias_node is not None:
                         results.append((module, _text(alias_node)))
 
-    def _walk(node) -> None:
+    # Iterative DFS (explicit stack) — avoids Python recursion-limit blow-up
+    # on deeply nested / machine-generated inputs. Mirrors the original
+    # recursive _walk: pre-order traversal over ALL children (named + unnamed).
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
         if node.type in ("import_statement", "export_statement"):
             src = node.child_by_field_name("source")
             if src is not None:
@@ -955,10 +1112,7 @@ def extract_import_names(
                     elif ch.type == "export_clause":
                         _emit_specifiers(node, module)
                         break
-        for ch in node.children:
-            _walk(ch)
-
-    _walk(tree.root_node)
+        stack.extend(reversed(node.children))
     return results
 
 
@@ -1050,8 +1204,87 @@ def _extract_name(node) -> Optional[str]:
     return None
 
 
+# ── Node-type → kind SSOT ────────────────────────────────────────────────────
+# Single source of truth shared by BOTH the manual-walk path (``_node_kind``)
+# and the query path (``_node_kind_from_type``).  Keeping one dict prevents the
+# two from silently drifting on shared node types — a class of bug that bit us
+# before (``lexical_declaration``/``object_declaration`` mapped inconsistently
+# between the two paths).  ``test_walk_and_query_agree_on_common_keys`` pins this.
+_BASE_KIND_MAP = {
+    # TypeScript / JavaScript
+    "function_declaration": "function",
+    "method_definition": "function",
+    "method_declaration": "function",
+    "field_definition": "assignment",
+    "public_field_definition": "assignment",
+    "expression_statement": "assignment",
+    "constructor_declaration": "function",
+    "class_declaration": "class",
+    "interface_declaration": "interface",
+    "type_alias_declaration": "type",
+    "enum_declaration": "enum",
+    "lexical_declaration": "assignment",
+    "variable_declaration": "assignment",
+    # Go
+    "type_declaration": "type",
+    "var_declaration": "variable",
+    "const_declaration": "constant",
+    "short_var_declaration": "variable",
+    # Python
+    "function_definition": "function",
+    "class_definition": "class",
+    "async_function_definition": "function",
+    # Rust
+    "function_item": "function",
+    "struct_item": "class",
+    "enum_item": "enum",
+    "trait_item": "interface",
+    "type_item": "type",
+    "const_item": "constant",
+    "static_item": "constant",
+    # C
+    "struct_specifier": "class",
+    "enum_specifier": "enum",
+    "union_specifier": "class",
+    "type_definition": "type",
+    # C++ only
+    "class_specifier": "class",
+    "namespace_definition": "namespace",
+    # Ruby
+    "class": "class",
+    "module": "namespace",
+    "method": "function",
+    # PHP
+    "trait_declaration": "class",
+    # C#
+    "namespace_declaration": "namespace",
+    "struct_declaration": "class",
+    "delegate_declaration": "function",
+    # Kotlin
+    "object_declaration": "class",
+    # Swift
+    "protocol_declaration": "interface",
+    # Scala
+    "object_definition": "class",
+    "trait_definition": "interface",
+}
+
+# CSS-only overlay — walk path only.  CSS uses no declarative query
+# (``_SYMBOL_QUERIES`` has no CSS entry), so these never reach the query path.
+# Selectors and custom properties get CSS-specific kinds (not the generic
+# "class"/"variable") so find_symbol's dispatch can route them distinctly and
+# they don't collide with Go structs / Rust consts.
+_CSS_KIND_MAP = {
+    "class_selector": "css_class",
+    "id_selector": "css_id",
+    "declaration": "css_variable",
+}
+
+_WALK_KIND_MAP = {**_BASE_KIND_MAP, **_CSS_KIND_MAP}
+
+
 def _node_kind(node) -> str:
-    """Map tree-sitter node type to our kind strings."""
+    """Map tree-sitter node type to our kind strings (manual-walk path)."""
     t = node.type
     if t == "export_statement":
         for child in node.children:
@@ -1064,62 +1297,7 @@ def _node_kind(node) -> str:
                               "async_function_definition"):
                 return _node_kind(child)
         return "function"
-    kind_map = {
-        "function_declaration": "function",
-        "method_definition": "function",
-        "method_declaration": "function",
-        "field_definition": "assignment",
-        "public_field_definition": "assignment",
-        "expression_statement": "assignment",
-        "constructor_declaration": "function",
-        "class_declaration": "class",
-        "interface_declaration": "interface",
-        "type_alias_declaration": "type",
-        "enum_declaration": "enum",
-        "lexical_declaration": "function",
-        "type_declaration": "type",
-        "var_declaration": "variable",
-        "const_declaration": "constant",
-        "short_var_declaration": "variable",
-        # Python
-        "function_definition": "function",
-        "class_definition": "class",
-        "async_function_definition": "function",
-        # Rust
-        "function_item": "function",
-        "struct_item": "class",
-        "enum_item": "enum",
-        "trait_item": "interface",
-        "type_item": "type",
-        "const_item": "constant",
-        "static_item": "constant",
-        "struct_specifier": "class",
-        "enum_specifier": "enum",
-        "union_specifier": "class",
-        "type_definition": "type",
-        # C++ only
-        "class_specifier": "class",
-        "namespace_definition": "namespace",
-        # Ruby
-        "class": "class",
-        "module": "namespace",
-        "method": "function",
-        "trait_declaration": "class",
-        # C#
-        "namespace_declaration": "namespace",
-        "struct_declaration": "class",
-        "delegate_declaration": "function",
-        "protocol_declaration": "interface",
-        "object_definition": "class",
-        "trait_definition": "interface",
-        # CSS — selectors and custom properties get CSS-specific kinds (not the
-        # generic "class"/"variable") so that find_symbol's dispatch can route
-        # them distinctly and they don't collide with Go structs / Rust consts.
-        "class_selector": "css_class",
-        "id_selector": "css_id",
-        "declaration": "css_variable",
-    }
-    return kind_map.get(t, "function")
+    return _WALK_KIND_MAP.get(t, "function")
 
 
 def find_symbol_range(
@@ -1204,6 +1382,7 @@ def find_all_symbols(
     # Iterative DFS (explicit stack) — avoids Python recursion-limit blow-up
     # on deeply nested / machine-generated inputs. Mirrors the original
     # _collect() descent rules exactly.
+    seen: set = set()
     stack = [root]
     while stack:
         node = stack.pop()
@@ -1214,11 +1393,10 @@ def find_all_symbols(
                 kind = _node_kind(node)
                 start = node.start_point.row + 1
                 end = node.end_point.row + 1
-                # Deduplicate against existing results
-                if not any(
-                    r[0] == name and r[2] == start and r[3] == end
-                    for r in results
-                ):
+                # Deduplicate against existing results (O(1) set lookup)
+                dedup_key = (name, start, end)
+                if dedup_key not in seen:
+                    seen.add(dedup_key)
                     results.append((name, kind, start, end))
                 # Container types (class/interface/enum/export): record AND
                 # descend into children to find nested symbols (methods,
@@ -1276,62 +1454,13 @@ def _find_all_symbols_via_query(
 
 
 def _node_kind_from_type(node_type: str) -> str:
-    """Map a tree-sitter node type string to kind string (no recursion needed)."""
-    kind_map = {
-        # Python
-        "function_definition": "function",
-        "async_function_definition": "function",
-        "class_definition": "class",
-        # TS/JS
-        "function_declaration": "function",
-        "class_declaration": "class",
-        "interface_declaration": "interface",
-        "type_alias_declaration": "type",
-        "enum_declaration": "enum",
-        "method_definition": "function",
-        "field_definition": "assignment",
-        "public_field_definition": "assignment",
-        "lexical_declaration": "assignment",
-        "variable_declaration": "assignment",
-        "expression_statement": "assignment",
-        # Go
-        "method_declaration": "function",
-        "type_declaration": "type",
-        "var_declaration": "variable",
-        "const_declaration": "constant",
-        "short_var_declaration": "variable",
-        # Java/Kotlin
-        "constructor_declaration": "function",
-        "object_declaration": "class",
-        # Rust
-        "function_item": "function",
-        "struct_item": "class",
-        "enum_item": "enum",
-        "trait_item": "interface",
-        "type_item": "type",
-        "const_item": "constant",
-        "static_item": "constant",
-        "struct_specifier": "class",
-        "enum_specifier": "enum",
-        "union_specifier": "class",
-        "type_definition": "type",
-        # C++ only
-        "class_specifier": "class",
-        "namespace_definition": "namespace",
-        # Ruby
-        "class": "class",
-        "module": "namespace",
-        "method": "function",
-        "trait_declaration": "class",
-        # C#
-        "namespace_declaration": "namespace",
-        "struct_declaration": "class",
-        "delegate_declaration": "function",
-        "protocol_declaration": "interface",
-        "object_definition": "class",
-        "trait_definition": "interface",
-    }
-    return kind_map.get(node_type, "function")
+    """Map a tree-sitter node type string to kind string (query path).
+
+    Shares ``_BASE_KIND_MAP`` with ``_node_kind`` so the two paths cannot drift
+    on common node types.  CSS-only types are absent here by design — CSS has no
+    declarative query, so those node types never reach this path.
+    """
+    return _BASE_KIND_MAP.get(node_type, "function")
 
 
 # ── CST utility functions (new in Phase 1) ──────────────────────────────────
@@ -1429,7 +1558,7 @@ def find_anchor_node(
             _has_next_named = True
         _parent_end_line = _parent_node.end_point[0] + 1  # 1-indexed
 
-    code_bytes = content.encode("utf-8")
+    code_bytes = _encode_content(content)
     return {
         "start_line": node.start_point[0] + 1,
         "end_line": node.end_point[0] + 1,
@@ -1461,7 +1590,7 @@ def parse_to_tree(content: str, language: str):
     if parser is None:
         return None
     try:
-        return parser.parse(content.encode("utf-8"))
+        return parser.parse(_encode_content(content))
     except Exception:
         return None
 
@@ -1498,15 +1627,15 @@ def structural_hash(node) -> str:
     # signature string. If a parent exists, that signature is appended to the
     # parent's parts (with the parent's field prefix); otherwise it is the
     # final result.
-    root_children = [
+    root_children = deque(
         (ch, (node.field_name_for_child(i) or ""))
         for i, ch in enumerate(node.children)
         if ch.is_named
-    ]
+    )
     # Each frame: (parts, pending_children, field_prefix)
     #   field_prefix — this frame's own field name (prefixed onto its
     #                  signature when appended to the parent)
-    stack: list[tuple[list[str], list, str]] = [
+    stack: list[tuple[list[str], deque, str]] = [
         ([node.type], root_children, ""),
     ]
     final_sig = None
@@ -1514,12 +1643,12 @@ def structural_hash(node) -> str:
     while stack:
         parts, children, field_prefix = stack[-1]
         if children:
-            child, child_field = children.pop(0)
-            child_children = [
+            child, child_field = children.popleft()
+            child_children = deque(
                 (ch, (child.field_name_for_child(j) or ""))
                 for j, ch in enumerate(child.children)
                 if ch.is_named
-            ]
+            )
             stack.append(([child.type], child_children, child_field))
             continue
         # All children consumed: finalize this node's signature.
@@ -1571,7 +1700,12 @@ def count_method_statements(
     if tree is None:
         return None
 
-    def _walk(node):
+    # Iterative DFS (explicit stack) — avoids Python recursion-limit blow-up
+    # on deeply nested / machine-generated inputs. First-match wins (mirrors
+    # the original recursive _walk).
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
         # method_definition — class methods in TS/JS
         if node.type == "method_definition":
             _name_node = None
@@ -1589,7 +1723,7 @@ def count_method_statements(
 
         # function_declaration — top-level functions, also arrow-function
         # assigned to const/let/var
-        if node.type == "function_declaration":
+        elif node.type == "function_declaration":
             _name_node = node.child_by_field_name("name")
             _body_node = None
             for child in node.named_children:
@@ -1602,7 +1736,7 @@ def count_method_statements(
                 return len(stmts)
 
         # arrow_function — const fn = () => { ... }
-        if node.type == "arrow_function":
+        elif node.type == "arrow_function":
             _body_node = None
             for child in node.named_children:
                 if child.type == "statement_block":
@@ -1612,13 +1746,9 @@ def count_method_statements(
                          if c.type not in ("{", "}")]
                 return len(stmts)
 
-        for child in node.named_children:
-            result = _walk(child)
-            if result is not None:
-                return result
-        return None
+        stack.extend(reversed(node.named_children))
 
-    return _walk(tree.root_node)
+    return None
 
 
 def get_class_member_names(
@@ -1636,17 +1766,26 @@ def get_class_member_names(
     if tree is None:
         return None
 
-    def _walk(node):
+    # Iterative DFS (explicit stack) — avoids Python recursion-limit blow-up
+    # on deeply nested / machine-generated inputs. First-match wins (mirrors
+    # the original recursive _walk).
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
         if node.type == "class_declaration":
             _name_node = node.child_by_field_name("name")
-            if _name_node is not None and _name_node.text.decode("utf-8") == class_name:
+            if (_name_node is not None
+                    and _name_node.text.decode("utf-8") == class_name):
                 _body_node = None
                 for child in node.named_children:
                     if child.type == "class_body":
                         _body_node = child
                         break
                 if _body_node is None:
-                    return None
+                    # Class found but has no body — original returned None here
+                    # (resumes search at siblings, does NOT descend). `continue`
+                    # mirrors that by not pushing this node's children.
+                    continue
                 _method_names: set[str] = set()
                 _field_names: set[str] = set()
                 for c in _body_node.named_children:
@@ -1660,13 +1799,9 @@ def get_class_member_names(
                             _field_names.add(_prop.text.decode("utf-8"))
                 return (_method_names, _field_names)
 
-        for child in node.named_children:
-            result = _walk(child)
-            if result is not None:
-                return result
-        return None
+        stack.extend(reversed(node.named_children))
 
-    return _walk(tree.root_node)
+    return None
 
 
 def count_unique_class_members(
@@ -1798,10 +1933,16 @@ def count_class_members(
     if tree is None:
         return None
 
-    def _walk(node):
+    # Iterative DFS (explicit stack) — avoids Python recursion-limit blow-up
+    # on deeply nested / machine-generated inputs. First-match wins (mirrors
+    # the original recursive _walk).
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
         if node.type == "class_declaration":
             _name_node = node.child_by_field_name("name")
-            if _name_node is not None and _name_node.text.decode("utf-8") == class_name:
+            if (_name_node is not None
+                    and _name_node.text.decode("utf-8") == class_name):
                 # Found the class — count members from the class body
                 _body_node = None
                 for child in node.named_children:
@@ -1809,7 +1950,9 @@ def count_class_members(
                         _body_node = child
                         break
                 if _body_node is None:
-                    return None
+                    # Class found but has no body — resumes search at siblings
+                    # without descending (mirrors original `return None`).
+                    continue
                 _methods = sum(
                     1 for c in _body_node.named_children
                     if c.type == "method_definition"
@@ -1820,13 +1963,9 @@ def count_class_members(
                 )
                 return (_methods, _fields)
 
-        for child in node.named_children:
-            result = _walk(child)
-            if result is not None:
-                return result
-        return None
+        stack.extend(reversed(node.named_children))
 
-    return _walk(tree.root_node)
+    return None
 
 
 def extract_class_methods(
@@ -1853,7 +1992,11 @@ def extract_class_methods(
     if language == "go":
         # Go methods are declared externally with a receiver:
         #   func (r *MyStruct) Method() { ... }
-        def _walk_go(node):
+        # Iterative DFS (explicit stack) — avoids Python recursion-limit
+        # blow-up on deeply nested / machine-generated inputs.
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
             if node.type == "method_declaration":
                 _receiver_node = node.child_by_field_name("receiver")
                 if _receiver_node is not None:
@@ -1874,30 +2017,36 @@ def extract_class_methods(
                                 node.start_point.row + 1,
                                 node.end_point.row + 1,
                             ))
-            for child in node.named_children:
-                _walk_go(child)
+            stack.extend(reversed(node.named_children))
 
-        _walk_go(tree.root_node)
         return results
 
-    # For class_body-based languages: find the class, then scan its body
-    def _find_class_body(node):
+    # For class_body-based languages: find the class, then scan its body.
+    # Iterative DFS (explicit stack) — avoids Python recursion-limit blow-up
+    # on deeply nested / machine-generated inputs. First-match wins (mirrors
+    # the original recursive _find_class_body).
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        matched = False
         if node.type in ("class_declaration", "class_definition"):
             _name_node = node.child_by_field_name("name")
             if _name_node is not None:
                 _cname = _name_node.text.decode("utf-8")
-                if _cname != class_name and _cname.split(".")[-1] != class_name:
+                if _cname == class_name or _cname.split(".")[-1] == class_name:
+                    matched = True
+                else:
                     # Check simple_identifier for Kotlin class names
                     for _ch in node.named_children:
-                        if _ch.type == "simple_identifier" and _ch.text.decode("utf-8") == class_name:
+                        if (_ch.type == "simple_identifier"
+                                and _ch.text.decode("utf-8") == class_name):
+                            matched = True
                             break
-                    else:
-                        for child in node.named_children:
-                            result = _find_class_body(child)
-                            if result is not None:
-                                return result
-                        return None
+            else:
+                # No name field — original fell through to "Found the class".
+                matched = True
 
+        if matched:
             # Found the class — find its body node
             _body_node = None
             for child in node.named_children:
@@ -1905,8 +2054,9 @@ def extract_class_methods(
                     _body_node = child
                     break
             if _body_node is None:
-                return None
-
+                # Class matched but has no body — original returned None here
+                # (resumes search at siblings without descending).
+                continue
             # Scan body for method-like definitions
             for item in _body_node.named_children:
                 _item_type = item.type
@@ -1935,15 +2085,10 @@ def extract_class_methods(
                             item.start_point.row + 1,
                             item.end_point.row + 1,
                         ))
-            return True
+            return results
 
-        for child in node.named_children:
-            result = _find_class_body(child)
-            if result is not None:
-                return result
-        return None
+        stack.extend(reversed(node.named_children))
 
-    _find_class_body(tree.root_node)
     return results
 
 

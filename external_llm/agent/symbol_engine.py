@@ -463,6 +463,7 @@ def resolve_symbol_near_line(
     try:
         from external_llm.languages.tree_sitter_utils import (
             get_parser,
+            grammar_key_for_path,
             is_available,
             parse_to_tree,
         )
@@ -486,13 +487,7 @@ def resolve_symbol_near_line(
         with open(abs_path, encoding="utf-8") as f:
             content = f.read()
 
-        _ext = os.path.splitext(file_path)[1].lower()
-        _ext_map = {
-            ".py": "python", ".ts": "typescript", ".tsx": "typescript",
-            ".js": "javascript", ".jsx": "javascript",
-            ".go": "go", ".java": "java", ".kt": "kotlin", ".kts": "kotlin",
-        }
-        lang = _ext_map.get(_ext)
+        lang = grammar_key_for_path(file_path)
         if not lang:
             return None
 

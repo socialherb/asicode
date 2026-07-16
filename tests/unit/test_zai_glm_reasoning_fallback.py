@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 import external_llm.openai_client as oc
 from external_llm.client import LLMMessage, LLMResponse, ToolCallResponse

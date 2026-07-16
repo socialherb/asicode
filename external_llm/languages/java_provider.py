@@ -15,10 +15,14 @@ from typing import Optional
 
 from .base import (
     SyntaxProvider,
+    _compile_env,
     _filter_genuine_syntax_errors,
     _replace_last_cmd_path,
     _tempfile_for_content,
     detect_project_root,
+    find_brace_block_end,
+    find_brace_block_end_offset,
+    tree_sitter_syntax_fallback,
 )
 from .models import (
     LanguageCapabilities,
@@ -120,8 +124,15 @@ class JavaSyntaxProvider(SyntaxProvider):
         _tmp_path, _cleanup = _tempfile_for_content(content, _suffix)
         if not _tmp_path:
             return SyntaxValidationResult(ok=True, language=LanguageId.JAVA)
+        # javac has no "-fsyntax-only": it must write .class output to a real
+        # directory. ``-d /dev/null`` makes javac abort with "not a directory"
+        # BEFORE compiling anything (rc=2, no file:line: diagnostic) — which the
+        # error regex silently discards, turning this gate fail-open (every
+        # source, even a genuine syntax error, returned ok=True). Mirror
+        # validate_semantics and hand javac a throwaway TemporaryDirectory.
+        _out_dir = tempfile.TemporaryDirectory()
         _cmd = _replace_last_cmd_path(
-            ["javac", "-d", os.devnull, file_path],
+            ["javac", "-d", _out_dir.name, file_path],
             file_path, _tmp_path,
         )
         try:
@@ -130,10 +141,11 @@ class JavaSyntaxProvider(SyntaxProvider):
                     _cmd,
                     capture_output=True, text=True, timeout=30,
                     cwd=os.path.dirname(_tmp_path) or ".",
+                    env=_compile_env(),
                 )
             except FileNotFoundError:
-                logger.debug("javac not installed; skipping validation")
-                return SyntaxValidationResult(ok=True, language=LanguageId.JAVA)
+                logger.debug("javac not installed; falling back to tree-sitter")
+                return tree_sitter_syntax_fallback(content, LanguageId.JAVA, file_path)
             except subprocess.TimeoutExpired:
                 logger.warning("javac timed out for %s", file_path)
                 return SyntaxValidationResult(ok=True, language=LanguageId.JAVA)
@@ -165,6 +177,7 @@ class JavaSyntaxProvider(SyntaxProvider):
             return SyntaxValidationResult(ok=False, errors=errors, language=LanguageId.JAVA)
         finally:
             _cleanup()
+            _out_dir.cleanup()
 
     # ── Semantic validation ──────────────────────────────────────────────
 
@@ -221,6 +234,7 @@ class JavaSyntaxProvider(SyntaxProvider):
                     cmd,
                     capture_output=True, text=True, timeout=120,
                     cwd=project_root,
+                    env=_compile_env(),
                 )
             except FileNotFoundError:
                 logger.debug("javac not installed; skipping semantic validation")
@@ -343,25 +357,13 @@ class JavaSyntaxProvider(SyntaxProvider):
 
     @staticmethod
     def _find_block_end(content: str, offset: int) -> int:
-        """Heuristic: find the matching closing brace from *offset*."""
-        depth = 0
-        started = False
-        line = content[:offset].count("\n") + 1
-        i = offset
-        length = len(content)
-        while i < length:
-            ch = content[i]
-            if ch == "\n":
-                line += 1
-            elif ch == "{":
-                depth += 1
-                started = True
-            elif ch == "}":
-                depth -= 1
-                if started and depth == 0:
-                    return line
-            i += 1
-        return content[:offset].count("\n") + 21
+        """Heuristic: find the matching closing brace from *offset*.
+
+        Delegates to the shared :func:`find_brace_block_end` (C-family SSOT)
+        which skips string/char/template literals and ``//`` / ``/* */``
+        comments so braces inside them do not corrupt the depth counter.
+        """
+        return find_brace_block_end(content, offset)
 
     # ── Definition keywords ───────────────────────────────────────────────
 
@@ -417,19 +419,13 @@ class JavaSyntaxProvider(SyntaxProvider):
 
     @staticmethod
     def _find_block_end_offset(content: str, offset: int) -> int:
-        """Find offset of matching closing brace (returns offset, not line)."""
-        depth = 0
-        started = False
-        for i in range(offset, len(content)):
-            ch = content[i]
-            if ch == "{":
-                depth += 1
-                started = True
-            elif ch == "}":
-                depth -= 1
-                if started and depth == 0:
-                    return i + 1
-        return len(content)
+        """Offset (exclusive) of matching ``}`` for the class-body range.
+
+        Delegates to :func:`base.find_brace_block_end_offset` (the shared SSOT) so
+        braces inside string/char/template literals or comments cannot corrupt the
+        depth counter. See base.py for the full contract.
+        """
+        return find_brace_block_end_offset(content, offset)
 
     def _find_symbol_body_range_regex(
         self, content: str, symbol_name: str,

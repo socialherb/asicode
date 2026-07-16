@@ -976,7 +976,7 @@ def apply_patch(
     unsafe: list[str] = []
     for rel in touched_files:
         norm = normalize_rel_path(rel)
-        if not norm or norm != rel:
+        if not norm:
             unsafe.append(rel)
             continue
         try:

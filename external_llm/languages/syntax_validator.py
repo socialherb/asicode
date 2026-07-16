@@ -16,7 +16,7 @@ Usage::
 
     from ..languages.syntax_validator import SyntaxValidator
 
-    result = SyntaxValidator.validate_syntax(content, lang)
+    result = SyntaxValidator.validate_syntax(content, lang, file_path=path)
     rng = SyntaxValidator.find_symbol_range(content, "MyClass", lang)
     syms = SyntaxValidator.find_symbols(content, lang)
     body = SyntaxValidator.extract_symbol_body(code, name, lang)
@@ -26,7 +26,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from . import tree_sitter_utils as ts_utils
-from .models import LanguageId, SyntaxError_, SyntaxValidationResult
+from .models import LanguageId, SyntaxValidationResult
 
 
 def _get_provider(lang: LanguageId):
@@ -42,22 +42,20 @@ class SyntaxValidator:
     # ── Syntax validation ──────────────────────────────────────────────
 
     @staticmethod
-    def validate_syntax(content: str, lang: LanguageId) -> SyntaxValidationResult:
-        """Check *content* for syntax errors via the language provider."""
+    def validate_syntax(content: str, lang: LanguageId, file_path: str = "") -> SyntaxValidationResult:
+        """Check *content* for syntax errors via the language provider.
+
+        *file_path* is forwarded so that providers (and tree-sitter fallback)
+        can detect dialect-specific grammar (e.g. ``.tsx`` → ``"tsx"`` in
+        ``tree_sitter_syntax_fallback``).
+        """
         provider = _get_provider(lang)
         if provider is not None:
-            return provider.validate_syntax("", content)
-        # Fallback: tree-sitter has_error
-        has_err = ts_utils.has_error(content, lang.value)
-        if has_err is None:
-            return SyntaxValidationResult(ok=True, language=lang)
-        if has_err:
-            return SyntaxValidationResult(
-                ok=False,
-                errors=[SyntaxError_(file="", line=0, col=0, message="syntax error (tree-sitter)")],
-                language=lang,
-            )
-        return SyntaxValidationResult(ok=True, language=lang)
+            return provider.validate_syntax(file_path, content)
+        # Fallback: tree-sitter with full position info
+        from .base import tree_sitter_syntax_fallback
+
+        return tree_sitter_syntax_fallback(content, lang, file_path)
 
     # ── Symbol range detection ─────────────────────────────────────────
 

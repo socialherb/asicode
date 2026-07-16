@@ -14,10 +14,13 @@ from typing import Optional
 
 from .base import (
     SyntaxProvider,
+    _compile_env,
     _filter_genuine_syntax_errors,
     _replace_last_cmd_path,
     _tempfile_for_content,
     detect_project_root,
+    find_brace_block_end,
+    tree_sitter_syntax_fallback,
 )
 from .models import (
     LanguageCapabilities,
@@ -106,10 +109,11 @@ class GoSyntaxProvider(SyntaxProvider):
                     _cmd,
                     capture_output=True, text=True, timeout=30,
                     cwd=_cwd,
+                    env=_compile_env(),
                 )
             except FileNotFoundError:
-                logger.debug("go not installed; skipping validation")
-                return SyntaxValidationResult(ok=True, language=LanguageId.GO)
+                logger.debug("go not installed; falling back to tree-sitter")
+                return tree_sitter_syntax_fallback(content, LanguageId.GO, file_path)
             except subprocess.TimeoutExpired:
                 logger.debug("go build timed out for %s", file_path)
                 return SyntaxValidationResult(ok=True, language=LanguageId.GO)
@@ -196,6 +200,7 @@ class GoSyntaxProvider(SyntaxProvider):
                 cmd,
                 capture_output=True, text=True, timeout=120,
                 cwd=module_root,
+                env=_compile_env(),
             )
         except FileNotFoundError:
             logger.debug("go not installed; skipping semantic validation")
@@ -330,25 +335,13 @@ class GoSyntaxProvider(SyntaxProvider):
 
     @staticmethod
     def _find_block_end(content: str, offset: int) -> int:
-        """Heuristic: find the matching closing brace from *offset*."""
-        depth = 0
-        started = False
-        line = content[:offset].count("\n") + 1
-        i = offset
-        length = len(content)
-        while i < length:
-            ch = content[i]
-            if ch == "\n":
-                line += 1
-            elif ch == "{":
-                depth += 1
-                started = True
-            elif ch == "}":
-                depth -= 1
-                if started and depth == 0:
-                    return line
-            i += 1
-        return content[:offset].count("\n") + 21
+        """Heuristic: find the matching closing brace from *offset*.
+
+        Delegates to the shared :func:`find_brace_block_end` (C-family SSOT)
+        which skips string/char/template literals and ``//`` / ``/* */``
+        comments so braces inside them do not corrupt the depth counter.
+        """
+        return find_brace_block_end(content, offset)
 
     # ── Definition keywords ───────────────────────────────────────────────
 

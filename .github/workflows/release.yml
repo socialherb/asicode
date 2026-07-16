@@ -1,0 +1,72 @@
+name: Release (PyPI Trusted Publishing)
+
+# Build sdist + wheel from the tagged public-snapshot commit and publish to
+# PyPI via Trusted Publishing (OIDC). No API token is stored anywhere: PyPI
+# issues a short-lived upload credential to this workflow after the project
+# owner registers it as a trusted publisher (one-time, browser):
+#
+#   https://pypi.org/manage/project/asicode/settings/publishing/
+#     PyPI Project Name : asicode
+#     Owner             : socialherb
+#     Repository name   : asicode
+#     Workflow name     : release.yml
+#     Environment name  : (leave blank)
+#
+# Trigger: pushing a `v*` tag to socialherb/asicode. The tag is produced by
+# scripts/release_public.py (--tag --push) and points at the release commit,
+# so the build always runs on exactly the shipped source — a CI checkout of a
+# tag is a clean detached tree, equivalent to `git archive <tag>` extraction
+# (NOT a dirty working tree). This keeps the release-build discipline intact.
+#
+# Idempotency: PyPI rejects re-uploads of identical files, so re-running this
+# workflow on an already-published tag fails safely at the publish step.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+# Never cancel a release mid-flight; queue concurrent tag pushes.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+    # id-token: write is required for PyPI Trusted Publishing (OIDC): the
+    # pypa/gh-action-pypi-publish action mints a short-lived upload token from
+    # it when no `password` is supplied. No long-lived API token is ever stored.
+    permissions:
+      id-token: write
+    steps:
+      - name: Checkout tagged commit (clean source)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PEP 517 build frontend
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade build twine
+
+      - name: Build sdist + wheel
+        # Build isolation installs [build-system].requires (setuptools>=77,
+        # wheel) into a throwaway env, so the runner Python version never
+        # constrains the build backend.
+        run: python -m build
+
+      - name: Verify distribution metadata
+        run: python -m twine check dist/*
+
+      - name: Publish to PyPI (OIDC, no stored token)
+        uses: pypa/gh-action-pypi-publish@release/v1

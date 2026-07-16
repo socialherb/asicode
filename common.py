@@ -70,11 +70,11 @@ def normalize_rel_path_fast(rel_path: str) -> str:
     - Returns empty string for empty/None input
 
     This is the canonical single-source helper for path normalization.
-    The inline chain ``.lstrip("/").removeprefix("./").lstrip("/")`` scattered
-    across 57+ call sites is defective: ``removeprefix`` removes only ONE ``./``,
-    so ``././foo.py`` → ``./foo`` (still prefixed). All callers should use either
-    this function or ``path_security.normalize_rel_path`` (which additionally
+    All previous callers that used the defective inline chain
+    ``.strip().removeprefix("/").removeprefix("./")`` have been migrated to call
+    this function (or ``path_security.normalize_rel_path``, which additionally
     strips quotes, removes ``a/``/``b/`` prefixes, and rejects traversal).
+    No defective chain remains in the repo as of 2026-07.
     """
     p = (rel_path or "").strip()
     p = p.replace("\\", "/")

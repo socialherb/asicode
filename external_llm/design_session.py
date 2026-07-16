@@ -199,7 +199,7 @@ class DesignSessionManager:
             session.chat_mode = fresh.chat_mode
             session.decisions = fresh.decisions
 
-    def add_turn(self, session_id: str, role: str, content: str, model: str = "", preserve: bool = False, digest: str = "", exclude_from_compression: bool = False, in_progress: bool = False, tool_results: Optional[list] = None) -> None:
+    def add_turn(self, session_id: str, role: str, content: str, model: str = "", preserve: bool = False, digest: str = "", exclude_from_compression: bool = False, in_progress: bool = False, tool_results: Optional[list] = None, auto: bool = False) -> None:
         """Add a turn to the session.
 
         digest: deterministic work-state digest of the turn's tool loop
@@ -217,6 +217,11 @@ class DesignSessionManager:
         an assistant turn. Other processes' build_context_messages render unresolved
         user turns with an [IN-PROGRESS IN ANOTHER TERMINAL] system label to avoid
         conflating them with the current request.
+
+        auto: True when this turn was produced by the auto-continue loop (countdown-
+        submitted input, not a human keystroke). Persisted so the chain of self-driven
+        steps can be reconstructed post-hoc and later used as data for repetition/
+        loop-detection. Only stored when True to keep non-auto turns lean.
         """
         session = self.get_or_create(session_id)
 
@@ -236,6 +241,8 @@ class DesignSessionManager:
         if in_progress and role == "user":
             turn["in_progress"] = True
             turn["owner"] = self._owner
+        if auto:
+            turn["auto"] = True
         # On ESC abort, persist tool_results in full — so the resume turn retains
         # read/modified details without loss. Normal complete turns do NOT forward them
         # (consistent with the existing policy that tool messages are discarded at turn end).

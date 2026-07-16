@@ -5,6 +5,7 @@
 ## Features
 
 - **Context economy**: recent turns stay verbatim while older turns are compressed in the background, and superseded tool outputs are dropped from the window — long sessions stay focused and cheap instead of accumulating until a context cliff
+- **Autonomous long-run loop (`/auto`)**: after each turn the model drafts the natural next step as ghost text; auto mode countdown-runs it, chaining turns without a human prompt — a required-follow-up-only contract, a consecutive-step cap, and announced stop points keep the loop from wandering, and typing or Esc hands control back instantly
 - **Parallel sub-agents, mixed models**: orchestration (`--orchestrate`) dispatches sub-tasks to worker processes — each opens its own terminal window on macOS — and every worker slot can run a different provider/model (`/model dev_1 …`)
 - **Multi-terminal, one repo**: run several `asi` sessions on the same repository at once — cross-process file locks, per-turn ownership markers, and stale-worker reaping keep agents from duplicating or clobbering each other's work
 - **Claude Code collaboration**: pair with the Claude Agent SDK for division of labor — Claude analyzes the codebase through asicode's MCP tools (read-only in analysis mode), asicode executes the edits, Claude optionally reviews the result (`pip install 'asicode[collaborate]'`)
@@ -76,6 +77,30 @@ searches, and edits the repository through typed tools, and each write is
 followed by verification. Headless mode (`asi -p`) and orchestration mode
 (`--orchestrate`, which decomposes a request and dispatches it to parallel
 sub-agent workers) drive the same loop.
+
+### Auto-Continue: Long-Running Agent Loops (`/auto`)
+After every turn asicode already suggests the natural next task as dim ghost
+text on the prompt (accept with `→`). `/auto` turns that suggestion into an
+unattended loop: the next step is auto-submitted after a short countdown, so a
+single instruction ("find and fix a bug, then keep going") can chain many
+turns of work — each one starting with a fresh tool loop, so long runs don't
+degrade the context window.
+
+Autonomy is bounded by design, because an unattended loop must know when to
+stop:
+
+- **Opt-in only** — `/auto [N|on|off]` is the sole trigger; intent is never
+  inferred from prompt text. The prompt status line shows `auto n/N` while armed.
+- **Required-follow-up contract** — the next step fires only when the previous
+  turn left mandatory work (unverified changes, unfinished steps); "nice to
+  have" ideas end the loop instead of extending it (`NONE` is the default).
+- **Announced stop points** — natural completion, the consecutive-step cap
+  (default 5), or an error turn all stop the loop with a visible notice rather
+  than going silent.
+- **Instant takeover** — typing cancels the pending step and resets the chain;
+  `Esc` skips one step but keeps the mode; `Enter` on the empty prompt runs
+  the step immediately. Auto-driven turns are tagged in the session record, so
+  you can audit afterwards exactly how far the loop went on its own.
 
 ### Context Economy
 Most agent CLIs let every turn and tool result pile up until the context

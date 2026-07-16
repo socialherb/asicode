@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from external_llm.agent.tool_safety import WriteSafetyManager, _MISSING_SNAP
+from external_llm.agent.tool_safety import _MISSING_SNAP, WriteSafetyManager
 
 
 @pytest.fixture
@@ -262,6 +262,33 @@ class TestRestoreSnapshotsAtomicSafety:
         assert leftovers == [], f"temp file leaked on replace failure: {leftovers}"
         # os.replace is atomic: the target is unchanged (not truncated/partial).
         assert open(target).read() == "old\n"
+
+    def test_returns_failed_paths_on_oserror(self, tmp_repo, monkeypatch):
+        """Bug #2: restore_snapshots now returns list of paths whose restoration
+        failed (was silent pass). When os.replace raises, the path appears in
+        the returned list."""
+        target = os.path.join(tmp_repo, "fail_target.py")
+        with open(target, "w") as f:
+            f.write("old\n")
+
+        def _boom(*_a, **_k):
+            raise OSError("replace denied")
+
+        monkeypatch.setattr("os.replace", _boom)
+        failed = WriteSafetyManager.restore_snapshots({target: "new\n"})
+        assert isinstance(failed, list), "must return a list of failed paths"
+        assert target in failed, "failed path must appear in returned list"
+
+    def test_returns_empty_list_on_success(self, tmp_repo):
+        """Happy path: successful restore returns empty list."""
+        target = os.path.join(tmp_repo, "ok_target.py")
+        original = "content\n"
+        with open(target, "w") as f:
+            f.write("changed\n")
+        failed = WriteSafetyManager.restore_snapshots({target: original})
+        assert isinstance(failed, list)
+        assert failed == []
+        assert open(target).read() == original
 
 
 class TestRestoreSnapshotsPreservesMode:

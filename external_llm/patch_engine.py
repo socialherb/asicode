@@ -1500,7 +1500,7 @@ class PatchEngine:
 
         # This function assumes input has already been sanitized (no BOM/indent on markers).
         # Call _sanitize_patch_lines() first.
-        tf = (target_file or "").strip().removeprefix("/").removeprefix("./")
+        tf = normalize_rel_path_fast(target_file or "")
         txt = str(patch).replace("\r\n", "\n")
         lines = txt.split("\n")
 
@@ -1580,7 +1580,7 @@ class PatchEngine:
         """
         if not patch:
             return ""
-        tf = (target_file or "").strip().removeprefix("/").removeprefix("./")
+        tf = normalize_rel_path_fast(target_file or "")
         if not tf:
             return patch
 
@@ -1649,7 +1649,7 @@ class PatchEngine:
         if not patch:
             return ""
 
-        tf = (target_file or "").strip().removeprefix("/").removeprefix("./")
+        tf = normalize_rel_path_fast(target_file or "")
         if not tf:
             return patch
 
@@ -1705,7 +1705,7 @@ class PatchEngine:
         if not patch:
             return ""
 
-        tf = (target_file or "").strip().removeprefix("/").removeprefix("./")
+        tf = normalize_rel_path_fast(target_file or "")
         txt = str(patch).replace("\r\n", "\n")
         lines = txt.split("\n")
 

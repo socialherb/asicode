@@ -383,8 +383,8 @@ class ExecutionGraphAdvisor:
                         dep_graph = None
                         dep_graph_summary: dict[str, Any] = {}
                         try:
-                            from external_llm.testing.test_dependency_graph import TestDependencyGraphBuilder
-                            builder = TestDependencyGraphBuilder(repo_root)
+                            from external_llm.testing.test_dependency_graph import DependencyGraphBuilder
+                            builder = DependencyGraphBuilder(repo_root)
                             dep_graph = builder.build()
                             dep_graph_summary = dep_graph.get_summary()
                         except Exception as _dep_err:

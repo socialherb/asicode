@@ -26,6 +26,7 @@ RELATION_WEIGHTS = {
 @dataclass
 class TestDependencyEdge:
     """A single test → target relationship."""
+    __test__ = False  # Not a pytest test class — domain model
     test_path: str
     target_module: Optional[str] = None
     target_file: Optional[str] = None
@@ -46,6 +47,7 @@ class TestDependencyEdge:
 @dataclass
 class TestCoverageCandidate:
     """A test file identified as covering impacted code."""
+    __test__ = False  # Not a pytest test class — domain model
     test_path: str
     coverage_score: float = 0.0
     matched_modules: list[str] = field(default_factory=list)
@@ -64,8 +66,7 @@ class TestCoverageCandidate:
 
 
 class TestDependencyGraph:
-    """
-    Pre-computed bidirectional mapping between source code and test files.
+    """Pre-computed bidirectional mapping between source code and test files.
 
     Provides:
     - module_to_tests: source module → list of test files that import it
@@ -73,6 +74,7 @@ class TestDependencyGraph:
     - test_to_modules: test file → list of modules it imports
     - test_to_files: test file → list of source files it relates to
     """
+    __test__ = False  # Not a pytest test class — domain model
 
     def __init__(self):
         self.module_to_tests: dict[str, list[str]] = defaultdict(list)
@@ -164,7 +166,7 @@ class TestDependencyGraph:
         return None
 
 
-class TestDependencyGraphBuilder:
+class DependencyGraphBuilder:
     """
     Builds TestDependencyGraph by scanning test files and extracting import relationships.
 

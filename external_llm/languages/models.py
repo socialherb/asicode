@@ -46,6 +46,7 @@ _EXT_MAP = {
     ".cs": "CSHARP",
     ".swift": "SWIFT",
     ".scala": "SCALA",
+    ".sc": "SCALA",
     ".lua": "LUA",
     ".sh": "BASH",
     ".bash": "BASH",
@@ -57,17 +58,32 @@ _EXT_MAP = {
 # called from .js/.jsx/.tsx, so they form one family — hence a group, not a
 # single LanguageId.
 #
+# Covers every extension that maps to a full-AST-support language
+# (_SYMBOL_QUERIES + _CALL_QUERIES + _IMPORT_QUERIES + _REFERENCE_QUERIES all
+# populated).  An extension absent here causes two live bugs:
+#   (a) caller_search_extensions returns the broad fallback union instead of a
+#       tight family glob — every other language's files are scanned;
+#   (b) _get_language_group returns -1, silently bypassing the cross-language
+#       resolution guard.
+#
 # Single source of truth, consumed by:
 #   * cross-file caller search (ripgrep glob set — see caller_search_extensions)
 #   * cross-language resolution guard (SpecGraphEnricher — see _get_language_group)
 _LANGUAGE_EXTENSION_GROUPS: list[frozenset[str]] = [
-    frozenset({".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}),  # JS/TS family
-    frozenset({".py"}),                                          # Python
+    frozenset({".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"}),  # JS/TS family
+    frozenset({".py", ".pyi"}),                                  # Python (+type stubs)
     frozenset({".go"}),                                          # Go
     frozenset({".java"}),                                        # Java
     frozenset({".kt", ".kts"}),                                  # Kotlin
     frozenset({".rs"}),                                          # Rust
     frozenset({".rb"}),                                          # Ruby
+    frozenset({".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh"}),  # C/C++ family
+    frozenset({".php"}),                                         # PHP
+    frozenset({".cs"}),                                          # C#
+    frozenset({".swift"}),                                       # Swift
+    frozenset({".scala", ".sc"}),                                # Scala
+    frozenset({".lua"}),                                         # Lua
+    frozenset({".sh", ".bash"}),                                 # Bash
 ]
 
 
@@ -136,7 +152,7 @@ class LanguageId(Enum):
         return LanguageId[name]
 
 
-@dataclass
+@dataclass(frozen=True)
 class SyntaxError_:
     """A single syntax/semantic diagnostic in a file.
 

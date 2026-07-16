@@ -22,6 +22,7 @@ class LanguageRegistry:
         self._providers: dict[LanguageId, SyntaxProvider] = {}
         # Auto-register built-in providers
         from .bash_provider import BashSyntaxProvider
+        from .c_provider import CppSyntaxProvider, CSyntaxProvider
         from .csharp_provider import CSharpSyntaxProvider
         from .css_provider import CssSyntaxProvider
         from .go_provider import GoSyntaxProvider
@@ -56,6 +57,10 @@ class LanguageRegistry:
         self.register(PhpSyntaxProvider())
         self.register(SwiftSyntaxProvider())
         self.register(BashSyntaxProvider())
+        # gcc/g++ (or clang/clang++) validation when the toolchain is present;
+        # tree-sitter fallback otherwise. Covers both C and C++.
+        self.register(CSyntaxProvider())
+        self.register(CppSyntaxProvider())
 
     @classmethod
     def instance(cls) -> "LanguageRegistry":

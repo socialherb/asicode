@@ -208,6 +208,34 @@ _LANGUAGE_TOOL_MAP: dict[LanguageId, list[_Tool]] = {
             ),
         ),
     ],
+    LanguageId.C: [
+        _Tool(
+            cmd="gcc",
+            label="GCC / Clang (gcc — C syntax checker)",
+            manual_hint=(
+                "Install a C compiler via your package manager\n"
+                "  macOS : xcode-select --install   (provides clang)\n"
+                "         brew install gcc\n"
+                "  Ubuntu: sudo apt install gcc\n"
+                "  Fedora: sudo dnf install gcc\n"
+                "clang is used automatically if gcc is absent."
+            ),
+        ),
+    ],
+    LanguageId.CPP: [
+        _Tool(
+            cmd="g++",
+            label="GCC / Clang (g++ — C++ syntax checker)",
+            manual_hint=(
+                "Install a C++ compiler via your package manager\n"
+                "  macOS : xcode-select --install   (provides clang++)\n"
+                "         brew install gcc\n"
+                "  Ubuntu: sudo apt install g++\n"
+                "  Fedora: sudo dnf install gcc-c++\n"
+                "clang++ is used automatically if g++ is absent."
+            ),
+        ),
+    ],
 }
 
 

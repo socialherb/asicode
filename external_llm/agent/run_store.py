@@ -1441,7 +1441,12 @@ class InMemoryRunStore:
 
     def prune_dynamic_strategies(self, min_trials: int = 20, max_avg_reward: float = 0.2) -> list[str]:
         """P12: Remove underperforming dynamic strategies. Returns pruned names."""
-        from external_llm.editor._editor_core.lane.meta_strategy_engine import MetaStrategyEngine
+        try:
+            from external_llm.editor._editor_core.lane.meta_strategy_engine import MetaStrategyEngine
+        except ImportError:
+            # lane is excluded from the public build — degrade gracefully.
+            logger.debug("prune_dynamic_strategies: lane not available, skipping")
+            return []
         prunable = MetaStrategyEngine.identify_prunable(
             self._strategy_rewards, min_trials=min_trials, max_avg_reward=max_avg_reward,
         )
@@ -1626,7 +1631,12 @@ class InMemoryRunStore:
         if not all_patterns:
             return
 
-        from external_llm.editor._editor_core.lane.meta_strategy_engine import MetaStrategyEngine
+        try:
+            from external_llm.editor._editor_core.lane.meta_strategy_engine import MetaStrategyEngine
+        except ImportError:
+            # lane is excluded from the public build — degrade gracefully.
+            logger.debug("evolve_strategies: lane not available, skipping")
+            return
         engine = MetaStrategyEngine(llm_client=llm_client, llm_model=llm_model)
 
         existing = list(self._dynamic_strategies.values())
@@ -2309,7 +2319,12 @@ class InMemoryRunStore:
             no_gain_count      — consecutive MULTI decisions with no quality gain
             cooldown_remaining — runs left to suppress MULTI (0 = no cooldown)
         """
-        from external_llm.editor._editor_core.lane.multi_strategy_gate import MultiGateCooldownState
+        try:
+            from external_llm.editor._editor_core.lane.multi_strategy_gate import MultiGateCooldownState
+        except ImportError:
+            # lane is excluded from the public build — degrade gracefully.
+            logger.debug("get_multi_gate_state: lane not available")
+            return None
         s = self._multi_gate_state.get(state_key)
         if s is None:
             return MultiGateCooldownState(state_key=state_key)
@@ -2333,7 +2348,12 @@ class InMemoryRunStore:
         If was_multi and realized_gain > 0: reset no_gain_count.
         Each call decrements cooldown_remaining by 1 (cooldown tick).
         """
-        from external_llm.editor._editor_core.lane.multi_strategy_gate import _COOLDOWN_NO_GAIN_LIMIT, _COOLDOWN_RUNS
+        try:
+            from external_llm.editor._editor_core.lane.multi_strategy_gate import _COOLDOWN_NO_GAIN_LIMIT, _COOLDOWN_RUNS
+        except ImportError:
+            # lane is excluded from the public build — degrade gracefully.
+            logger.debug("record_multi_gate_outcome: lane not available, skipping")
+            return
         s = self._multi_gate_state.setdefault(
             state_key, {"no_gain_count": 0, "cooldown_remaining": 0}
         )

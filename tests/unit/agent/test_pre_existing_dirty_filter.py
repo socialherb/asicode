@@ -4,7 +4,6 @@ The snapshot mechanism captures test files that were already dirty (user's WIP)
 before any agent action, and excludes them from the scoped verification quality gate
 to prevent false failures when the user already has broken test files.
 """
-import os
 import subprocess
 from unittest.mock import MagicMock
 

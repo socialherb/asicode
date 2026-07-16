@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Optional
 
 from external_llm.agent.operation_models import Operation
@@ -94,14 +93,10 @@ def verify_target_survived(
                         if _meta is not None:
                             from external_llm.languages.tree_sitter_utils import (
                                 count_method_statements,
+                                grammar_key_for_path,
                             )
                             _fp = getattr(pre_module, "file_path", "") or ""
-                            _ext = os.path.splitext(_fp)[1].lower()
-                            _ts_lang = {
-                                ".ts": "typescript", ".tsx": "typescript",
-                                ".js": "javascript", ".jsx": "javascript",
-                            }
-                            _lang = _ts_lang.get(_ext, "typescript")
+                            _lang = grammar_key_for_path(_fp) or "typescript"
 
                             _old_method_source = pre_code[_meta.start_byte:_meta.end_byte]
                             _old_stmt_count = count_method_statements(
@@ -192,16 +187,13 @@ def verify_no_duplicate_in_class(
     """
     if not class_name:
         return True
-    _ext = os.path.splitext(file_path)[1].lower() if file_path else ""
-    _ts_lang = {".ts": "typescript", ".tsx": "typescript",
-                ".js": "javascript", ".jsx": "javascript"}
-    _lang = _ts_lang.get(_ext, "typescript")
-
     try:
         from external_llm.languages.tree_sitter_utils import (
             count_class_members,
             get_class_member_names,
+            grammar_key_for_path,
         )
+        _lang = grammar_key_for_path(file_path) or "typescript"
         _unique = get_class_member_names(code, class_name, _lang)
         _total = count_class_members(code, class_name, _lang)
         if _unique is not None and _total is not None:
@@ -258,14 +250,12 @@ def verify_no_hallucinated_calls(
         return True
 
     _fp = getattr(module, "file_path", "") or ""
-    _ext = os.path.splitext(_fp)[1].lower()
-    _ts_lang_map = {".ts": "typescript", ".tsx": "typescript",
-                    ".js": "javascript", ".jsx": "javascript"}
-    _lang = _ts_lang_map.get(_ext, "typescript")
     try:
         from external_llm.languages.tree_sitter_utils import (
+            grammar_key_for_path,
             parse_to_tree,
         )
+        _lang = grammar_key_for_path(_fp) or "typescript"
         _tree = parse_to_tree(code, _lang)
         if _tree is not None:
             def _collect_members(node):
@@ -347,10 +337,11 @@ def verify_scope_integrity(
             parse_to_tree,
         )
         _fp = getattr(module, "file_path", "") or ""
-        _ext = os.path.splitext(_fp)[1].lower()
-        _ts_lang = {".ts": "typescript", ".tsx": "typescript",
-                    ".js": "javascript", ".jsx": "javascript"}
-        _lang = _ts_lang.get(_ext, "typescript")
+        try:
+            from external_llm.languages.tree_sitter_utils import grammar_key_for_path
+            _lang = grammar_key_for_path(_fp) or "typescript"
+        except ImportError:
+            _lang = "typescript"
 
         _tree = parse_to_tree(code, _lang)
         if _tree is None:

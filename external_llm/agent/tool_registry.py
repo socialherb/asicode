@@ -14,12 +14,14 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 if TYPE_CHECKING:
     import threading
 
     from .agent_profile import AgentProfile
+
+import subprocess
 
 from external_llm.common.indent_utils import reindent_text
 
@@ -54,7 +56,6 @@ from .tool_handlers.web_search_tools import WebSearchToolsMixin
 from .tool_handlers.write_tools import WriteToolsMixin
 from .tool_safety import WriteSafetyManager
 from .tool_schemas import AGENT_TOOL_NAMES, AGENT_TOOL_SCHEMAS
-import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -375,13 +376,13 @@ class ToolRegistry(
     # composition is immutable during a run, so caching by repo_root avoids
     # the full os.walk (~259-452ms/call, measured on this repo) on every
     # ToolRegistry construction (IPC worker creates one per task).
-    _LANGUAGE_DETECTION_CACHE: "dict[str, Optional[LanguageId]]" = {}
+    _LANGUAGE_DETECTION_CACHE: ClassVar["dict[str, Optional[LanguageId]]"] = {}
 
     # Single source of truth: tool name → handler method name mapping.
     # Used by dispatch() to resolve handlers and by has_tool_handler() for
     # handler-existence checks (e.g. MCP adapter). Keeping method names as
     # strings avoids class-level self-capture issues.
-    _TOOL_HANDLER_MAP: dict[str, str] = {
+    _TOOL_HANDLER_MAP: ClassVar[dict[str, str]] = {
         # internal only — dispatched via delegate_to_helper, no direct LLM exposure
         "edit_file": "_tool_edit_file",
         "edit_text": "_tool_edit_text",
@@ -790,7 +791,7 @@ class ToolRegistry(
 
     # Tools that write to files — need per-file locking in multi-agent mode
     # All write tools get snapshot + syntax verify + rollback safety wrapper
-    _WRITE_TOOLS = {"apply_patch", "write_plan", "edit_ast", "edit_file", "edit_text", "modify_symbol", "anchor_edit"}
+    _WRITE_TOOLS: ClassVar[set[str]] = {"apply_patch", "write_plan", "edit_ast", "edit_file", "edit_text", "modify_symbol", "anchor_edit"}
     # Tools that must NEVER run concurrently. ask_user blocks on human input and
     # relies on one-question-at-a-time invariants — a unique question_id
     # (millisecond timestamp) and an atomic question-count limit. Running two in
@@ -803,7 +804,7 @@ class ToolRegistry(
     # on the same job_id. Both fall back to sequential execution when in a batch.
     _SERIAL_TOOLS = frozenset({"ask_user", "job"})
     # Read-only tools safe for result caching (no side effects, deterministic output)
-    _READ_ONLY_TOOLS = {
+    _READ_ONLY_TOOLS: ClassVar[set[str]] = {
         "get_project_info",
         "find_symbol", "find_references",
         "find_relevant_files",
@@ -1280,16 +1281,16 @@ class ToolRegistry(
         """Capture file contents before a write operation."""
         return self._safety_manager.snapshot_target_files(tool_name, args)
 
-    def _verify_after_write(self, snapshots: dict) -> tuple[bool, str]:
+    def _verify_after_write(self, snapshots: dict, _post_contents: dict | None = None) -> tuple[bool, str]:
         """Basic syntax check on files that were modified.
 
         Returns (True, "") or (False, "error detail").
         """
-        return self._safety_manager.verify_after_write(snapshots)
+        return self._safety_manager.verify_after_write(snapshots, _post_contents=_post_contents)
 
-    def _restore_snapshots(self, snapshots: dict) -> None:
-        """Restore files from pre-write snapshot."""
-        self._safety_manager.restore_snapshots(snapshots)
+    def _restore_snapshots(self, snapshots: dict) -> list[str]:
+        """Restore files from pre-write snapshot. Returns list of failed paths."""
+        return self._safety_manager.restore_snapshots(snapshots)
 
     def _repair_verify_failure(self, snapshots: dict) -> bool:
         """Attempt to repair argument mismatch errors before rollback.
@@ -1317,14 +1318,14 @@ class ToolRegistry(
         )
         from external_llm.editor._editor_core.vm.repair_registry import RepairRegistry
 
-        from ..languages import LanguageRegistry as _LR
+        from ..languages import LanguageRegistry
 
         _repaired_any = False
         for path in snapshots:
             if not _os.path.isfile(path):
                 continue
 
-            provider = _LR.instance().get(path)
+            provider = LanguageRegistry.instance().get(path)
             if not provider or not provider.capabilities().has_syntax_validator:
                 continue
 
@@ -1422,25 +1423,74 @@ class ToolRegistry(
         Non-syntax compilation errors (ARGUMENT_MISMATCH, TYPE_MISMATCH, etc.)
         may be resolved by downstream ops in a multi-op plan — preserve the
         intermediate changes instead of rolling back.
+
+        Origin-skip guard: when the PRE-EDIT content of the edited file also
+        fails isolated-compile, the verify errors are environmental cascade
+        noise (missing deps/SDK — e.g. an Android ViewModel compiled without
+        the SDK, or Kotlin without coroutines), NOT caused by this edit. We
+        soft-fail so a correct edit is not rolled back against a broken
+        baseline. This mirrors edit_text's ``_et_orig_ok`` gate ("we never
+        block an edit fixing a pre-existing error") and is the root-cause
+        general guard for the whole cascade-noise class. Only existing files
+        have an origin to check; new-file snapshots (``_MISSING_SNAP``) skip.
         """
         from external_llm.editor._editor_core.vm.failure_classifier import FailureType, create_failure_classifier
         from external_llm.editor._editor_core.vm.models import VerifyError
 
-        from ..languages import LanguageRegistry as _LR
+        from ..languages import LanguageRegistry
 
         if not snapshots:
             return False
 
-        # Find a language provider for any of the snapshot files
+        # ── Parse the file path from verify_detail ──
+        # verify_detail format (from verify_after_write):
+        #   "file_path:line:col: message"
+        _detail_path_match = re.match(r'^([^:]+):(\d+):(\d+): ', verify_detail)
+        _detail_path = _detail_path_match.group(1) if _detail_path_match else None
+
+        # Find a language provider + its pre-edit origin content for the error's file.
         _lang = None
-        for path in snapshots:
-            provider = _LR.instance().get(path)
-            if provider and provider.capabilities().has_syntax_validator:
-                _lang = provider.language_id().value
-                break
+        _provider = None
+        _origin = None  # (path, content_str) of the snapshot file
+        if _detail_path and _detail_path in snapshots:
+            # Use the file that actually produced the error (Bug #1 fix)
+            _path_provider = LanguageRegistry.instance().get(_detail_path)
+            if _path_provider and _path_provider.capabilities().has_syntax_validator:
+                _lang = _path_provider.language_id().value
+                _provider = _path_provider
+                _origin_content = snapshots[_detail_path]
+                if isinstance(_origin_content, str):
+                    _origin = (_detail_path, _origin_content)
+
+        if not _lang:
+            # Fallback: first snapshot file with a validator (pre-3.9 behaviour)
+            for path, orig_content in snapshots.items():
+                provider = LanguageRegistry.instance().get(path)
+                if provider and provider.capabilities().has_syntax_validator:
+                    _lang = provider.language_id().value
+                    _provider = provider
+                    if isinstance(orig_content, str):
+                        _origin = (path, orig_content)
+                    break
 
         if not _lang:
             return False
+
+        # ── Origin-skip guard (mirrors edit_text's _et_orig_ok gate) ──
+        if _origin is not None:
+            _o_path, _o_content = _origin
+            try:
+                _orig_ok = _provider.validate_syntax(_o_path, _o_content).ok
+            except Exception:
+                _orig_ok = True  # validator crash → don't block the edit
+            if not _orig_ok:
+                logger.warning(
+                    "Write safety: pre-edit content of %s also failed isolated "
+                    "compile — verify errors are environmental cascade noise, "
+                    "keeping edit (origin-skip guard): %s",
+                    _o_path, verify_detail,
+                )
+                return True
 
         try:
             classifier = create_failure_classifier(_lang)
@@ -1644,6 +1694,15 @@ class ToolRegistry(
             # concurrent writers (restore-on-rollback must reflect pre-write content).
             if tool_name in self._WRITE_TOOLS and tool_name not in ("edit_text", "edit_ast", "anchor_edit"):
                 _write_snapshots = self._snapshot_target_files(tool_name, args)
+            # Snapshot _text_edited_files BEFORE the handler runs: non-excluded
+            # write tools (e.g. modify_symbol) record the edited path in
+            # _text_edited_files from INSIDE the handler (write_tools.py), which
+            # is BEFORE dispatch's verify below. On a genuine rollback we must
+            # also undo that recording, else a later apply_patch to the file is
+            # wrongly refused with "already edited this session". Excluded tools
+            # (edit_text/edit_ast/anchor_edit) never reach the rollback path
+            # (no _write_snapshots), so their rollback-free recordings are safe.
+            _pre_text_edits = set(self._text_edited_files)
             result = handler(args)
             result.execution_time = time.monotonic() - start_time
 
@@ -1672,7 +1731,10 @@ class ToolRegistry(
                                     _repaired = None
 
                             if _repaired is not None:
-                                _reverify_ok, _reverify_detail = self._verify_after_write(_write_snapshots)
+                                _reverify_ok, _reverify_detail = self._verify_after_write(
+                                    _write_snapshots,
+                                    _post_contents={_repair_path: _repaired},
+                                )
                                 if _reverify_ok:
                                     _repair_ok = True
                                     logger.info(
@@ -1726,6 +1788,10 @@ class ToolRegistry(
                         _soft_fail = False
                     if not _soft_fail:
                         self._restore_snapshots(_write_snapshots)
+                        # Undo the handler's _text_edited_files recording so the
+                        # working tree and the session-edit ledger stay consistent
+                        # after rollback (see _pre_text_edits snapshot above).
+                        self._text_edited_files = _pre_text_edits
                     else:
                         logger.warning(
                             "Write safety: non-syntax error — keeping changes "
@@ -1971,7 +2037,7 @@ class ToolRegistry(
 
         # Collect results in order
         results = []
-        for future, call in futures:
+        for future, _call in futures:
             try:
                 result = future.result()
                 results.append(result)

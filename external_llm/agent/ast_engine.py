@@ -80,7 +80,6 @@ def extract_ast_call_names(source: str, bare_name: str) -> set:
         try:
             tree = _ts_parse_to_tree(source, "python")
             if tree is not None:
-                source.encode("utf-8")
                 # Find function_definition matching bare_name
                 fn_query = f"""
 (function_definition name: (identifier) @name

@@ -1561,7 +1561,7 @@ class ExternalLLMService:
         Strong fallback prompt: force Cursor-like single FILE block output for exactly the target file.
         The server will synthesize a unified diff from this.
         """
-        tf = str(target_file or "").strip().lstrip("/").lstrip("./")
+        tf = normalize_rel_path_fast(target_file or "")
         rules = (
             "\n\n"
             "CRITICAL OUTPUT RULES (FILE BLOCK ONLY):\n"

@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from external_llm.agent.config.thresholds import config as _cfg
+from external_llm.analysis.unused_import_scanner import _has_noqa_comment as _has_noqa_comment
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,35 @@ _VISITOR_BASE_NAMES: frozenset[str] = frozenset({
 })
 _VISITOR_HOOK_PREFIXES: tuple[str, ...] = ("visit_", "leave_")
 _VISITOR_HOOK_EXACT: frozenset[str] = frozenset({"on_visit", "on_leave", "generic_visit"})
+
+
+# ── noqa suppression ──────────────────────────────────────────────────────────
+
+# Module-level cache keyed by (path → mtime, lines): the scanner may run many
+# times in one long-lived process, and the scanned files are edited between
+# runs — a path-only cache would serve stale lines and suppress/flag against
+# code that no longer exists. mtime comparison invalidates per file; storing
+# one entry per path keeps the cache bounded by the file count.
+_source_lines_cache: dict[str, tuple[float, list[str]]] = {}
+
+def _source_line_has_noqa(abs_path: str, lineno: int, codes: set[str] | None = None) -> bool:
+    """Check if the source line at *lineno* (1-indexed) has a # noqa comment."""
+    try:
+        mtime = os.path.getmtime(abs_path)
+    except OSError:
+        return False
+    cached = _source_lines_cache.get(abs_path)
+    if cached is None or cached[0] != mtime:
+        try:
+            with open(abs_path) as fh:
+                cached = (mtime, fh.read().splitlines())
+        except OSError:
+            cached = (mtime, [])
+        _source_lines_cache[abs_path] = cached
+    lines = cached[1]
+    if 1 <= lineno <= len(lines):
+        return _has_noqa_comment(lines[lineno - 1], codes)
+    return False
 
 
 # ── Test-path & string-dispatch suppression ───────────────────────────────────
@@ -595,6 +625,10 @@ def scan_vulture_dead_code(
             count = per_file_counts.get(rel_file, 0)
             if count >= max_per_file:
                 continue
+            # noqa(F841) on the flagged line suppresses the candidate
+            if first_lineno and _source_line_has_noqa(abs_file, first_lineno, {"F841"}):
+                continue
+
             per_file_counts[rel_file] = count + 1
 
             norm_conf = _compute_normalized_confidence(confidence, name, kind)

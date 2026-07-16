@@ -11,9 +11,10 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
-from ...languages import LanguageId
 from ...common.atomic_io import atomic_write_text
+from ...languages import LanguageId
 from .._shared_utils import compile_quiet, extract_files_from_patch
+from ...languages._normalize import normalize_key
 
 if TYPE_CHECKING:
     from ..tool_registry import ToolResult
@@ -188,8 +189,8 @@ def _detect_file_unit(content: str) -> Optional[int]:
         # tokenizer path treats string interiors as a single logical line; for
         # non-Python content it transparently falls back to ``indent_unit``.
         from ...common.indent_utils import (
-            detect_indent_char,
             _file_indent_unit_from_logical,
+            detect_indent_char,
         )
         return _file_indent_unit_from_logical(
             content, detect_indent_char(content.split("\n"))
@@ -394,12 +395,16 @@ def _check_block_introducer_nesting(new_content, insert_start_line, insert_end_l
     range (lines ``[insert_start_line, insert_end_line)``, 0-based
     half-open):
 
-    1. Nested-in-function — is it a lexical child of a FunctionDef /
-       AsyncFunctionDef? Landing inside an unrelated function is essentially
-       never the intent for a snippet that itself introduces a new def/class
-       — the intent is always sibling/module (or class-body) level, never
-       "define a new nested helper inside someone else's function" via
-       anchor_edit.
+    1. Nested-in-function — is it a lexical child of a PRE-EXISTING
+       FunctionDef / AsyncFunctionDef? Landing inside someone else's
+       function is essentially never the intent for a snippet that itself
+       introduces a new def/class — the intent is always sibling/module (or
+       class-body) level, never "define a new nested helper inside an
+       unrelated function" via anchor_edit. NOTE: an inner helper defined
+       inside a function that is ALSO part of the same insertion is a
+       legitimate closure (the whole construct moved together), so the
+       enclosing function must itself be OUTSIDE the inserted range to count
+       as a violation.
     2. Swallowed-trailing-code — does its body extend PAST the inserted
        range? Re-anchoring the new construct to a shallower indent (fix #1)
        can leave pre-existing sibling statements that followed the anchor
@@ -423,19 +428,37 @@ def _check_block_introducer_nesting(new_content, insert_start_line, insert_end_l
     _violations = []
 
     def _walk(node, func_stack):
+        # func_stack entries: (name, was_introduced_in_range) for each enclosing
+        # FUNCTION (ClassDef is deliberately excluded — a method is not "nested").
         for child in _ast.iter_child_nodes(node):
-            _is_def = isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))
+            _is_func = isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+            _is_def = _is_func or isinstance(child, _ast.ClassDef)
+            _introduced = False
             if _is_def:
+                # Access .lineno only on def/class nodes — not every child has it
+                # (e.g. `arguments`), and a stray AttributeError is swallowed by
+                # the broad except below, silently masking real violations.
                 _lineno0 = child.lineno - 1
                 _introduced = insert_start_line <= _lineno0 < insert_end_line
                 if _introduced:
-                    if func_stack:
-                        _violations.append(("nested_in_function", child.name, func_stack[-1]))
+                    # Only flag nested-in-function for a PRE-EXISTING enclosing
+                    # function. An inner helper defined inside a function that is
+                    # ALSO part of this same insertion is a legitimate closure —
+                    # the whole construct moved together, so nothing "landed" in
+                    # someone else's body. Walk outward to the nearest enclosing
+                    # function that was NOT introduced by this edit.
+                    _enclosing = None
+                    for _ename, _e_introduced in reversed(func_stack):
+                        if not _e_introduced:
+                            _enclosing = _ename
+                            break
+                    if _enclosing is not None:
+                        _violations.append(("nested_in_function", child.name, _enclosing))
                     _end_lineno = getattr(child, "end_lineno", None)
                     if _end_lineno is not None and _end_lineno > insert_end_line:
                         _violations.append(("swallowed_trailing_code", child.name, None))
-            if isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
-                _walk(child, func_stack + [child.name])
+            if _is_func:
+                _walk(child, func_stack + [(child.name, _introduced)])
             else:
                 _walk(child, func_stack)
 
@@ -619,6 +642,47 @@ except ImportError:
     PatchContext = None  # type: ignore
 
 
+# ── repo file index for "File not found" path suggestions ────────────────
+# `edit_text`/`anchor_edit` already emit close-match hints when the anchor
+# text or symbol isn't found, but a missing *file* returned a bare
+# "File not found" with no corrective info — the #1 recurring write-tool
+# failure signal in this repo. The index below lets `_suggest_missing_paths`
+# offer "Did you mean: a/b/foo.py?" hints, mirroring the existing behaviour.
+_FILE_INDEX_TTL = 60.0
+_FILE_INDEX_CACHE: dict[str, tuple[float, list[str]]] = {}
+_FILE_INDEX_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist", ".tox",
+    ".eggs", ".cache", ".idea", ".vscode", "site-packages",
+})
+
+
+def _repo_file_index(repo_root: str) -> list[str]:
+    """Return a sorted list of repo-relative file paths, cached per repo_root.
+
+    Rebuilt when older than ``_FILE_INDEX_TTL`` seconds so a stale index
+    (files added/moved) self-heals without paying os.walk on every call.
+    """
+    import time as _time
+    now = _time.monotonic()
+    cached = _FILE_INDEX_CACHE.get(repo_root)
+    if cached and (now - cached[0]) < _FILE_INDEX_TTL:
+        return cached[1]
+    paths: list[str] = []
+    root = str(repo_root)
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _FILE_INDEX_SKIP_DIRS]
+            for fn in filenames:
+                rel = os.path.relpath(os.path.join(dirpath, fn), root)
+                paths.append(rel.replace(os.sep, "/"))
+    except Exception:
+        pass
+    paths.sort()
+    _FILE_INDEX_CACHE[repo_root] = (now, paths)
+    return paths
+
+
 class WriteToolsMixin:
     """Mixin providing write tool implementations for ToolRegistry."""
 
@@ -705,7 +769,7 @@ class WriteToolsMixin:
             op["op"] = mapped
             repairs.append(f"action:{action!r}→op:{mapped!r}")
 
-        op_type = str(op.get("op") or op.get("type") or "").lower().replace("-", "_")
+        op_type = normalize_key(str(op.get("op") or op.get("type") or ""))
 
         if op_type in ("insert_after", "insert_before"):
             if "anchor" not in op and ("start_line" in op or "line" in op):
@@ -906,7 +970,7 @@ class WriteToolsMixin:
     def _detect_placeholder_op(self, op: dict[str, Any]) -> Optional[str]:
         if not isinstance(op, dict):
             return None
-        op_type = str(op.get("op") or op.get("type") or "").lower().replace("-", "_")
+        op_type = normalize_key(str(op.get("op") or op.get("type") or ""))
         if op_type != "edit_blocks":
             return None
         for blk in (op.get("blocks") or []):
@@ -939,7 +1003,7 @@ class WriteToolsMixin:
         for op in ops:
             if not isinstance(op, dict):
                 continue
-            op_type = str(op.get("op") or op.get("type") or "").lower().replace("-", "_")
+            op_type = normalize_key(str(op.get("op") or op.get("type") or ""))
             path = str(op.get("path") or "")
 
             if op_type == "edit_blocks" and "missing" in error_str.lower() and "before" in error_str.lower():
@@ -1320,7 +1384,7 @@ class WriteToolsMixin:
                     ),
                 )
             # Normalize the same way plan_compiler._norm_op_type does
-            op_type = raw_op_type.lower().replace("-", "_").replace(" ", "_")
+            op_type = normalize_key(raw_op_type)
             op_type = "".join(ch for ch in op_type if (ch.isalnum() or ch == "_"))
             op_type = self._OP_TYPE_ALIASES.get(op_type, op_type)
             if op_type not in self._WRITE_PLAN_OP_TYPES:
@@ -2495,7 +2559,7 @@ class WriteToolsMixin:
         _norm = Path(self.repo_root) / file_path
         if not _norm.exists():
             return self._make_result(
-                ok=False, error=f"File not found: {file_path}", execution_time=0
+                ok=False, error=f"File not found: {file_path}{self._suggest_missing_paths(file_path)}", execution_time=0
             )
 
         try:
@@ -2874,6 +2938,65 @@ class WriteToolsMixin:
                 "Copy the EXACT text — including indentation — from the numbered "
                 "block above into old_string."
             )
+        except Exception:
+            return ""
+
+    def _suggest_missing_paths(self, file_path: str) -> str:
+        """Return a ". Did you mean: ..." suffix for a path that doesn't exist.
+
+        Mirrors the close-match hints already given for anchor-text and
+        symbol resolution failures (the #1 write-tool failure signal here is
+        a missing *file*). Ranks repo files by exact-basename > same-stem >
+        close-name match, refining ties by path proximity so the closest
+        directory wins among same-named files (e.g. many ``__init__.py``).
+
+        Returns "" when nothing plausible is found or on any error, so the
+        caller appends the result and degrades to the original message.
+        """
+        import difflib
+        try:
+            _missing = (file_path or "").strip()
+            if not _missing:
+                return ""
+            _paths = _repo_file_index(str(self.repo_root))
+            if not _paths:
+                return ""
+            _tgt_base = os.path.basename(_missing).lower()
+            _tgt_stem = Path(_missing).stem.lower()
+            _tgt_full = _missing.replace("\\", "/").lower()
+
+            def _score(rel: str) -> tuple[float, float]:
+                rb = os.path.basename(rel).lower()
+                if rb == _tgt_base:
+                    tier = 1.0
+                elif _tgt_stem and Path(rel).stem.lower() == _tgt_stem:
+                    tier = 0.8
+                else:
+                    tier = difflib.SequenceMatcher(None, _tgt_base, rb).ratio() * 0.7
+                prox = difflib.SequenceMatcher(None, _tgt_full, rel.lower()).ratio()
+                return tier, prox
+
+            # Stable sort: alphabetical first, then by score descending, so
+            # equal-score ties keep deterministic path ordering.
+            scored = [(_score(r), r) for r in _paths]
+            scored.sort(key=lambda kv: kv[1])
+            scored.sort(key=lambda kv: kv[0], reverse=True)
+
+            def _keep(rel: str) -> bool:
+                rb = os.path.basename(rel).lower()
+                if rb == _tgt_base:
+                    return True
+                if _tgt_stem and Path(rel).stem.lower() == _tgt_stem:
+                    return True
+                # 0.75 leans to precision: short common names (conftest.py,
+                # __init__.py) false-match around ~0.66, while real typos sit
+                # ≥0.77. Exact-basename/stem tiers above are unaffected.
+                return difflib.SequenceMatcher(None, _tgt_base, rb).ratio() >= 0.75
+
+            top = [r for (_s, r) in scored if _keep(r)][:3]
+            if not top:
+                return ""
+            return ". Did you mean: " + ", ".join(top)
         except Exception:
             return ""
 
@@ -3737,7 +3860,7 @@ class WriteToolsMixin:
             _norm = Path(self.repo_root) / file_path
 
         if not _norm.exists():
-            return self._make_result(ok=False, error=f"File not found: {_norm}", execution_time=0)
+            return self._make_result(ok=False, error=f"File not found: {_norm}{self._suggest_missing_paths(file_path)}", execution_time=0)
 
         # Strict UTF-8 first, then latin-1. latin-1 decodes ANY byte sequence
         # losslessly (1:1 byte↔char), so untouched regions round-trip exactly
@@ -4744,16 +4867,16 @@ class WriteToolsMixin:
         lines = patch_text.split('\n')
         for i, line in enumerate(lines):
             if line.startswith('--- a/'):
-                file_path = line[6:].strip()
+                file_path = line[6:].split('\t')[0].strip()
                 if file_path == '/dev/null':
                     file_path = None
                 if i + 1 < len(lines) and lines[i + 1].startswith('+++ b/'):
-                    new_file_path = lines[i + 1][6:].strip()
+                    new_file_path = lines[i + 1][6:].split('\t')[0].strip()
                     if new_file_path != '/dev/null':
                         file_path = new_file_path
                 break
             elif line.startswith('+++ b/'):
-                file_path = line[6:].strip()
+                file_path = line[6:].split('\t')[0].strip()
                 if file_path == '/dev/null':
                     file_path = None
                 break
@@ -4863,7 +4986,7 @@ class WriteToolsMixin:
                         logger.debug(f"Failed to read file {file_path} for patch analysis: {e}")
         elif "no such file" in error_lower or "cannot stat" in error_lower:
             reason = "file_not_found"
-            hint = f"Target file not found: {file_path or 'unknown'}"
+            hint = f"Target file not found: {file_path or 'unknown'}{self._suggest_missing_paths(file_path or '')}"
 
         file_context_snippet: Optional[str] = None
         if reason == "context_mismatch" and file_path and hunks:
@@ -5015,7 +5138,7 @@ class WriteToolsMixin:
             return self._make_result(ok=False, content="", error=f"Path traversal blocked: {file_path}")
         abs_path = str(sec)
         if not os.path.isfile(abs_path):
-                return self._make_result(ok=False, content="", error=f"File not found: {file_path}")
+                return self._make_result(ok=False, content="", error=f"File not found: {file_path}{self._suggest_missing_paths(file_path)}")
 
         rel_path = os.path.relpath(abs_path, self.repo_root)
 
@@ -5167,7 +5290,7 @@ class WriteToolsMixin:
             return self._make_result(ok=False, content="", error=f"Path blocked (outside repo): {file_path}")
         abs_path = str(sec)
         if not os.path.isfile(abs_path):
-            return self._make_result(ok=False, content="", error=f"File not found: {file_path}")
+            return self._make_result(ok=False, content="", error=f"File not found: {file_path}{self._suggest_missing_paths(file_path)}")
 
         # Normalize to relative for output
         rel_path = os.path.relpath(abs_path, self.repo_root)
@@ -5407,7 +5530,7 @@ class WriteToolsMixin:
         _norm = Path(self.repo_root) / file_path
         if not _norm.exists():
             return self._make_result(
-                ok=False, content="", error=f"File not found: {file_path}", execution_time=0,
+                ok=False, content="", error=f"File not found: {file_path}{self._suggest_missing_paths(file_path)}", execution_time=0,
             )
 
         try:
@@ -5585,14 +5708,29 @@ class WriteToolsMixin:
 
             # Syntax validation
             from ...languages.syntax_validator import SyntaxValidator
-            _sv = SyntaxValidator.validate_syntax(new_content, lang_id)
+            _sv = SyntaxValidator.validate_syntax(new_content, lang_id, file_path=file_path)
+            _gate_soft_failed = False
             if not _sv.ok:
                 _sv_err_msg = _sv.errors[0].message if _sv.errors else "unknown"
-                return self._make_result(
-                    ok=False, content="",
-                    error=f"anchor_edit(delete) produced invalid syntax: {_sv_err_msg}",
-                    metadata={"file_path": file_path, "failure_class": "syntax_invalid_after_edit"},
-                )
+                _sv_err_line = _sv.errors[0].line if _sv.errors else 0
+                # Soft-fail / origin-skip — mirrors edit_text + dispatch and the
+                # insert/replace gate above. Keep edits whose pre-edit content also
+                # fails isolated-compile (cascade noise) or whose errors are
+                # cross-file-resolvable; refuse only genuine syntax errors.
+                _gate_refuse = True
+                if lang_id is not LanguageId.PYTHON:
+                    _sv_detail = f"{file_path}:{_sv_err_line or 0}:0: {_sv_err_msg}"
+                    _gate_refuse = not self._should_soft_fail_verify(
+                        _sv_detail, {file_path: original}
+                    )
+                if _gate_refuse:
+                    return self._make_result(
+                        ok=False, content="",
+                        error=f"anchor_edit(delete) produced invalid syntax: {_sv_err_msg}",
+                        metadata={"file_path": file_path, "failure_class": "syntax_invalid_after_edit"},
+                    )
+                # soft-fail → fall through to write
+                _gate_soft_failed = True
 
             _norm.write_text(new_content, encoding="utf-8")
             self._record_text_edit(file_path)
@@ -5610,6 +5748,8 @@ class WriteToolsMixin:
             _syn = self._run_syntax_check_for_file(str(_norm))
             if not _syn.get("skipped"):
                 _anchor_meta["syntax_check"] = _syn
+            if _gate_soft_failed:
+                _anchor_meta["syntax_gate"] = "soft_fail"
             logger.info(
                 "anchor_edit(delete): removed %d lines (L%d-L%d) matching %r from %s",
                 _del_count, _del_anchor + 1, _del_end, _del_search_pat[:60], file_path,
@@ -6098,43 +6238,60 @@ class WriteToolsMixin:
 
         # ── Syntax validation + write ──────────────────────────────────────
         from ...languages.syntax_validator import SyntaxValidator
-        _sv = SyntaxValidator.validate_syntax(new_content, lang_id)
+        _sv = SyntaxValidator.validate_syntax(new_content, lang_id, file_path=file_path)
+        _gate_soft_failed = False
         if not _sv.ok:
             _sv_err_msg = _sv.errors[0].message if _sv.errors else "unknown"
             _sv_err_line = getattr(_sv.errors[0], "line", None) if _sv.errors else None
-            # Build an actionable hint: show the region around the error and
-            # the anchor context so the LLM can see WHY the edit broke syntax.
-            # The most common cause of "invalid syntax" in insert mode is the
-            # snippet accidentally including a copy of existing code (a
-            # "fragment duplication"), which then gets re-indented to the
-            # anchor level and produces a duplicate/dangling block.
-            _hint_parts = [f"anchor_edit introduced syntax error (file unchanged): {_sv_err_msg}"]
-            _hint_parts.append(f"file={file_path}, anchor_line={anchor_lineno + 1}")
-            if _sv_err_line:
-                _hint_parts.append(f"syntax_error_at_line={_sv_err_line}")
-            if edit_mode in ("insert_before", "insert_after"):
-                _hint_parts.append(
-                    "Likely cause: code_snippet accidentally includes a copy of "
-                    "existing code around the anchor (fragment duplication). The "
-                    "snippet should contain ONLY the new code to insert, not the "
-                    "anchor line or its surrounding context. Re-read the file, "
-                    "then provide only the new lines in code_snippet."
+            # ── Soft-fail / origin-skip (mirrors edit_text + dispatch) ──
+            # Non-Python compiled languages may emit cascade noise (missing
+            # deps/SDK — e.g. an Android ViewModel without the SDK) or
+            # cross-file-resolvable errors under isolated-compile. Keep such
+            # edits; refuse only GENUINE syntax errors on a valid baseline.
+            # Python compile() is self-contained, so it keeps the strict refuse.
+            # See _should_soft_fail_verify (origin-skip guard).
+            _gate_refuse = True
+            if lang_id is not LanguageId.PYTHON:
+                _sv_detail = f"{file_path}:{_sv_err_line or 0}:0: {_sv_err_msg}"
+                _gate_refuse = not self._should_soft_fail_verify(
+                    _sv_detail, {file_path: original}
                 )
-            _hint_parts.append(
-                "If inserting a top-level construct (def/class) at file scope, "
-                "prefer apply_patch (which uses exact line ranges) over anchor_edit."
-            )
-            return self._make_result(
-                ok=False, content="",
-                error=" ".join(_hint_parts),
-                metadata={
-                    "file_path": file_path,
-                    "failure_class": "syntax_invalid_after_edit",
-                    "anchor_line": anchor_lineno + 1,
-                    "syntax_error_line": _sv_err_line,
-                    "mode": edit_mode,
-                },
-            )
+            if _gate_refuse:
+                # Build an actionable hint: show the region around the error and
+                # the anchor context so the LLM can see WHY the edit broke syntax.
+                # The most common cause of "invalid syntax" in insert mode is the
+                # snippet accidentally including a copy of existing code (a
+                # "fragment duplication"), which then gets re-indented to the
+                # anchor level and produces a duplicate/dangling block.
+                _hint_parts = [f"anchor_edit introduced syntax error (file unchanged): {_sv_err_msg}"]
+                _hint_parts.append(f"file={file_path}, anchor_line={anchor_lineno + 1}")
+                if _sv_err_line:
+                    _hint_parts.append(f"syntax_error_at_line={_sv_err_line}")
+                if edit_mode in ("insert_before", "insert_after"):
+                    _hint_parts.append(
+                        "Likely cause: code_snippet accidentally includes a copy of "
+                        "existing code around the anchor (fragment duplication). The "
+                        "snippet should contain ONLY the new code to insert, not the "
+                        "anchor line or its surrounding context. Re-read the file, "
+                        "then provide only the new lines in code_snippet."
+                    )
+                _hint_parts.append(
+                    "If inserting a top-level construct (def/class) at file scope, "
+                    "prefer apply_patch (which uses exact line ranges) over anchor_edit."
+                )
+                return self._make_result(
+                    ok=False, content="",
+                    error=" ".join(_hint_parts),
+                    metadata={
+                        "file_path": file_path,
+                        "failure_class": "syntax_invalid_after_edit",
+                        "anchor_line": anchor_lineno + 1,
+                        "syntax_error_line": _sv_err_line,
+                        "mode": edit_mode,
+                    },
+                )
+            # soft-fail → fall through to write
+            _gate_soft_failed = True
 
         _norm.write_text(new_content, encoding="utf-8")
         self._record_text_edit(file_path)
@@ -6155,6 +6312,8 @@ class WriteToolsMixin:
         if _anchor_end is not None:
             _anchor_meta["anchor_end"] = _anchor_end + 1
             _anchor_meta["multiline_anchor"] = True
+        if _gate_soft_failed:
+            _anchor_meta["syntax_gate"] = "soft_fail"
         # ── Structural feedback (Python only) ────────────────────────────────
         # Expose the indent the snippet was inserted at, the enclosing scope it
         # landed in, and (when applicable) whether anchor_indent was corrected

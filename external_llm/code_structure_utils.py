@@ -23,6 +23,9 @@ try:
         find_all_symbols as _ts_find_all_symbols,
     )
     from .languages.tree_sitter_utils import (
+        grammar_key_for_path as _ts_grammar_key_for_path,
+    )
+    from .languages.tree_sitter_utils import (
         parse_to_tree as _ts_parse_to_tree,
     )
     _HAS_TS = True
@@ -1482,7 +1485,10 @@ def find_last_top_level_def(path: str) -> Optional[str]:
         # TS/JS: tree-sitter first (accurate multi-construct detection),
         # regex fallback when JS/TS grammars are unavailable.
         if path.endswith(('.ts', '.tsx', '.js', '.jsx')):
-            _lang = "typescript" if path.endswith(('.ts', '.tsx')) else "javascript"
+            # _lang is only consumed on the tree-sitter path (regex fallback
+            # ignores it), and _ts_grammar_key_for_path is only defined when
+            # tree-sitter imported cleanly — guard to preserve the no-TS path.
+            _lang = _ts_grammar_key_for_path(path) if _HAS_TS else "typescript"
             _last = _find_last_top_level_ts(_src, _lang)
             if _last is not None:
                 return _last

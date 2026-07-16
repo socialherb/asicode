@@ -66,6 +66,17 @@ class TestBuildFileBlockOnlySystemPrompt:
             "FILE: header must reference the exact target path"
         )
 
+    def test_dotfile_preserves_leading_dot(self) -> None:
+        """Regression: lstrip("./") would mangle .gitignore → gitignore.
+        normalize_rel_path_fast uses a while-loop, not character-set lstrip.
+        """
+        target = ".gitignore"
+        prompt = ExternalLLMService._build_file_block_only_system_prompt(target)
+        assert "FILE: .gitignore" in prompt, (
+            "Dotfile's leading dot must survive normalization — "
+            "the model would otherwise try to rewrite 'gitignore' instead of '.gitignore'"
+        )
+
     def test_rejects_empty_target(self) -> None:
         # Should not crash with empty string
         prompt = ExternalLLMService._build_file_block_only_system_prompt("")

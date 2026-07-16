@@ -12,6 +12,7 @@ from .models import (
     SyntaxError_,
     SyntaxValidationResult,
 )
+
 _CAPABILITIES = LanguageCapabilities(
     has_syntax_validator=True,
 )

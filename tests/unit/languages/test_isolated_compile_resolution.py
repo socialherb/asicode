@@ -99,27 +99,145 @@ class TestJavaResolutionSafety:
         assert r.ok is False
         assert len(r.errors) == 1
 
+    def test_lone_cannot_find_symbol_is_a_genuine_typo(self):
+        # A local typo (`total += valeu;`) with NO failed import: javac emits
+        # ONLY "cannot find symbol". Without the "package … does not exist"
+        # context this is a real error that must gate the edit — otherwise the
+        # typo silently passes (the exact C/C++ gate-bypass class, now Java).
+        out = (
+            "Server.java:12: error: cannot find symbol\n"
+            "  symbol:   variable valeu\n"
+        )
+        r = self._validate(out)
+        assert r.ok is False
+        assert len(r.errors) == 1
+        assert "cannot find symbol" in r.errors[0].message
+
+    def test_public_class_filename_artifact_does_not_mask_typo(self):
+        # The isolated temp file is randomly named, so a public class ALWAYS
+        # draws "class X is public, should be declared in a file named X.java".
+        # That artifact is unconditionally dropped but must NOT count as
+        # resolution context — the co-occurring "cannot find symbol" typo must
+        # still gate. (Empirically confirmed with javac 17: public-class typos
+        # emit both lines with no "does not exist".)
+        out = (
+            "Server.java:1: error: class Server is public, should be declared "
+            "in a file named Server.java\n"
+            "Server.java:12: error: cannot find symbol\n"
+        )
+        r = self._validate(out)
+        assert r.ok is False
+        assert len(r.errors) == 1
+        assert "cannot find symbol" in r.errors[0].message
+
+    def test_syntax_gate_writes_to_a_real_output_dir_not_devnull(self):
+        # Regression: ``javac -d /dev/null`` aborts with "not a directory"
+        # BEFORE compiling (rc=2, no file:line: diagnostic the regex matches),
+        # so the gate returned ok=True for EVERY source — a silent fail-open
+        # that disabled Java syntax validation entirely. The -d target must be
+        # a real (temp) directory.
+        import os
+        captured = {}
+
+        def _capture(cmd, *a, **k):
+            d_target = cmd[cmd.index("-d") + 1]
+            captured["d_target"] = d_target
+            # Must be a real directory *at compile time* (temp dir is cleaned up
+            # in the finally block, so check it here while it still exists).
+            captured["is_dir"] = os.path.isdir(d_target)
+            return _fake_proc(0, "")
+
+        p = JavaSyntaxProvider()
+        with patch("external_llm.languages.java_provider.subprocess.run",
+                   side_effect=_capture):
+            p.validate_syntax("Server.java", "public class Server {}")
+        assert captured["d_target"] != os.devnull
+        assert captured["is_dir"] is True
+
 
 # ── Kotlin ──────────────────────────────────────────────────────────────────
 
 class TestKotlinResolutionSafety:
-    def _validate(self, stdout, returncode=1):
+    def _validate(self, stdout, returncode=1, content="irrelevant — subprocess mocked"):
         p = KotlinSyntaxProvider()
         with patch("external_llm.languages.kotlin_provider.subprocess.run",
                    return_value=_fake_proc(returncode, stdout)):
-            return p.validate_syntax("Server.kt", "irrelevant — subprocess mocked")
+            return p.validate_syntax("Server.kt", content)
 
-    def test_resolution_errors_are_ignored(self):
-        out = "Server.kt:7:5: error: unresolved reference 'launch'\n"
-        r = self._validate(out)
+    def test_resolution_errors_from_failed_import_are_ignored(self):
+        """A coroutine import that can't resolve in the classpath-less temp-file
+        compile is environmental noise.  Real kotlinc reports an unresolved
+        reference ON THE IMPORT LINE (the unresolved package segment) plus the
+        cascading usage error — both must be dropped so the valid edit is not
+        rolled back."""
+        content = (
+            "import kotlinx.coroutines.GlobalScope\n"
+            "import kotlinx.coroutines.launch\n"
+            "\n"
+            "fun main() {\n"
+            "    GlobalScope.launch { }\n"
+            "}\n"
+        )
+        out = (
+            "Server.kt:1:8: error: unresolved reference 'kotlinx'\n"
+            "Server.kt:2:8: error: unresolved reference 'kotlinx'\n"
+            "Server.kt:5:5: error: unresolved reference 'GlobalScope'\n"
+        )
+        r = self._validate(out, content=content)
         assert r.ok is True
         assert not r.errors
+
+    def test_bare_unresolved_reference_is_genuine_error(self):
+        """A bare ``unresolved reference`` with NO import failure is a genuine
+        local typo (``total += valeu``), not a cascade — it must gate the edit.
+        Previously this was unconditionally filtered, silently disabling the
+        syntax gate (same defect class as the Java 'cannot find symbol' /
+        g++ 'was not declared in this scope' fix)."""
+        content = (
+            "fun main() {\n"
+            "    var total = 0\n"
+            "    total += valeu\n"
+            "    println(total)\n"
+            "}\n"
+        )
+        out = "Server.kt:3:14: error: unresolved reference 'valeu'\n"
+        r = self._validate(out, content=content)
+        assert r.ok is False
+        assert len(r.errors) == 1
+        assert "unresolved reference" in r.errors[0].message
 
     def test_genuine_syntax_error_still_fails(self):
         out = "Server.kt:5:1: error: expecting member declaration\n"
         r = self._validate(out)
         assert r.ok is False
         assert len(r.errors) == 1
+
+    def test_syntax_gate_uses_real_output_dir_not_script_mode(self):
+        # Regression: ``kotlinc -script`` only works for ``.kts`` files — for a
+        # ``.kt`` file kotlinc aborts with "unrecognized script type" (rc=1, no
+        # file:line: diagnostic the regex matches), so the gate returned ok=True
+        # for EVERY source — a silent fail-open that disabled Kotlin syntax
+        # validation entirely (same defect class as the Java ``-d /dev/null``
+        # bug). The command must NOT pass ``-script`` and must point ``-d`` at a
+        # real (temp) directory.
+        import os
+        captured = {}
+
+        def _capture(cmd, *a, **k):
+            captured["has_script"] = "-script" in cmd
+            if "-d" in cmd:
+                d_target = cmd[cmd.index("-d") + 1]
+                captured["d_target"] = d_target
+                captured["is_dir"] = os.path.isdir(d_target)
+            return _fake_proc(0, "")
+
+        p = KotlinSyntaxProvider()
+        with patch("external_llm.languages.kotlin_provider.subprocess.run",
+                   side_effect=_capture):
+            p.validate_syntax("Server.kt", "fun main() {}")
+        assert captured["has_script"] is False
+        assert captured["d_target"] != os.devnull
+        assert captured["is_dir"] is True
 
 
 # ── Shared classifier (base.py) ─────────────────────────────────────────────
@@ -156,8 +274,73 @@ class TestResolutionClassifier:
         assert "expected ';'" in kept[0].message
 
     def test_filter_all_resolution_returns_empty(self):
+        # "cannot find symbol" IS a cascade here: "package foo does not exist"
+        # supplies the resolution context, so both drop.
         errs = [
             SyntaxError_(file="f.java", line=7, col=0, message="cannot find symbol"),
             SyntaxError_(file="f.java", line=8, col=0, message="package foo does not exist"),
         ]
         assert _filter_genuine_syntax_errors(errs, LanguageId.JAVA) == []
+
+    def test_java_lone_cannot_find_symbol_is_kept(self):
+        # No "does not exist" context ⇒ genuine typo, must survive the filter.
+        errs = [
+            SyntaxError_(file="f.java", line=12, col=0, message="cannot find symbol"),
+        ]
+        kept = _filter_genuine_syntax_errors(errs, LanguageId.JAVA)
+        assert len(kept) == 1
+        assert "cannot find symbol" in kept[0].message
+
+    def test_java_public_class_artifact_is_not_resolution_context(self):
+        # "is public, should be declared" is dropped (isolated-compile artifact)
+        # but does NOT grant resolution context, so the typo is kept.
+        errs = [
+            SyntaxError_(file="f.java", line=1, col=0,
+                         message="class Foo is public, should be declared in a file named Foo.java"),
+            SyntaxError_(file="f.java", line=12, col=0, message="cannot find symbol"),
+        ]
+        kept = _filter_genuine_syntax_errors(errs, LanguageId.JAVA)
+        assert len(kept) == 1
+        assert "cannot find symbol" in kept[0].message
+
+    # ── Kotlin: line-based context (no phrase-level disambiguator) ──────────
+
+    def test_kotlin_bare_unresolved_reference_is_kept(self):
+        # No resolution context ⇒ genuine typo, must survive the filter. Kotlin
+        # has no _RESOLUTION_CONTEXT_PHRASES, so the default (None) context is
+        # always False — the provider supplies line-based context instead.
+        errs = [
+            SyntaxError_(file="f.kt", line=3, col=14,
+                         message="unresolved reference 'valeu'"),
+        ]
+        kept = _filter_genuine_syntax_errors(errs, LanguageId.KOTLIN)
+        assert len(kept) == 1
+        assert "unresolved reference" in kept[0].message
+
+    def test_kotlin_unresolved_reference_dropped_with_import_context(self):
+        # Provider detected an import-line failure → has_resolution_context=True
+        # → the co-occurring usage error is cascade noise, dropped.
+        errs = [
+            SyntaxError_(file="f.kt", line=1, col=8,
+                         message="unresolved reference 'kotlinx'"),
+            SyntaxError_(file="f.kt", line=5, col=5,
+                         message="unresolved reference 'GlobalScope'"),
+        ]
+        kept = _filter_genuine_syntax_errors(
+            errs, LanguageId.KOTLIN, has_resolution_context=True,
+        )
+        assert kept == []
+
+    def test_kotlin_genuine_syntax_error_kept_with_import_context(self):
+        # Even when an import failed, a genuine SYNTAX error must still gate.
+        errs = [
+            SyntaxError_(file="f.kt", line=1, col=8,
+                         message="unresolved reference 'kotlinx'"),
+            SyntaxError_(file="f.kt", line=5, col=1,
+                         message="expecting member declaration"),
+        ]
+        kept = _filter_genuine_syntax_errors(
+            errs, LanguageId.KOTLIN, has_resolution_context=True,
+        )
+        assert len(kept) == 1
+        assert "expecting member declaration" in kept[0].message

@@ -489,10 +489,8 @@ def _is_real_ts_symbol(name: str, file_content: str, file_path: str = "") -> boo
     # ── Primary: tree-sitter AST (most accurate) ────────────────────
     _lang = "typescript"
     if file_path:
-        _ext = os.path.splitext(file_path)[1].lower()
-        _ts_lang_map = {".ts": "typescript", ".tsx": "typescript",
-                        ".js": "javascript", ".jsx": "javascript"}
-        _detected = _ts_lang_map.get(_ext)
+        from external_llm.languages.tree_sitter_utils import grammar_key_for_path
+        _detected = grammar_key_for_path(file_path)
         if _detected:
             _lang = _detected
             try:
@@ -701,10 +699,8 @@ def ts_symbol_exists_in_file(file_path: str, symbol: str) -> bool:
         return False
 
     # ── Tree-sitter AST path (primary) ──────────────────────────────
-    ext = os.path.splitext(file_path)[1].lower()
-    _LANG_MAP = {'.ts': 'typescript', '.tsx': 'typescript',
-                  '.js': 'javascript', '.jsx': 'javascript'}
-    language = _LANG_MAP.get(ext)
+    from external_llm.languages.tree_sitter_utils import grammar_key_for_path
+    language = grammar_key_for_path(file_path)
     if language:
         try:
             from ..languages.tree_sitter_utils import is_available, parse_to_tree

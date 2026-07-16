@@ -29,6 +29,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -88,6 +89,7 @@ class BrowserActionToolsMixin:
     _browser = None
     _playwright = None
     _page = None
+    _pw_install_lock = threading.Lock()  # serialise Playwright install across threads
 
     # ── Public dispatch entry point ───────────────────────────────────── #
 
@@ -102,16 +104,17 @@ class BrowserActionToolsMixin:
             )
 
         if not HAS_PLAYWRIGHT:
-            if not self._ensure_playwright_installed():
-                return self._make_result(
-                    ok=False, content="",
-                    error=(
-                        "Playwright is not available — automatic installation was "
-                        "declined or failed.\n"
-                        "Install manually:\n"
-                        "  pip install playwright && playwright install chromium"
-                    ),
-                )
+            with BrowserActionToolsMixin._pw_install_lock:
+                if not self._ensure_playwright_installed():
+                    return self._make_result(
+                        ok=False, content="",
+                        error=(
+                            "Playwright is not available — automatic installation was "
+                            "declined or failed.\n"
+                            "Install manually:\n"
+                            "  pip install playwright && playwright install chromium"
+                        ),
+                    )
             # Module-level names updated by _reload_playwright_module; proceed.
 
         _ACTIONS = {
@@ -292,9 +295,13 @@ class BrowserActionToolsMixin:
         return BrowserActionToolsMixin._browser
 
     def _get_page(self):
-        """Get or create a page in the shared browser."""
+        """Get or create a page in the shared browser.
+
+        Recreates the page if the existing one was closed (crash / user close).
+        """
         browser = self._get_browser()
-        if BrowserActionToolsMixin._page is None:
+        page = BrowserActionToolsMixin._page
+        if page is None or page.is_closed():
             BrowserActionToolsMixin._page = browser.new_page()
         return BrowserActionToolsMixin._page
 
@@ -352,10 +359,11 @@ class BrowserActionToolsMixin:
         if len(text) > max_chars:
             text = text[:max_chars] + f"\n\n...[TRUNCATED at {max_chars} chars]..."
 
-        result = f"Title: {title}\nURL: {url}\n\n{text}"
+        final_url = page.url
+        result = f"Title: {title}\nURL: {final_url}\n\n{text}"
         return self._make_result(
             ok=True, content=result,
-            metadata={"title": title, "url": url, "length": len(text)},
+            metadata={"title": title, "url": final_url, "length": len(text)},
         )
 
     def _browser_click(self, args: dict[str, Any]) -> "ToolResult":
@@ -367,7 +375,7 @@ class BrowserActionToolsMixin:
 
         page = self._get_page()
         page.click(selector, timeout=timeout)
-        time.sleep(0.3)
+        page.wait_for_load_state("domcontentloaded")
 
         return self._make_result(
             ok=True, content=f"Clicked '{selector}'",
@@ -444,8 +452,12 @@ class BrowserActionToolsMixin:
             page.wait_for_selector(str(selector), timeout=timeout)
             return self._make_result(ok=True, content=f"Selector '{selector}' appeared.")
         else:
-            time.sleep(1)
-            return self._make_result(ok=True, content="Waited 1 second (no selector given).")
+            wait_ms = max(timeout, 1)
+            time.sleep(wait_ms / 1000)
+            return self._make_result(
+                ok=True,
+                content=f"Waited {wait_ms / 1000:.1f}s (no selector given).",
+            )
 
     def _browser_close(self, args: dict[str, Any]) -> "ToolResult":
         self._close_shared_browser()

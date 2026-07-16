@@ -5,7 +5,7 @@ from collections.abc import Callable
 from typing import Optional
 
 from external_llm.editor._editor_core.vm.classification import Classification
-from external_llm.editor._editor_core.vm.failure_classifier import BaseFailureClassifier, FailureType
+from external_llm.editor._editor_core.vm.failure_classifier import FailureType
 from external_llm.editor._editor_core.vm.models import VerifyError
 from external_llm.editor._editor_core.vm.repair_strategies import get_strategies
 from external_llm.editor.primitives.models import PrimitiveOp

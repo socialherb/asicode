@@ -39,7 +39,8 @@ class ExecuteMode(str, enum.Enum):
         """Fuzzy match: allow any case variation and hyphen/underscore variants."""
         if not isinstance(value, str):
             return None
-        _normalized = value.lower().strip().replace("-", "_").replace(" ", "_")
+        from external_llm.languages._normalize import normalize_key
+        _normalized = normalize_key(value)
         for member in cls:
             if member.value == _normalized:
                 return member
