@@ -387,10 +387,10 @@ class StreamingDisplay:
         parts = [f"{elapsed:.1f}s"]
         if self._call_seq:
             parts.append(f"{self._call_seq} tool{'' if self._call_seq == 1 else 's'}")
-        if result is not None:
-            cost = getattr(result, "total_cost_usd", 0.0) or 0.0
-            if cost:
-                parts.append(f"${cost:.4f}")
+        # Dollar amount intentionally omitted — cost is an estimate, not a precise
+        # bill, so it is never surfaced on the user-facing summary line (consistent
+        # with _print_session_summary in asi.py). total_cost_usd remains available
+        # on the result object for downstream logging/debugging.
 
         self._print(f"  {_BORDER}{'─' * _RULE_WIDTH}{_RESET}")
         label = _display_label or "done"

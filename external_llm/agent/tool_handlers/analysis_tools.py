@@ -213,6 +213,18 @@ class AnalysisToolsMixin:
         scan_path = str(args.get("path", "")).strip() or None
         max_results = int(args.get("max_results", 30))
 
+        # ── Cooperative cancel pre-check ────────────────────────────────────
+        # Mirrors _tool_run_tests / _tool_shell_exec so ESC / Ctrl-C before the
+        # scan starts returns immediately instead of entering the (potentially
+        # minutes-long) scanner loop.
+        _ce = getattr(getattr(self, "config", None), "cancel_event", None)
+        if _ce is not None and _ce.is_set():
+            return self._make_result(
+                ok=False, content="",
+                error="Operation cancelled before structural scan",
+                retryable=False,
+            )
+
         if not scanner_name:
             return self._make_result(ok=False, content="", error="'scanner' is required")
 
@@ -274,7 +286,19 @@ class AnalysisToolsMixin:
         total_affected = set()
         per_scanner: list[dict] = []
 
-        for name in scanners_to_run:
+        for idx, name in enumerate(scanners_to_run):
+            # ── Cooperative cancel checkpoint (scanner-to-scanner) ──────────
+            # Without this, a ``scanner="all"`` run blocks until every scanner
+            # finishes even after ESC / Ctrl-C sets cancel_event.  Check between
+            # scanners so partial results accumulated so far are preserved and
+            # returned to the caller.
+            if _ce is not None and _ce.is_set():
+                all_lines.append(
+                    f"\n(cancelled after {idx}/{len(scanners_to_run)} scanner(s) — "
+                    f"{len(scanners_to_run) - idx} not run)"
+                )
+                break
+
             _spec_n = registry.get_spec(name)
 
             # ── Language capability gate ────────────────────────────────────
@@ -343,7 +367,7 @@ class AnalysisToolsMixin:
             if _spec_n is not None and getattr(_spec_n, "requires_graph", False):
                 _kwargs["repo_graph"] = getattr(self, "_call_graph", None)
             try:
-                result = registry.run(name, repo_root=self.repo_root, file_paths=file_paths, **_kwargs)
+                result = registry.run(name, repo_root=self.repo_root, file_paths=file_paths, cancel_event=_ce, **_kwargs)
             except Exception as e:
                 logger.warning(f"Scanner {name} failed: {e}")
                 all_lines.append(f"  - {name}: ERROR — {e}")

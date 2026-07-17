@@ -283,7 +283,8 @@ class WebSearchToolsMixin:
                     time.sleep(backoff)
                     continue
                 raise  # final attempt failed — propagate
-        assert last_err is not None  # unreachable: retries >= 1 guarantees a try
+        if last_err is None:  # unreachable: retries >= 1 guarantees a try
+            raise AssertionError("invariant: retries>=1 guarantees last_err is set")
         raise last_err
 
     # ── DuckDuckGo (no API key, via duckduckgo_search) ──────────────

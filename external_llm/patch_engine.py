@@ -2051,11 +2051,22 @@ class PatchEngine:
                 hunk_body.append(lines[i])
                 i += 1
 
-            # Count lines
+            # Count lines. A completely empty body line is a blank CONTEXT line
+            # whose leading space was stripped (LLMs and some editors do this) —
+            # git apply counts it as context, so we must too, or the rewritten
+            # header undercounts and git silently truncates the hunk tail
+            # (applying a half-hunk "successfully" = silent corruption).
+            # Normalize it back to " " so the emitted patch is well-formed.
             old_count = 0
             new_count = 0
+            normalized_body = []
             for hl in hunk_body:
-                s = hl.rstrip("\n")
+                s = hl.rstrip("\r\n")
+                if s == "":
+                    old_count += 1
+                    new_count += 1
+                    normalized_body.append(" " + hl[len(s):])
+                    continue
                 if s.startswith(" "):
                     old_count += 1
                     new_count += 1
@@ -2064,6 +2075,8 @@ class PatchEngine:
                 elif s.startswith("+"):
                     new_count += 1
                 # lines starting with \ (no newline at end) are skipped
+                normalized_body.append(hl)
+            hunk_body = normalized_body
 
             # Rebuild header with correct counts
             new_header = f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}"
@@ -2114,6 +2127,14 @@ class PatchEngine:
           3. Preprocessed patch (no extra flags, just correct counts)
           4. --3way (creates merge markers if needed — last resort)
 
+        The ``-C0`` variants apply hunks purely by (recounted) line numbers —
+        git checks ZERO context lines, so a stale header silently lands the
+        hunk at the wrong location with rc=0 (real case 2026-07-18: an insert
+        intended after a Kotlin function's closing brace landed 17 lines
+        below, outside the enclosing ``object``). Every ``-C0`` success is
+        therefore content-verified via :meth:`_verify_c0_placement` and rolled
+        back on mismatch, letting the caller fall through to re-anchoring.
+
         Args:
             allow_3way: When False, drop the ``--3way`` variant. The caller sets this for
                 targets known to lack a pre-image blob (untracked / gitignored /
@@ -2130,18 +2151,28 @@ class PatchEngine:
             fixed = fixed.replace("\r\n", "\n")
 
         # Try the preprocessed patch variants
+        # --recount everywhere: never trust hunk-header counts (ours included) —
+        # an undercounted header makes git consume only part of the hunk body and
+        # apply the truncated prefix with rc=0 (silent corruption; see
+        # test_patch_tolerant.py::TestFixHunkCountsBlankContext).
         patches_to_try = [
-            (fixed, ["--ignore-whitespace"], "fixed_ignore_ws"),
-            (fixed, ["-C0", "--ignore-whitespace"], "fixed_C0_ignore_ws"),  # C0 = no context required
-            (fixed, ["-C0"], "fixed_C0"),                                    # pure line-number matching
-            (fixed, ["--ignore-space-change"], "fixed_ignore_sc"),
-            (fixed, [], "fixed_plain"),
+            (fixed, ["--recount", "--ignore-whitespace"], "fixed_ignore_ws"),
+            (fixed, ["--recount", "-C0", "--ignore-whitespace"], "fixed_C0_ignore_ws"),  # C0 = no context required
+            (fixed, ["--recount", "-C0"], "fixed_C0"),                                    # pure line-number matching
+            (fixed, ["--recount", "--ignore-space-change"], "fixed_ignore_sc"),
+            (fixed, ["--recount"], "fixed_plain"),
         ]
         if allow_3way:
             patches_to_try.append(
                 (patch_text, ["--3way"], "3way_merge"),  # fallback to raw + 3way
             )
+        _c0_verify_fail: Optional[str] = None
         for try_patch, flags, mode_name in patches_to_try:
+            _is_c0 = "-C0" in flags
+            # A -C0 sibling already applied at these line numbers and failed
+            # placement verification — another -C0 variant lands identically.
+            if _is_c0 and _c0_verify_fail is not None:
+                continue
             encoded = try_patch.encode("utf-8")
             try:
                 # --check first
@@ -2153,6 +2184,11 @@ class PatchEngine:
                     timeout=10,
                 )
                 if check.returncode == 0:
+                    # -C0 skips git's own context matching, so keep a pre-apply
+                    # snapshot to roll back a misplaced (unverifiable) hunk.
+                    _c0_snapshot: dict[str, Optional[str]] = {}
+                    if _is_c0:
+                        _c0_snapshot = self._snapshot_patch_targets(try_patch)
                     # Actually apply
                     apply_r = subprocess.run(
                         ["git", "apply", *flags, "-"],
@@ -2162,6 +2198,17 @@ class PatchEngine:
                         timeout=30,
                     )
                     if apply_r.returncode == 0:
+                        if _is_c0:
+                            _place_ok, _place_detail = self._verify_c0_placement(try_patch)
+                            if not _place_ok:
+                                self._restore_patch_targets(_c0_snapshot)
+                                _c0_verify_fail = _place_detail
+                                logger.warning(
+                                    "tolerant_git_apply: mode=%s applied but placement "
+                                    "verification failed — rolled back: %s",
+                                    mode_name, _place_detail,
+                                )
+                                continue
                         logger.info("tolerant_git_apply succeeded mode=%s flags=%s", mode_name, flags)
                         return True, None, mode_name
                     else:
@@ -2189,7 +2236,123 @@ class PatchEngine:
         # If every variant above fails, the patch itself is malformed — that is
         # the repair ladder's job (AST / symbol / semantic / file-block), not the
         # git index's. Mutating the index here only risked leaving the file staged.
+        if _c0_verify_fail is not None:
+            return False, (
+                "All tolerant git apply variants failed (line-number-only apply "
+                f"was rolled back — hunk context does not match the file at the "
+                f"patch's line numbers, likely stale: {_c0_verify_fail})"
+            ), "none"
         return False, "All tolerant git apply variants failed", "none"
+
+    @staticmethod
+    def _ws_norm_line(line: str) -> str:
+        """Whitespace-insensitive normal form of a source line (≥ git's --ignore-whitespace)."""
+        return "".join(line.split())
+
+    def _snapshot_patch_targets(self, patch_text: str) -> dict[str, Optional[str]]:
+        """Snapshot content of every file a patch touches. None = did not exist."""
+        from .agent._shared_utils import extract_files_from_patch
+
+        snap: dict[str, Optional[str]] = {}
+        for rel in extract_files_from_patch(patch_text):
+            abs_p = os.path.join(self.repo_root, rel) if self.repo_root else rel
+            try:
+                with open(abs_p, encoding="utf-8", errors="replace") as fh:
+                    snap[abs_p] = fh.read()
+            except OSError:
+                snap[abs_p] = None
+        return snap
+
+    def _restore_patch_targets(self, snapshot: dict[str, Optional[str]]) -> None:
+        """Undo an applied patch from a _snapshot_patch_targets snapshot."""
+        for path, content in snapshot.items():
+            try:
+                if content is None:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                else:
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write(content)
+            except OSError as exc:
+                logger.error("tolerant_git_apply: rollback of %s failed: %s", path, exc)
+
+    def _verify_c0_placement(self, patch_text: str) -> tuple[bool, str]:
+        """Content-verify hunk placement after a ``-C0`` (context-free) git apply.
+
+        For every hunk that carries context lines, require its post-image
+        (context + added lines, whitespace-normalized) to appear as a
+        consecutive block somewhere in the file after apply — at the correct
+        location this holds by construction; at a stale-line-number location
+        the surrounding lines differ from the patch's context and the block is
+        absent. Hunks with no context lines (pure line-number inserts) have
+        nothing to verify against and are accepted as-is, as are new files.
+
+        Returns (ok, detail) — detail names the offending file on failure.
+        """
+        files: dict[str, list[list[str]]] = {}
+        new_files: set[str] = set()
+        cur: Optional[str] = None
+        cur_is_new = False
+        cur_hunk: Optional[list[str]] = None
+
+        for line in patch_text.splitlines():
+            if line.startswith("diff --git ") or line.startswith("--- "):
+                cur_hunk = None
+                cur_is_new = line.startswith("--- /dev/null")
+                continue
+            if line.startswith("+++ "):
+                cur_hunk = None
+                p = line[4:].strip()
+                if p.startswith("b/"):
+                    p = p[2:]
+                cur = None if p == "/dev/null" else p
+                if cur is not None:
+                    files.setdefault(cur, [])
+                    if cur_is_new:
+                        new_files.add(cur)
+                continue
+            if line.startswith("@@"):
+                if cur is None:
+                    cur_hunk = None
+                else:
+                    cur_hunk = []
+                    files[cur].append(cur_hunk)
+                continue
+            if cur_hunk is None:
+                continue
+            if line[:1] in (" ", "+", "-"):
+                cur_hunk.append(line)
+            elif line == "":
+                # Trailing-whitespace-stripped empty context line.
+                cur_hunk.append(" ")
+            elif line.startswith("\\"):
+                continue  # "\ No newline at end of file"
+            else:
+                cur_hunk = None  # hunk body ended (junk / next section)
+
+        for rel, hunk_list in files.items():
+            if rel in new_files:
+                continue
+            abs_p = os.path.join(self.repo_root, rel) if self.repo_root else rel
+            try:
+                with open(abs_p, encoding="utf-8", errors="replace") as fh:
+                    file_norm = [self._ws_norm_line(ln) for ln in fh.read().splitlines()]
+            except OSError:
+                continue  # deleted by the patch — nothing to place-check
+            for hunk in hunk_list:
+                if not any(ln[:1] == " " for ln in hunk):
+                    continue  # context-free hunk: unverifiable by content
+                post = [self._ws_norm_line(ln[1:]) for ln in hunk if ln[:1] in (" ", "+")]
+                m = len(post)
+                if m == 0:
+                    continue
+                n = len(file_norm)
+                if m > n or not any(file_norm[i:i + m] == post for i in range(n - m + 1)):
+                    return False, (
+                        f"{rel}: hunk context+content not found as a consecutive "
+                        "block after context-free apply"
+                    )
+        return True, ""
 
     # ── Fuzzy context re-anchoring: fix wrong @@ line numbers ────────────────
 

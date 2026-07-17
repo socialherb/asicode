@@ -376,3 +376,98 @@ def test_path_to_index_map_stays_consistent(tmp_path: Path) -> None:
     (tmp_path / "doc0.py").write_text("def rewritten():\n    return 42\n")
     searcher.invalidate_files(["doc0.py"])
     _check()
+
+
+# ── Cooperative cancel regressions ───────────────────────────────────────────
+# ``RAGSearcher`` is constructed by ``ToolRegistry`` with the agent's
+# ``cancel_event``. The per-file read+tokenize loop in ``_build_index()`` (the
+# lazy first-call cost of every ``find_relevant_files``) must bail out promptly
+# on ESC / Ctrl-C. ``_build_index`` returns False and ``_ensure_index`` keeps
+# ``_built`` False, so the uncommitted per-doc arrays never become visible.
+
+def test_build_index_pre_set_cancel_returns_false(tmp_path: Path) -> None:
+    """A pre-set cancel_event makes _build_index() return False at the first
+    checkpoint without committing any docs."""
+    _seed_repo(tmp_path, n=10)
+    ev = threading.Event()
+    ev.set()
+    rs = RAGSearcher(str(tmp_path), vector_cache_enabled=False, cancel_event=ev)
+    assert rs._build_index() is False
+    assert rs._n_docs == 0
+
+
+def test_ensure_index_mid_cancel_no_commit(tmp_path: Path) -> None:
+    """A mid-build cancel (after several files were processed into the LOCAL
+    arrays) must NOT commit them: ``_built`` stays False and ``_n_docs`` is 0.
+
+    Deterministic via a generator stub for ``_walk_files`` that sets the event
+    after yielding 5 files — the checkpoint on the next iteration trips cancel.
+    """
+    _seed_repo(tmp_path, n=20)
+    ev = threading.Event()
+    rs = RAGSearcher(str(tmp_path), vector_cache_enabled=False, cancel_event=ev)
+    files = list(tmp_path.rglob("*.py"))
+    yielded: list = []
+
+    def _gen():
+        for f in files:
+            yielded.append(f)
+            if len(yielded) >= 5:
+                ev.set()
+            yield f
+
+    rs._walk_files = _gen
+    rs._ensure_index()
+    assert len(yielded) >= 5, "must have walked >=5 files before cancel tripped"
+    assert rs._built is False
+    assert rs._n_docs == 0  # local arrays never committed to self
+
+
+def test_build_index_without_cancel_event_unchanged(tmp_path: Path) -> None:
+    """cancel_event=None builds exactly as before (returns True)."""
+    _seed_repo(tmp_path, n=10)
+    rs = RAGSearcher(str(tmp_path), vector_cache_enabled=False)
+    assert rs._build_index() is True
+    assert rs._n_docs > 0
+
+
+# ── design-chat per-turn mutation regressions ────────────────────────────────
+# REGRESSION for a capture-at-construction bug: ``RAGSearcher`` is built by
+# ``ToolRegistry`` from ``config``, and the design-chat REPL (asi.py) sets
+# ``config.cancel_event`` PER TURN *after* the registry — and thus the searcher —
+# was constructed with ``cancel_event=None``. A frozen construction-time value
+# would leave ESC inert on every ``find_relevant_files`` first-call build. The
+# searcher must read ``config.cancel_event`` FRESH at ``_build_index()`` time.
+
+def test_ensure_index_honors_per_turn_config_mutation(tmp_path: Path) -> None:
+    """ESC pressed via a config.cancel_event set AFTER construction is honored."""
+    import types
+    _seed_repo(tmp_path, n=10)
+    cfg = types.SimpleNamespace(cancel_event=None)
+    rs = RAGSearcher(str(tmp_path), vector_cache_enabled=False, config=cfg)
+    assert rs._cancel_event is None
+    assert rs._get_cancel_event() is None
+
+    ev = threading.Event()
+    cfg.cancel_event = ev
+    ev.set()                                           # ESC pressed
+    assert rs._cancel_event is None                    # STILL frozen None ...
+    assert rs._get_cancel_event() is ev                # ... but fresh read sees live event
+    rs._ensure_index()
+    assert rs._built is False                          # fresh read → cancel honored
+    assert rs._n_docs == 0                             # local arrays never committed
+
+    ev.clear()
+    rs._ensure_index()
+    assert rs._built is True
+    assert rs._n_docs > 0
+
+
+def test_build_index_with_config_no_event_unchanged(tmp_path: Path) -> None:
+    """config passed but cancel_event None → _build_index returns True as before."""
+    import types
+    _seed_repo(tmp_path, n=10)
+    cfg = types.SimpleNamespace(cancel_event=None)
+    rs = RAGSearcher(str(tmp_path), vector_cache_enabled=False, config=cfg)
+    assert rs._build_index() is True
+    assert rs._n_docs > 0

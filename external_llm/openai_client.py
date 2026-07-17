@@ -70,6 +70,7 @@ def _is_reasoning_model(model: str) -> bool:
         _m.startswith("o-") or _m.startswith("o1") or _m.startswith("o3")
         or _m.startswith("o4") or "gpt-5" in _m or "reasoner" in _m
         or _bare.startswith("deepseek-v4")
+        or "kimi-k3" in _m
     )
 
 
@@ -88,6 +89,21 @@ def _is_deepseek_v4(model: str) -> bool:
     """
     _bare = model.strip().lower().split("/")[-1]
     return _bare.startswith("deepseek-v4")
+
+
+def _is_kimi_k3(model: str) -> bool:
+    """True for Kimi K3, which always has thinking ON and only supports ``reasoning_effort="max"``.
+
+    Kimi K3 is unique among reasoning models:
+    * ``reasoning_effort`` currently supports only ``"max"`` — ``"medium"`` / ``"low"``
+      cause a 400 error.
+    * Thinking is always enabled and cannot be disabled.
+    * The ``thinking`` parameter (used by K2.x) must NOT be sent.
+
+    Strips provider/route prefixes so ``opencode/kimi-k3`` matches.
+    """
+    _bare = model.strip().lower().split("/")[-1]
+    return "kimi-k3" in _bare  # substring to match variants (kimi-k3-0711, kimi-k3-turbo, etc.)
 
 
 def _parse_error_code(response: requests.Response) -> Optional[int]:
@@ -182,6 +198,9 @@ def _apply_thinking_mode(
       exactly, removing the divergence where ``OpenAIClient`` (OpenCode Go /
       OpenRouter) wrongly used ``reasoning_effort`` for DeepSeek v4.
 
+    * **Kimi K3** — always has thinking ON and only supports
+      ``reasoning_effort="max"``; ``thinking`` parameter must NOT be sent.
+
     * **OpenAI o-series / gpt-5** — lack the ``thinking`` parameter, so they keep
       the ``reasoning_effort`` dial (``minimal`` for gpt-5, else ``low``).
 
@@ -195,6 +214,9 @@ def _apply_thinking_mode(
         payload["thinking"] = {"type": "enabled" if thinking_mode else "disabled"}
         if thinking_mode and effort_override:
             payload["reasoning_effort"] = effort_override
+    elif _is_kimi_k3(model):
+        # Kimi K3: always thinking ON, only "max" supported, no "thinking" parameter.
+        payload["reasoning_effort"] = "max"  # K3 only supports "max"; override is always ignored
     elif is_reasoning:
         payload["reasoning_effort"] = (
             effort_override if (thinking_mode and effort_override)
@@ -590,7 +612,12 @@ class OpenAIClient(LLMClient):
             kwargs.pop("temperature", None)  # reasoning models reject temperature != 1
             _mt = kwargs.pop("max_tokens", None)
             if _mt:
-                payload["max_completion_tokens"] = _mt
+                # OpenCode (opencode.ai) does NOT support max_completion_tokens — it is
+                # silently ignored, causing reasoning to run unbounded and time out.
+                # Mirror the per-provider dispatch in chat() to keep this consistent.
+                _base = (self.base_url or "").lower()
+                _is_opencode = "opencode.ai" in _base
+                payload["max_completion_tokens" if not _is_opencode else "max_tokens"] = _mt
         # See chat(): strip Anthropic-only cache breakpoint marker.
         kwargs.pop("cache_breakpoint_offset", None)
         payload.update(kwargs)

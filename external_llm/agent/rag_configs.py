@@ -1,18 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Optional
 
 from external_llm.agent.language_hint import _HANGUL_END, _HANGUL_START
-
-
-@dataclass
-class MergeConfig:
-    """Configuration for merging BM25 and vector search results."""
-    bm25_weight: float = 0.6
-    vector_weight: float = 0.4
-    deduplication_threshold: float = 0.8
-    repo_root: str = field(default_factory=str)
 
 
 def _extract_identifiers(text: str) -> list[str]:
@@ -165,4 +155,4 @@ class CodeTokenizer:
 
 
 
-__all__ = ['CodeTokenizer', 'MergeConfig']
+__all__ = ['CodeTokenizer']

@@ -9,9 +9,7 @@ import re
 from typing import Optional
 
 from external_llm.editor._editor_core.ts_vm.execution_vm.models import VerifyError
-from external_llm.editor._editor_core.vm.classification import (
-    Classification, EvidenceSource, FailureType, FixHint
-)
+from external_llm.editor._editor_core.vm.classification import FailureType
 from external_llm.editor._editor_core.vm.failure_classifier import BaseFailureClassifier
 
 __all__ = ["FailureType", "TSFailureClassifier"]

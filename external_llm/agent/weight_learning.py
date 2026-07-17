@@ -2525,10 +2525,9 @@ class MiniQLearner:
     Thread-safe via external lock (caller must hold).
     """
 
-    def __init__(self, name: str, alpha: float = 0.1, min_signals: int = 5):
+    def __init__(self, name: str, alpha: float = 0.1):
         self.name = name
         self._alpha = alpha
-        self._min_signals = min_signals
         self._q: dict[str, dict[str, float]] = {}        # {state: {action: Q}}
         self._counts: dict[str, dict[str, int]] = {}     # {state: {action: count}}
         self._perf: dict[str, dict[str, float]] = {}     # {action: {trials, successes, total_reward}}
@@ -2546,33 +2545,6 @@ class MiniQLearner:
         if reward > 0:
             perf["successes"] += 1
         perf["total_reward"] += reward
-
-    def get_scores(self, state: str, actions: list[str]) -> dict[str, float]:
-        """Return Q-based scores. Empty if insufficient data."""
-        c_row = self._counts.get(state, {})
-        total = sum(c_row.values())
-        if total < self._min_signals:
-            return {}
-        q_row = self._q.get(state, {})
-        return {a: round(q_row.get(a, 0.0), 4) for a in actions}
-
-    def get_best(self, state: str, actions: list[str], default: str = "") -> str:
-        """Return best action by Q, or default if insufficient data."""
-        scores = self.get_scores(state, actions)
-        if not scores:
-            return default
-        return max(actions, key=lambda a: scores.get(a, float("-inf")))
-
-    def get_report(self) -> dict[str, Any]:
-        result = {}
-        for action, perf in sorted(self._perf.items(), key=lambda x: -x[1].get("trials", 0)):
-            t = perf.get("trials", 0)
-            result[action] = {
-                "trials": int(t),
-                "success_rate": round(perf.get("successes", 0) / t, 3) if t > 0 else 0.0,
-                "avg_reward": round(perf.get("total_reward", 0) / t, 3) if t > 0 else 0.0,
-            }
-        return result
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2614,11 +2586,11 @@ class AdaptiveLearnerHub:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.tool_learner = MiniQLearner("tool", alpha=0.1, min_signals=10)
-        self.patch_learner = MiniQLearner("patch", alpha=0.15, min_signals=5)
-        self.context_learner = MiniQLearner("context", alpha=0.1, min_signals=8)
-        self.routing_learner = MiniQLearner("routing", alpha=0.1, min_signals=10)
-        self.prompt_learner = MiniQLearner("prompt", alpha=0.1, min_signals=5)
+        self.tool_learner = MiniQLearner("tool", alpha=0.1)
+        self.patch_learner = MiniQLearner("patch", alpha=0.15)
+        self.context_learner = MiniQLearner("context", alpha=0.1)
+        self.routing_learner = MiniQLearner("routing", alpha=0.1)
+        self.prompt_learner = MiniQLearner("prompt", alpha=0.1)
 
     # ── 1. Tool selection learning ──────────────────────────────
 

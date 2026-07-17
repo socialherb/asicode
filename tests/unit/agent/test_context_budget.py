@@ -107,6 +107,15 @@ class TestResolveContextLimit:
     def test_kimi_k2_7_code_returns_262k(self):
         assert _resolve_context_limit("kimi-k2.7-code") == 262_144
 
+    def test_kimi_k3_returns_1m_fallback(self):
+        # kimi-k3 is a 1M+ model (1,048,576 = 2^20) — uses the _DEFAULT_CONTEXT_LIMIT
+        # fallback (no explicit entry), consistent with every other 1M+ model.
+        # The table is exact-match-only, so variants must resolve uniformly to 1M
+        # (no per-variant drift). Regression guard: do NOT re-add a 1M+ entry.
+        assert _resolve_context_limit("kimi-k3") == _DEFAULT_CONTEXT_LIMIT
+        assert _resolve_context_limit("kimi-k3-0711") == _DEFAULT_CONTEXT_LIMIT
+        assert _resolve_context_limit("kimi-k3-turbo") == _DEFAULT_CONTEXT_LIMIT
+
     def test_minimax_m3_returns_1m_fallback(self):
         assert _resolve_context_limit("minimax-m3") == _DEFAULT_CONTEXT_LIMIT
 

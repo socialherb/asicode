@@ -332,3 +332,119 @@ def test_full_project_scans_entire_project_when_no_targets(tmp_path):
     files = {c.file for c in cands}
     # dead.py was discovered by walking the project, not from file_paths (empty).
     assert "dead.py" in files
+
+
+# ── Cooperative cancellation ──────────────────────────────────────────────
+
+
+def test_is_cancelled_none_safe():
+    """``_is_cancelled(None)`` must be False — the helper is called from every
+    checkpoint and None (no cancel_event wired) is the common case for direct
+    API callers and tests."""
+    import threading
+
+    from external_llm.analysis.vulture_scanner import _is_cancelled
+
+    assert _is_cancelled(None) is False
+    ev = threading.Event()
+    assert _is_cancelled(ev) is False
+    ev.set()
+    assert _is_cancelled(ev) is True
+
+
+def test_cancelled_scan_returns_empty_without_scavenge(tmp_path, monkeypatch):
+    """A pre-set cancel_event short-circuits the scan to [] before the expensive
+    scavenge runs. Verified by spying on ``vulture.core.Vulture`` — its
+    ``scavenge`` must never be invoked."""
+    import threading
+
+    import vulture.core as vcore
+    import external_llm.analysis.vulture_scanner as vs
+
+    scavenge_calls: list = []
+
+    class _SpyVulture:
+        def scavenge(self, *a, **k):
+            scavenge_calls.append(1)
+
+        def get_unused_code(self, *a, **k):
+            return []
+
+    monkeypatch.setattr(vcore, "Vulture", _SpyVulture)
+
+    ev = threading.Event()
+    ev.set()
+    result = vs.scan_vulture_dead_code(
+        repo_root=str(tmp_path), file_paths=["probe.py"], repo_graph=None,
+        min_confidence=0, cancel_event=ev,
+    )
+    assert result == []
+    assert scavenge_calls == [], (
+        f"scavenge ran {len(scavenge_calls)} time(s) despite cancel_event being set"
+    )
+
+
+def test_scavenge_with_cancel_aborts_promptly():
+    """The core Step-C guarantee: when scavenge is an opaque long call, setting
+    cancel_event mid-call makes ``_scavenge_with_cancel`` return False well
+    before the call would naturally complete (the daemon thread is abandoned).
+    This is what makes ESC responsive DURING the dominant-cost scavenge."""
+    import threading
+    import time
+
+    from external_llm.analysis.vulture_scanner import _scavenge_with_cancel
+
+    class _SlowVulture:
+        def scavenge(self, paths, exclude=None):
+            time.sleep(1.0)  # simulate a long opaque parse
+
+    ev = threading.Event()
+
+    def _cancel_soon():
+        time.sleep(0.05)
+        ev.set()
+
+    threading.Thread(target=_cancel_soon, daemon=True).start()
+    t0 = time.time()
+    ok = _scavenge_with_cancel(_SlowVulture(), ["x.py"], [], cancel_event=ev)
+    elapsed = time.time() - t0
+    assert ok is False, "expected cancel → False"
+    assert elapsed < 0.4, (
+        f"cancel took {elapsed:.2f}s — scavenge did not abort promptly "
+        "(should return within the poll interval, not wait for the 1s sleep)"
+    )
+
+
+def test_scavenge_with_cancel_runs_inline_when_no_event():
+    """cancel_event=None (non-interactive path) runs scavenge inline with no
+    thread overhead and returns True on completion."""
+    from external_llm.analysis.vulture_scanner import _scavenge_with_cancel
+
+    calls: list = []
+
+    class _V:
+        def scavenge(self, paths, exclude=None):
+            calls.append((paths, exclude))
+
+    ok = _scavenge_with_cancel(_V(), ["a.py"], ["ex"], cancel_event=None)
+    assert ok is True
+    assert calls == [(["a.py"], ["ex"])]
+
+
+def test_scavenge_with_cancel_pre_set_returns_false():
+    """A pre-set cancel_event returns False without invoking scavenge at all."""
+    import threading
+
+    from external_llm.analysis.vulture_scanner import _scavenge_with_cancel
+
+    calls: list = []
+
+    class _V:
+        def scavenge(self, paths, exclude=None):
+            calls.append(1)
+
+    ev = threading.Event()
+    ev.set()
+    ok = _scavenge_with_cancel(_V(), ["a.py"], [], cancel_event=ev)
+    assert ok is False
+    assert calls == [], "scavenge should not run when cancel_event is pre-set"

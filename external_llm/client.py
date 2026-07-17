@@ -350,33 +350,6 @@ class LLMClient(ABC):
             session.close()
             logger.debug("LLMClient session closed for %s", self.get_provider_name())
 
-    def simple_prompt(
-        self,
-        user_prompt: str,
-        system_prompt: Optional[str] = None,
-        model: str = "",
-        **kwargs
-    ) -> LLMResponse:
-        """
-        Simplified interface for single-turn prompts
-
-        Args:
-            user_prompt: User's prompt
-            system_prompt: Optional system instructions
-            model: Model to use
-            **kwargs: Additional parameters
-
-        Returns:
-            LLMResponse
-        """
-        messages = []
-        if system_prompt:
-            messages.append(LLMMessage(role="system", content=system_prompt))
-        messages.append(LLMMessage(role="user", content=user_prompt))
-
-        return self.chat(messages, model=model, **kwargs)
-
-
 def resolve_provider_base_url(provider: str) -> Optional[str]:
     """Resolve the base URL override for ``provider`` in a provider-scoped way.
 
@@ -433,7 +406,7 @@ def create_llm_client(
 
     Example:
         >>> client = create_llm_client("openai", api_key="sk-...")
-        >>> response = client.simple_prompt("Fix this code", model="gpt-4")
+        >>> response = client.chat([LLMMessage(role="user", content="Fix this code")], model="gpt-4")
     """
     provider_lower = provider.lower()
 

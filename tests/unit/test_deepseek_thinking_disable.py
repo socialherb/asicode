@@ -32,6 +32,7 @@ from external_llm.openai_client import (
     OpenAIClient,
     _apply_thinking_mode,
     _is_deepseek_v4,
+    _is_kimi_k3,
 )
 
 # ── 1. classifier ──────────────────────────────────────────────────────────
@@ -58,6 +59,28 @@ def test_is_deepseek_v4(model: str, expected: bool) -> None:
     assert _is_deepseek_v4(model) is expected
 
 
+# ── kimi-k3 classifier ────────────────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        # Exact match
+        ("kimi-k3", True),
+        # Provider/route prefixes must be stripped.
+        ("opencode/kimi-k3", True),
+        # Variants — substring match required (Bug 1 guard)
+        ("kimi-k3-0711", True),
+        ("kimi-k3-turbo", True),
+        ("moonshot/kimi-k3-preview", True),
+        # Negative cases
+        ("kimi-k2.5", False),
+        ("deepseek-v4-flash", False),
+        ("o3", False),
+        ("", False),
+    ],
+)
+def test_is_kimi_k3(model: str, expected: bool) -> None:
+    assert _is_kimi_k3(model) is expected
 # ── 2. payload mutation (unit) ─────────────────────────────────────────────
 
 def test_apply_thinking_deepseek_off_sends_disabled_no_effort() -> None:
@@ -102,6 +125,38 @@ def test_apply_thinking_none_is_noop() -> None:
     p: dict = {}
     _apply_thinking_mode(p, "deepseek-v4-flash", None, "high", is_reasoning=True)
     assert p == {}
+
+
+# ── kimi-k3 payload mutation ──────────────────────────────────────────────
+
+def test_apply_thinking_kimi_k3_always_max() -> None:
+    """Kimi K3 always sends reasoning_effort="max", even with effort_override="low".
+
+    K3 only supports "max"; "low"/"medium" cause a 400 error.  The override
+    must be ignored to protect against caller drift (Bug 2).
+    """
+    p: dict = {}
+    _apply_thinking_mode(p, "kimi-k3", True, None, is_reasoning=True)
+    assert p == {"reasoning_effort": "max"}
+    assert "thinking" not in p
+
+    # effort_override="low" must be ignored — never send "low" to K3.
+    p2: dict = {}
+    _apply_thinking_mode(p2, "kimi-k3", True, "low", is_reasoning=True)
+    assert p2 == {"reasoning_effort": "max"}
+    assert "thinking" not in p2
+
+    # thinking_mode=False — still sends max (K3 has no way to disable thinking)
+    p3: dict = {}
+    _apply_thinking_mode(p3, "kimi-k3", False, None, is_reasoning=True)
+    assert p3 == {"reasoning_effort": "max"}
+    assert "thinking" not in p3
+
+    # Provider-prefixed variant
+    p4: dict = {}
+    _apply_thinking_mode(p4, "opencode/kimi-k3", True, None, is_reasoning=True)
+    assert p4 == {"reasoning_effort": "max"}
+    assert "thinking" not in p4
 
 
 # ── 3. full path: chat() / chat_with_tools() payload ───────────────────────
@@ -176,3 +231,68 @@ def test_chat_with_tools_deepseek_off_sends_thinking_disabled(monkeypatch):
     p = cap[-1]
     assert p.get("thinking") == {"type": "disabled"}
     assert "reasoning_effort" not in p
+
+
+# ── max_completion_tokens dispatch parity (chat vs chat_with_tools) ──
+# Both methods MUST apply the same rule: reasoning model on a native OpenAI
+# endpoint → max_completion_tokens (reasoning gets its own budget); on OpenCode
+# (opencode.ai) → max_tokens (it silently ignores max_completion_tokens, which
+# would make reasoning run unbounded and time out). Drift between the two
+# methods = the token-estimator wire-drift class.
+
+def _capture_client_with_base(monkeypatch, base_url):
+    """OpenAIClient with a configurable base_url, recording POST payloads."""
+    import external_llm.openai_client as oc
+    monkeypatch.setattr(oc.time, "sleep", lambda *_a, **_k: None)
+    c = OpenAIClient(api_key="test")
+    c.base_url = base_url
+    captured: list[dict] = []
+
+    class _S:
+        pass
+
+    c._session = _S()
+    c._session.post = lambda *a, **k: (captured.append(k.get("json")) or _FakeResp())
+    return c, captured
+
+
+# (model, base_url, expected_payload_key) — exercises all 4 rule quadrants.
+_MAX_TOKEN_CASES = [
+    # reasoning + native OpenAI  → max_completion_tokens (separate reasoning budget)
+    ("o3", "https://api.openai.com/v1", "max_completion_tokens"),
+    # reasoning + OpenCode       → max_tokens (endpoint ignores max_completion_tokens)
+    ("o3", "https://opencode.ai/v1", "max_tokens"),
+    # non-reasoning + native     → max_tokens (legacy field)
+    ("gpt-4o", "https://api.openai.com/v1", "max_tokens"),
+    # non-reasoning + OpenCode   → max_tokens
+    ("gpt-4o", "https://opencode.ai/v1", "max_tokens"),
+]
+
+
+@pytest.mark.parametrize("model,base_url,expect_key", _MAX_TOKEN_CASES)
+def test_chat_max_tokens_dispatch(monkeypatch, model, base_url, expect_key):
+    """chat(): max_completion_tokens iff reasoning + non-OpenCode; else max_tokens."""
+    c, cap = _capture_client_with_base(monkeypatch, base_url)
+    c.chat([LLMMessage(role="user", content="hi")], model=model, max_tokens=1000)
+    p = cap[-1]
+    assert p.get(expect_key) == 1000, f"{model} @ {base_url}: expected {expect_key}=1000, got {p}"
+    other = "max_tokens" if expect_key == "max_completion_tokens" else "max_completion_tokens"
+    assert other not in p, f"{model} @ {base_url}: unexpected {other}={p.get(other)!r} leaked"
+
+
+@pytest.mark.parametrize("model,base_url,expect_key", _MAX_TOKEN_CASES)
+def test_chat_with_tools_max_tokens_dispatch_parity(monkeypatch, model, base_url, expect_key):
+    """chat_with_tools() MUST mirror chat()'s max_tokens dispatch rule exactly.
+
+    OpenCode (opencode.ai) silently ignores ``max_completion_tokens`` — sending
+    it there makes reasoning run unbounded and time out. The two methods share
+    ONE contract (this is the token-estimator wire-drift guard); if they
+    diverge, one path times out while the other works.
+    """
+    c, cap = _capture_client_with_base(monkeypatch, base_url)
+    c.chat_with_tools([LLMMessage(role="user", content="hi")], tools=[],
+                      model=model, max_tokens=1000)
+    p = cap[-1]
+    assert p.get(expect_key) == 1000, f"{model} @ {base_url}: expected {expect_key}=1000, got {p}"
+    other = "max_tokens" if expect_key == "max_completion_tokens" else "max_completion_tokens"
+    assert other not in p, f"{model} @ {base_url}: unexpected {other}={p.get(other)!r} leaked"

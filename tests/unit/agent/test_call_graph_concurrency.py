@@ -185,3 +185,117 @@ def test_invalidate_then_read_rebuilds_consistently(tmp_path: Path) -> None:
     callees = idx.get_callees("method_0")
     assert callees, "post-invalidate read returned empty (rebuild did not fire)"
     assert {e.callee_symbol for e in callees}, callees
+
+
+# ── Cooperative cancel regressions ───────────────────────────────────────────
+# ``CallGraphIndexer`` is constructed by ``ToolRegistry`` with the agent's
+# ``cancel_event``. The repo-wide ``ast.parse`` loop in ``build()`` (seconds on
+# large repos — the lazy first-call cost of every graph query /
+# ``analyze_change_impact``) must bail out promptly on ESC / Ctrl-C and leave NO
+# partially-built index visible to the in-flight query (which would otherwise
+# run ``_lookup_edges`` on a torn ``_forward``).
+
+def test_build_with_pre_set_cancel_event_no_partial_index(tmp_path: Path) -> None:
+    """A pre-set cancel_event short-circuits build() at the first checkpoint."""
+    _seed_repo(tmp_path, n=10)
+    ev = threading.Event()
+    ev.set()
+    idx = CallGraphIndexer(str(tmp_path), cancel_event=ev)
+    idx.build()
+    assert idx._built is False
+    assert len(idx._nodes) == 0
+    assert len(idx._forward) == 0
+    assert len(idx._reverse) == 0
+
+
+def test_build_mid_cancel_discards_partial_index(tmp_path: Path) -> None:
+    """Cancelling mid-build (after some files were indexed into the dicts) must
+    discard the partial index so the in-flight query never sees a torn ``_forward``.
+
+    Deterministic via an ``_index_file`` wrapper that sets the event after the
+    3rd file is indexed — guaranteeing the dicts are non-empty at the checkpoint.
+    """
+    _seed_repo(tmp_path, n=10)
+    ev = threading.Event()
+    idx = CallGraphIndexer(str(tmp_path), cancel_event=ev)
+    orig = idx._index_file
+    count = [0]
+
+    def _count_then_cancel(path):
+        orig(path)
+        count[0] += 1
+        if count[0] >= 3:
+            ev.set()
+
+    idx._index_file = _count_then_cancel
+    idx.build()
+    assert count[0] >= 3, "wrapper must index >=3 files before tripping cancel"
+    assert idx._built is False
+    assert len(idx._nodes) == 0, "partial index must be discarded on cancel"
+    assert len(idx._forward) == 0
+    assert len(idx._reverse) == 0
+    # Retry after clearing cancel: restore the real _index_file (the wrapper
+    # would otherwise keep re-tripping cancel since count[0] is already >=3),
+    # then full-build succeeds (no stuck/half state).
+    idx._index_file = orig
+    ev.clear()
+    idx.build()
+    assert idx._built is True
+    assert len(idx._nodes) > 0
+
+
+def test_build_without_cancel_event_unchanged(tmp_path: Path) -> None:
+    """cancel_event=None (direct API callers, tests) builds exactly as before."""
+    _seed_repo(tmp_path, n=10)
+    idx = CallGraphIndexer(str(tmp_path))  # cancel_event defaults to None
+    idx.build()
+    assert idx._built is True
+    assert len(idx._nodes) > 0
+
+
+# ── design-chat per-turn mutation regressions ────────────────────────────────
+# REGRESSION for a capture-at-construction bug: ``CallGraphIndexer`` is built by
+# ``ToolRegistry`` from ``config``, and the design-chat REPL (asi.py) sets
+# ``config.cancel_event`` PER TURN *after* the registry — and thus the indexer —
+# was constructed with ``cancel_event=None``. A frozen construction-time value
+# would leave ESC inert on every ``analyze_change_impact`` / ``query_dependency_
+# graph`` first-call build (the exact interactive path ESC must protect). The
+# indexer must read ``config.cancel_event`` FRESH at ``build()`` time — the same
+# call-time fresh read vulture uses in analysis_tools. ``config=`` (not
+# ``cancel_event=``) is the ToolRegistry wiring.
+
+def test_build_honors_per_turn_config_mutation(tmp_path: Path) -> None:
+    """ESC pressed via a config.cancel_event set AFTER construction is honored."""
+    import types
+    _seed_repo(tmp_path, n=10)
+    cfg = types.SimpleNamespace(cancel_event=None)      # asi.py:6703 state at construction
+    idx = CallGraphIndexer(str(tmp_path), config=cfg)   # ToolRegistry wiring (config=)
+    assert idx._cancel_event is None                    # construction-time value frozen
+    assert idx._get_cancel_event() is None              # no event yet
+
+    # Per-turn mutation (asi.py:8536): a live event lands on config AFTER build.
+    ev = threading.Event()
+    cfg.cancel_event = ev
+    ev.set()                                           # ESC pressed
+    assert idx._cancel_event is None                   # STILL frozen None ...
+    assert idx._get_cancel_event() is ev               # ... but fresh read sees live event
+    idx.build()
+    assert idx._built is False                         # fresh read → cancel honored
+    assert len(idx._nodes) == 0 and len(idx._forward) == 0
+
+    # Clear ESC → same indexer now builds (fresh read reflects the clear).
+    ev.clear()
+    idx.build()
+    assert idx._built is True
+    assert len(idx._nodes) > 0
+
+
+def test_build_with_config_no_event_builds_normally(tmp_path: Path) -> None:
+    """config passed but cancel_event stays None → builds exactly as before."""
+    import types
+    _seed_repo(tmp_path, n=10)
+    cfg = types.SimpleNamespace(cancel_event=None)
+    idx = CallGraphIndexer(str(tmp_path), config=cfg)
+    idx.build()
+    assert idx._built is True
+    assert len(idx._nodes) > 0

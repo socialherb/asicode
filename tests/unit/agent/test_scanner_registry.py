@@ -316,6 +316,67 @@ class TestRun:
             "lock must not collapse into a single global lock"
         )
 
+    # ── Cooperative cancel forwarding (run(cancel_event=...)) ──────────────
+
+    def test_cancel_event_forwarded_only_to_opt_in_scanners(self):
+        """``run(cancel_event=ev)`` forwards the event ONLY to scanners whose
+        signature declares ``cancel_event``. A scanner unaware of cancellation
+        must never receive the kwarg — doing so would raise ``TypeError`` for
+        any scanner defined without ``**kwargs``. The opt-in gate is what lets
+        cooperative cancellation reach vulture without breaking every other
+        scanner."""
+        import threading
+
+        r = ScannerRegistry()
+        received: dict = {}
+
+        _SENTINEL = object()
+
+        def _opt(repo_root="", file_paths=None, cancel_event=_SENTINEL):
+            received["opt"] = cancel_event
+            return []
+
+        # NOTE: deliberately NO ``**kwargs`` and NO ``cancel_event`` param.
+        # If run() injects cancel_event here, this raises TypeError.
+        def _plain(repo_root="", file_paths=None):
+            received["plain_called"] = True
+            return []
+
+        r.register(ScannerSpec(name="opt", description="x", file_filter=""), _opt)
+        r.register(ScannerSpec(name="plain", description="x", file_filter=""), _plain)
+
+        ev = threading.Event()
+        ev.set()
+        r.run("opt", cancel_event=ev)
+        r.run("plain", cancel_event=ev)
+
+        assert received["opt"] is ev, "opt-in scanner did not receive cancel_event"
+        assert received.get("plain_called") is True, (
+            "plain scanner was not called (cancel_event likely injected → TypeError)"
+        )
+
+    def test_cancel_event_none_does_not_inject_kwarg(self):
+        """When ``cancel_event`` is None/omitted (the common non-interactive
+        path), the kwarg must NOT be injected at all — opt-in scanners are
+        never burdened with it. Verified via a sentinel default that stays
+        untouched when the param is not passed."""
+        r = ScannerRegistry()
+        received: dict = {}
+
+        _SENTINEL = object()
+
+        def _opt(repo_root="", file_paths=None, cancel_event=_SENTINEL):
+            received["opt"] = cancel_event
+            return []
+
+        r.register(ScannerSpec(name="opt", description="x", file_filter=""), _opt)
+
+        # cancel_event omitted entirely (default None in run()'s signature).
+        r.run("opt")
+        assert received["opt"] is _SENTINEL, (
+            "cancel_event=None still injected the kwarg (should be a no-op)"
+        )
+
 
 # ── vulture_dead_code_scanner registration & requires_graph (lines 343-369) ───
 

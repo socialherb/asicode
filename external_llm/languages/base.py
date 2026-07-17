@@ -357,28 +357,119 @@ def _skip_quoted_literal(content: str, start: int, length: int, quote: str, esca
     return length
 
 
-def _find_closing_brace(content: str, offset: int) -> int:
-    """Core brace scanner — returns offset of matching ``}`` or -1.
+def _is_verbatim_string_start(content: str, i: int) -> bool:
+    """Whether the ``"`` at *i* opens a C# verbatim string (``@"..."``).
 
-    Shared by both twins (find_brace_block_end / find_brace_block_end_offset).
-    Pure offset tracking with no line counting — just depth and
-    literal/comment skipping. Multi-line literals (backtick, template,
-    block-comment) are fully skipped at the character level, so their
-    contents cannot corrupt the depth counter.
+    C# verbatim strings treat ``\\`` as a literal backslash and use ``""`` for an
+    embedded quote — the opposite of the ``escapes=True`` rule that
+    :func:`_skip_quoted_literal` applies to ordinary strings. Without this
+    detection a verbatim string whose closing ``"`` is preceded by ``\\``
+    (e.g. ``@"C:\\x\\"``) is mis-scanned: the ``\\"`` is read as an escape,
+    the scan overshoots past the real close, and downstream braces are
+    mis-counted (symptom: the fail-closed pre-write gate falsely rejects a
+    valid edit).
 
-    Returns -1 when no matching brace is found (unterminated block), letting
-    each twin apply its own conservative fallback.
-
-    Known limitation: backtick (`` ` ``) is always ``escapes=False`` for Go
-    raw string compat.  A TS template-literal escaped backtick (``\\````) will
-    be treated as unescaped, causing the backtick to close prematurely and
-    the scanner to treat the remaining ``}`` at balanced depth as the block
-    end — producing a 1-line under-count on the line twin.  This path is
-    regex-fallback only (no tree-sitter) and the pattern is extremely rare in
-    real code; accepted trade-off.
+    Handles all three C# verbatim prefixes — ``@"``, ``$@"``, ``@$"`` — since
+    ``@"`` is essentially C#-unique (no other scanned language prefixes a
+    string literal with ``@``), so this detection is safe across the shared
+    scanner.
     """
-    depth = 0
-    started = False
+    if i >= 1 and content[i - 1] == "@":
+        return True
+    # @$" form (interpolated verbatim): '$' immediately precedes '"', '@' before it
+    if i >= 2 and content[i - 1] == "$" and content[i - 2] == "@":
+        return True
+    return False
+
+
+def _skip_verbatim_string(content: str, start: int, length: int) -> int:
+    """Skip a C# verbatim string whose opening ``"`` is at *start*.
+
+    In a verbatim string ``\\`` is a literal backslash (NOT an escape) and a
+    doubled ``""`` represents a single embedded ``"``. The scan therefore runs
+    until a ``"`` that is NOT followed by another ``"``. Returns the index of
+    that closing quote (or *length* if unterminated).
+    """
+    j = start + 1
+    while j < length:
+        if content[j] == '"':
+            if j + 1 < length and content[j + 1] == '"':  # doubled → embedded quote
+                j += 2
+                continue
+            return j  # lone closing quote
+        j += 1
+    return length
+
+
+def _consume_char_or_lifetime(content: str, i: int, length: int) -> int:
+    """Given a tick ``'`` at *i*, return the index past the construct it opens.
+
+    Disambiguates a **char literal** (``'a'``, ``'\\n'``, ``'\\u{41}'``,
+    ``'\\''``) from a Rust **lifetime** (``'a``, ``'static``, ``&'a self``).
+    A lifetime has NO closing tick; a char literal always closes after exactly
+    one element (a single character or one escape sequence). Validating that
+    element grammar distinguishes the two WITHOUT a language parameter — the
+    rule is uniform across C/C++/Java/Rust/Go runes.
+
+    Returns:
+
+    - char literal → index past the closing ``'``
+    - lifetime / lone trailing tick → ``i + 1`` (the tick's identifier is left
+      as ordinary source so braces like ``struct Parser<'a> {`` are counted)
+
+    Known limitation: multi-char char literals (C ``'ab'``) lacking a closing
+    tick on the element are treated as lifetimes. They cannot contain braces
+    in practice (digits/letters only), so the net count is unaffected; only
+    the pathological ``'{}'`` is mis-scanned (documented, like the backtick
+    xfail).
+    """
+    j = i + 1
+    if j >= length:
+        return i + 1
+    c = content[j]
+    if c == "\\":  # escape sequence
+        if j + 1 >= length:
+            return i + 1
+        e = content[j + 1]
+        if e in "uU" and j + 2 < length and content[j + 2] == "{":
+            # \u{XXXX} / \U{XXXXXXXX} — close brace then expect closing '
+            close = content.find("}", j + 3)
+            if close != -1 and close + 1 < length and content[close + 1] == "'":
+                return close + 2
+            return i + 1
+        if e == "x":  # \xHH — 1-2 hex digits
+            k = j + 2
+            while k < length and content[k] in "0123456789abcdefABCDEF" and k - (j + 2) < 2:
+                k += 1
+            if k < length and content[k] == "'":
+                return k + 1
+            return i + 1
+        # simple escape: \n \t \\ \' \" \0 \r \a \b \f \v — one char after backslash
+        if j + 2 < length and content[j + 2] == "'":
+            return j + 3
+        return i + 1
+    # single-char element
+    if j + 1 < length and content[j + 1] == "'":
+        return j + 2
+    return i + 1  # no closing tick within one element → lifetime
+
+
+def _iter_brace_tokens(content: str, offset: int = 0):
+    """Yield ``(ch, idx)`` for every ``{``/``}`` OUTSIDE literals and comments.
+
+    SSOT literal/comment/char-vs-lifetime scanner shared by both
+    :func:`_find_closing_brace` (offset of matching close) and
+    :func:`net_brace_count` (net depth tally). Centralising the skip logic
+    here means the Rust-lifetime disambiguation and string/comment handling
+    live in exactly one place — the two consumers cannot desync (the prior
+    copy-pasted loops were the recurring bug source).
+
+    Skips: ``//`` line comments, ``/* */`` block comments, ``"..."`` strings,
+    ``'...'`` char literals / Rust lifetimes (see
+    :func:`_consume_char_or_lifetime`), and backtick ``\\`...\\` `` template/
+    raw strings (``escapes=False`` for Go raw-string compat). An unterminated
+    comment/string ends generation.
+    """
     i = offset
     length = len(content)
     while i < length:
@@ -387,36 +478,89 @@ def _find_closing_brace(content: str, offset: int) -> int:
         if ch == "/" and i + 1 < length and content[i + 1] == "/":
             nl = content.find("\n", i)
             if nl == -1:
-                break
+                return
             i = nl
             continue
         # ── block comment /* … */ ────────────────────────────────────
         if ch == "/" and i + 1 < length and content[i + 1] == "*":
             end = content.find("*/", i + 2)
             if end == -1:
-                break
+                return
             i = end + 2
             continue
-        # ── string/char/template literals ─────────────────────────────
+        # ── string / template literals ────────────────────────────────
         if ch == '"':
-            i = _skip_quoted_literal(content, i, length, '"', escapes=True) + 1
+            # C# verbatim @"..." (\ literal, "" embedded quote) needs its own
+            # scan rule — otherwise \" before the real close is read as an
+            # escape and the scan overshoots, mis-counting downstream braces.
+            if _is_verbatim_string_start(content, i):
+                i = _skip_verbatim_string(content, i, length) + 1
+            else:
+                i = _skip_quoted_literal(content, i, length, '"', escapes=True) + 1
             continue
         if ch == "'":
-            i = _skip_quoted_literal(content, i, length, "'", escapes=True) + 1
+            # Char literal ('x','\n',...) vs Rust lifetime ('a,'static): a
+            # lifetime has no closing tick, so consume only the tick and let
+            # its identifier scan normally — otherwise the '{' in
+            # `struct Parser<'a> {` is swallowed between two ticks.
+            i = _consume_char_or_lifetime(content, i, length)
             continue
         if ch == "`":
             i = _skip_quoted_literal(content, i, length, "`", escapes=False) + 1
             continue
-        # ── brace depth ──────────────────────────────────────────────
+        # ── brace token ───────────────────────────────────────────────
+        if ch == "{" or ch == "}":
+            yield (ch, i)
+        i += 1
+
+
+def _find_closing_brace(content: str, offset: int) -> int:
+    """Core brace scanner — returns offset of matching ``}`` or -1.
+
+    Thin consumer of :func:`_iter_brace_tokens` (the SSOT literal/comment/
+    char-vs-lifetime scanner). Tracks depth and returns the offset of the
+    first ``}`` that returns depth to zero after an opening ``{``.
+
+    Returns -1 when no matching brace is found (unterminated block), letting
+    each twin (:func:`find_brace_block_end` /
+    :func:`find_brace_block_end_offset`) apply its own conservative fallback.
+
+    Known limitation: backtick (`` ` ``) is always ``escapes=False`` for Go
+    raw-string compat — see :func:`_iter_brace_tokens`.
+    """
+    depth = 0
+    started = False
+    for ch, idx in _iter_brace_tokens(content, offset):
         if ch == "{":
             depth += 1
             started = True
-        elif ch == "}":
+        else:  # "}"
             depth -= 1
             if started and depth == 0:
-                return i
-        i += 1
+                return idx
     return -1
+
+
+def net_brace_count(content: str) -> int:
+    """Literal/comment-aware net brace count (``{`` minus ``}``).
+
+    Thin consumer of :func:`_iter_brace_tokens` — shares the EXACT same
+    string/char/template-literal and ``//`` / ``/* */`` comment skipping as
+    :func:`_find_closing_brace`, so the two can never desync. Returns 0 for a
+    balanced region.
+
+    This is the SSOT brace tally for the pre-write safety gate in
+    ``symbol_modify_tool._post_edit_syntax_ok``: brace-delimited languages that
+    lack an inline compiler (Kotlin/Rust/C/C++/Java/Scala/Swift/C#) are
+    validated for balance before write, so a symbol-range scan that left an
+    orphan ``}`` (or dropped a brace) is rejected instead of corrupting the
+    file. It is a coarse gate — a real compiler is stronger — but it catches
+    the known corruption class where braces are added/removed in net terms.
+    """
+    depth = 0
+    for ch, _idx in _iter_brace_tokens(content):
+        depth += 1 if ch == "{" else -1
+    return depth
 
 
 def find_brace_block_end(content: str, offset: int) -> int:

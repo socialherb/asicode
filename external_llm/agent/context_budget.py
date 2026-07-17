@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 #   OpenRouter:https://openrouter.ai/
 #   Kimi:      https://platform.kimi.ai/docs/models
 # DeepSeek v4-flash/v4-pro, GLM-5.2, Qwen3.7-max/plus, Qwen3.6-plus/3.5-plus,
-# MiMo-v2.5-pro/v2.5/v2-pro, MiniMax-M3, deepseek-chat, deepseek-reasoner
+# MiMo-v2.5-pro/v2.5/v2-pro, MiniMax-M3, kimi-k3, deepseek-chat, deepseek-reasoner
 # are all 1M+ models — no explicit entry needed (use _DEFAULT_CONTEXT_LIMIT fallback).
 _CONTEXT_LIMITS: dict[str, int] = {
     # OpenAI
@@ -69,6 +69,8 @@ _CONTEXT_LIMITS: dict[str, int] = {
     # mimo-v2-omni has 256_000 (decimal 256K). Source: openrouter.ai.
     "mimo-v2-omni":     256_000,
     # Moonshot Kimi (opencode provider)
+    # kimi-k3 is a 1M+ model (1,048,576 = 2^20) — uses _DEFAULT_CONTEXT_LIMIT fallback
+    # (no explicit entry); variants like kimi-k3-0711/kimi-k3-turbo resolve uniformly to 1M.
     # kimi-k2.7-code uses binary 256K (262_144 = 2^18). kimi-k2.6/k2.5 use decimal 256K.
     # Source: platform.kimi.ai/docs/models.
     "kimi-k2.7-code":   262_144,

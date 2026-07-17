@@ -17,6 +17,13 @@ from __future__ import annotations
 from external_llm.editor._editor_core.vm.models import VerifyError, VMResult
 from external_llm.editor._editor_core.vm.vm import GenericExecutionVM
 
+__all__ = [
+    "GenericExecutionVM",
+    "VerifyError",
+    "VMResult",
+    "create_vm",
+]
+
 
 def create_vm(language: str = "python", **kwargs) -> GenericExecutionVM:
     """Factory: create a VM configured for *language*.

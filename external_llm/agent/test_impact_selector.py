@@ -108,9 +108,6 @@ def is_test_file(rel_path: str) -> bool:
     return ("/test_" in p or p.startswith("test_") or p.endswith("_test.py")) and p.endswith(".py")
 
 
-# Backward-compat alias — older callers and tests imported the private name.
-_is_test_file = is_test_file
-
 
 def git_status_test_files(repo_root: str | Path) -> list[str]:
     """Return repo-relative test files that are new/modified per ``git status``.

@@ -94,9 +94,6 @@ class RouteDecision:
     multi_agent: Optional[bool] = None
     max_turns_override: Optional[int] = None
 
-    # LLM target hints: modify_files, new_files from LLM classification
-    llm_target_hints: Optional[dict[str, Any]] = None
-
     # (pre_resolved_spec and explore_report removed — ExploreAgent pipeline removed)
 
     # Target specificity score (0.0 = maximally ambiguous, 1.0 = fully specified)
@@ -117,7 +114,7 @@ class RouteFeatures:
 
     decide_flow() reads: has_edit_intent, has_explicit_file, has_explicit_symbol,
     has_specific_change_object, is_multi_file, is_project_wide, has_conflicting_intent,
-    all_targets_non_structured, any_target_structured, mentioned_files, requests_new_file,
+    all_targets_non_structured, requests_filesystem_op, requests_ui_change,
     requests_test_work, target_specificity_score, task_kind, complexity, scope.
 
     Other fields are intermediate — used within extract_features() and
@@ -131,9 +128,6 @@ class RouteFeatures:
 
     # file/symbol extraction
     mentioned_files: list[str] = field(default_factory=list)
-    existing_files: list[str] = field(default_factory=list)
-    missing_files: list[str] = field(default_factory=list)
-    mentioned_symbols: list[str] = field(default_factory=list)  # intermediate
 
     # intent
     has_edit_intent: bool = False
@@ -143,7 +137,6 @@ class RouteFeatures:
     has_question_form: bool = False  # intermediate
 
     # task shape
-    requests_new_file: bool = False
     requests_filesystem_op: bool = False  # intermediate
     requests_refactor: bool = False  # intermediate
     requests_test_work: bool = False
@@ -161,22 +154,18 @@ class RouteFeatures:
     # scope
     file_count: int = 0            # intermediate
     symbol_count: int = 0          # intermediate
-    is_single_file: bool = True    # intermediate
     is_multi_file: bool = False
     is_project_wide: bool = False
     has_cross_file_signal: bool = False  # intermediate
     has_propagation_signal: bool = False  # intermediate
 
     # ambiguity / conflict
-    is_ambiguous_write: bool = False  # intermediate
     has_conflicting_intent: bool = False
 
     # triviality
     looks_trivial_edit: bool = False  # intermediate
 
     # language / capability
-    all_targets_structured: Optional[bool] = None  # intermediate
-    any_target_structured: Optional[bool] = None
     all_targets_non_structured: Optional[bool] = None
 
     # readonly analysis subtype
@@ -276,7 +265,6 @@ class DeterministicClassifier:
         if it == "refactor":
             f.requests_refactor = True
         if it == "create":
-            f.requests_new_file = True
             f.requests_boilerplate = True
         elif it in ("extend", "feature"):
             f.is_multi_file = True  # extend/feature → at least multi-file scope
@@ -328,8 +316,6 @@ class DeterministicClassifier:
         intent_result: Optional["IntentResult"] = None,
     ) -> RouteFeatures:
         """Extract structural features from request. Keywords → features, NOT lanes."""
-        import os
-
         f = RouteFeatures()
         f.request_lower = request.lower().strip()
         f.word_count = len(request.split())
@@ -350,18 +336,10 @@ class DeterministicClassifier:
         # ── file / symbol extraction ──
         f.mentioned_files = self._get_file_ext_pattern().findall(request)
         f.file_count = len(set(f.mentioned_files))
-        if repo_root and f.mentioned_files:
-            for fp in f.mentioned_files:
-                full = os.path.join(repo_root, fp)
-                if os.path.exists(full):
-                    f.existing_files.append(fp)
-                else:
-                    f.missing_files.append(fp)
 
         _sym_matches = self._SYMBOL_PATTERN.findall(request)
         # Strip backticks from backtick-quoted symbol names
         _sym_matches = [m.strip('`') for m in _sym_matches]
-        f.mentioned_symbols = _sym_matches
         f.symbol_count = len(_sym_matches)
 
         # ── intent extraction ──
@@ -382,11 +360,6 @@ class DeterministicClassifier:
 
         # has_question_form: structural check for "?" form (supplement IntentResult)
         f.has_question_form = f.has_question_form or rl.rstrip().endswith("?")
-
-        # new file detection: supplement IntentResult.create with actual missing file paths
-        f.requests_new_file = f.requests_new_file or (
-            bool(f.missing_files) and f.has_edit_intent
-        )
 
         # ── targeting / specificity ──
         f.has_explicit_file = f.file_count > 0
@@ -448,39 +421,17 @@ class DeterministicClassifier:
             and not f.has_cross_file_signal
             and not f.has_propagation_signal):
             f.is_multi_file = False
-            f.is_single_file = True
-        else:
-            f.is_single_file = not f.is_multi_file
 
         # ── language / capability ──
         if f.mentioned_files:
             _registry = LanguageRegistry.instance()
             _structured = [_registry.supports_structured_ops(fp) for fp in f.mentioned_files]
-            f.all_targets_structured = all(_structured)
-            f.any_target_structured = any(_structured)
             f.all_targets_non_structured = not any(_structured)
 
         # ── ambiguity extraction ──
         f.has_conflicting_intent = (
             f.has_edit_intent
             and (f.has_read_intent or f.has_explain_intent or f.has_locate_intent)
-        )
-
-        # locate+question form = asking WHERE, not requesting edit
-        _is_locate_question = (
-            f.has_locate_intent and f.has_question_form and not f.has_explicit_file
-        )
-        # conflicting intent (read+edit both) = has a task structure, not ambiguous
-        f.is_ambiguous_write = (
-            f.has_edit_intent
-            and not f.has_explicit_file
-            and not f.has_explicit_symbol
-            and not f.has_specific_change_object
-            and not f.has_propagation_signal
-            and not f.has_cross_file_signal
-            and not _is_locate_question
-            and not (f.has_conflicting_intent and f.word_count > 5)
-            and f.word_count <= 20
         )
 
         # ── readonly subtype ──

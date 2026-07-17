@@ -88,7 +88,6 @@ class FailureContext:
     test_id: Optional[str] = None
 
     traceback: list[TraceFrame] = field(default_factory=list)
-    raw_snippet: str = ""
 
     # meta signals for strategy engine
     fingerprint: str = ""
@@ -110,7 +109,7 @@ def analyze_failure(*, stage: str, raw_text: str, repo_root: Optional[str] = Non
     """
     raw = (raw_text or "").strip()
     if not raw:
-        ctx = FailureContext(stage=stage, type="UnknownError", message="empty error text", raw_snippet="")
+        ctx = FailureContext(stage=stage, type="UnknownError", message="empty error text")
         ctx.fingerprint = _fingerprint(ctx)
         return ctx
 
@@ -137,7 +136,7 @@ def analyze_failure(*, stage: str, raw_text: str, repo_root: Optional[str] = Non
         return ctx
 
     # 3) Last resort
-    ctx = FailureContext(stage=stage, type="UnknownError", message=_first_line(raw), raw_snippet=_snip(raw))
+    ctx = FailureContext(stage=stage, type="UnknownError", message=_first_line(raw))
     ctx.fingerprint = _fingerprint(ctx)
     return ctx
 
@@ -155,7 +154,6 @@ def _try_parse_git_apply(stage: str, raw: str) -> Optional[FailureContext]:
             stage=stage or "git_apply_check",
             type="GitApplyError",
             message=_first_line(raw),
-            raw_snippet=_snip(raw),
         )
         # Try extract "path:line" (first matching line only)
         _pf_prefix = "patch failed:"
@@ -184,17 +182,17 @@ def _try_parse_diff_format(stage: str, raw: str) -> Optional[FailureContext]:
     lower = raw.lower()
 
     if "empty_patch" in lower:
-        ctx = FailureContext(stage=stage, type="EmptyPatch", message=_first_line(raw), raw_snippet=_snip(raw))
+        ctx = FailureContext(stage=stage, type="EmptyPatch", message=_first_line(raw))
         ctx.tags.append("empty_patch")
         return ctx
 
     if "missing_hunks" in lower or "no @@ hunk" in lower:
-        ctx = FailureContext(stage=stage, type="InvalidUnifiedDiff", message=_first_line(raw), raw_snippet=_snip(raw))
+        ctx = FailureContext(stage=stage, type="InvalidUnifiedDiff", message=_first_line(raw))
         ctx.tags.append("missing_hunks")
         return ctx
 
     if "invalid_diff" in lower or "no diff found" in lower:
-        ctx = FailureContext(stage=stage, type="InvalidUnifiedDiff", message=_first_line(raw), raw_snippet=_snip(raw))
+        ctx = FailureContext(stage=stage, type="InvalidUnifiedDiff", message=_first_line(raw))
         ctx.tags.append("invalid_diff")
         return ctx
 
@@ -224,7 +222,6 @@ def _try_parse_pytest(stage: str, raw: str, repo_root: Optional[str]) -> Optiona
             stage=stage or "tests",
             type="MissingPytestPlugin" if missing else "PytestUsageError",
             message=_first_line(raw),
-            raw_snippet=_snip(raw),
         )
         ctx.tags.append("unrecognized_argument")
         if missing:
@@ -239,7 +236,7 @@ def _try_parse_pytest(stage: str, raw: str, repo_root: Optional[str]) -> Optiona
     if not (has_core_failure_markers or has_collection_markers):
         return None
 
-    ctx = FailureContext(stage=stage or "tests", type="PytestFailure", message=_first_line(raw), raw_snippet=_snip(raw))
+    ctx = FailureContext(stage=stage or "tests", type="PytestFailure", message=_first_line(raw))
 
     # Collection error detection
     if ("error collecting" in low) or ("importerror while importing test module" in low) or ("collected 0 items" in low):
@@ -278,7 +275,6 @@ def _try_parse_python_traceback(stage: str, raw: str, repo_root: Optional[str]) 
         stage=stage or "runtime",
         type=_normalize_exception_type(ex_type),
         message=ex_msg or _first_line(raw),
-        raw_snippet=_snip(raw),
     )
 
     if ex_type == "ModuleNotFoundError":
@@ -387,23 +383,4 @@ def _first_line(raw: str) -> str:
         if ln.strip():
             return ln.strip()
     return raw[:200].strip()
-
-
-def _snip(raw: str, limit: int = 1200) -> str:
-    """Truncate raw_snippet to limit length.
-
-    pytest/python tracebacks have the exception type and message at the end (tail).
-    Truncating only the head would cause the LLM to miss key diagnostics like
-    `AssertionError: ...` when viewing the raw_snippet. Preserves head+tail evenly
-    to ensure tail diagnostics are never lost.
-    """
-    s = raw.strip()
-    if len(s) <= limit:
-        return s
-    _half = limit // 2
-    return (
-        s[:_half]
-        + "\n...<snip — middle omitted; traceback tail preserved below>...\n"
-        + s[-_half:]
-    )
 

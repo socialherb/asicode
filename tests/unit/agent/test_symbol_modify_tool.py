@@ -17,10 +17,13 @@ from external_llm.agent.symbol_modify_tool import (
     _find_symbol_range_via_treesitter,
     _looks_like_full_symbol_block,
     _realign_dedented_leading_lines,
+    _trailing_foreign_stmt,
     modify_symbol,
 )
 from external_llm.common.atomic_io import atomic_write_text
 from external_llm.common.indent_utils import min_indent
+from external_llm.languages.base import net_brace_count
+from external_llm.languages.tree_sitter_utils import find_all_symbols
 
 
 def _ts_grammar_available(lang: str) -> bool:
@@ -552,6 +555,65 @@ class TestFindSymbolLineRange:
         r = _find_symbol_line_range("x = 1\n", "nonexistent", "test.py")
         assert r is None
 
+    def test_allman_style_brace_on_next_line(self, monkeypatch):
+        """Allman/BSD style: '{' on the line after the signature must still yield
+        a range covering def + body + closing brace — NOT a body-less / empty
+        range. Regression: the no-brace branch saw the '{' line at the
+        signature's own indent and returned an empty (i, i) range, which on edit
+        duplicated the symbol instead of replacing it.
+        """
+        # Force the brace/indent fallback (tree-sitter unavailable) so the
+        # Allman detection in _find_symbol_line_range itself is exercised.
+        monkeypatch.setattr(
+            "external_llm.agent.symbol_modify_tool._find_symbol_range_via_treesitter",
+            lambda *a, **k: None,
+        )
+        source = (
+            "#include <stdio.h>\n"
+            "int compute(int x)\n"
+            "{\n"
+            "    int a = x * 2;\n"
+            "    return a;\n"
+            "}\n"
+            "int helper()\n"
+            "{\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        r = _find_symbol_line_range(source, "compute", "m.c")
+        assert r is not None
+        start, end = r
+        assert start == 1                         # def line index
+        assert end == 6                            # exclusive: through closing '}'
+        lines = source.splitlines()
+        assert lines[start].strip() == "int compute(int x)"
+        assert lines[end - 1].strip() == "}"       # closing brace included
+
+    def test_no_brace_indent_branch_not_empty(self, monkeypatch):
+        """The indentation fallback must never return an empty (i, i) range.
+        It previously examined the def line itself (which sits at exactly
+        sym_indent) on the first iteration and broke with `end -= 1`. Simulated
+        via an AST-fail Python file (a syntax error forces the fallback path).
+        """
+        monkeypatch.setattr(
+            "external_llm.agent.symbol_modify_tool._find_symbol_range_via_treesitter",
+            lambda *a, **k: None,
+        )
+        source = (
+            "def !!!bad===\n"
+            "def foo():\n"
+            "    a = 1\n"
+            "    b = 2\n"
+            "def bar():\n"
+            "    pass\n"
+        )
+        r = _find_symbol_line_range(source, "foo", "t.py")
+        assert r is not None
+        start, end = r
+        assert start == 1
+        assert end > start                          # NOT the empty (1, 1) range
+        assert end == 4                             # def + two body lines
+
 
 # ── Provider-based symbol location (modifiers / annotations) ────────────────
 # Regression: _find_symbol_line_range previously used a hardcoded prefix list
@@ -667,6 +729,235 @@ class TestFindSymbolRangeViaTreeSitter:
         assert _find_symbol_range_via_treesitter(src, "go", "m.py") is None
 
 
+class TestKotlinBraceCorruptionFix:
+    """Regression guard for the orphan-``}`` corruption class.
+
+    Root-cause chain (all four links fixed):
+      1. The Kotlin grammar exposes the function name as a positional named
+         child (``simple_identifier``), NOT a ``"name"`` field, so
+         ``find_all_symbols`` skipped every Kotlin symbol and
+         ``_find_symbol_range_via_treesitter`` returned ``None``.
+      2. The fallback ``_find_symbol_line_range`` used a naive per-line
+         ``count('{') - count('}')`` that miscounted braces inside
+         string/comment literals and terminated one line early, excluding the
+         real closing ``}``.
+      3. The surgical edit spliced the new block over the truncated range,
+         leaving the original closing ``}`` as an orphan (172 syntax errors).
+      4. ``_post_edit_syntax_ok`` passed non-Python brace languages through
+         unverified, so the corruption reached disk and reported success.
+
+    Fixes: A (``_extract_name`` field-name fallback), B (literal-aware SSOT
+    brace scanner in the fallback path), C (pre-write brace-balance gate).
+    """
+
+    # The exact corruption trigger: braces inside string literals and comments.
+    REPRO = textwrap.dedent("""\
+        class Report {
+
+            private fun generatePdfReport(): String {
+                val total = "Total: {amount}"
+                val close = "close }"
+                // trailing brace } in comment
+                run {
+                    println("inner {")
+                }
+                run {
+                    println("second {")
+                }
+                return file
+            }
+
+            private fun helperAfter(): Int {
+                return 42
+            }
+        }
+    """)
+
+    def test_a_kotlin_function_detected_by_find_all_symbols(self):
+        # Fix A: the field-name fallback lets the manual walk extract Kotlin
+        # function symbols (previously an empty list forced the naive fallback).
+        if not _ts_grammar_available("kotlin"):
+            pytest.skip("tree-sitter-kotlin not installed")
+        names = {s[0] for s in find_all_symbols(self.REPRO, "kotlin")}
+        assert "generatePdfReport" in names
+        assert "helperAfter" in names
+        assert "Report" in names
+
+    def test_ab_range_includes_closing_brace_with_braces_in_literals(self):
+        # Fix A+B: the reported range MUST contain the real closing brace even
+        # when the body carries braces inside string/comment literals.
+        r = _find_symbol_line_range(self.REPRO, "generatePdfReport", "Report.kt")
+        assert r is not None
+        # closing brace of generatePdfReport is 1-based line 14 = 0-idx 13
+        assert r[0] <= 13 < r[1], (
+            f"closing brace (0-idx 13) not in range {r} -> orphan-}} risk"
+        )
+
+    def test_b_naive_fallback_includes_closing_brace(self, monkeypatch):
+        # Fix B: even with tree-sitter unavailable, the literal-aware SSOT brace
+        # scanner (NOT naive per-line counting) drives the fallback range.
+        monkeypatch.setattr(
+            "external_llm.agent.symbol_modify_tool._find_symbol_range_via_treesitter",
+            lambda *a, **k: None,
+        )
+        r = _find_symbol_line_range(self.REPRO, "generatePdfReport", "Report.kt")
+        assert r is not None
+        assert r[0] <= 13 < r[1], (
+            f"fallback range {r} dropped closing brace -> orphan-}} risk"
+        )
+
+    def test_bc_fallback_brace_offset_edge_cases(self, monkeypatch):
+            # Regression guard for three fallback-path (tree-sitter unavailable)
+            # brace-offset bugs in _find_symbol_line_range:
+            #  (3) a default-arg literal like fmt = "{}" made find('{') land
+            #      mid-string → block-end scan balanced from the wrong point →
+            #      truncated range that orphans the body on edit.
+            #  (4) Allman detection skipped '//'/'#' but not /* */ block comments
+            #      (javadoc) sitting between signature and '{' → body-less range.
+            #  (2) CRLF/CR files: splitlines() strips the terminator, so the
+            #      `len(line)+1` offset drifts one char per CRLF line and can land
+            #      the scan point inside an earlier symbol's body.
+            monkeypatch.setattr(
+                "external_llm.agent.symbol_modify_tool._find_symbol_range_via_treesitter",
+                lambda *a, **k: None,
+            )
+            # (3) literal '{' / '}' in a Kotlin default-arg string
+            kt = 'fun greet(fmt: String = "{}") {\n    println(fmt)\n}\n'
+            assert _find_symbol_line_range(kt, "greet", "x.kt") == (0, 3)
+            kt2 = 'fun f(s: String = "}") {\n    x()\n}\nfun next() { y() }\n'
+            assert _find_symbol_line_range(kt2, "f", "x.kt") == (0, 3)
+            # (4) Allman + multi-line /* */ (javadoc) and single-line /* */
+            c = "void compute()\n/**\n * doc\n */\n{\n    do_work();\n}\n"
+            assert _find_symbol_line_range(c, "compute", "x.c") == (0, 7)
+            c2 = "void compute()\n/* one */\n{\n    do_work();\n}\n"
+            assert _find_symbol_line_range(c2, "compute", "x.c") == (0, 5)
+            # (2) CRLF vs LF parity — symbol on a non-zero line so offset
+            #     accumulation matters; both must yield the same correct range.
+            body = "fun first() { val x = 1 }\nfun target() {\n    println()\n}\n"
+            assert _find_symbol_line_range(body, "target", "x.kt") == (1, 4)
+            assert _find_symbol_line_range(body.replace("\n", "\r\n"), "target", "x.kt") == (1, 4)
+            deep = "val a = 1\nval b = 2\nval c = 3\nval d = 4\nval e = 5\nfun target() {\n    x()\n}\n"
+            assert _find_symbol_line_range(deep.replace("\n", "\r\n"), "target", "x.kt") == (5, 8)
+
+    def test_fallback_range_excludes_next_sibling_doc_comment(self, monkeypatch):
+        # Regression: the brace-branch trailing-skip absorbed the NEXT symbol's
+        # leading ``//``/``#`` doc comment into this symbol's range, so editing
+        # or deleting this symbol would silently delete the sibling's doc. The
+        # fix returns the exact closing-brace line with no trailing absorption.
+        monkeypatch.setattr(
+            "external_llm.agent.symbol_modify_tool._find_symbol_range_via_treesitter",
+            lambda *a, **k: None,
+        )
+        src = (
+            "void foo(void) { return; }\n"
+            "\n"
+            "// doc for bar\n"
+            "void bar(void) { return; }\n"
+        )
+        r = _find_symbol_line_range(src, "foo", "x.c")
+        assert r is not None
+        # foo's range must NOT reach the ``// doc for bar`` line (0-idx 2).
+        assert r[1] <= 2, f"range {r} absorbed next sibling's doc comment"
+        sl = src.splitlines(keepends=True)
+        foo_text = "".join(sl[r[0]:r[1]])
+        assert "// doc for bar" not in foo_text
+
+    def test_first_significant_line_skips_block_comments(self):
+        # SSOT helper shared by _looks_like_full_symbol_block and the surgical
+        # full-block reclassification — must skip #/// AND /* */ (incl. multi-
+        # line) so a javadoc-prefixed replacement is classified correctly.
+        from external_llm.agent.symbol_modify_tool import _first_significant_line
+        # multi-line block comment
+        assert _first_significant_line("/**\n * doc\n */\nint foo()") == "int foo()"
+        # single-line block comment
+        assert _first_significant_line("/* one */\nint foo()") == "int foo()"
+        # code after a same-line block comment (rare but handled)
+        assert _first_significant_line("/* c */ int foo()") == "int foo()"
+        # no comment
+        assert _first_significant_line("int foo()") == "int foo()"
+        # line comment + decorator skipped
+        assert _first_significant_line("// c\n@dec\ndef foo():") == "def foo():"
+        # all comments -> empty
+        assert _first_significant_line("/** c */") == ""
+    def test_c_orphan_brace_rejected_pre_write(self):
+        # Fix C: the pre-write gate rejects brace-imbalanced content for
+        # compiler-less brace languages (Kotlin/Java/Rust/C/C++/...).
+        from external_llm.agent.symbol_modify_tool import _post_edit_syntax_ok
+        balanced = 'class C {\n    fun f() {\n        println(1)\n    }\n}\n'
+        orphan = 'class C {\n    fun f() {\n        return 1\n    }\n    }\n}\n'
+        brace_in_string = (
+            'class C {\n    fun f() {\n        val s = "close }"\n    }\n}\n'
+        )
+        assert _post_edit_syntax_ok(balanced, "x.kt") is True
+        assert _post_edit_syntax_ok(orphan, "x.kt") is False
+        # literal-aware: a brace inside a string must NOT trip the gate
+        assert _post_edit_syntax_ok(brace_in_string, "x.kt") is True
+        # Java orphan also rejected (same gate applies across brace languages)
+        assert _post_edit_syntax_ok(
+            'class C {\n    void f() { return; }\n    }\n}\n', "x.java"
+        ) is False
+    def test_c_rust_lifetime_not_fail_closed(self):
+            # Fix C extension: a Rust lifetime tick ('a) was mistaken for a char-
+            # literal start, so net_brace_count() saw struct Parser<'a> { as -1 and
+            # the pre-write gate rejected EVERY Rust edit on any file containing a
+            # lifetime-before-brace. A valid balanced Rust struct with lifetimes
+            # must pass the gate (return True), while a genuine orphan still fails.
+            from external_llm.agent.symbol_modify_tool import _post_edit_syntax_ok
+            balanced_rust = "struct Parser<'a> {\n    input: &'a str,\n}\n"
+            two_lifetimes = "impl<'a, 'b> Foo<'a> {\n    x: &'b str,\n}\n"
+            orphan_rust = "struct Parser<'a> {\n    input: &'a str,\n    }\n}\n"
+            assert _post_edit_syntax_ok(balanced_rust, "p.rs") is True, (
+                "Rust lifetime swallowed the opening brace -> valid edit fail-closed"
+            )
+            assert _post_edit_syntax_ok(two_lifetimes, "p.rs") is True
+            assert _post_edit_syntax_ok(orphan_rust, "p.rs") is False, (
+                "genuine orphan brace must still be rejected"
+            )
+
+    def test_c_brace_gate_relative_delta(self):
+        # The brace-balance gate uses a RELATIVE delta when the pre-edit source
+        # is supplied, so a brace-neutral edit to a file with a PRE-EXISTING
+        # imbalance (scanner limitation / mid-fix broken code) is no longer
+        # false-rejected — while an edit that introduces an orphan brace still is.
+        from external_llm.agent.symbol_modify_tool import _post_edit_syntax_ok
+        # Source has a pre-existing imbalance (trailing junk) — net != 0.
+        src = "fun foo() {\n    val s = \"x\"\n}\n}}}}\n"
+        # Brace-neutral edit: same braces, only a literal changed.
+        neutral = "fun foo() {\n    val s = \"y\"\n}\n}}}}\n"
+        # Absolute gate (no source) false-rejects a valid brace-neutral edit.
+        assert _post_edit_syntax_ok(neutral, "x.kt") is False
+        # Relative gate (with source) accepts the brace-neutral edit.
+        assert _post_edit_syntax_ok(neutral, "x.kt", src) is True
+        # Relative gate still rejects an edit that shifts the balance (orphan }).
+        assert _post_edit_syntax_ok(neutral + "}", "x.kt", src) is False
+        # Balanced file + balanced edit still accepted under the relative gate.
+        good = "fun foo() {\n    println(1)\n}\n"
+        assert _post_edit_syntax_ok(good, "x.kt", good) is True
+
+    def test_end_to_end_modify_no_orphan_brace(self):
+        # End-to-end: modify_symbol yields a balanced file with no orphan `}`
+        # and the sibling function survives intact.
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "Report.kt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(self.REPRO)
+        new_body = textwrap.dedent("""\
+            private fun generatePdfReport(): String {
+                val total = "Total: {amount}"
+                val close = "close }"
+                // trailing brace } in comment
+                return "done {ok}"
+            }
+        """)
+        ok, msg, new_content = modify_symbol(
+            p, "generatePdfReport", new_body, repo_root=d,
+        )
+        assert ok, f"modify_symbol failed: {msg}"
+        assert net_brace_count(new_content) == 0, "orphan `}` introduced"
+        assert "private fun helperAfter(): Int" in new_content
+        assert new_content.rstrip().endswith("}")
+
+
 class TestModifySymbolNonPythonEndToEnd:
     """Full modify_symbol write path for modifier-bearing declarations."""
 
@@ -737,6 +1028,109 @@ class TestModifySymbolNonPythonEndToEnd:
         assert ok, f"modify_symbol failed: {diff}"
         assert 'errors.New("started")' in nc
         assert "return nil" not in nc
+
+    def test_c_allman_full_block_no_duplication(self):
+        """Allman-style C function (bare return type, '{' on the next line) must
+        be REPLACED, not duplicated. Regression: ``_looks_like_full_symbol_block``
+        missed bare C return types, routing the full block through the body-only
+        path and splicing the whole function into the body slot — the def line
+        appeared twice. The inserted block is brace-balanced, so the net-brace
+        verify gate could not catch this silent corruption.
+        """
+        if not _ts_grammar_available("c"):
+            pytest.skip("tree-sitter-c not installed")
+        src = textwrap.dedent("""\
+            #include <stdio.h>
+            int compute(int x)
+            {
+                int a = x * 2;
+                return a;
+            }
+            int helper()
+            {
+                return 0;
+            }""")
+        new = textwrap.dedent("""\
+            int compute(int x)
+            {
+                int a = x * 9;
+                return a;
+            }""")
+        ok, diff, nc = self._run(src, "compute", "m.c", new)
+        assert ok, f"modify_symbol failed: {diff}"
+        assert nc.count("int compute") == 1, "def line duplicated (corruption)"
+        assert "x * 9" in nc
+        assert "x * 2" not in nc
+        assert nc.count("int helper") == 1
+
+    def test_c_kr_full_block_still_works(self):
+        """K&R-style C function parity — must remain correct after the fix."""
+        if not _ts_grammar_available("c"):
+            pytest.skip("tree-sitter-c not installed")
+        src = textwrap.dedent("""\
+            #include <stdio.h>
+            int compute(int x) {
+                int a = x * 2;
+                return a;
+            }
+            int helper() {
+                return 0;
+            }""")
+        new = textwrap.dedent("""\
+            int compute(int x) {
+                int a = x * 3;
+                return a;
+            }""")
+        ok, diff, nc = self._run(src, "compute", "m.c", new)
+        assert ok, f"modify_symbol failed: {diff}"
+        assert nc.count("int compute") == 1
+        assert "x * 3" in nc
+        assert "x * 2" not in nc
+
+    def test_c_javadoc_prefixed_full_block_no_duplication(self, monkeypatch):
+        """A replacement block prefixed with a ``/** */`` javadoc comment must be
+        classified as a FULL block (not body-only). Regression: the full-block
+        reclassification and ``_looks_like_full_symbol_block`` skipped only
+        ``#``/``//``/``@`` and missed ``/* */`` block comments, so the comment
+        text was read as the replacement's first significant line, the def-line
+        match failed, and the whole block (def line included) was spliced into
+        the body slot — duplicating the def line with brace-balanced output the
+        net-brace verify gate cannot catch (silent corruption).
+        """
+        monkeypatch.setattr(
+            "external_llm.agent.symbol_modify_tool._find_symbol_range_via_treesitter",
+            lambda *a, **k: None,
+        )
+        src = textwrap.dedent("""\
+            int compute(int x)
+            {
+                return x * 2;
+            }
+            """)
+        new = textwrap.dedent('''\
+            /**
+             * Compute something.
+             * @param x input value
+             */
+            int compute(int x)
+            {
+                return x * 9;
+            }
+            ''')
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "m.c")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(src)
+        try:
+            ok, diff, nc = modify_symbol(p, "compute", new, repo_root=d)
+            assert ok, f"modify_symbol failed: {diff}"
+            assert nc.count("int compute") == 1, "def line duplicated (corruption)"
+            assert "x * 9" in nc
+            assert "x * 2" not in nc
+            assert "/**" in nc, "javadoc comment dropped from replacement"
+        finally:
+            os.unlink(p)
+            os.rmdir(d)
 
 
 # ── Defense-1: body-only indent-drift correction ────────────────────────────
@@ -1416,6 +1810,122 @@ class TestAtomicWriteText:
         p = tmp_path / "nested" / "deep" / "out.txt"
         atomic_write_text(str(p), "payload")
         assert p.read_text() == "payload"
+
+
+# ── Tests for the block-past-symbol-boundary diagnostic ─────────────────────
+# Real case (design-chat 2026-07-16): the model rewrote a method to fix its
+# indentation AND appended the NEXT method's signature opening line to express
+# "add a blank line between methods". Every strategy failed compile ('(' was
+# never closed) and the generic error made the model misdiagnose the failure
+# as a re-indentation limitation.
+
+
+class TestTrailingForeignStmt:
+    def test_detects_next_method_signature_opener(self):
+        code = (
+            "    def _gate(self, ok):\n"
+            "        return ok\n"
+            "\n"
+            "    def _process_tool_call(\n"
+        )
+        assert _trailing_foreign_stmt(code) == "def _process_tool_call("
+
+    def test_detects_same_indent_decorator(self):
+        code = (
+            "    def _gate(self, ok):\n"
+            "        return ok\n"
+            "\n"
+            "    @property\n"
+        )
+        assert _trailing_foreign_stmt(code) == "@property"
+
+    def test_clean_block_returns_none(self):
+        code = (
+            "    def _gate(self, ok):\n"
+            "        return ok\n"
+            "\n"
+        )
+        assert _trailing_foreign_stmt(code) is None
+
+    def test_nested_def_is_legitimate(self):
+        code = (
+            "def outer():\n"
+            "    def inner():\n"
+            "        return 1\n"
+            "    return inner\n"
+        )
+        assert _trailing_foreign_stmt(code) is None
+
+    def test_class_block_with_methods_is_legitimate(self):
+        code = (
+            "class X:\n"
+            "    def a(self):\n"
+            "        return 1\n"
+            "\n"
+            "    def b(self):\n"
+            "        return 2\n"
+        )
+        assert _trailing_foreign_stmt(code) is None
+
+    def test_no_definition_returns_none(self):
+        assert _trailing_foreign_stmt("return 1\n") is None
+
+
+class TestBlockPastSymbolBoundaryError:
+    SOURCE = textwrap.dedent("""\
+        class Loop:
+            def _gate(
+                self, ok: bool
+            ) -> bool:
+                    if not ok:
+                        return False
+                    return ok
+            def _process_tool_call(
+                self,
+                tc,
+            ) -> str:
+                return "x"
+        """)
+
+    def test_targeted_error_names_foreign_stmt(self):
+        # Full block ending with the next method's dangling signature opener:
+        # splice leaves an unclosed '(' so every strategy is syntax-blocked.
+        path = _write_temp_file(self.SOURCE)
+        try:
+            original = Path(path).read_text()
+            code = (
+                "    def _gate(\n"
+                "        self, ok: bool\n"
+                "    ) -> bool:\n"
+                "        if not ok:\n"
+                "            return False\n"
+                "        return ok\n"
+                "\n"
+                "    def _process_tool_call(\n"
+            )
+            success, msg, _ = modify_symbol(path, "Loop._gate", code)
+            assert not success
+            assert "extends past the symbol boundary" in msg
+            assert "def _process_tool_call(" in msg
+            assert "apply_patch" in msg
+            assert Path(path).read_text() == original
+            ast.parse(Path(path).read_text())
+        finally:
+            os.unlink(path)
+
+    def test_generic_error_kept_when_no_foreign_stmt(self):
+        path = _write_temp_file(self.SOURCE)
+        try:
+            original = Path(path).read_text()
+            # Internally-inconsistent indentation, no boundary violation.
+            bad_code = "return 1\n   return 2\n  return 3"
+            success, msg, _ = modify_symbol(path, "Loop._gate", bad_code)
+            assert not success
+            assert "re-indentation/splice would break Python syntax" in msg
+            assert "extends past the symbol boundary" not in msg
+            assert Path(path).read_text() == original
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":

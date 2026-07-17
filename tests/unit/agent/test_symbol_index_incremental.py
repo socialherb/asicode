@@ -5,6 +5,7 @@ added / changed / removed files, and the cache must be bounded by an entry cap.
 """
 import os
 import textwrap
+import threading
 
 import pytest
 
@@ -191,3 +192,169 @@ def test_apply_incremental_does_not_poison_cached_file_index(repo):
     # The cached (old) file_index still has a.py -- not mutated in place.
     assert "a.py" in file_idx
     assert "a.py" not in new_file_idx
+
+
+# ── Cooperative-cancel contract ─────────────────────────────────────────
+# Cancel is control flow, NOT a value. A cold-path cancel must RAISE
+# _CancelledBuild (never collapse to {}), because {} is indistinguishable from
+# "repo has no symbols" — consumers (executor_verification P6.9 / P6.10) would
+# then treat an existing symbol as "missing repo-wide" and emit a hard
+# "you MUST create it" directive, risking a DUPLICATE DEFINITION.
+
+
+def test_cold_cancel_propagates_not_returns_empty(repo):
+    """Cold-path cancel raises _CancelledBuild instead of returning {}.
+
+    Regression for the duplicate-definition bug: the old `return {}` made the
+    two consumers falsely mandate creating an already-existing symbol.
+    """
+    ev = threading.Event()
+    ev.set()
+    si._INDEX_CACHE.clear()  # force cold path
+    with pytest.raises(si._CancelledBuild):
+        si.build_repo_symbol_index(str(repo), cancel_event=ev)
+
+
+def test_cold_cancel_does_not_poison_cache(repo):
+    """After a cold cancel the cache stays empty; the next call rebuilds."""
+    ev = threading.Event()
+    ev.set()
+    si._INDEX_CACHE.clear()
+    with pytest.raises(si._CancelledBuild):
+        si.build_repo_symbol_index(str(repo), cancel_event=ev)
+    assert str(repo) not in si._INDEX_CACHE
+    # A subsequent non-cancelled call performs the full build.
+    ev.clear()
+    idx = si.build_repo_symbol_index(str(repo))
+    assert "Aa" in idx and "Bb" in idx
+
+
+def test_apply_incremental_honors_cancel_event():
+    """_apply_incremental raises _CancelledBuild mid-loop (branch-switch gap).
+
+    A branch switch can flip thousands of mtimes at once, making this loop the
+    most expensive part of the build and the exact moment cancel is needed.
+    Previously this loop had no checkpoint; now it bails out without committing
+    (new_file_index is a local copy → cache never poisoned).
+    """
+    ev = threading.Event()
+    ev.set()
+    # cur_mtimes has entries absent from old → the re-scan loop is entered →
+    # the per-iteration checkpoint fires immediately.
+    with pytest.raises(si._CancelledBuild):
+        si._apply_incremental(
+            "/unused", {}, {}, {"a.py": 1.0, "b.py": 2.0}, cancel_event=ev
+        )
+    # cancel_event=None stays inert (inline / non-interactive callers) — the
+    # loop runs to completion without raising. (The file doesn't exist, so
+    # _scan_file yields an empty list; only the no-raise contract matters here.)
+    out, mtimes = si._apply_incremental(
+        "/unused", {}, {}, {"a.py": 1.0}, cancel_event=None
+    )
+    assert mtimes == {"a.py": 1.0}
+    assert "a.py" in out
+
+
+def test_consumer_skip_pattern_prevents_spurious_create(repo):
+    """Consumer contract: catch _CancelledBuild BEFORE `except Exception:`.
+
+    Mirrors the executor_verification P6.9 / P6.10 fix. On cold cancel the caller
+    skips the dependent decision (does NOT call decide_import_vs_create) rather
+    than fall through to a hard "create" directive.
+    """
+    from external_llm.agent.symbol_index import decide_import_vs_create
+
+    ev = threading.Event()
+    ev.set()
+    si._INDEX_CACHE.clear()
+
+    # Correct (post-fix) consumer pattern: catch the cancel, skip the decision.
+    cancelled = False
+    index = None
+    try:
+        index = si.build_repo_symbol_index(str(repo), cancel_event=ev)
+    except si._CancelledBuild:
+        cancelled = True  # → caller skips decide_import_vs_create entirely
+    assert cancelled is True
+    assert index is None
+    # Because decide_import_vs_create is skipped, no verdict is produced.
+
+    # Contrast — the OLD `except Exception: index = {}` behaviour: feeding {} to
+    # decide_import_vs_create would WRONGLY mandate creating an existing symbol.
+    wrong = decide_import_vs_create("Aa", "x.py", {})
+    assert wrong["action"] == "create"  # the bug the skip-pattern now avoids
+
+
+# ── git ls-files SSOT integration (shared with write_tools._repo_file_index) ──
+# These guard the duplicate-definition invariant: a symbol defined ONLY in a
+# gitignored vendored/generated copy must NOT leak into the index, or
+# decide_import_vs_create would flip a correct "create" into a wrong "import".
+
+def _make_git_repo(tmp_path, name="grepo"):
+    """Create a real (empty) git checkout under tmp_path and return its path."""
+    import subprocess
+    repo = tmp_path / name
+    repo.mkdir()
+    for args in (
+        ["git", "-C", str(repo), "init", "-q"],
+        ["git", "-C", str(repo), "config", "user.email", "t@t.test"],
+        ["git", "-C", str(repo), "config", "user.name", "test"],
+    ):
+        subprocess.run(args, capture_output=True, check=True)
+    return repo
+
+
+def _git_commit(repo):
+    import subprocess
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"], capture_output=True, check=True)
+
+
+def test_gitignored_vendored_symbol_excluded_from_index(tmp_path):
+    """Regression (duplicate-definition guard): a symbol defined ONLY in a
+    gitignored vendored copy must NOT appear in the repo-wide symbol index.
+
+    If it leaked in, decide_import_vs_create would see the symbol as "already
+    exists elsewhere" and tell the LLM to import it — masking a genuine missing
+    definition. The git-first _collect_mtimes path (shared SSOT with
+    write_tools) respects .gitignore, so vendored copies are never scanned.
+    """
+    repo = _make_git_repo(tmp_path)
+    (repo / "app.py").write_text("class EnemyBullet:\n    pass\n")
+    (repo / "vendor").mkdir()
+    (repo / "vendor" / "enemy.py").write_text("class EnemyBullet:\n    pass\n")
+    (repo / ".gitignore").write_text("vendor/\n")
+    _git_commit(repo)
+    idx = si.build_repo_symbol_index(str(repo))
+    assert "EnemyBullet" in idx
+    # ONLY from app.py, NOT the vendored copy under the gitignored vendor/.
+    assert [loc.file_path for loc in idx["EnemyBullet"]] == ["app.py"]
+
+
+def test_non_ascii_path_symbol_is_indexed(tmp_path):
+    """Regression: a symbol in a Korean-named file is indexed via the git -z path.
+
+    Confirms the SSOT change fixed the os.walk path's historical weakness on
+    CJK paths (git porcelain C-quoting would otherwise break membership, so a
+    legitimately-defined symbol could be missed → false "create" directive).
+    """
+    repo = _make_git_repo(tmp_path, name="krepo")
+    (repo / "src").mkdir()
+    (repo / "src" / "모듈.py").write_text("class 한글클래스:\n    pass\n")
+    _git_commit(repo)
+    idx = si.build_repo_symbol_index(str(repo))
+    assert "한글클래스" in idx
+    assert idx["한글클래스"][0].file_path == "src/모듈.py"
+
+
+def test_os_walk_fallback_when_not_git_checkout(tmp_path):
+    """Non-git tree → git_list_repo_files returns None → os.walk fallback used.
+
+    Ensures the fallback path still produces a valid index (the _SKIP_DIRS
+    hardcoded set is narrower than .gitignore, acceptable for non-git trees).
+    """
+    repo = tmp_path / "plain"
+    repo.mkdir()
+    (repo / "plain.py").write_text("def plain_fn():\n    pass\n")
+    idx = si.build_repo_symbol_index(str(repo))
+    assert "plain_fn" in idx

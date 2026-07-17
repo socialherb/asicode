@@ -861,17 +861,25 @@ class InMemoryRunStore:
 
         Only ``contract_repair_outcome`` signals are stored.  FIFO eviction
         keeps the buffer bounded to ``_max_contract_signals`` entries.
+
+        ``_telemetry_lock`` serializes the append + FIFO reassign RMW against
+        concurrent run-completion telemetry calls in parallel sub-agents (which
+        share this singleton store), and against the paired reader
+        ``get_recent_planner_memory_signals`` (the ``list(reversed(...[-limit:]))``
+        slice races the reassign: "list changed size during iteration").
         """
-        for sig in signals:
-            if isinstance(sig, dict) and sig.get("signal_type") == "contract_repair_outcome":
-                self._contract_repair_signals.append(sig)
-        # FIFO eviction
-        if len(self._contract_repair_signals) > self._max_contract_signals:
-            self._contract_repair_signals = self._contract_repair_signals[-self._max_contract_signals:]
+        with self._telemetry_lock:
+            for sig in signals:
+                if isinstance(sig, dict) and sig.get("signal_type") == "contract_repair_outcome":
+                    self._contract_repair_signals.append(sig)
+            # FIFO eviction
+            if len(self._contract_repair_signals) > self._max_contract_signals:
+                self._contract_repair_signals = self._contract_repair_signals[-self._max_contract_signals:]
 
     def get_recent_planner_memory_signals(self, limit: int = 10) -> list[dict]:
         """Return most recent planner_memory_signals (newest first)."""
-        return list(reversed(self._contract_repair_signals[-limit:]))
+        with self._telemetry_lock:
+            return list(reversed(self._contract_repair_signals[-limit:]))
 
     def summarize_recent_contract_repairs(self, limit: int = 10) -> dict[str, Any]:
         """Summarize recent contract repair signals for planner bias injection.
@@ -937,16 +945,22 @@ class InMemoryRunStore:
 
         Only ``strategy_outcome`` signals are stored.  FIFO eviction keeps the
         buffer bounded to ``_max_strategy_signals`` entries.
+
+        ``_telemetry_lock`` serializes the append + FIFO reassign RMW against
+        concurrent run-completion telemetry calls and the paired reader
+        ``get_recent_strategy_outcome_signals`` (slice races the reassign).
         """
-        for sig in signals:
-            if isinstance(sig, dict) and sig.get("signal_type") == "strategy_outcome":
-                self._strategy_outcome_signals.append(sig)
-        if len(self._strategy_outcome_signals) > self._max_strategy_signals:
-            self._strategy_outcome_signals = self._strategy_outcome_signals[-self._max_strategy_signals:]
+        with self._telemetry_lock:
+            for sig in signals:
+                if isinstance(sig, dict) and sig.get("signal_type") == "strategy_outcome":
+                    self._strategy_outcome_signals.append(sig)
+            if len(self._strategy_outcome_signals) > self._max_strategy_signals:
+                self._strategy_outcome_signals = self._strategy_outcome_signals[-self._max_strategy_signals:]
 
     def get_recent_strategy_outcome_signals(self, limit: int = 20) -> list[dict]:
         """Return most recent strategy outcome signals (newest first)."""
-        return list(reversed(self._strategy_outcome_signals[-limit:]))
+        with self._telemetry_lock:
+            return list(reversed(self._strategy_outcome_signals[-limit:]))
 
     def summarize_strategy_outcomes(self, limit: int = 20) -> dict[str, Any]:
         """Summarize recent strategy outcomes for planner bias injection.
@@ -1131,42 +1145,51 @@ class InMemoryRunStore:
         switched: bool = False,
         strategy_chain: Optional[list[str]] = None,
     ) -> None:
-        """Record a strategy execution outcome for future preference scoring."""
-        key = (request_type, estimated_scope, used_decomposition, strategy_name)
-        if key not in self._strategy_exec_stats:
-            self._strategy_exec_stats[key] = StrategyExecutionStats(
-                request_type=request_type,
-                estimated_scope=estimated_scope,
-                used_decomposition=used_decomposition,
-                strategy_name=strategy_name,
-            )
-        stats = self._strategy_exec_stats[key]
-        if success:
-            stats.success_count += 1
-        else:
-            stats.failure_count += 1
-        if repaired:
-            stats.repair_count += 1
-        if switched:
-            stats.switch_count += 1
+        """Record a strategy execution outcome for future preference scoring.
 
-        # Track chain history if multi-hop chain provided
-        if strategy_chain and len(strategy_chain) >= 2:
-            chain_key_str = "->".join(strategy_chain)
-            chain_key = (request_type, estimated_scope, used_decomposition, chain_key_str)
-            if chain_key not in self._chain_exec_stats:
-                self._chain_exec_stats[chain_key] = StrategyExecutionStats(
+        ``_telemetry_lock`` serializes the check-then-act insert + non-atomic
+        increment RMW against concurrent run completions in parallel sub-agents,
+        and against the paired readers ``get_strategy_preference`` /
+        ``get_strategy_usage_count`` / ``get_strategy_chain_preference`` which
+        ``.get(key)`` the same dicts. Without it two threads both miss the key
+        and both insert (clobbering counts), or split the increment.
+        """
+        key = (request_type, estimated_scope, used_decomposition, strategy_name)
+        with self._telemetry_lock:
+            if key not in self._strategy_exec_stats:
+                self._strategy_exec_stats[key] = StrategyExecutionStats(
                     request_type=request_type,
                     estimated_scope=estimated_scope,
                     used_decomposition=used_decomposition,
                     strategy_name=strategy_name,
-                    strategy_chain=strategy_chain,
                 )
-            chain_stats = self._chain_exec_stats[chain_key]
+            stats = self._strategy_exec_stats[key]
             if success:
-                chain_stats.success_count += 1
+                stats.success_count += 1
             else:
-                chain_stats.failure_count += 1
+                stats.failure_count += 1
+            if repaired:
+                stats.repair_count += 1
+            if switched:
+                stats.switch_count += 1
+
+            # Track chain history if multi-hop chain provided
+            if strategy_chain and len(strategy_chain) >= 2:
+                chain_key_str = "->".join(strategy_chain)
+                chain_key = (request_type, estimated_scope, used_decomposition, chain_key_str)
+                if chain_key not in self._chain_exec_stats:
+                    self._chain_exec_stats[chain_key] = StrategyExecutionStats(
+                        request_type=request_type,
+                        estimated_scope=estimated_scope,
+                        used_decomposition=used_decomposition,
+                        strategy_name=strategy_name,
+                        strategy_chain=strategy_chain,
+                    )
+                chain_stats = self._chain_exec_stats[chain_key]
+                if success:
+                    chain_stats.success_count += 1
+                else:
+                    chain_stats.failure_count += 1
 
     def get_strategy_preference(
         self,
@@ -1177,27 +1200,28 @@ class InMemoryRunStore:
     ) -> dict[str, Any]:
         """Return preference score for a strategy given context."""
         key = (request_type, estimated_scope, used_decomposition, strategy_name)
-        stats = self._strategy_exec_stats.get(key)
-        if stats is None:
+        with self._telemetry_lock:
+            stats = self._strategy_exec_stats.get(key)
+            if stats is None:
+                return {
+                    "preference_score": 0.0,
+                    "total": 0,
+                    "success_rate": 0.0,
+                    "explanations": ["no_history"],
+                }
+            total = stats.success_count + stats.failure_count
+            success_rate = stats.success_count / total if total > 0 else 0.0
+            # Simple preference: success_rate * confidence_weight
+            # confidence grows with more data (max at 10 samples)
+            confidence = min(total / 10.0, 1.0)
+            preference_score = max(success_rate * confidence, 0.0)
+            explanations = [f"success_rate={success_rate:.3f}", f"total={total}", f"confidence={confidence:.3f}"]
             return {
-                "preference_score": 0.0,
-                "total": 0,
-                "success_rate": 0.0,
-                "explanations": ["no_history"],
+                "preference_score": round(preference_score, 6),
+                "total": total,
+                "success_rate": success_rate,
+                "explanations": explanations,
             }
-        total = stats.success_count + stats.failure_count
-        success_rate = stats.success_count / total if total > 0 else 0.0
-        # Simple preference: success_rate * confidence_weight
-        # confidence grows with more data (max at 10 samples)
-        confidence = min(total / 10.0, 1.0)
-        preference_score = max(success_rate * confidence, 0.0)
-        explanations = [f"success_rate={success_rate:.3f}", f"total={total}", f"confidence={confidence:.3f}"]
-        return {
-            "preference_score": round(preference_score, 6),
-            "total": total,
-            "success_rate": success_rate,
-            "explanations": explanations,
-        }
 
     def get_strategy_chain_preference(
         self,
@@ -1216,24 +1240,25 @@ class InMemoryRunStore:
             }
         chain_key_str = "->".join(strategy_chain)
         chain_key = (request_type, estimated_scope, used_decomposition, chain_key_str)
-        stats = self._chain_exec_stats.get(chain_key)
-        if stats is None:
+        with self._telemetry_lock:
+            stats = self._chain_exec_stats.get(chain_key)
+            if stats is None:
+                return {
+                    "preference_score": 0.0,
+                    "total": 0,
+                    "success_rate": 0.0,
+                    "explanations": ["no_chain_history"],
+                }
+            total = stats.success_count + stats.failure_count
+            success_rate = stats.success_count / total if total > 0 else 0.0
+            confidence = min(total / 10.0, 1.0)
+            preference_score = max(success_rate * confidence, 0.0)
             return {
-                "preference_score": 0.0,
-                "total": 0,
-                "success_rate": 0.0,
-                "explanations": ["no_chain_history"],
+                "preference_score": round(preference_score, 6),
+                "total": total,
+                "success_rate": success_rate,
+                "explanations": [f"chain={chain_key_str}", f"success_rate={success_rate:.3f}"],
             }
-        total = stats.success_count + stats.failure_count
-        success_rate = stats.success_count / total if total > 0 else 0.0
-        confidence = min(total / 10.0, 1.0)
-        preference_score = max(success_rate * confidence, 0.0)
-        return {
-            "preference_score": round(preference_score, 6),
-            "total": total,
-            "success_rate": success_rate,
-            "explanations": [f"chain={chain_key_str}", f"success_rate={success_rate:.3f}"],
-        }
 
     def get_strategy_usage_count(
         self,
@@ -1244,10 +1269,11 @@ class InMemoryRunStore:
     ) -> int:
         """Return total run count (success + failure) for a strategy in given context."""
         key = (request_type, estimated_scope, used_decomposition, strategy_name)
-        stats = self._strategy_exec_stats.get(key)
-        if stats is None:
-            return 0
-        return stats.success_count + stats.failure_count
+        with self._telemetry_lock:
+            stats = self._strategy_exec_stats.get(key)
+            if stats is None:
+                return 0
+            return stats.success_count + stats.failure_count
 
     def get_decomposition_aware_strategy_summary(
         self,
@@ -1310,8 +1336,15 @@ class InMemoryRunStore:
         }
 
     def get_total_strategy_reward_trials(self) -> int:
-        """Total reward samples across all strategies."""
-        return sum(len(v) for v in self._strategy_rewards.values())
+        """Total reward samples across all strategies.
+
+        ``_telemetry_lock`` guards the ``_strategy_rewards.values()`` iteration
+        against concurrent key insertions in ``record_strategy_reward`` (which
+        would otherwise raise ``RuntimeError: dictionary changed size during
+        iteration``).
+        """
+        with self._telemetry_lock:
+            return sum(len(v) for v in self._strategy_rewards.values())
 
     # ── P9: EMA-based reward smoothing ─────────────────────────────────────────
 
@@ -1368,26 +1401,31 @@ class InMemoryRunStore:
         Uses adaptive threshold — stricter with few samples, relaxed with many.
         """
         from .context_utils import adaptive_distill_threshold
-        self._distilled_rules = []
-        for strategy, ctx_map in self._strategy_context_ema.items():
-            # Count total samples for this strategy across all contexts
-            _total_samples = len(self._strategy_rewards.get(strategy, []))
-            _threshold = adaptive_distill_threshold(_total_samples)
-            for ctx, val in ctx_map.items():
-                if val >= _threshold:
-                    self._distilled_rules.append({
-                        "context": ctx,
-                        "preferred_strategy": strategy,
-                        "confidence": round(val, 4),
-                    })
-        if self._distilled_rules:
-            logger.info(
-                "P11.1 distilled %d rules: %s",
-                len(self._distilled_rules),
-                [(r["context"], r["preferred_strategy"], r["confidence"])
-                 for r in self._distilled_rules[:5]],
-            )
-        return len(self._distilled_rules)
+        with self._telemetry_lock:
+            # Guards both the ``_strategy_context_ema.items()`` iteration and the
+            # ``_strategy_rewards`` reads against concurrent writers
+            # (``record_strategy_reward`` / ``update_strategy_context_ema``),
+            # which would otherwise raise dict-changed-size-during-iteration.
+            self._distilled_rules = []
+            for strategy, ctx_map in self._strategy_context_ema.items():
+                # Count total samples for this strategy across all contexts
+                _total_samples = len(self._strategy_rewards.get(strategy, []))
+                _threshold = adaptive_distill_threshold(_total_samples)
+                for ctx, val in ctx_map.items():
+                    if val >= _threshold:
+                        self._distilled_rules.append({
+                            "context": ctx,
+                            "preferred_strategy": strategy,
+                            "confidence": round(val, 4),
+                        })
+            if self._distilled_rules:
+                logger.info(
+                    "P11.1 distilled %d rules: %s",
+                    len(self._distilled_rules),
+                    [(r["context"], r["preferred_strategy"], r["confidence"])
+                     for r in self._distilled_rules[:5]],
+                )
+            return len(self._distilled_rules)
 
     def get_distilled_rules(self) -> list[dict]:
         """Return all distilled rules for debugging."""
@@ -1447,16 +1485,20 @@ class InMemoryRunStore:
             # lane is excluded from the public build — degrade gracefully.
             logger.debug("prune_dynamic_strategies: lane not available, skipping")
             return []
-        prunable = MetaStrategyEngine.identify_prunable(
-            self._strategy_rewards, min_trials=min_trials, max_avg_reward=max_avg_reward,
-        )
-        pruned = []
-        for name in prunable:
-            if name in self._dynamic_strategies:
-                del self._dynamic_strategies[name]
-                pruned.append(name)
-                logger.info("P12 pruned dynamic strategy: %s", name)
-        return pruned
+        with self._telemetry_lock:
+            # ``identify_prunable`` iterates the live ``_strategy_rewards`` dict;
+            # the lock guards it against concurrent key insertions in
+            # ``record_strategy_reward`` (dict-changed-size-during-iteration).
+            prunable = MetaStrategyEngine.identify_prunable(
+                self._strategy_rewards, min_trials=min_trials, max_avg_reward=max_avg_reward,
+            )
+            pruned = []
+            for name in prunable:
+                if name in self._dynamic_strategies:
+                    del self._dynamic_strategies[name]
+                    pruned.append(name)
+                    logger.info("P12 pruned dynamic strategy: %s", name)
+            return pruned
 
     # ── P12.2: Cooldown ──────────────────────────────────────────────────────
 
@@ -1689,15 +1731,19 @@ class InMemoryRunStore:
         Returns list of (repair_action, avg_success_rate) sorted descending.
         Only includes actions with >= min_samples.
         """
-        methods = self._repair_outcomes.get(failure_class, {})
-        scored: list[tuple[str, float]] = []
-        for action, hist in methods.items():
-            if len(hist) < min_samples:
-                continue
-            recent = hist[-10:]
-            avg = sum(recent) / len(recent)
-            scored.append((action, avg))
-        return sorted(scored, key=lambda x: x[1], reverse=True)
+        with self._telemetry_lock:
+            # ``methods`` is a live reference to the inner dict; the lock guards
+            # the ``.items()`` iteration against concurrent key insertions in
+            # ``record_repair_outcome`` (dict-changed-size-during-iteration).
+            methods = self._repair_outcomes.get(failure_class, {})
+            scored: list[tuple[str, float]] = []
+            for action, hist in methods.items():
+                if len(hist) < min_samples:
+                    continue
+                recent = hist[-10:]
+                avg = sum(recent) / len(recent)
+                scored.append((action, avg))
+            return sorted(scored, key=lambda x: x[1], reverse=True)
 
     # ── Switch outcome memory ─────────────────────────────────────────────────
 

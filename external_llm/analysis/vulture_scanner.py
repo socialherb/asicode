@@ -33,7 +33,7 @@ import os
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.analysis.unused_import_scanner import _has_noqa_comment as _has_noqa_comment
@@ -150,7 +150,78 @@ def _is_test_path(rel_file: str) -> bool:
     )
 
 
-def _collect_dispatch_live_names(scan_paths: list[str]) -> frozenset[str]:
+def _is_cancelled(cancel_event: Any) -> bool:
+    """Cooperative cancel check — None-safe.
+
+    Used by the vulture scanner's pre/post-processing loops so ESC / Ctrl-C
+    (which sets the agent's ``cancel_event``) can interrupt the scan between
+    files.  ``v.scavenge()`` itself is an opaque library call that cannot be
+    interrupted mid-parse; the checkpoints bracket it so cancel is honored
+    before scavenge starts and during result post-processing.
+    """
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _scavenge_with_cancel(
+    v: Any,
+    scan_paths: list[str],
+    exclude_patterns: list[str],
+    cancel_event: Any = None,
+) -> bool:
+    """Run ``v.scavenge()`` honoring a cooperative cancel.
+
+    ``v.scavenge()`` is an opaque library call (bulk ``ast.parse`` over every
+    scan path) that cannot be interrupted mid-parse — historically the dominant
+    cost of a vulture scan (up to several seconds on large projects) and the
+    exact window during which ESC / Ctrl-C felt dead.  To restore
+    responsiveness DURING scavenge we move it into a daemon thread and poll the
+    cancel event from the (now free) main thread.  Freed from the C call, the
+    main thread can also service ``KeyboardInterrupt`` immediately, fixing
+    Ctrl-C for the in-process path (the same mechanism that handles ESC).
+
+    Returns True if scavenge completed; False if it was cancelled (or never
+    started).  On cancel the daemon thread is ABANDONED — it keeps parsing the
+    stale file set until it finishes or the process exits (it is a daemon, so
+    it never blocks shutdown).  Abandonment is safe: ``v`` is local to the
+    caller and is never touched again once this returns False, so there is no
+    shared mutable state to race on; only CPU is consumed transiently.
+
+    When ``cancel_event`` is None (direct API callers, tests, the non-
+    interactive CLI), scavenge runs inline with no thread overhead — the common
+    path where cancellation is irrelevant.
+    """
+    if _is_cancelled(cancel_event):
+        return False
+    if cancel_event is None:
+        v.scavenge(scan_paths, exclude=exclude_patterns)
+        return True
+
+    import threading
+
+    done = threading.Event()
+    err: list = []
+
+    def _run() -> None:
+        try:
+            v.scavenge(scan_paths, exclude=exclude_patterns)
+        except BaseException as exc:  # noqa: BLE001 - re-raise on the caller
+            err.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=_run, name="vulture-scavenge", daemon=True)
+    worker.start()
+    # Poll at ~20 Hz: responsive to cancel without busy-waiting.  ``done.wait``
+    # runs in pure Python (bytecode loop), so KeyboardInterrupt lands promptly.
+    while not done.wait(timeout=0.05):
+        if _is_cancelled(cancel_event):
+            return False  # abandon worker thread
+    if err:
+        raise err[0]
+    return True
+
+
+def _collect_dispatch_live_names(scan_paths: list[str], cancel_event: Any = None) -> frozenset[str]:
     """Identifier-shaped string literals found across *scan_paths*.
 
     Vulture cannot see string-based dispatch — e.g. a handler map
@@ -172,6 +243,8 @@ def _collect_dispatch_live_names(scan_paths: list[str]) -> frozenset[str]:
 
     seen: set[str] = set()
     for path in scan_paths:
+        if _is_cancelled(cancel_event):
+            break
         try:
             with open(path, "rb") as fh:
                 for tok in tokenize.tokenize(fh.readline):
@@ -188,7 +261,7 @@ def _collect_dispatch_live_names(scan_paths: list[str]) -> frozenset[str]:
     return frozenset(seen)
 
 
-def _collect_visitor_hook_linenos(scan_paths: list[str]) -> set[tuple[str, int]]:
+def _collect_visitor_hook_linenos(scan_paths: list[str], cancel_event: Any = None) -> set[tuple[str, int]]:
     """``(abs_path, def_lineno)`` pairs of visitor-protocol methods in visitor subclasses.
 
     ``libcst`` (``CSTVisitor``/``CSTTransformer``) and ``ast``
@@ -208,8 +281,11 @@ def _collect_visitor_hook_linenos(scan_paths: list[str]) -> set[tuple[str, int]]
 
     seen: set[tuple[str, int]] = set()
     for path in scan_paths:
+        if _is_cancelled(cancel_event):
+            break
         try:
-            tree = ast.parse(open(path, encoding="utf-8").read())
+            with open(path, encoding="utf-8") as _f:
+                tree = ast.parse(_f.read())
         except (OSError, SyntaxError):
             continue
 
@@ -452,6 +528,7 @@ def scan_vulture_dead_code(
     max_per_file: int = _cfg.counts.SCANNER_VULTURE_MAX,
     repo_graph: object = None,
     exclude_kinds: Optional[Iterable[str]] = None,
+    cancel_event: Any = None,
 ) -> list[VultureCandidate]:
     """Run Vulture and return normalized dead-code candidates.
 
@@ -532,13 +609,19 @@ def scan_vulture_dead_code(
     # Names referenced as identifier-shaped string literals → dispatch-live
     # (handler maps resolved via getattr). Collected once; consulted per
     # candidate below to suppress string-dispatched callables.
-    _dispatch_live = _collect_dispatch_live_names(scan_paths)
+    # Cooperative cancel: if already set before the (expensive) pre-processing
+    # and scavenge, return empty immediately.
+    if _is_cancelled(cancel_event):
+        logger.debug("[VULTURE_SCANNER] cancelled before pre-processing")
+        return []
+
+    _dispatch_live = _collect_dispatch_live_names(scan_paths, cancel_event=cancel_event)
 
     # Visitor-protocol methods (visit_<Node>/leave_<Node>/on_visit/...) in
     # libcst/ast visitor subclasses — framework-dispatched via getattr, no
     # static caller. Detected structurally (base-class inheritance), not by
     # name alone. Keyed by (abs_path, def_lineno) for precise matching.
-    _visitor_hooks = _collect_visitor_hook_linenos(scan_paths)
+    _visitor_hooks = _collect_visitor_hook_linenos(scan_paths, cancel_event=cancel_event)
 
     # Bump recursion limit — Vulture's scavenge can recurse deeply on large
     # projects and raise RecursionError mid-scan (see git d2582924).
@@ -549,7 +632,17 @@ def scan_vulture_dead_code(
 
     try:
         v = vulture.core.Vulture(verbose=False)
-        v.scavenge(scan_paths, exclude=exclude_patterns or [])
+        # Run scavenge with cooperative cancel (see _scavenge_with_cancel).
+        # Returns False if cancelled mid-parse — ESC / Ctrl-C during the opaque
+        # ast.parse now aborts promptly instead of blocking until it completes.
+        # Returning inside this try lets the ``finally`` restore the recursion
+        # limit, fixing a latent leak where the old standalone pre-scavenge
+        # cancel-check returned before the finally ran.
+        if not _scavenge_with_cancel(
+            v, scan_paths, exclude_patterns or [], cancel_event=cancel_event,
+        ):
+            logger.debug("[VULTURE_SCANNER] cancelled before/during scavenge")
+            return []
 
         per_file_counts: dict[str, int] = {}
 
@@ -557,6 +650,9 @@ def scan_vulture_dead_code(
             min_confidence=min_confidence,
             sort_by_size=False,
         ):
+            if _is_cancelled(cancel_event):
+                logger.debug("[VULTURE_SCANNER] cancelled during result processing")
+                break
             # Vulture Item fields: name, typ, filename, first_lineno, last_lineno, confidence, message, size
             file_path = getattr(item, "filename", "")
             name = getattr(item, "name", "")

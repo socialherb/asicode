@@ -101,6 +101,21 @@ class TestFileContentCache:
         result = cache.get(fp)
         assert result is None, "Cache should miss after mtime change"
 
+    def test_mtime_stored_as_int_nanoseconds(self, cache, tmpfile: Path):
+        """mtime cached as integer nanoseconds (st_mtime_ns), not float seconds.
+
+        Sub-millisecond edit→re-read cycles can collapse to the same float
+        mtime (float64 resolution is ~238ns at epoch magnitude), serving stale
+        content from cache. st_mtime_ns is integer-nanosecond precise. Mirrors
+        the dev_tool tail-meta fix (see test_dev_tool_tail_meta.py).
+        """
+        fp = str(tmpfile)
+        cache.set(fp, "content")
+        key = cache._make_key(fp, None, None)
+        _content, cached_mtime, _tl, _sh = cache.cache[key]
+        assert isinstance(cached_mtime, int)
+        assert cached_mtime == os.stat(fp).st_mtime_ns
+
     def test_get_file_deleted_invalidates(self, cache, tmpfile: Path):
         """When file is deleted, cached entry should be invalidated."""
         fp = str(tmpfile)

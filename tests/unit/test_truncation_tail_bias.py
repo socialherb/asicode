@@ -11,8 +11,6 @@ Three bugs shared a common root cause: truncation that preserved only the
 2. ``git_tools`` bash output cap kept only ``content[:cap]``, chopping off the
    pytest summary (``short test summary info``, ``N failed``, FAILED list)
    that ``failure_context._try_parse_pytest`` keys on.
-3. ``failure_context._snip`` kept only ``raw[:limit]``, dropping the exception
-   type/message that sits at the end of a traceback.
 """
 from __future__ import annotations
 
@@ -127,39 +125,6 @@ def test_bash_truncation_cjk_output_more_aggressive():
     )
 
 
-# ---------------------------------------------------------------------------
-# Bug 3: _snip must preserve head + tail of a traceback.
-# ---------------------------------------------------------------------------
-def test_snip_preserves_tail_exception():
-    """The exception line at the end of a traceback must survive snipping."""
-    from external_llm.agent.failure_context import _snip
-
-    head = "Traceback (most recent call last):\n"
-    middle = ("  fill fill fill fill\n") * 200
-    tail = "AssertionError: expected 5 but got 3"
-    raw = head + middle + tail
-    assert len(raw) > 1200
-
-    out = _snip(raw, limit=1200)
-
-    assert "Traceback (most recent call last)" in out
-    assert "AssertionError: expected 5 but got 3" in out, (
-        "tail exception line must be preserved (the bug dropped it)"
-    )
-    assert len(out) <= 1200 + 200  # roughly the budget + the snip marker
-
-
-def test_snip_passthrough_when_under_limit():
-    """Short input is returned verbatim (stripped)."""
-    from external_llm.agent.failure_context import _snip
-
-    raw = "  short error  \n"
-    assert _snip(raw, limit=1200) == "short error"
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 def _write_py(root: Path, rel: str, content: str) -> None:
     path = root / rel
     path.parent.mkdir(parents=True, exist_ok=True)

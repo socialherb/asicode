@@ -602,3 +602,162 @@ class TestFindBlockEndOffsetSharedSSOT:
         body = src[start:end]
         assert "void real()" in body, f"{provider_cls.__name__}: method lost, body={body!r}"
 
+
+# ── Rust lifetimes vs char literals: the char-vs-lifetime disambiguation ──────
+# Regression for the fail-closed bug where a Rust lifetime tick ('a) was treated
+# as a char-literal start: _skip_quoted_literal swallowed everything up to the
+# NEXT tick (another lifetime or a real char literal), eating any '{' between
+# them. With a lifetime-before-brace pattern — struct Parser<'a> { — the opening
+# brace was swallowed, so:
+#   * net_brace_count() returned -1 → _post_edit_syntax_ok fail-closed EVERY Rust
+#     edit on any file containing struct Foo<'a> { ... }.
+#   * find_brace_block_end() returned the start line → symbol range truncated to
+#     the signature → orphan '}' → file corruption.
+# Fix: _consume_char_or_lifetime validates the char-literal element grammar; a
+# lifetime (no closing tick) consumes only the tick so its braces scan normally.
+
+class TestBraceScannerRustLifetimes:
+    """Rust lifetimes must not be mistaken for char literals."""
+
+    def test_lifetime_does_not_swallow_opening_brace(self):
+        from external_llm.languages.base import find_brace_block_end, net_brace_count
+        src = "struct Parser<'a> {\n    input: &'a str,\n}\n"
+        # Pre-fix: net_brace_count == -1 (opening brace swallowed between ticks).
+        assert net_brace_count(src) == 0
+        # Pre-fix: returned 1 (start-line fallback) → orphan brace corruption.
+        assert find_brace_block_end(src, src.index("{")) == 3
+
+    def test_two_lifetimes(self):
+        from external_llm.languages.base import find_brace_block_end, net_brace_count
+        src = "impl<'a, 'b> Foo<'a> {\n    x: &'b str,\n}\n"
+        assert net_brace_count(src) == 0
+        assert find_brace_block_end(src, src.index("{")) == 3
+
+    def test_static_lifetime_with_inner_block(self):
+        from external_llm.languages.base import find_brace_block_end, net_brace_count
+        src = "fn f() {\n    let x: &'static str = \"hi\";\n}\n"
+        assert net_brace_count(src) == 0
+        assert find_brace_block_end(src, src.index("{")) == 3
+
+    def test_lifetime_in_return_type(self):
+        from external_llm.languages.base import find_brace_block_end, net_brace_count
+        src = "fn add<'a>(x: &'a i32) -> &'a i32 {\n    x\n}\n"
+        assert net_brace_count(src) == 0
+        assert find_brace_block_end(src, src.index("{")) == 3
+
+    def test_rust_char_literals_still_skipped(self):
+        # A real char literal ('a', '\n', '\u{41}', escaped quote '\'') MUST still
+        # be skipped — the lifetime fix must not over-correct and treat char
+        # literals as lifetimes. A brace-shaped char literal ('{', '}') is the
+        # critical regression guard.
+        from external_llm.languages.base import net_brace_count
+        for lit in ("'a'", "'\\n'", "'\\''", "'\\u{41}'", "'\\x7b'", "'{'", "'}'"):
+            src = "fn f() {\n    let c = " + lit + ";\n}\n"
+            assert net_brace_count(src) == 0, f"char literal {lit!r} mis-scanned"
+
+    def test_adjacent_lifetimes_in_expression(self):
+        # 'a + 'b — two lifetimes with no intervening closing tick. Each tick must
+        # be consumed independently; the '{' of the block must count.
+        from external_llm.languages.base import find_brace_block_end, net_brace_count
+        src = "fn f<'a,'b>() {\n    let _ = 'a;\n    let _ = 'b;\n}\n"
+        assert net_brace_count(src) == 0
+        assert find_brace_block_end(src, src.index("{")) == 4
+
+    def test_c_family_char_literals_unchanged(self):
+        # Regression: C/C++/Java char-literal handling must be byte-identical to
+        # the old _skip_quoted_literal path (the lifetime fix shares the same core
+        # via _iter_brace_tokens). Braces inside char literals are still skipped.
+        from external_llm.languages.base import net_brace_count
+        for lit in ("'a'", "'\\n'", "'}'", "'{'"):
+            src = "int f() {\n    char c = " + lit + ";\n}\n"
+            assert net_brace_count(src) == 0, f"C char literal {lit!r} mis-scanned"
+
+    def test_ssot_consumers_agree(self):
+        # The two consumers (_find_closing_brace, net_brace_count) share one core
+        # (_iter_brace_tokens). A balanced-with-lifetime region must report net 0
+        # AND a valid matching-close offset simultaneously.
+        from external_llm.languages.base import _find_closing_brace, net_brace_count
+        src = "struct P<'a> {\n    x: &'a str,\n}\n"
+        assert net_brace_count(src) == 0
+        close = _find_closing_brace(src, src.index("{"))
+        assert close != -1 and src[close] == "}"
+
+
+
+class TestBraceScannerCSharpVerbatimStrings:
+    """C# verbatim ``@"..."`` strings must not trip the brace scanner.
+
+    In a verbatim string ``\\`` is a literal backslash (not an escape) and
+    ``""`` is an embedded quote. The pre-fix scanner applied ``escapes=True``
+    to every ``"``, so a verbatim string whose closing ``"`` followed a ``\\``
+    (e.g. ``@"C:\\x\\"``) was mis-scanned: ``\\"`` read as an escape → scan
+    overshoots the real close → downstream braces mis-counted → fail-closed
+    pre-write gate falsely rejects a valid edit.
+    """
+
+    def test_verbatim_trailing_backslash(self):
+        # The confirmed bug: @"C:\x\" followed by a normal string with '}'.
+        from external_llm.languages.base import net_brace_count
+
+        src = 'var a = @"C:\\x\\";\nvar b = "}";\n'
+        assert net_brace_count(src) == 0
+
+    def test_verbatim_backslash_is_literal(self):
+        # Backslash anywhere in a verbatim string is literal — never an escape.
+        from external_llm.languages.base import net_brace_count
+
+        src = 'var a = @"a\\b{c}d";\nvoid f() {\n}\n'
+        assert net_brace_count(src) == 0
+
+    def test_verbatim_doubled_quote(self):
+        # "" is an embedded quote, NOT a string terminator.
+        from external_llm.languages.base import net_brace_count
+
+        src = 'var a = @"say ""hi"" end";\nvoid f() {\n}\n'
+        assert net_brace_count(src) == 0
+
+    def test_verbatim_contains_braces(self):
+        # Braces inside a verbatim string are literal text, not block delimiters.
+        from external_llm.languages.base import net_brace_count
+
+        src = 'var a = @"has { brace } inside";\n'
+        assert net_brace_count(src) == 0
+
+    def test_dollar_at_verbatim_prefix(self):
+        # $@"..." interpolated verbatim — '@' immediately precedes '"'.
+        from external_llm.languages.base import net_brace_count
+
+        src = 'var a = $@"path\\x\\";\nvoid f() {\n}\n'
+        assert net_brace_count(src) == 0
+
+    def test_at_dollar_verbatim_prefix(self):
+        # @$"..." interpolated verbatim — '@' then '$' then '"'.
+        from external_llm.languages.base import net_brace_count
+
+        src = 'var a = @$"path\\x\\";\nvoid f() {\n}\n'
+        assert net_brace_count(src) == 0
+
+    def test_non_verbatim_string_unchanged(self):
+        # A plain "..." string with an escaped quote must still be parsed with
+        # escape semantics (regression guard: verbatim detection must not
+        # over-trigger on ordinary strings).
+        from external_llm.languages.base import net_brace_count
+
+        src = 'var a = "tab\\t";\nvoid f() {\n}\n'
+        assert net_brace_count(src) == 0
+
+    def test_verbatim_then_real_imbalance_detected(self):
+        # A genuine orphan brace after a verbatim string must still be caught
+        # (the verbatim fix must not mask real corruption).
+        from external_llm.languages.base import net_brace_count
+
+        src = 'var a = @"end\\";\nvoid f() {\n'  # missing closing }
+        assert net_brace_count(src) == 1
+
+    def test_csharp11_raw_strings_ok(self):
+        # C#11 """...""" raw strings were never buggy (fragment-scanning
+        # consumes contained braces correctly) — guard against regression.
+        from external_llm.languages.base import net_brace_count
+
+        src = 'var a = """has { brace } here""";\nvoid f() {\n}\n'
+        assert net_brace_count(src) == 0

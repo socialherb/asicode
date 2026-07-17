@@ -1,5 +1,5 @@
-"""Regression tests for _run_bounded_subprocess — the mandatory-timeout +
-process-group-kill helper shared by git_tools.py and intelligent_service.py.
+"""Regression tests for run_bounded_subprocess — the mandatory-timeout +
+process-group-kill helper in common/subprocess_utils.py (single source of truth).
 
 Before this helper existed, recovery paths invoked subprocess.run with no
 timeout. A pytest that dropped into --pdb / input(), or a pip install hitting a
@@ -22,14 +22,20 @@ import time
 import pytest
 
 import external_llm.agent.tool_handlers.git_tools as gt_mod
-import external_llm.intelligent_service as isvc_mod
+from external_llm.common.subprocess_utils import run_bounded_subprocess
 
-# Both modules expose an identical-signature helper. Run every behavioral test
-# against BOTH copies so a future divergence is caught immediately.
+# The helper now lives in common/subprocess_utils.py; git_tools binds it as
+# _run_bounded_subprocess. Test the SSOT directly, plus the git_tools binding
+# (the live production call path) so a re-localized shadow copy is caught.
 _HELPERS = [
+    pytest.param(run_bounded_subprocess, id="common"),
     pytest.param(gt_mod._run_bounded_subprocess, id="git_tools"),
-    pytest.param(isvc_mod._run_bounded_subprocess, id="intelligent_service"),
 ]
+
+
+def test_git_tools_helper_is_the_shared_implementation():
+    """git_tools must bind the shared helper, not a re-localized copy."""
+    assert gt_mod._run_bounded_subprocess is run_bounded_subprocess
 
 
 pytestmark = pytest.mark.skipif(
@@ -128,6 +134,7 @@ def test_no_timeoutless_subprocess_run_in_target_files():
     import ast
 
     targets = [
+        "external_llm/common/subprocess_utils.py",
         "external_llm/agent/tool_handlers/git_tools.py",
         "external_llm/intelligent_service.py",
         "webapp/ui/ui_tools.py",

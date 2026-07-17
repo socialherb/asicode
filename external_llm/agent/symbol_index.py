@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import ast
 import builtins
+import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import Optional
 
+from ..common.repo_files import git_list_repo_files
 from ..languages import LanguageId
 
 # Within this many seconds of the last scan, the index is served from cache
@@ -37,6 +39,25 @@ class SymbolLocation:
     name: str
     file_path: str  # relative to repo_root
     kind: str       # "class" | "function" | "async_function"
+
+
+logger = logging.getLogger(__name__)
+
+
+class _CancelledBuild(Exception):
+    """Abort a repo-wide scan when a cooperative-cancel event fires mid-walk.
+
+    Caught by build_repo_symbol_index on the WARM path, which returns the stale
+    cached index WITHOUT poisoning _INDEX_CACHE. On the COLD path there is no
+    fallback, so the exception PROPAGATES to the caller — it must NOT be
+    swallowed into {} because consumers cannot tell "build cancelled" from
+    "repo genuinely has no symbols", and treating a cancelled (partial) build
+    as "symbol missing repo-wide" makes them emit a hard "you MUST create it"
+    directive that risks a DUPLICATE DEFINITION of an existing symbol.
+    Mirrors the CallGraphIndexer cancel regime: discard partial state and never
+    expose a half-built index. Importable by name (callers catch it before their
+    broad `except Exception:`); not part of the public API.
+    """
 
 
 # ── In-memory cache ──────────────────────────────────────────────────────
@@ -114,14 +135,54 @@ def _scan_file(abs_path: str, rel_path: str) -> list[SymbolLocation]:
     return result
 
 
-def _collect_mtimes(repo_root: str) -> dict[str, float]:
-    """Walk the repo once and return {rel_path: mtime} for all .py files.
+def _collect_mtimes(repo_root: str, cancel_event=None) -> dict[str, float]:
+    """Return {rel_path: mtime} for all .py files in the repo.
 
-    Determinism: directory traversal is sorted (see build_repo_symbol_index
-    docstring) so the resulting dict is reproducible across machines.
+    Primary source: ``git ls-files`` via the shared SSOT
+    ``common.repo_files.git_list_repo_files`` (same implementation
+    ``write_tools._repo_file_index`` uses). This keeps the symbol index and
+    the did-you-mean file index over the SAME file set, so a symbol defined
+    only in a gitignored vendored/generated copy (``vendor/``,
+    ``third_party/``, ``*_pb2.py``) does NOT leak into the index and flip a
+    correct ``"create"`` into a wrong ``"import"`` (duplicate-definition
+    risk). Falls back to ``os.walk`` + ``_SKIP_DIRS`` only when git is
+    unavailable or the path is not a checkout.
+
+    Determinism: paths are sorted (git path returns sorted; the walk path
+    sorts dirs+files) so the resulting dict is reproducible across machines.
+
+    Raises _CancelledBuild if ``cancel_event`` is set mid-enumeration, so the
+    caller can bail out of an otherwise ~25ms+ scan without finishing it.
     """
     mtimes: dict[str, float] = {}
+
+    # Primary: git ls-files (fast + .gitignore-aware + non-ASCII safe).
+    # Per-file (not per-directory) cancel checkpoint — the git path does not
+    # walk the tree, so there are no directory boundaries to check between.
+    git_paths = git_list_repo_files(str(repo_root))
+    if git_paths is not None:
+        for rel_path in git_paths:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _CancelledBuild()
+            if LanguageId.from_path(rel_path) is not LanguageId.PYTHON:
+                continue
+            abs_path = os.path.join(repo_root, rel_path)
+            try:
+                mtimes[rel_path] = os.path.getmtime(abs_path)
+            except OSError:
+                continue
+        return mtimes
+
+    # Fallback: os.walk with a hardcoded skip-set (no .gitignore awareness).
+    # Used only for non-git trees; the skip-set is intentionally narrower than
+    # .gitignore, which is acceptable because non-git trees have no vendored
+    # copies to exclude in the first place.
     for root, dirs, files in os.walk(repo_root):
+        # Cooperative cancel: check between directories so a mid-walk ESC (the
+        # caller passes the live config.cancel_event) is honored promptly
+        # rather than blocking until the walk completes.
+        if cancel_event is not None and cancel_event.is_set():
+            raise _CancelledBuild()
         dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS)
         for fn in sorted(files):
             if LanguageId.from_path(fn) is not LanguageId.PYTHON:
@@ -136,7 +197,7 @@ def _collect_mtimes(repo_root: str) -> dict[str, float]:
 
 
 def _rebuild_file_index(
-    repo_root: str, mtimes: dict[str, float]
+    repo_root: str, mtimes: dict[str, float], cancel_event=None
 ) -> dict[str, list[SymbolLocation]]:
     """Re-parse the given file set into a fresh *file-keyed* index.
 
@@ -145,9 +206,15 @@ def _rebuild_file_index(
     files deleted between the walk and the parse.
 
     Returns {rel_path: [SymbolLocation, ...]}.
+
+    Raises _CancelledBuild if ``cancel_event`` is set: the cold-build reparse
+    of every .py file is the ~2s dominant cost, so a per-file checkpoint lets a
+    mid-parse ESC abort promptly instead of blocking the whole reparse.
     """
     file_index: dict[str, list[SymbolLocation]] = {}
     for rel_path in mtimes:
+        if cancel_event is not None and cancel_event.is_set():
+            raise _CancelledBuild()
         abs_path = os.path.join(repo_root, rel_path)
         # _scan_file already returns top-level symbols for this file; keep the
         # list as-is (file-index does not need the per-name sort, that happens
@@ -180,6 +247,7 @@ def _apply_incremental(
     old_file_index: dict[str, list[SymbolLocation]],
     old_mtimes: dict[str, float],
     cur_mtimes: dict[str, float],
+    cancel_event=None,
 ) -> tuple[dict[str, list[SymbolLocation]], dict[str, float]]:
     """Incrementally update a file-keyed index from the mtime diff.
 
@@ -204,6 +272,13 @@ def _apply_incremental(
 
     # Added or changed files: re-scan that single file.
     for rel_path in cur_keys:
+        # Cooperative cancel: a branch switch can flip thousands of mtimes at
+        # once, making this loop the most expensive part of the build. Bail out
+        # without committing — new_file_index is a local copy, so the cache is
+        # never poisoned (build_repo_symbol_index catches _CancelledBuild on the
+        # warm path and reuses the stale cached index).
+        if cancel_event is not None and cancel_event.is_set():
+            raise _CancelledBuild()
         if rel_path not in old_keys or old_mtimes[rel_path] != cur_mtimes[rel_path]:
             abs_path = os.path.join(repo_root, rel_path)
             new_file_index[rel_path] = _scan_file(abs_path, rel_path)
@@ -211,7 +286,7 @@ def _apply_incremental(
     return new_file_index, cur_mtimes
 
 
-def build_repo_symbol_index(repo_root: str) -> dict[str, list[SymbolLocation]]:
+def build_repo_symbol_index(repo_root: str, cancel_event=None) -> dict[str, list[SymbolLocation]]:
     """Scan repo for top-level class/function definitions (cached).
 
     Three-layer cache to keep the agent hot-path cheap:
@@ -231,7 +306,7 @@ def build_repo_symbol_index(repo_root: str) -> dict[str, list[SymbolLocation]]:
          the changed/added files and drop removed ones, reusing every untouched
          file's parsed symbols. A single-file edit (the common case) costs one
          ``_scan_file`` call (~1ms) instead of a whole-repo reparse (~2s on this
-         repo). A newly created .py file is absent from old_mtimes → caught by
+         repo). A newly created .py file is absent in old_mtimes → caught by
          the set comparison (not mtime), so decide_import_vs_create won't create
          a duplicate definition.
 
@@ -239,9 +314,27 @@ def build_repo_symbol_index(repo_root: str) -> dict[str, list[SymbolLocation]]:
     so per-file add/change/remove is O(1); the name-keyed index consumers
     expect ({symbol_name: [SymbolLocation, ...]}) is derived ONCE per file-index
     change and cached alongside it, so the TTL fast-path returns it in O(1)
-    instead of re-deriving every turn.
+    instead of re-deriving it every turn.
 
     Returns {symbol_name: [SymbolLocation, ...]}.
+
+    Cooperative cancel: ``cancel_event`` (a threading.Event, or None for
+    non-interactive callers) is checked per-file inside the walk/reparse loops.
+    When set mid-build, the scan aborts WITHOUT poisoning _INDEX_CACHE. Two
+    regimes, by necessity:
+      * **Warm path** (a cached index exists): returns the stale cached index —
+        a valid, slightly-outdated index is preferable to forcing every consumer
+        to bail out. This covers both the mtime-walk cancel and the incremental
+        rebuild cancel.
+      * **Cold path** (no cache): RAISES ``_CancelledBuild`` — it must NOT be
+        swallowed into ``{}``, because ``{}`` is indistinguishable from "repo
+        has no symbols" and would make consumers falsely mandate *creating* an
+        already-existing symbol (duplicate-definition risk). Callers catch
+        ``_CancelledBuild`` before their broad ``except Exception:`` and SKIP the
+        dependent decision rather than block on partial data.
+    Either way the cache stays untouched so the next non-cancelled call rebuilds
+    correctly. This matches the CallGraphIndexer cancel regime (discard partial
+    state, never persist a torn index).
     """
     cached = _INDEX_CACHE.get(repo_root)
     if cached is not None:
@@ -252,10 +345,16 @@ def build_repo_symbol_index(repo_root: str) -> dict[str, list[SymbolLocation]]:
             return old_name_index
 
         # TTL expired: one fused walk to gather the file set + mtimes.
-        cur_mtimes = _collect_mtimes(repo_root)
+        try:
+            cur_mtimes = _collect_mtimes(repo_root, cancel_event)
+        except _CancelledBuild:
+            # Aborted mid-walk: reuse the stale cached index rather than forcing
+            # callers to fall back to an empty one. Cache is left untouched.
+            logger.debug("build_repo_symbol_index: cancelled during mtime walk — reusing stale cached index")
+            return old_name_index
 
         # Stale iff the tracked file set differs OR any mtime changed.
-        # A newly created .py file is absent from old_mtimes → caught by the
+        # A newly created .py file is absent in old_mtimes → caught by the
         # set comparison (not mtime), so decide_import_vs_create won't create a
         # duplicate definition.
         if cur_mtimes == old_mtimes:
@@ -264,16 +363,37 @@ def build_repo_symbol_index(repo_root: str) -> dict[str, list[SymbolLocation]]:
             return old_name_index
 
         # Something changed: incremental rebuild — only changed files re-parse.
-        new_file_index, mtimes = _apply_incremental(
-            repo_root, old_file_index, old_mtimes, cur_mtimes
-        )
+        try:
+            new_file_index, mtimes = _apply_incremental(
+                repo_root, old_file_index, old_mtimes, cur_mtimes, cancel_event
+            )
+        except _CancelledBuild:
+            # Incremental rebuild cancelled mid-way (e.g. a branch switch flips
+            # thousands of mtimes at once). The partial new_file_index is a local
+            # copy and is discarded here — the cache is never poisoned. Reuse the
+            # stale cached index rather than propagating: this is the WARM path,
+            # so a valid (if slightly outdated) index exists and is preferable to
+            # forcing every consumer to bail out.
+            logger.debug("build_repo_symbol_index: cancelled during incremental rebuild — reusing stale cached index")
+            return old_name_index
         new_name_index = _name_index_from_file_index(new_file_index)
         _capped_index_put(_INDEX_CACHE, repo_root, (new_file_index, new_name_index, mtimes, time.monotonic()))
         return new_name_index
 
     # Cold cache: full walk + parse.
-    mtimes = _collect_mtimes(repo_root)
-    file_index = _rebuild_file_index(repo_root, mtimes)
+    try:
+        mtimes = _collect_mtimes(repo_root, cancel_event)
+        file_index = _rebuild_file_index(repo_root, mtimes, cancel_event)
+    except _CancelledBuild:
+        # No cached index to fall back on. PROPAGATE — do NOT swallow into {}.
+        # {} is indistinguishable from "repo has no symbols", and consumers
+        # (executor_verification P6.9/P6.10) would treat a partial/cancelled
+        # build as "symbol missing repo-wide" and emit a hard "you MUST create
+        # it" directive, risking a DUPLICATE DEFINITION of an existing symbol.
+        # The cache stays untouched (a cached {} would shadow the repo for
+        # _INDEX_TTL_SECONDS), so the next non-cancelled call rebuilds correctly.
+        logger.debug("build_repo_symbol_index: cancelled during cold build — propagating (cache not poisoned)")
+        raise
     name_index = _name_index_from_file_index(file_index)
     _capped_index_put(_INDEX_CACHE, repo_root, (file_index, name_index, mtimes, time.monotonic()))
     return name_index

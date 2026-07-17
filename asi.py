@@ -1348,6 +1348,7 @@ _KNOWN_MODELS: dict[str, list[str]] = {
         "glm-5",
         "deepseek-v4-pro",
         "deepseek-v4-flash",
+        "kimi-k3",
         "kimi-k2.7-code",
         "kimi-k2.6",
         "kimi-k2.5",
@@ -5848,7 +5849,12 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
                 event.current_buffer.reset()
             _ctrlc_armed = new_armed
             if should_raise:
-                raise KeyboardInterrupt()
+                # raise 금지: 키바인딩은 이벤트 루프 콜백 안에서 실행되므로
+                # 여기서 raise하면 prompt()로 전파되지 않고 loop의 예외 핸들러로
+                # 새어나가 "Unhandled exception in event loop" 트레이스백이 찍힌다.
+                # app.exit(exception=...)가 prompt() 호출 지점에서 raise되는 정석 경로.
+                event.app.exit(exception=KeyboardInterrupt(), style="class:aborting")
+                return
             if new_armed:
                 # First Ctrl+C on main prompt: show "press again" hint.
                 try:
@@ -6170,7 +6176,7 @@ def _prompt_input(chat_mode: str = "code", status: str = "") -> str:
             from rich.text import Text as _RichText
             _out_console.print(_RichText(f"  {status}", style=_C["muted"]))
         _out_console.print(
-            f"  [{_C['border']}]/help for commands  ·  Enter send  ·  Ctrl+C exit  ·  {_display_mode}[/{_C['border']}]"
+            f"  [{_C['border']}]/help for commands  ·  Enter send  ·  Ctrl+C exit  · Alt+Enter new line · {_display_mode}[/{_C['border']}]"
         )
         # bottom_toolbar: draw a thin underline rule right below the ❯ prompt input area,
         # forming the "input box" UI. Ignored in fallback(input()) path.
@@ -6179,7 +6185,7 @@ def _prompt_input(chat_mode: str = "code", status: str = "") -> str:
         print("━" * 50)
         if status:
             print(f"  {status}")
-        print(f"/help for commands  ·  Enter send  ·  Ctrl+C exit  ·  {_display_mode}")
+        print(f"/help for commands  ·  Enter send  ·  Ctrl+C exit  · Alt+Enter new line · {_display_mode}")
         return _collect_input(f"{_mode_tag}> ")
 
 
@@ -6875,7 +6881,11 @@ def run_repl(args: argparse.Namespace) -> None:
         try:
             from external_llm.client import LLMMessage
             _ci_client, _ci_model = _get_compress_llm()
-            logging.getLogger(__name__).info(
+            # DEBUG (not INFO): compaction runs automatically every turn the file
+            # is over budget — INFO-level "insights compact: client/model" would
+            # spam the terminal on every turn. Demoted to debug so it is silent
+            # by default but recoverable via --debug.
+            logging.getLogger(__name__).debug(
                 "insights compact: client=%s, model=%s",
                 type(_ci_client).__name__, _ci_model,
             )
@@ -6932,7 +6942,7 @@ def run_repl(args: argparse.Namespace) -> None:
                 # common case for reasoning models (trace ate the budget).
                 # Truncated with empty content — double budget for retry
                 _ci_max_tokens = min(_ci_max_tokens * 2, 128000)
-                logging.getLogger(__name__).info(
+                logging.getLogger(__name__).debug(
                     "insights compact: truncated (length), retrying with "
                     "max_tokens=%d (attempt %d/%d)",
                     _ci_max_tokens, _ci_attempt + 1, _ci_max_attempts,
@@ -6981,7 +6991,7 @@ def run_repl(args: argparse.Namespace) -> None:
         # record actually reaches the handler.  This is the only reliable
         # place to capture what the LLM returned (or why it failed).
         if _ci_finish_reason:
-            logging.getLogger(__name__).info(
+            logging.getLogger(__name__).debug(
                 "insights compact: finish_reason=%s, result_len=%d, model=%s",
                 _ci_finish_reason, len(_ci_result),
                 _ci_model if "_ci_model" in locals() else "?",
@@ -7121,7 +7131,7 @@ def run_repl(args: argparse.Namespace) -> None:
             _ci_ct = _ci_ct_total
             _ci_crt = _ci_crt_total
             if _ci_pt or _ci_ct:
-                logging.getLogger(__name__).info(
+                logging.getLogger(__name__).debug(
                     "insights compact: tokens prompt=%d completion=%d cache_read=%d",
                     _ci_pt, _ci_ct, _ci_crt,
                 )
@@ -7332,14 +7342,13 @@ def run_repl(args: argparse.Namespace) -> None:
                 _think_label = "think (auto)"
             if _reasoning_effort and _thinking_state is not False:
                 _think_label = f"think ON ({_reasoning_effort})"
-            _key_hints = "Alt+Enter new line"
             _status_bits = [f"{_provider_str} / {_model_str}", _think_label]
             if _auto_continue_state["on"]:
                 # Persistent mode indicator — the countdown fires turns later,
                 # so the user must be able to see the mode is armed.
                 _status_bits.append(
-                    f"🔁 auto {_auto_continue_state['depth']}/{_auto_continue_state['cap']}")
-            user_input = _prompt_input(chat_mode=_current_mode, status="  ·  ".join([*_status_bits, _key_hints]))
+                    f"🔁 auto-continue {_auto_continue_state['depth']}/{_auto_continue_state['cap']}")
+            user_input = _prompt_input(chat_mode=_current_mode, status="  ·  ".join(_status_bits))
             # ── Auto-continue depth bookkeeping ──
             # Countdown-submitted input deepens the chain (capped); any manual
             # input re-anchors the loop (depth reset) — the user took over.

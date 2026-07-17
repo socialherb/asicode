@@ -34,7 +34,7 @@ class _FakeAnalysisTools(AnalysisToolsMixin):
 
     def _make_result(
         self, ok: bool = True, content: str = "", error: str | None = None,
-        metadata: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None, retryable: bool = False,
     ):
         return {"ok": ok, "content": content, "error": error, "metadata": metadata or {}}
 
@@ -147,3 +147,56 @@ class TestStructuralScanLanguageFilter:
         content = result["content"]
         assert "## unused_import_scanner" in content
         assert "Skipped:" not in content
+
+
+# ── Cooperative cancel pre-check ──────────────────────────────────────────
+
+
+class TestStructuralScanCancelPreCheck:
+    """The scan handler short-circuits to ok=False when config.cancel_event is
+    already set on entry — ESC / Ctrl-C before the scan starts returns
+    immediately instead of entering the (potentially minutes-long) loop."""
+
+    def test_pre_set_cancel_event_returns_false_immediately(self, tmp_path):
+        import threading
+        from types import SimpleNamespace
+
+        repo = str(tmp_path)
+        # Go-only file set is irrelevant — the pre-check fires before any walk.
+        tools = _FakeAnalysisTools(repo, ["a.py"])
+        ev = threading.Event()
+        ev.set()
+        tools.config = SimpleNamespace(cancel_event=ev)
+
+        result = tools._tool_run_structural_scan({"scanner": "all", "path": ""})
+
+        assert result["ok"] is False
+        assert "cancel" in (result["error"] or "").lower()
+
+    def test_unset_cancel_event_does_not_short_circuit(self, tmp_path):
+        """A non-set cancel_event must NOT trigger the pre-check — the scan
+        proceeds and produces output. Guards against an over-eager gate."""
+        import threading
+        from types import SimpleNamespace
+
+        repo = str(tmp_path)
+        tools = _FakeAnalysisTools(repo, ["main.go"])
+        ev = threading.Event()  # NOT set
+        tools.config = SimpleNamespace(cancel_event=ev)
+
+        result = tools._tool_run_structural_scan({"scanner": "all", "path": ""})
+
+        assert result["ok"] is True
+        assert result["content"]  # produced output, not the cancel short-circuit
+
+    def test_no_config_does_not_short_circuit(self, tmp_path):
+        """No ``config`` attribute at all (e.g. direct API/test use) must be
+        None-safe — the pre-check is skipped and the scan runs normally."""
+        repo = str(tmp_path)
+        tools = _FakeAnalysisTools(repo, ["main.go"])
+        # tools.config intentionally absent
+
+        result = tools._tool_run_structural_scan({"scanner": "all", "path": ""})
+
+        assert result["ok"] is True
+        assert result["content"]

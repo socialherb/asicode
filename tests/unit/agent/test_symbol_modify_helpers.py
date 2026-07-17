@@ -10,7 +10,7 @@ level helpers had ZERO direct coverage:
   - _file_indent_unit_from_logical  (GCD indent detection excluding continuations)
   - _mode_logical_indent            (most-common indent, tie → shallowest)
   - _block_parses_after_dedent      (ast.parse consistency check)
-  - _python_syntax_ok               (compile / node --check / gofmt gate)
+  - _post_edit_syntax_ok               (compile / node --check / gofmt gate)
   - _apply_diff_to_source           (in-memory unified-diff applier)
 
 These functions are the bedrock of the re-indentation heuristics (the very
@@ -34,7 +34,7 @@ from external_llm.agent.symbol_modify_tool import (  # noqa: E402
     _apply_diff_to_source,
     _block_parses_after_dedent,
     _mode_logical_indent,
-    _python_syntax_ok,
+    _post_edit_syntax_ok,
     _reindent_relative,
 )
 from external_llm.common.indent_utils import (  # noqa: E402
@@ -170,22 +170,22 @@ class TestBlockParsesAfterDedent:
         assert _block_parses_after_dedent(lines) is True
 
 
-# ── _python_syntax_ok ────────────────────────────────────────────────────────
+# ── _post_edit_syntax_ok ────────────────────────────────────────────────────────
 
-class TestPythonSyntaxOk:
+class TestPostEditSyntaxOk:
     def test_valid_python(self):
-        assert _python_syntax_ok("x = 1\n", "m.py") is True
+        assert _post_edit_syntax_ok("x = 1\n", "m.py") is True
 
     def test_invalid_python(self):
-        assert _python_syntax_ok("def (\n", "m.py") is False
+        assert _post_edit_syntax_ok("def (\n", "m.py") is False
 
     def test_non_python_passes_through(self):
         # Non-Python files without node/gofmt infra pass through as True.
-        assert _python_syntax_ok("garbage {{{", "m.js") in (True, False)
+        assert _post_edit_syntax_ok("garbage {{{", "m.js") in (True, False)
 
     def test_path_drives_language(self):
         # Same content, .txt → not Python/JS/TS/Go → always True.
-        assert _python_syntax_ok("def (\n", "m.txt") is True
+        assert _post_edit_syntax_ok("def (\n", "m.txt") is True
 
 
 # ── _apply_diff_to_source ────────────────────────────────────────────────────

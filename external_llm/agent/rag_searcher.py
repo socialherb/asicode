@@ -22,7 +22,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .config.thresholds import config as _cfg
 from .performance_metrics import get_global_collector
@@ -124,9 +124,24 @@ class RAGSearcher:
     Call invalidate_files() to update incrementally after edits.
     """
 
-    def __init__(self, repo_root: str, vector_cache_enabled: bool = True) -> None:
+    def __init__(
+        self,
+        repo_root: str,
+        vector_cache_enabled: bool = True,
+        cancel_event: Optional[threading.Event] = None,
+        config: Any = None,
+    ) -> None:
         self.repo_root = Path(repo_root).resolve()
         self._built = False
+        # Cooperative cancel: hold config (NOT the event value) and read
+        # config.cancel_event FRESH in _build_index via _get_cancel_event.
+        # The design-chat REPL mutates config.cancel_event PER TURN (asi.py)
+        # AFTER this searcher is constructed with cancel_event=None; a captured
+        # value would freeze None and leave ESC inert during the multi-second
+        # first find_relevant_files build — the exact interactive path ESC must
+        # protect. An explicit cancel_event arg (tests / direct callers) wins.
+        self._cancel_event = cancel_event
+        self._config = config
         self._index_lock = threading.Lock()
         self.vector_cache_enabled = vector_cache_enabled
         self.vector_cache_manager = None
@@ -610,12 +625,49 @@ class RAGSearcher:
             if self._built:
                 return
             t0 = time.monotonic()
-            self._build_index()
+            completed = self._build_index()
+            if not completed:
+                # Cancelled mid-build: leave _built False so the next query
+                # retries.  _build_index accumulates into *local* lists/dicts
+                # and only commits to self._* at the very end, so instance state
+                # is pristine on cancel (no half-populated arrays to reset).
+                # (Side note: vector_cache_manager.add_document is a per-file
+                # side-effect inside the loop and may be partially written on
+                # cancel; it is incremental/idempotent and decoupled from the
+                # BM25 path, so this is safe.)
+                return
             elapsed = time.monotonic() - t0
             logger.debug("RAG index built: %d docs in %.2fs", self._n_docs, elapsed)
             self._built = True
 
-    def _build_index(self) -> None:
+    def _get_cancel_event(self) -> Optional[threading.Event]:
+        """Return the live cooperative-cancel event.
+
+        Reads ``config.cancel_event`` FRESH (call-time, not construction-time)
+        so a per-turn mutation of ``config.cancel_event`` — as the design-chat
+        REPL performs each turn — is honored even though this searcher was
+        constructed before the mutation landed.  An explicit ``cancel_event``
+        passed to ``__init__`` (tests / direct callers without a config) takes
+        precedence and is returned as-is.  Returns None when neither is set
+        (non-interactive CLI, out-of-process callers) → checkpoints become
+        inert no-ops.
+        """
+        if self._cancel_event is not None:
+            return self._cancel_event
+        return getattr(self._config, "cancel_event", None)
+
+    def _build_index(self) -> bool:
+        """Build the BM25 index. Returns True if completed, False if cancelled.
+
+        Accumulates into *local* lists/dicts and only commits to ``self._*`` at
+        the very end, so a mid-build cancel leaves instance state pristine —
+        ``_built`` stays False and the next query re-runs this method from
+        scratch.  ``vector_cache_manager.add_document`` is the one side-effect
+        inside the loop; on cancel it may be partially written, but it is
+        incremental/idempotent and decoupled from the BM25 path.  Hold
+        ``_index_lock`` for the whole build (the caller does) so no reader
+        races the final commit.
+        """
         rel_paths: list[str] = []
         doc_tcs: list[dict[str, int]] = []
         doc_lens: list[int] = []
@@ -624,6 +676,14 @@ class RAGSearcher:
         total_len = 0
 
         for fpath in self._walk_files():
+            # Cooperative cancel: the per-file read+tokenize loop is the
+            # dominant cost of a first find_relevant_files call (seconds on
+            # large repos).  Bail out between files; _ensure_index keeps
+            # _built False so the partial arrays never become visible.
+            _ce = self._get_cancel_event()
+            if _ce is not None and _ce.is_set():
+                logger.debug("RAG index build cancelled")
+                return False
             try:
                 text = fpath.read_text(encoding="utf-8", errors="replace")
                 if len(text) > _MAX_FILE_CHARS:
@@ -664,6 +724,7 @@ class RAGSearcher:
         self._total_doc_len = total_len
         self._avgdl = total_len / max(n, 1)
         self._rel_path_to_idx = {p: i for i, p in enumerate(rel_paths)}
+        return True
 
     def _walk_files(self) -> list[Path]:
         results: list[Path] = []

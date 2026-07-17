@@ -339,9 +339,6 @@ class VectorCacheManager:
             if isinstance(doc, dict) and "doc_id" in doc
         }
 
-        # Statistics
-        self.hit_count = 0
-        self.miss_count = 0
 
         # Dirty flag: set True whenever the in-memory index/metadata mutates
         # (add_document / clear), cleared by a successful _save_index(). This
@@ -531,7 +528,6 @@ class VectorCacheManager:
         """Search for documents similar to query."""
         self._ensure_model_loaded()
         if not HAS_NUMPY or not HAS_FAISS or self.index is None or self.index.ntotal == 0 or self.embedding_model is None:
-            self.miss_count += 1
             return []
 
         try:
@@ -567,15 +563,9 @@ class VectorCacheManager:
                         "from_cache": True
                     })
 
-            if results:
-                self.hit_count += 1
-            else:
-                self.miss_count += 1
-
             return results
         except Exception as e:
             logger.warning(f"Vector cache search failed: {e}")
-            self.miss_count += 1
             return []
 
     def clear(self):

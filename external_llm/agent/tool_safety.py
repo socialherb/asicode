@@ -12,7 +12,7 @@ import logging
 import os
 import tempfile
 from collections.abc import Callable
-from typing import Any, ClassVar, Optional
+from typing import Any, Optional
 
 from external_llm.languages.tree_sitter_utils import grammar_key_for_ext
 
@@ -141,9 +141,6 @@ def summarize_decl_losses(original: str, current: str, suffix: str = ".py") -> s
 class WriteSafetyManager:
     """Manages write safety: file snapshots before writes, syntax verification
     after writes, and rollback on failure.  Also handles approval gating."""
-
-    # Tools that get snapshot + syntax verify + rollback safety wrapper
-    WRITE_TOOLS_WITH_SAFETY: ClassVar[set[str]] = {"apply_patch", "write_plan"}
 
     _PATCH_FILE_THRESHOLD = 3
 
@@ -502,6 +499,44 @@ class WriteSafetyManager:
         if not lines_out:
             return None
         return "[POST-EDIT DIFF]\n" + "\n".join(lines_out)
+
+    @staticmethod
+    def all_files_unchanged(snapshots: dict) -> bool:
+        """True iff ``snapshots`` is non-empty and every file is byte-identical to disk.
+
+        Targets the NO_EFFECTIVE_PROGRESS failure mode: a write tool (notably
+        ``apply_patch``) can report ``ok=True`` while its patch matched content
+        that was already present, so nothing on disk changed. ``summarize_change``
+        surfaces a "⚠️ NO CHANGE" *warning* in the result text, but the ``ok``
+        flag stays True — so progress/retry heuristics treat the no-op as a
+        successful step. Callers that want a hard signal use this to downgrade
+        ``ok`` to False.
+
+        Returns False for an empty dict (nothing was snapshotted, so the
+        post-hoc check is meaningless), for any new-file (``_MISSING_SNAP``)
+        entry (a created file IS a change), or if any file differs from / cannot
+        be read from disk.
+
+        Known limitation: both the snapshot and the re-read here decode via
+        ``utf-8`` with ``errors="replace"`` (consistent with
+        :meth:`snapshot_target_files` / :meth:`summarize_change`). A change
+        confined to *invalid* UTF-8 bytes would map to the same replacement
+        char on both sides and read as "unchanged". apply_patch targets text,
+        so this is near-impossible in practice; the consistency across the
+        three methods keeps them in lock-step either way.
+        """
+        if not snapshots:
+            return False
+        for _path, original in snapshots.items():
+            if original is _MISSING_SNAP:
+                return False
+            try:
+                with open(_path, encoding="utf-8", errors="replace") as _f:
+                    if _f.read() != original:
+                        return False
+            except OSError:
+                return False
+        return True
 
     def new_semantic_warnings(self, snapshots: dict) -> Optional[str]:
         """Compare pre-snapshot vs current content for new ruff F-code findings.

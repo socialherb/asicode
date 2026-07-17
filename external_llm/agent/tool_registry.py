@@ -512,8 +512,19 @@ class ToolRegistry(
         self.config = config
         self._lint_runner = LintRunner(repo_root)
         self._symbol_searcher = SymbolSearcher(repo_root)
-        self._rag_searcher = RAGSearcher(repo_root, vector_cache_enabled=config.vector_cache_enabled)
-        _cgi = CallGraphIndexer(repo_root)  # lazy build on first access
+        # Pass the live config (NOT a captured cancel_event value) so these
+        # indexers read config.cancel_event FRESH at build() time. The design-
+        # chat REPL mutates config.cancel_event PER TURN (asi.py) AFTER this
+        # registry is constructed; a captured value would freeze the
+        # construction-time value (None in design-chat) and leave ESC inert on
+        # find_relevant_files / analyze_change_impact — the exact interactive
+        # path it must protect. Mirrors the call-time fresh read vulture uses.
+        self._rag_searcher = RAGSearcher(
+            repo_root,
+            vector_cache_enabled=config.vector_cache_enabled,
+            config=config,
+        )
+        _cgi = CallGraphIndexer(repo_root, config=config)  # lazy build on first access
         self._call_graph = RepositoryGraphFacade(call_graph_indexer=_cgi, repo_root=repo_root)
 
         # Argument repair layer

@@ -23,6 +23,7 @@ import shutil
 import subprocess
 from typing import Optional
 
+from external_llm.common.atomic_io import atomic_write_text
 from external_llm.common.indent_utils import (
     _analyze_logical_lines,
     _file_indent_unit_from_logical,
@@ -32,11 +33,21 @@ from external_llm.common.indent_utils import (
     normalize_indent_char_to_file,
     reindent_block,
 )
-from external_llm.common.atomic_io import atomic_write_text
 
 from ..languages import LanguageId, LanguageRegistry
+from ..languages.base import _find_closing_brace, net_brace_count
 from ._shared_utils import compile_quiet
 from .repair_helpers import _strip_redundant_dataclass_decorator, _strip_redundant_inline_imports
+
+# Brace-delimited languages with no inline compiler gate of their own in
+# _post_edit_syntax_ok (PYTHON uses compile(), JS/TS use `node --check`, GO uses
+# `gofmt -e`). These fall through to the literal-aware brace-balance gate so
+# a symbol-range scan that left an orphan `}` (or dropped a brace) is rejected
+# before write instead of corrupting the file.
+_BRACE_LANGUAGES_NO_COMPILER = frozenset({
+    LanguageId.KOTLIN, LanguageId.RUST, LanguageId.C, LanguageId.CPP,
+    LanguageId.JAVA, LanguageId.SCALA, LanguageId.SWIFT, LanguageId.CSHARP,
+})
 
 logger = logging.getLogger(__name__)
 
@@ -58,14 +69,57 @@ _DEFINITION_PREFIXES = (
 )
 
 
+def _first_significant_line(text: str, skip_decorators: bool = True) -> str:
+    """First non-blank, non-comment line of ``text`` (single SSOT comment policy).
+
+    Skips blank lines, ``#`` line comments, ``//`` line comments, ``/* */``
+    block comments (possibly multi-line), and — unless ``skip_decorators`` is
+    False — ``@`` decorators. Returns the stripped first significant line, or
+    ``""`` if none.
+
+    Shared by :func:`_looks_like_full_symbol_block` and the surgical-edit
+    full-block reclassification so both apply ONE comment-skipping policy. The
+    prior inline filters skipped only ``#``/``//``/``@`` and missed ``/* */``
+    block comments: a replacement block prefixed with a javadoc ``/** */`` had
+    its first significant line read as the comment text, so the def-line match
+    against the (comment-free) symbol range failed, the block was misrouted to
+    the body-only path, and the def line was duplicated — brace-balanced output
+    the net-brace verify gate cannot catch (silent corruption).
+    """
+    in_block = False
+    for raw in text.splitlines():
+        s = raw.strip()
+        if in_block:
+            idx = s.find("*/")
+            if idx != -1:
+                in_block = False
+                tail = s[idx + 2:].strip()
+                if tail and not tail.startswith(("#", "//")):
+                    return tail
+            continue
+        if not s:
+            continue
+        if skip_decorators and s.startswith("@"):
+            continue
+        if s.startswith("#") or s.startswith("//"):
+            continue
+        if s.startswith("/*"):
+            idx = s.find("*/")
+            if idx == -1:
+                in_block = True
+                continue
+            tail = s[idx + 2:].strip()
+            if tail and not tail.startswith(("#", "//")):
+                return tail
+            continue
+        return s
+    return ""
+
+
 def _looks_like_full_symbol_block(text: str) -> bool:
     """Return True if text appears to be a full function/class definition block."""
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped.startswith("@") or stripped.startswith("//"):
-            continue
-        return any(stripped.startswith(p) for p in _DEFINITION_PREFIXES)
-    return False
+    first = _first_significant_line(text)
+    return any(first.startswith(p) for p in _DEFINITION_PREFIXES)
 
 
 def _realign_dedented_leading_lines(code: str) -> str:
@@ -103,6 +157,44 @@ def _realign_dedented_leading_lines(code: str) -> str:
     return "\n".join(lines) + ("\n" if code.endswith("\n") else "")
 
 
+def _trailing_foreign_stmt(code: str) -> Optional[str]:
+    """Detect a def/class/decorator row PAST the symbol's own block.
+
+    Diagnostic-only: consulted when composing the final syntax-blocked error,
+    never to gate a write. A full replacement block must contain exactly one
+    definition at its base indent — the symbol's own. Models sometimes append
+    content past the symbol boundary (real case: the NEXT method's signature
+    opening line, sent to express "add a blank line between methods"); the
+    splice then leaves that statement dangling next to the original and every
+    strategy fails compile with a generic error the model misdiagnoses as a
+    re-indentation failure. Returns the first offending row (stripped,
+    truncated) so the error can name it, or None.
+
+    Only rows at an indent <= the symbol def row's own indent count: nested
+    helpers/inner classes sit deeper and are legitimate. A docstring line
+    starting with 'def ' at a shallow column could false-positive, but that
+    merely rewords an error already being returned.
+    """
+    lines = code.splitlines()
+    def_idx = next(
+        (i for i, ln in enumerate(lines)
+         if ln.strip().startswith(("def ", "async def ", "class "))),
+        -1,
+    )
+    if def_idx < 0:
+        return None
+    def_line = lines[def_idx]
+    def_indent = len(def_line) - len(def_line.lstrip())
+    for ln in lines[def_idx + 1:]:
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        if indent <= def_indent and stripped.startswith(
+            ("def ", "async def ", "class ", "@")
+        ):
+            return stripped[:80]
+    return None
 
 
 def _reindent_relative(
@@ -731,7 +823,28 @@ def _apply_surgical_edit(
     lines = source.splitlines(keepends=True)
     sym_text = "".join(lines[sym_start_line:sym_end_line])
 
-    if _looks_like_full_symbol_block(code):
+    # `_looks_like_full_symbol_block` recognises Python/JS/modifier-prefixed
+    # defs but misses bare C-family return-type signatures (``int foo()``,
+    # ``void bar()``, ``char* baz()``). For those, reclassify the replacement as
+    # a full block when its first significant line re-states the symbol's own
+    # signature. Without this, Allman-style C blocks were misrouted to the
+    # body-only path and the full code spliced into the body slot — duplicating
+    # the def line and silently corrupting the file (the inserted block is
+    # brace-balanced, so the net-brace verify gate cannot catch it). This match
+    # is exact, so body-only code (which by definition omits the def line) is
+    # never misclassified — no regression risk for the Python body-only path.
+    full_block = _looks_like_full_symbol_block(code)
+    if not full_block:
+        # SSOT comment policy: _first_significant_line skips #/// AND /* */
+        # block comments, so a javadoc-prefixed replacement still matches the
+        # (comment-free) symbol signature and is correctly classified as a
+        # full block — preventing the def-line duplication described above.
+        sym_def_line = _first_significant_line(sym_text)
+        code_def_line = _first_significant_line(code)
+        if sym_def_line and code_def_line == sym_def_line:
+            full_block = True
+
+    if full_block:
         search_text = sym_text
     else:
         # Locate the first BODY line: skip the def/class statement header
@@ -987,33 +1100,95 @@ def _find_symbol_line_range(source: str, symbol: str, file_path: str) -> Optiona
 
     stripped = lines[i].strip()
     sym_indent = len(lines[i]) - len(stripped)
+    # Line index carrying the opening brace: the def line itself (K&R style),
+    # or — for Allman/BSD style — the line after the signature.
+    brace_open_line = i
     has_brace = "{" in stripped
-    brace_depth = 0
-    end = i
+    if not has_brace:
+        # Allman style (C/C++/C#/Java/…): the '{' sits on the line after the
+        # signature. Detect it so brace-balancing yields an accurate range.
+        # Without this, the indentation heuristic below sees the '{' line at
+        # the signature's own indent and returns a body-less range, which on
+        # edit leaves an orphan body block (or, with the prior off-by-one, an
+        # empty (i, i) range that duplicated the symbol instead of replacing).
+        j = i + 1
+        in_block = False
+        while j < len(lines):
+            s = lines[j].strip()
+            if in_block:
+                if "*/" in s:
+                    in_block = False
+                j += 1
+                continue
+            if s.startswith("/*"):
+                # /* ... */ block comment (javadoc etc.) may sit between an
+                # Allman signature and its '{'; skip it — only enter multi-line
+                # state when the close marker isn't on this same line.
+                if "*/" not in s:
+                    in_block = True
+                j += 1
+                continue
+            if s and not s.startswith(("#", "//")):
+                break
+            j += 1
+        if j < len(lines) and lines[j].lstrip().startswith("{"):
+            has_brace = True
+            brace_open_line = j
+    if has_brace:
+        # Brace-delimited language: compute the extent via the literal/comment-
+        # aware brace scanner SSOT (languages.base.find_brace_block_end, shared
+        # with all C-family providers), NOT a naive per-line
+        # `count('{') - count('}')`. The naive counter miscounts braces inside
+        # string/char/comment literals — e.g. Kotlin `val close = "close }"`
+        # or `// trailing brace }` — and reaches depth 0 one line early,
+        # dropping the real closing brace from the range and leaving an orphan
+        # `}` after a surgical edit (172 syntax errors in the reported case).
+        # Byte offset of brace_open_line's start within `source`, robust to
+        # CRLF/CR: splitlines() strips the terminator, so a naive
+        # `len(line) + 1` per preceding line drifts one char per CRLF/CR line
+        # and can land the scan point inside an earlier symbol's body.
+        _ke_lines = source.splitlines(keepends=True)
+        line_start = sum(len(_ke_lines[k]) for k in range(brace_open_line))
+        # find_brace_block_end scans from line_start via the literal-aware SSOT,
+        # so the first REAL '{' it balances is the body opener — a default-arg
+        # literal like fmt = "{}" no longer hijacks the scan point (the prior
+        # `line_start + find('{')` could land mid-string, truncate the range,
+        # and orphan the body on edit). Returns a 1-based inclusive line;
+        # conservative fallback is the start line when no match is found.
+        close_off = _find_closing_brace(source, line_start)
+        if close_off == -1:
+            # No matching ``}`` (genuinely unbalanced/malformed input). Return
+            # the def line alone: the brace-balance gate in _post_edit_syntax_ok
+            # then rejects the edit, which is the correct fail-closed behaviour
+            # for malformed code (the prior trailing-skip walked the body via
+            # indentation here, but on an unbalanced file any range is unreliable).
+            return (i, i + 1)
+        # Symbol boundary is EXACTLY the closing-brace line — no trailing-skip.
+        # The brace scanner is literal-aware and returns the precise matching ``}``,
+        # so anything past it is either trailing whitespace or the NEXT sibling's
+        # leading doc comment. The old trailing-skip absorbed the next sibling's
+        # comment into this symbol's range, so editing/deleting this symbol would
+        # silently delete the sibling's doc (pre-existing latent corruption,
+        # fallback-path only since the tree-sitter AST path returns a precise node
+        # range that excludes attached comments). Returning the exact close-brace
+        # line yields the precise symbol range with no absorption.
+        close_line_1based = source[:close_off].count("\n") + 1
+        return (i, close_line_1based)
+    # No opening brace anywhere → indentation-based extent. (Python is handled
+    # earlier by the AST path; this covers the rare genuinely brace-less case.)
+    # Examine the candidate boundary line directly (lines[end]) and break
+    # WITHOUT decrementing: end is an exclusive slice boundary. The prior
+    # `lines[end-1]` + `end -= 1` form re-examined the def line itself on the
+    # first iteration (it sits at exactly sym_indent) and returned (i, i) — an
+    # empty range that on edit duplicated the symbol instead of replacing it.
+    end = i + 1
     while end < len(lines):
-        cl = lines[end]
-        cs = cl.strip()
-        brace_depth += cs.count("{") - cs.count("}")
+        cs = lines[end].strip()
+        if cs and not cs.startswith(("@", "#", "//")):
+            nindent = len(lines[end]) - len(cs)
+            if nindent <= sym_indent:
+                break
         end += 1
-        if has_brace and brace_depth == 0:
-            # Brace-balanced: skip blank/comment lines, stop at next construct
-            while end < len(lines):
-                nl = lines[end]
-                ns = nl.strip()
-                if ns and not ns.startswith("#") and not ns.startswith("//"):
-                    nindent = len(nl) - len(ns)
-                    if nindent <= sym_indent and not ns.startswith("@"):
-                        break
-                end += 1
-            break
-        if not has_brace and end > i + 1:
-            # Indentation-based: stop when a line at same/lesser indent appears
-            cs = lines[end - 1].strip()
-            if cs:
-                nindent = len(lines[end - 1]) - len(cs)
-                if nindent <= sym_indent and not cs.startswith("@") and not cs.startswith("#") and not cs.startswith("//"):
-                    end -= 1
-                    break
     return (i, end)
 
 
@@ -1078,7 +1253,9 @@ def _apply_hunk(
         result_lines.insert(hunk_start + i, nl if nl.endswith("\n") else nl + "\n")
 
 
-def _python_syntax_ok(content: str, path: str) -> bool:
+def _post_edit_syntax_ok(
+    content: str, path: str, source: str = "", _source_net: Optional[int] = None
+) -> bool:
     """Whether ``content`` is safe to write for ``path``.
 
     For PYTHON files, uses ``compile()`` to verify the candidate before it ever
@@ -1089,6 +1266,15 @@ def _python_syntax_ok(content: str, path: str) -> bool:
 
     For JS/TS/JSX/TSX files, uses ``node --check`` (if available) to catch syntax
     errors before write. For GO files, uses ``gofmt -e`` (if available).
+
+    For brace languages without an inline compiler, verifies literal-aware brace
+    balance. When ``source`` (the pre-edit content) is supplied, the check is
+    RELATIVE — only edits that CHANGE the net brace count are rejected. The
+    absolute ``net == 0`` form false-rejected any edit to a file with a
+    pre-existing imbalance (a scanner limitation on brace-bearing raw/template
+    strings, or genuinely broken code the user is mid-fixing). The corruption
+    this gate exists to catch — an orphan ``}`` left by a bad symbol-range scan
+    — always shifts the balance, so the delta is the precise signal.
 
     All other languages are passed through unchanged (they rely on post-write
     rollback or manual detection).
@@ -1132,6 +1318,24 @@ def _python_syntax_ok(content: str, path: str) -> bool:
                 return r.returncode == 0 and not r.stderr
             except (subprocess.TimeoutExpired, OSError):
                 return True  # fall through on infra failure
+    # Brace-delimited languages without an inline compiler (Kotlin/Rust/C/C++/
+    # Java/Scala/Swift/C#): verify literal-aware brace balance so a symbol-range
+    # scan that left an orphan `}` (or dropped a brace) is rejected before write
+    # instead of corrupting the file. A real compiler is stronger, but this
+    # catches the known corruption class in net terms and needs no toolchain.
+    if lid in _BRACE_LANGUAGES_NO_COMPILER:
+        new_net = net_brace_count(content)
+        if source:
+            # Relative delta: reject only edits that shift the net brace count.
+            # See docstring — catches the orphan-brace corruption class while no
+            # longer false-rejecting edits to files with a pre-existing imbalance.
+            # ``_source_net`` (precomputed once by the caller for brace languages)
+            # avoids re-scanning the same pre-edit content on each fallback tier.
+            src_net = _source_net if _source_net is not None else net_brace_count(source)
+            if new_net != src_net:
+                return False
+        elif new_net != 0:
+            return False
     return True
 
 
@@ -1187,6 +1391,12 @@ def modify_symbol(
     # have broken Python syntax — used to return an actionable error at the end.
     syntax_blocked = False
 
+    # Pre-edit net brace count, computed ONCE for brace languages so the three
+    # fallback tiers don't each re-scan the same source (net_brace_count is O(n)).
+    source_net: Optional[int] = None
+    if LanguageId.from_path(rel_path) in _BRACE_LANGUAGES_NO_COMPILER:
+        source_net = net_brace_count(source)
+
     # ── Try 1: AST precise (Python only) ──
     if LanguageId.from_path(rel_path) is LanguageId.PYTHON:
         diff, mode = _apply_ast_precise(source, rel_path, symbol, code)
@@ -1195,7 +1405,7 @@ def modify_symbol(
                 new_content = _apply_diff_to_source(source, diff)
             except Exception as e:
                 return False, f"Diff apply failed after AST precise: {e}", ""
-            if not _python_syntax_ok(new_content, rel_path):
+            if not _post_edit_syntax_ok(new_content, rel_path, source, _source_net=source_net):
                 logger.info(
                     "AST precise diff reapplication produced invalid Python for %s "
                     "- trying surgical fallback", symbol,
@@ -1205,6 +1415,10 @@ def modify_symbol(
                 atomic_write_text(abs_path, new_content)
                 return True, diff, new_content
 
+        if mode == "skipped_compile_error":
+            # AST precise assembled the block but the spliced file failed
+            # compile — same fail-closed class as the post-apply checks below.
+            syntax_blocked = True
         if mode not in ("skipped_no_new_body",) and not syntax_blocked:
             logger.info("AST precise failed (%s) for %s - trying surgical fallback", mode, symbol)
 
@@ -1216,7 +1430,7 @@ def modify_symbol(
         if diff is not None:
             try:
                 new_content = _apply_diff_to_source(source, diff)
-                if not _python_syntax_ok(new_content, rel_path):
+                if not _post_edit_syntax_ok(new_content, rel_path, source, _source_net=source_net):
                     logger.info(
                         "Surgical edit produced invalid Python for %s - trying text fallback",
                         symbol,
@@ -1239,7 +1453,7 @@ def modify_symbol(
         new_text = code if code.endswith("\n") else code + "\n"
         new_content = "".join([*lines[:sym_start], new_text, *lines[sym_end:]])
         if new_content != source:
-            if not _python_syntax_ok(new_content, rel_path):
+            if not _post_edit_syntax_ok(new_content, rel_path, source, _source_net=source_net):
                 logger.info("Text replacement produced invalid Python for %s", symbol)
                 syntax_blocked = True
             else:
@@ -1251,6 +1465,18 @@ def modify_symbol(
                     return False, f"Write failed after text replacement: {e}", ""
 
     if syntax_blocked:
+        foreign = (
+            _trailing_foreign_stmt(code)
+            if _looks_like_full_symbol_block(code) else None
+        )
+        if foreign:
+            return False, (
+                f"modify_symbol could not produce syntactically valid code for '{symbol}': "
+                f"the replacement block extends past the symbol boundary — it contains "
+                f"'{foreign}' at the symbol's own indent level after the '{symbol}' block. "
+                f"Trim the block to the '{symbol}' definition only and retry; edits outside "
+                "the symbol (e.g. blank lines between methods) belong to apply_patch."
+            ), ""
         return False, (
             f"modify_symbol could not produce syntactically valid code for '{symbol}' "
             "(re-indentation/splice would break Python syntax). Use apply_patch instead."

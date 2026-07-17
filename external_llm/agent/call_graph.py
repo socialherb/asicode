@@ -75,8 +75,30 @@ class CallGraphIndexer:
         result = idx.get_related_symbols("MyClass.my_method")
     """
 
-    def __init__(self, repo_root: str):
+    def __init__(
+        self,
+        repo_root: str,
+        cancel_event: Optional[threading.Event] = None,
+        config: Any = None,
+    ):
         self._root = Path(repo_root).resolve()
+        # Cooperative cancel: when set (ESC / Ctrl-C in the agent loop), the
+        # repo-wide ast.parse loop in build() bails out between files.  We hold
+        # a *config* reference (NOT the event value) and read
+        # ``config.cancel_event`` FRESH at build() time via _get_cancel_event —
+        # mirroring the call-time fresh read vulture uses in analysis_tools.
+        # This is required by the design-chat REPL, which sets
+        # ``config.cancel_event`` PER TURN (asi.py) AFTER the ToolRegistry — and
+        # thus this indexer — was constructed with cancel_event=None; a capture-
+        # at-construction value would freeze None forever and leave ESC inert on
+        # the exact interactive path it is meant to protect.  An explicit
+        # ``cancel_event`` arg (tests, direct callers without a config) still
+        # takes precedence.  Cloned ToolRegistries share this indexer AND the
+        # parent's config (clone.config = self.config, clone._call_graph =
+        # self._call_graph), so one event reaches all holders without per-clone
+        # wiring.
+        self._cancel_event = cancel_event
+        self._config = config
         # symbol -> first definition node
         self._nodes: dict[str, CallGraphNode] = {}
         # caller_symbol -> edges out
@@ -96,6 +118,22 @@ class CallGraphIndexer:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def _get_cancel_event(self) -> Optional[threading.Event]:
+        """Return the live cooperative-cancel event.
+
+        Reads ``config.cancel_event`` FRESH (call-time, not construction-time)
+        so a per-turn mutation of ``config.cancel_event`` — as the design-chat
+        REPL performs each turn — is honored even though this indexer was
+        constructed before the mutation landed.  An explicit ``cancel_event``
+        passed to ``__init__`` (tests / direct callers without a config) takes
+        precedence and is returned as-is.  Returns None when neither is set
+        (non-interactive CLI, out-of-process callers) → checkpoints become
+        inert no-ops, matching the pre-cancel behavior.
+        """
+        if self._cancel_event is not None:
+            return self._cancel_event
+        return getattr(self._config, "cancel_event", None)
+
     def build(self) -> None:
         """Walk repo and build index. Safe to call multiple times (rebuilds).
 
@@ -111,7 +149,26 @@ class CallGraphIndexer:
 
             # ── Python files (existing) ──
             py_files = _walk_py_files(self._root)
-            for py_file in py_files:
+            for _fi, py_file in enumerate(py_files):
+                # Cooperative cancel: the ast.parse loop is the dominant cost of a
+                # first graph query (several seconds on large repos).  Bail out
+                # between files.  _built is left False (set only at the end of
+                # build()) and the dicts are already empty (reset above), so no
+                # partially-built index is ever observed by readers (which hold
+                # the same _lock and only run after build() returns).
+                # Fresh read each iteration so a mid-build ESC (design-chat sets
+                # config.cancel_event on the live config object) is honored.
+                _ce = self._get_cancel_event()
+                if _ce is not None and _ce.is_set():
+                    logger.debug("call_graph: build cancelled at %d/%d py files", _fi, len(py_files))
+                    # Discard the partial index — _index_file writes directly into
+                    # self._nodes/_forward/_reverse, so a mid-build cancel would
+                    # otherwise leave a torn index visible to the in-flight query
+                    # (which then runs _lookup_edges on a partial _forward).
+                    self._nodes = {}
+                    self._forward = {}
+                    self._reverse = {}
+                    return
                 try:
                     self._index_file(py_file)
                 except SyntaxError:
@@ -128,6 +185,13 @@ class CallGraphIndexer:
             if _ML_CG:
                 ts_files = _walk_ts_js_files(self._root)
                 for ts_file in ts_files:
+                    _ce = self._get_cancel_event()
+                    if _ce is not None and _ce.is_set():
+                        logger.debug("call_graph: build cancelled during TS indexing")
+                        self._nodes = {}
+                        self._forward = {}
+                        self._reverse = {}
+                        return
                     try:
                         self._index_ts_file(ts_file)
                         _ts_count += 1

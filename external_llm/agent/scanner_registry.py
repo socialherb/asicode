@@ -103,6 +103,29 @@ class ScannerResult:
     """Number of candidates truncated by max_per_file limit (0 = all returned)."""
 
 
+def _scanner_accepts_cancel_event(fn: Callable[..., Any]) -> bool:
+    """True if *fn*'s signature accepts a ``cancel_event`` keyword argument.
+
+    Scanners that opt into cooperative cancellation declare ``cancel_event``
+    as a parameter (or accept ``**kwargs``). ``run()`` forwards the event only
+    to scanners that accept it, so scanners unaware of cancellation are never
+    broken by an unexpected keyword.
+    """
+    import inspect
+
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError):
+        return False
+    return (
+        "cancel_event" in sig.parameters
+        or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+    )
+
+
 class ScannerRegistry:
     """Registry of analysis scanners callable via RUN_SCANNER operations."""
 
@@ -119,6 +142,9 @@ class ScannerRegistry:
         self._scanners[spec.name] = fn
         self._specs[spec.name] = spec
         self._run_locks[spec.name] = threading.Lock()
+        # Cache whether fn accepts a cancel_event kwarg (cooperative cancel).
+        # Inspected once at registration to avoid per-run signature overhead.
+        fn._accepts_cancel_event = _scanner_accepts_cancel_event(fn)
         logger.info(
             "[SCANNER_REGISTRY] registered '%s' (%s)",
             spec.name, spec.description,
@@ -196,6 +222,8 @@ class ScannerRegistry:
         name: str,
         repo_root: str = "",
         file_paths: Optional[list[str]] = None,
+        *,
+        cancel_event: Optional[Any] = None,
         **kwargs: Any,
     ) -> ScannerResult:
         """Invoke a scanner and wrap the result.
@@ -275,6 +303,11 @@ class ScannerRegistry:
             except AttributeError:
                 pass
 
+            # Forward cancel_event only to scanners that accept it, so
+            # cooperative cancellation reaches opt-in scanners (e.g. vulture)
+            # without breaking scanners that don't declare the parameter.
+            if cancel_event is not None and getattr(fn, "_accepts_cancel_event", False):
+                kwargs["cancel_event"] = cancel_event
             candidates = fn(
                 repo_root=repo_root,
                 file_paths=file_paths or [],

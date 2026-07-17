@@ -52,10 +52,18 @@ def _is_referenced_outside_defining(field: str) -> bool:
     Test-only references do NOT count as wiring — a flag set only in tests is
     dead in production.
     """
-    result = subprocess.run(
-        ["git", "grep", "-l", "-e", field, "--", "*.py"],
-        capture_output=True, text=True, cwd=REPO,
-    )
+    # timeout= so a hung git grep can never stall the hook/CI forever. A gate
+    # must FAIL on timeout (fail-closed): if we cannot verify reachability we
+    # must not default to "reachable". (Not run_bounded_subprocess — that helper
+    # swallows timeouts into returncode=-9, a fail-open semantic unsuited to gates.)
+    try:
+        result = subprocess.run(
+            ["git", "grep", "-l", "-e", field, "--", "*.py"],
+            capture_output=True, text=True, cwd=REPO, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"❌ git grep for {field!r} timed out after 60s — failing closed rather than guess reachability.", file=sys.stderr)
+        sys.exit(1)
     for f in result.stdout.splitlines():
         if not f:
             continue

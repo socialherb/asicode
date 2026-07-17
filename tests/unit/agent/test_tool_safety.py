@@ -609,6 +609,68 @@ class TestSummarizeChange:
         assert "+2/0" in result or "+2" in result  # 2 lines added, 0 removed
 
 
+# ── all_files_unchanged (NO_EFFECTIVE_PROGRESS hard gate) ─────────────────
+
+class TestAllFilesUnchanged:
+    """Cover all_files_unchanged — the apply_patch no-op downgrade signal."""
+
+    def test_empty_snapshots_returns_false(self, manager):
+        """No snapshots → the post-hoc check is meaningless (not 'all unchanged')."""
+        assert manager.all_files_unchanged({}) is False
+
+    def test_single_unchanged_file_true(self, manager, tmp_repo):
+        """File on disk == snapshot → byte-identical → True."""
+        target = os.path.join(tmp_repo, "foo.py")
+        content = "x = 1\ny = 2\n"
+        with open(target, "w") as f:
+            f.write(content)
+        assert manager.all_files_unchanged({target: content}) is True
+
+    def test_changed_file_false(self, manager, tmp_repo):
+        """Disk content differs from snapshot → effective change happened → False."""
+        target = os.path.join(tmp_repo, "foo.py")
+        with open(target, "w") as f:
+            f.write("x = 1\n")
+        # snapshot recorded a different (pre-edit) content
+        assert manager.all_files_unchanged({target: "x = 999\n"}) is False
+
+    def test_missing_snap_entry_false(self, manager, tmp_repo):
+        """A _MISSING_SNAP entry means a new file was created — that IS a change."""
+        target = os.path.join(tmp_repo, "new.py")
+        with open(target, "w") as f:
+            f.write("x = 1\n")
+        assert manager.all_files_unchanged({target: _MISSING_SNAP}) is False
+
+    def test_mixed_all_unchanged_true(self, manager, tmp_repo):
+        """Multiple files, all byte-identical → True."""
+        a = os.path.join(tmp_repo, "a.py")
+        b = os.path.join(tmp_repo, "b.py")
+        for p, c in ((a, "a = 1\n"), (b, "b = 2\n")):
+            with open(p, "w") as f:
+                f.write(c)
+        assert manager.all_files_unchanged({a: "a = 1\n", b: "b = 2\n"}) is True
+
+    def test_mixed_one_changed_false(self, manager, tmp_repo):
+        """Multiple files, one differs → False."""
+        a = os.path.join(tmp_repo, "a.py")
+        b = os.path.join(tmp_repo, "b.py")
+        with open(a, "w") as f:
+            f.write("a = 1\n")
+        with open(b, "w") as f:
+            f.write("b = 2\n")
+        # b's snapshot is stale
+        assert manager.all_files_unchanged({a: "a = 1\n", b: "b = OLD\n"}) is False
+
+    def test_unreadable_file_false(self, manager, tmp_repo):
+        """An OSError during read → conservatively False (cannot confirm unchanged)."""
+        target = os.path.join(tmp_repo, "gone.py")
+        with open(target, "w") as f:
+            f.write("x = 1\n")
+        snapshots = {target: "x = 1\n"}
+        os.remove(target)  # file vanished between snapshot and check
+        assert manager.all_files_unchanged(snapshots) is False
+
+
 # ── Phase 1: semantic lint (new_semantic_warnings) ───────────────────────────
 
 class TestNewSemanticWarnings:

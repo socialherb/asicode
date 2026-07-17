@@ -1201,6 +1201,25 @@ def _extract_name(node) -> Optional[str]:
     name_node = node.child_by_field_name("name")
     if name_node:
         return name_node.text.decode("utf-8")
+    # Fallback for grammars that expose the symbol name as a positional named
+    # child rather than a "name" field. Kotlin is the known case: its
+    # function_declaration / class_declaration / object_declaration / etc. carry
+    # the name as a bare simple_identifier / type_identifier named child, so
+    # child_by_field_name("name") returns None. Without this fallback every
+    # Kotlin symbol is skipped by find_all_symbols, forcing the caller
+    # (symbol_modify_tool._find_symbol_line_range) onto the naive
+    # brace-counting range heuristic — which miscounts braces inside string /
+    # comment literals and corrupts the file on edit.
+    #
+    # The first identifier-typed named child is the symbol name in every such
+    # grammar: modifiers (private/public/override/...) precede the name but are
+    # not identifier-typed, and post-name constructs (parameter lists, return
+    # types, bodies) come after. Verified against Kotlin/Scala/Swift/Java/Go
+    # grammars — only Kotlin lacks the "name" field, but this is grammar-version
+    # agnostic and will cover any future grammar with the same shape.
+    for child in node.named_children:
+        if child.type in ("simple_identifier", "type_identifier", "identifier"):
+            return child.text.decode("utf-8")
     return None
 
 

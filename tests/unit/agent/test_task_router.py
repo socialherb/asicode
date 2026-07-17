@@ -35,23 +35,17 @@ class TestDeterministicClassifier:
         f.is_multi_file = False
         f.is_project_wide = False
         f.all_targets_non_structured = False
-        f.any_target_structured = True
         f.target_specificity_score = 0.5
         f.complexity = Complexity.LOW
         f.scope = Scope.SINGLE_FILE
         f.task_kind = TaskKind.SINGLE_FILE_EDIT
         f.mentioned_files = []
-        f.existing_files = []
-        f.missing_files = []
-        f.mentioned_symbols = []
         f.symbol_count = 0
         f.file_count = 0
         f.has_conflicting_intent = False
         f.has_cross_file_signal = False
         f.has_propagation_signal = False
-        f.is_ambiguous_write = False
         f.looks_trivial_edit = False
-        f.requests_new_file = False
         f.requests_test_work = False
         f.requests_refactor = False
         f.requests_style_change = False
@@ -63,7 +57,6 @@ class TestDeterministicClassifier:
         f.has_explain_intent = False
         f.has_locate_intent = False
         f.readonly_kind = None
-        f.is_single_file = True
         for k, v in overrides.items():
             setattr(f, k, v)
         return f

@@ -429,6 +429,73 @@ def test_patch_success_rate(engine, git_repo, desc, patch, expected):
     git_reset(git_repo)
 
 
+# ── Tests: _fix_hunk_counts blank-context-line handling ────────────────────────
+
+
+class TestFixHunkCountsBlankContext:
+    """A completely empty hunk-body line is a blank context line whose leading
+    space was stripped. git apply counts it; _fix_hunk_counts must too —
+    otherwise it rewrites the header UNDERcounted, git consumes only that many
+    body lines, and applies the truncated hunk prefix with rc=0: the trailing
+    -/+ lines are silently dropped (real repro: intended edit lost, wrong body
+    left behind, reported as success)."""
+
+    STALE_PATCH_WITH_BLANK_CTX = (
+        "--- a/file.py\n"
+        "+++ b/file.py\n"
+        "@@ -2,7 +2,6 @@\n"
+        "     return STALE_CONTEXT_LINE\n"
+        "\n"                              # blank context line, space stripped
+        " def b():\n"
+        "-    return 2\n"
+        "-\n"
+        "-def c():\n"
+        "-    return 3\n"
+        "+    return 99\n"
+    )
+
+    def test_blank_line_counted_as_context(self, engine):
+        """Header must count the blank line: 3 ctx + 4 minus = 7 old, 3 ctx + 1 plus = 4 new."""
+        fixed = engine._fix_hunk_counts(self.STALE_PATCH_WITH_BLANK_CTX)
+        assert "@@ -2,7 +2,4 @@" in fixed, f"undercounted header in:\n{fixed}"
+
+    def test_blank_line_normalized_to_space(self, engine):
+        """The bare blank body line is rewritten to a ' ' context line."""
+        fixed = engine._fix_hunk_counts(self.STALE_PATCH_WITH_BLANK_CTX)
+        body = fixed.split("@@ -2,7 +2,4 @@\n", 1)[1]
+        assert "\n\n" not in "\n" + body.rstrip("\n"), (
+            f"bare empty line survived normalization:\n{fixed}"
+        )
+
+    def test_no_silent_half_hunk_apply(self, engine, git_repo):
+        """End-to-end regression: stale-context patch on a freshly-edited file
+        must either fail cleanly or apply the FULL hunk — never a truncated
+        prefix that drops the '+' line."""
+        src = git_repo / "file.py"
+        src.write_text(
+            "def a():\n    return 1\n\ndef b():\n    return 2\n\ndef c():\n    return 3\n"
+        )
+        subprocess.run(["git", "add", "file.py"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "add file.py"], cwd=git_repo, check=True)
+        # freshly-edited: working tree differs from index
+        src.write_text(
+            "def a():\n    return 111\n\ndef b():\n    return 2\n\ndef c():\n    return 3\n"
+        )
+
+        result = engine.apply_patch(self.STALE_PATCH_WITH_BLANK_CTX, "file.py")
+        content = src.read_text()
+        if result.success:
+            # Full-hunk semantics: b() -> 99, c() deleted
+            assert "return 99" in content, (
+                f"silent half-hunk apply: '+' line dropped.\n"
+                f"metadata={result.metadata}\ncontent:\n{content}"
+            )
+            assert "def c()" not in content
+        else:
+            # Clean failure must leave the freshly-edited tree untouched
+            assert "return 111" in content and "return 2" in content
+
+
 # ── Tests: pre-apply git-state gate (_classify_target_git_state + skip_3way) ───
 
 
@@ -686,3 +753,129 @@ class TestModeB3waySkip:
             f"detector should fire on fabricated SHA. metadata: {result.metadata}"
         )
         git_reset(git_repo)
+
+
+# ── Tests: -C0 blind-placement verification (_verify_c0_placement) ────────────
+
+
+class TestC0PlacementVerification:
+    """-C0 applies hunks purely by line number (git checks ZERO context), so a
+    stale header lands the hunk at the wrong location with rc=0 — silent
+    corruption (real case 2026-07-18: a Kotlin insert intended after a
+    function's closing brace landed 17 lines below, outside the enclosing
+    object; brace-heavy files make every `}` an ambiguous neighbor). Every
+    -C0 success must be content-verified and rolled back on mismatch."""
+
+    # Kotlin-shaped file: two structurally identical blocks so a stale line
+    # number points at a *plausible* (brace-adjacent) but wrong location.
+    KT_CONTENT = (
+        "object Alpha {\n"
+        "    fun first() {\n"
+        "        one()\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        "object Beta {\n"
+        "    fun second() {\n"
+        "        two()\n"
+        "    }\n"
+        "}\n"
+    )
+
+    @pytest.fixture
+    def kt_repo(self, git_repo):
+        (git_repo / "code.kt").write_text(self.KT_CONTENT)
+        subprocess.run(["git", "add", "code.kt"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "add code.kt"], cwd=git_repo, check=True)
+        return git_repo
+
+    # Insertion whose context line (`oneStale()`) exists NOWHERE in the file
+    # (model context drift) and whose @@ line number points into Beta. git
+    # apply's own offset search saves stale line numbers when the context is
+    # valid — so only nowhere-matching context reaches the -C0 variants, which
+    # would previously blind-apply inside Beta with rc=0.
+    STALE_INSERT_PATCH = (
+        "diff --git a/code.kt b/code.kt\n"
+        "--- a/code.kt\n"
+        "+++ b/code.kt\n"
+        "@@ -8,2 +8,3 @@\n"
+        "        oneStale()\n"
+        "+        inserted()\n"
+        "    }\n"
+    )
+
+    def test_misplaced_c0_apply_rolled_back(self, engine, kt_repo):
+        """Drifted context + stale line numbers: the -C0 apply must be rolled
+        back and reported, not silently kept at the wrong location."""
+        ok, err, mode = engine._tolerant_git_apply(self.STALE_INSERT_PATCH, "code.kt")
+        content = (kt_repo / "code.kt").read_text()
+        assert not ok, f"unverifiable -C0 apply must not report success (mode={mode})"
+        assert content == self.KT_CONTENT, (
+            f"failed apply must roll back cleanly:\n{content}"
+        )
+        assert "rolled back" in (err or ""), f"error should explain the rollback: {err}"
+
+    def test_full_pipeline_never_misplaces(self, engine, kt_repo):
+        """apply_patch end-to-end on the drifted patch: either a repair path
+        places the hunk correctly, or the whole apply fails and the file is
+        untouched — never an insert inside the wrong block."""
+        result = engine.apply_patch(self.STALE_INSERT_PATCH, "code.kt")
+        content = (kt_repo / "code.kt").read_text()
+        assert "two()\n        inserted()" not in content, (
+            f"misplaced insert survived the pipeline "
+            f"(metadata={result.metadata}):\n{content}"
+        )
+        if "inserted()" not in content:
+            assert content == self.KT_CONTENT
+
+    def test_contextless_insert_still_applies(self, engine, kt_repo):
+        """A pure line-number insert with NO context lines is -C0's raison
+        d'être — nothing to verify against, must keep working."""
+        patch = (
+            "diff --git a/code.kt b/code.kt\n"
+            "--- a/code.kt\n"
+            "+++ b/code.kt\n"
+            "@@ -3,0 +4 @@\n"
+            "+        oneAndAHalf()\n"
+        )
+        ok, err, mode = engine._tolerant_git_apply(patch, "code.kt")
+        assert ok, f"context-free insert should still apply: {err} (mode={mode})"
+        assert "oneAndAHalf()" in (kt_repo / "code.kt").read_text()
+
+    def test_correct_placement_passes_verification(self, engine, kt_repo):
+        """_verify_c0_placement accepts a hunk whose context+content block is
+        present (correct apply) and rejects it when absent (misplaced)."""
+        correct_patch = (
+            "diff --git a/code.kt b/code.kt\n"
+            "--- a/code.kt\n"
+            "+++ b/code.kt\n"
+            "@@ -3,2 +3,3 @@\n"
+            "        one()\n"
+            "+        inserted()\n"
+            "    }\n"
+        )
+        # Simulate the CORRECT post-apply state → verification passes.
+        (kt_repo / "code.kt").write_text(self.KT_CONTENT.replace(
+            "        one()\n", "        one()\n        inserted()\n", 1))
+        ok, detail = engine._verify_c0_placement(correct_patch)
+        assert ok, detail
+        # Simulate a MISPLACED post-apply state (insert landed inside Beta,
+        # context `one()` nowhere adjacent) → verification fails.
+        (kt_repo / "code.kt").write_text(self.KT_CONTENT.replace(
+            "        two()\n", "        two()\n        inserted()\n", 1))
+        ok, detail = engine._verify_c0_placement(correct_patch)
+        assert not ok, "misplaced hunk must fail placement verification"
+        assert "code.kt" in detail
+
+    def test_new_file_patch_skips_verification(self, engine, kt_repo):
+        """New-file hunks (--- /dev/null) have no placement to verify."""
+        patch = (
+            "diff --git a/fresh.kt b/fresh.kt\n"
+            "--- /dev/null\n"
+            "+++ b/fresh.kt\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+object Fresh {\n"
+            "+}\n"
+        )
+        ok, detail = engine._verify_c0_placement(patch)
+        assert ok, detail

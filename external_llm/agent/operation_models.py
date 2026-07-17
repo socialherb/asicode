@@ -912,10 +912,10 @@ class SkipReason(str, enum.Enum):
       * dependency cascade — ``_DEPENDENCY_RELATED_SKIP_REASONS``: this op
         never got the chance to execute because of another op's failure or
         a graph topology problem (cycle, unschedulable).
-      * non-dependency — gate-already-satisfied, nested-inside-parent, and
-        aborted-after-critical-failure (the abort is a single-failure decision,
-        not a cascade — keeping it out of the dependency category prevents
-        ``has_dependency_skips`` from misrouting force-finish/critical-edit
+      * non-dependency — gate-already-satisfied, nested-inside-parent,
+        aborted-after-critical-failure, and cancelled (a user-initiated ESC
+        abort, NOT a cascade — keeping it out of the dependency category prevents
+        ``has_dependency_skips`` from misrouting force-finish/critical-edit/cancel
         aborts to dependency-targeted repair).
     """
     GATE_ALREADY_SATISFIED         = "gate_already_satisfied"
@@ -928,6 +928,10 @@ class SkipReason(str, enum.Enum):
     BLOCKED_BY_AUTO_CORRECT_SKIP   = "blocked_by_auto_correct_skip"
     BLOCKED_BY_FAILED_DEPENDENCY   = "blocked_by_failed_dependency"
     ABORTED_AFTER_CRITICAL_FAILURE = "aborted_after_critical_failure"
+    # User pressed ESC — the whole plan is cancelled. NOT dependency-related
+    # (a user action, not a cascade); see _LADDER_SENTINEL_CANCEL / post-loop
+    # drain in executor_schedule_core._schedule_operations.
+    CANCELLED                      = "cancelled"
     UNSCHEDULABLE                  = "unschedulable"
     UNRESOLVED_CYCLE               = "unresolved_cycle"
     BLOCKED_BY_DCR_AUTO_REJECT       = "blocked_by_dcr_auto_reject"

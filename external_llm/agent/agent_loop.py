@@ -794,7 +794,11 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         try:
             repo_root = getattr(self.registry, 'repo_root', '.')
             self._symbol_searcher = SymbolSearcher(repo_root)
-            _cgi = CallGraphIndexer(repo_root)
+            # config=self.config (not a captured cancel_event value) so the
+            # indexer reads config.cancel_event FRESH at build() time — the
+            # orchestrator mutates config.cancel_event per task and a captured
+            # value would go stale. Matches tool_registry's wiring.
+            _cgi = CallGraphIndexer(repo_root, config=self.config)
             self._call_graph = RepositoryGraphFacade(
                 call_graph_indexer=_cgi,
                 repo_root=repo_root,
@@ -831,6 +835,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 run_store=self._shared_run_store,
                 planner=self._planner_agent,
                 agent_loop_factory=self._create_scoped_agent_loop,
+                config=self.config,
             )
 
             logger.info("Hybrid architecture components initialized")

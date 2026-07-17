@@ -14,6 +14,7 @@ from ..background_job_manager import (
     get_global_background_job_manager,
     recover_communicate_partial,
 )
+from ...common.subprocess_utils import run_bounded_subprocess as _run_bounded_subprocess
 
 if TYPE_CHECKING:
     from ..tool_registry import ToolResult
@@ -324,60 +325,6 @@ def _truncate_bash_output(content: str, max_chars: int) -> str:
     )
 
 
-def _run_bounded_subprocess(
-    cmd, *, timeout: int = 120, shell: bool = False,
-    executable: Optional[str] = None, cwd: Optional[str] = None,
-    input: Optional[str] = None, env: Optional[dict[str, str]] = None,
-) -> "subprocess.CompletedProcess":
-    """``subprocess.run`` with a mandatory timeout and full process-group cleanup.
-
-    Guarantees the agent never blocks indefinitely on a recovery-path subprocess.
-    Recovery commands can stall waiting on input — ``pytest`` dropping into
-    ``--pdb`` / ``input()``, a build prompt, or a network stall during ``pip
-    install``. A bare ``subprocess.run`` (no timeout) hangs forever in that case;
-    and since ``TimeoutExpired`` is a ``SubprocessError`` (not ``OSError``), it
-    also escapes the surrounding ``except Exception`` only *after* the hang — by
-    then the agent loop is wedged.
-
-    Mirrors the safety discipline of the main bash path (``_tool_shell_exec``):
-    ``start_new_session=True`` + ``killpg`` on timeout, so grandchildren
-    (pytest-spawned server fixtures, child build servers) are torn down too,
-    not orphaned. Returns a ``CompletedProcess`` (returncode=-9 + a trailing
-    note on timeout) so callers keep their existing ``.returncode`` /
-    ``.stdout`` / ``.stderr`` access and degrade gracefully.
-    """
-    import os as _os
-    import signal as _signal
-    proc = subprocess.Popen(
-        cmd, shell=shell, executable=executable, cwd=cwd,
-        stdin=subprocess.PIPE if input is not None else None,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
-        start_new_session=True, env=env,
-    )
-    try:
-        stdout, stderr = proc.communicate(input=input, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # Kill the whole process group (start_new_session created one) so
-        # grandchildren are terminated too, not orphaned.
-        try:
-            _os.killpg(_os.getpgid(proc.pid), _signal.SIGKILL)
-        except (ProcessLookupError, OSError):
-            pass
-        # Reap the killed process and drain partial output to avoid zombies.
-        try:
-            stdout, stderr = proc.communicate(timeout=5)
-        except Exception:
-            stdout, stderr = "", ""
-        _note = f"\n[aborted: exceeded {timeout}s timeout]"
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=-9,
-            stdout=stdout or "", stderr=(stderr or "") + _note,
-        )
-    return subprocess.CompletedProcess(
-        args=cmd, returncode=proc.returncode,
-        stdout=stdout or "", stderr=stderr or "",
-    )
 class ShellToolsMixin:
     """Mixin providing shell tool implementations for ToolRegistry."""
 

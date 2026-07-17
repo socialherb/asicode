@@ -17,10 +17,18 @@ BASELINE = REPO / "scripts" / "f401_baseline.txt"
 
 
 def _get_current_errors() -> set[str]:
-    result = subprocess.run(
-        ["ruff", "check", "--select=F401", "--output-format=concise", "."],
-        capture_output=True, text=True, cwd=REPO,
-    )
+    # timeout= so a hung ruff can never stall the hook/CI forever. A gate must
+    # FAIL on timeout (fail-closed), not silently pass on empty output — which is
+    # why we do NOT use common/subprocess_utils.run_bounded_subprocess here (that
+    # helper swallows timeouts into returncode=-9, a fail-open semantic).
+    try:
+        result = subprocess.run(
+            ["ruff", "check", "--select=F401", "--output-format=concise", "."],
+            capture_output=True, text=True, cwd=REPO, timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        print("❌ ruff F401 scan timed out after 180s — failing closed rather than risk a silent pass.", file=sys.stderr)
+        sys.exit(1)
     errors: set[str] = set()
     for line in result.stdout.splitlines():
         if "F401" not in line:

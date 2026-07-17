@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from ...common.atomic_io import atomic_write_text
+from ...common.repo_files import git_list_repo_files
 from ...languages import LanguageId
-from .._shared_utils import compile_quiet, extract_files_from_patch
+from .._shared_utils import _capped_put, compile_quiet, extract_files_from_patch
 from ...languages._normalize import normalize_key
 
 if TYPE_CHECKING:
@@ -649,6 +650,10 @@ except ImportError:
 # failure signal in this repo. The index below lets `_suggest_missing_paths`
 # offer "Did you mean: a/b/foo.py?" hints, mirroring the existing behaviour.
 _FILE_INDEX_TTL = 60.0
+# Bounded (cap 8) via the shared ``_capped_put`` — same discipline as the
+# sibling per-repo file-list caches ``_PY_WALK_CACHE`` / ``_TS_WALK_CACHE``.
+# Without it a long-lived orchestrator visiting many repos grew this dict
+# unboundedly (one full path list per repo, never evicted).
 _FILE_INDEX_CACHE: dict[str, tuple[float, list[str]]] = {}
 _FILE_INDEX_SKIP_DIRS = frozenset({
     ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
@@ -657,17 +662,48 @@ _FILE_INDEX_SKIP_DIRS = frozenset({
 })
 
 
+def _git_list_tracked_files(repo_root: str) -> Optional[list[str]]:
+    """List tracked+untracked files via the shared SSOT ``git_list_repo_files``.
+
+    Thin wrapper over ``external_llm.common.repo_files.git_list_repo_files``.
+    Both this module (did-you-mean suggestions) and ``symbol_index`` (import-
+    vs-create resolution) now share one implementation, so the file set they
+    see is always identical — see that function's docstring for the
+    .gitignore / non-ASCII / vendored-copy guarantees that a separate
+    ``os.walk`` + hardcoded skip-set cannot provide.
+    """
+    return git_list_repo_files(repo_root)
+
+
 def _repo_file_index(repo_root: str) -> list[str]:
     """Return a sorted list of repo-relative file paths, cached per repo_root.
 
+    Primary source: ``git ls-files -z --cached --others --exclude-standard`` —
+    fast (reads the index, no recursive walk), .gitignore-aware, and NUL-
+    separated so non-ASCII (Korean, CJK, …) paths survive unmangled.
+
+    Falls back to os.walk when git is unavailable or the path isn't a git
+    checkout; the walk prunes ``_FILE_INDEX_SKIP_DIRS`` (no .gitignore
+    awareness — inferior but correct for non-git trees).
+
     Rebuilt when older than ``_FILE_INDEX_TTL`` seconds so a stale index
-    (files added/moved) self-heals without paying os.walk on every call.
+    (files added/moved) self-heals without paying the listing cost on every
+    call. A git failure or a partial os.walk abort is NOT cached, so the next
+    call retries a full listing instead of serving an incomplete index.
     """
     import time as _time
     now = _time.monotonic()
     cached = _FILE_INDEX_CACHE.get(repo_root)
     if cached and (now - cached[0]) < _FILE_INDEX_TTL:
         return cached[1]
+
+    # Primary: git ls-files (fast + .gitignore-aware + non-ASCII safe)
+    git_paths = _git_list_tracked_files(str(repo_root))
+    if git_paths is not None:
+        _capped_put(_FILE_INDEX_CACHE, repo_root, (now, git_paths))
+        return git_paths
+
+    # Fallback: os.walk with a hardcoded skip-set (no .gitignore awareness)
     paths: list[str] = []
     root = str(repo_root)
     try:
@@ -677,9 +713,13 @@ def _repo_file_index(repo_root: str) -> list[str]:
                 rel = os.path.relpath(os.path.join(dirpath, fn), root)
                 paths.append(rel.replace(os.sep, "/"))
     except Exception:
-        pass
+        # os.walk may abort partway (PermissionError on a sub-tree, etc.).
+        # Do NOT cache a partial index — it would yield incomplete "did you
+        # mean" suggestions for the full TTL. Return what we have for THIS
+        # call (best-effort) but let the next call retry the full walk.
+        return sorted(paths)
     paths.sort()
-    _FILE_INDEX_CACHE[repo_root] = (now, paths)
+    _capped_put(_FILE_INDEX_CACHE, repo_root, (now, paths))
     return paths
 
 

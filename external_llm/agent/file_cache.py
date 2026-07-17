@@ -14,7 +14,7 @@ class FileContentCache:
     """File content caching layer"""
 
     def __init__(self, max_size: int = 1000):
-        self.cache: OrderedDict[str, tuple[str, float, Optional[int], Optional[str]]] = OrderedDict()  # key -> (content, mtime, total_lines, showing)
+        self.cache: OrderedDict[str, tuple[str, int, Optional[int], Optional[str]]] = OrderedDict()  # key -> (content, mtime_ns, total_lines, showing)
         self.max_size = max_size
         self.hits = 0
         self.misses = 0
@@ -34,7 +34,7 @@ class FileContentCache:
                 content, cached_mtime, total_lines, showing = self.cache[cache_key]
 
                 try:
-                    current_mtime = os.path.getmtime(file_path)
+                    current_mtime = os.stat(file_path).st_mtime_ns
                 except OSError:
                     # File no longer exists, invalidate cache
                     del self.cache[cache_key]
@@ -59,7 +59,7 @@ class FileContentCache:
         cache_key = self._make_key(file_path, start_line, end_line)
 
         try:
-            mtime = os.path.getmtime(file_path)
+            mtime = os.stat(file_path).st_mtime_ns
         except OSError:
             # Can't cache if file doesn't exist
             return
