@@ -16,7 +16,10 @@ from external_llm.agent._shared_utils import (
     _WIRE_BLOCK_TOKENIZERS,
     _WIRE_CONTENT_KEY_MARKERS,
     _count_block_wholesale,
+    _cjk_aware_tokens,
+    _cjk_tokens_from_jsonable,
     _estimate_single_message_tokens,
+    _tok_tool_use,
     _warn_unknown_block_type,
     estimate_tokens_from_msgs,
     get_unknown_block_type_counts,
@@ -150,6 +153,76 @@ class TestFailSafeUnknownTypes:
 
     def test_unknown_type_not_in_canonical_set(self):
         assert "future_citations_block" not in CANONICAL_WIRE_BLOCK_TYPES
+    # ══════════════════════════════════════════════════════════════════════════════
+    # 3b. CJK never under-counted (the regression this class of seal exists to catch)
+    # ══════════════════════════════════════════════════════════════════════════════
+
+    class TestCJKNeverUnderCounted:
+        """Seals the CJK under-count regression.
+
+        The wire-block / tool-args / wholesale paths previously used
+        ``len(json.dumps(..., ensure_ascii=False)) // 3``.  Because
+        ``ensure_ascii=False`` keeps a Korean char as ONE Python char, a 3000-char
+        CJK payload computed to ~1000 tokens while real tokenisation is ~3000+ — a
+        ~3x under-count that punches straight through the budget guard and causes
+        the context-overflow 400 this subsystem exists to prevent.
+
+        Every JSON-args path is now routed through ``_cjk_tokens_from_jsonable``
+        (byte-based, same estimator as message content).  These tests pin that: a
+        CJK payload must count AT LEAST as many tokens as its UTF-8 byte estimate
+        implies (bytes // 2), and strictly more than the broken ``chars // 3``
+        formula ever returned.
+        """
+
+        KOREAN = "안녕하세요" * 100          # 500 chars, all Hangul (3 bytes each)
+
+        def test_wholesale_cjk_not_undercounted(self):
+            """Wholesale fail-safe must honour its 'never under-count' docstring for CJK."""
+            block = {"type": "future_block", "text": self.KOREAN}
+            # Canonical byte-based lower bound: utf8_bytes // 2.
+            byte_lower = len(self.KOREAN.encode("utf-8")) // 2
+            assert _count_block_wholesale(block) >= byte_lower
+
+        def test_tool_use_cjk_args_not_undercounted(self):
+            """A Korean edit patch (tool_use input) must not be under-counted."""
+            block = {"type": "tool_use", "id": "t1", "name": "edit",
+                     "input": {"patch": self.KOREAN}}
+            byte_lower = len(json.dumps(block["input"], ensure_ascii=False).encode("utf-8")) // 2
+            assert _tok_tool_use(block) >= byte_lower
+
+        def test_cjk_beats_broken_chars_div_3_formula(self):
+            """The new count must strictly exceed what the old ``chars // 3`` returned.
+
+            For 500 Hangul chars the old formula gave ~167 tokens; the real cost is
+            ~1500+.  If this assertion ever fails, a JSON-args path regressed to
+            ``len(json) // 3``.
+            """
+            n = _cjk_tokens_from_jsonable({"x": self.KOREAN})
+            assert n > len(self.KOREAN) // 3
+
+        def test_message_estimator_counts_cjk_tool_payload(self):
+            """End-to-end: an assistant message whose tool_call carries a Korean
+            argument is counted at roughly its byte budget, not silently dropped."""
+            msg = LLMMessage(
+                role="assistant", content="",
+                tool_calls=[{"name": "edit", "args": {"patch": self.KOREAN}}],
+            )
+            est = _estimate_single_message_tokens(msg)
+            byte_lower = len(self.KOREAN.encode("utf-8")) // 2
+            assert est >= byte_lower, f"CJK tool payload under-counted: {est} < {byte_lower}"
+
+        def test_ascii_payload_remains_safely_over_counted(self):
+            """ASCII payloads are now over-counted (~2x of chars//3) — that is the
+            documented safe direction and must not crash or go negative."""
+            n = _cjk_tokens_from_jsonable({"cmd": "ls -la /usr/bin"})
+            assert n > 0
+
+        def test_cjk_jsonable_matches_byte_estimator(self):
+            """The JSON-args estimator must agree with the canonical byte estimator
+            on the dumped form — this is the core correctness invariant linking
+            ``_cjk_tokens_from_jsonable`` to ``_cjk_aware_tokens``."""
+            s = json.dumps({"x": self.KOREAN}, ensure_ascii=False)
+            assert _cjk_tokens_from_jsonable({"x": self.KOREAN}) == _cjk_aware_tokens(s)
 
     def test_non_string_type_field_does_not_crash(self):
         """Client-supplied raw_content may carry a malformed (unhashable) type

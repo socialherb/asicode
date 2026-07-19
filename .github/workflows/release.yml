@@ -68,5 +68,19 @@ jobs:
       - name: Verify distribution metadata
         run: python -m twine check dist/*
 
+      - name: Smoke-test installed wheel (importability)
+        # twine check only validates metadata/README rendering — it does NOT
+        # prove the wheel actually imports. This clean-venv install + `import`
+        # + `asi --version` smoke catches the failure class that caused the
+        # 0.2.6 incident (modules silently excluded from the wheel → fail-open
+        # disable at runtime) and any bare import of a wheel-excluded package
+        # (e.g. the lane package). It also exercises the --version flag.
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/python -m pip install --upgrade pip
+          /tmp/smoke/bin/python -m pip install dist/*.whl
+          /tmp/smoke/bin/python -c "import asi; print('import asi OK')"
+          /tmp/smoke/bin/asi --version
+
       - name: Publish to PyPI (OIDC, no stored token)
         uses: pypa/gh-action-pypi-publish@release/v1

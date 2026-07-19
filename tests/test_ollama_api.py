@@ -161,3 +161,46 @@ class TestModelNameGuard:
         """OpenRouter-style 'org/model' is skipped even if a colon is present."""
         assert query_ollama_num_ctx("qwen/qwen3:8b", base_url_hint=_TEST_URL) is None
         assert mock_post.call_count == 0
+
+
+# ── _num_ctx_for_model priority resolution (OllamaClient) ──────────────────
+
+from external_llm.providers import OllamaClient
+
+
+class TestNumCtxForModelFallback:
+    """Pin _num_ctx_for_model's priority chain and the flat 8192 floor.
+
+    Regression guard: the floor MUST be 8192 for every model — including large
+    tags like 'qwen3:99b' — because asicode's system prefix (core_prompt +
+    project.md + design_insights ≈ 5272 tokens, measured via _cjk_aware_tokens)
+    overflows Ollama's 4096 default. A size-based '13B+ -> 4096' tier is NOT
+    viable and must never be reintroduced: 4096 < 5272 → asicode 400s on its own
+    system prompt before any user content.
+    """
+
+    def _client(self):
+        return OllamaClient(api_key=None, base_url=_TEST_URL, timeout=10)
+
+    @patch("external_llm.ollama_api.query_ollama_num_ctx", return_value=None)
+    @patch("external_llm.model_registry.get_ollama_num_ctx", return_value=None)
+    def test_flat_8192_floor_even_for_huge_model_tag(self, _reg, _api):
+        """A '99b' tag (far beyond any size tier) still returns 8192, never 4096."""
+        assert self._client()._num_ctx_for_model("qwen3:99b") == 8192
+
+    @patch("external_llm.ollama_api.query_ollama_num_ctx", return_value=None)
+    @patch("external_llm.model_registry.get_ollama_num_ctx", return_value=None)
+    def test_floor_is_universal_not_size_based(self, _reg, _api):
+        """Small tags also get 8192 — the floor applies to every model, not '<8B'."""
+        assert self._client()._num_ctx_for_model("qwen3:1.7b") == 8192
+
+    @patch("external_llm.ollama_api.query_ollama_num_ctx", return_value=32768)
+    def test_priority0_modelfile_value_wins(self, _api):
+        """Priority 0 (/api/show Modelfile value) overrides the 8192 floor."""
+        assert self._client()._num_ctx_for_model("bonsai27b") == 32768
+
+    @patch("external_llm.ollama_api.query_ollama_num_ctx", return_value=None)
+    @patch("external_llm.model_registry.get_ollama_num_ctx", return_value=6144)
+    def test_priority1_registry_wins_over_floor(self, _reg, _api):
+        """Priority 1 (OLLAMA_NUM_CTX_OVERRIDES) beats the 8192 floor."""
+        assert self._client()._num_ctx_for_model("gemma:e2b") == 6144

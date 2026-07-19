@@ -684,6 +684,25 @@ def _kinds_where(flag: str) -> frozenset[OperationKind]:
     return frozenset(k for k, p in OP_KIND_POLICY.items() if getattr(p, flag, False))
 
 
+# ── Derived kind frozensets — SSOT for kind-set membership tests ──────────
+# IMPORTANT: OperationKind is a ``str, Enum`` whose members compare equal to
+# their LOWERCASE value (``OperationKind.READ_SYMBOL == "read_symbol"``), NOT
+# their uppercase name (``OperationKind.READ_SYMBOL == "READ_SYMBOL"`` is False).
+# Always test membership against these frozensets of enum *members* — never
+# against tuples of uppercase NAME literals like ``("READ_SYMBOL", …)``: those
+# silently never match and produce dead code.  (A str-Enum member hashes equal
+# to its value string, so ``op.kind in READ_ONLY_KINDS`` works whether op.kind
+# is the enum member or the lowercase value string.)
+READ_ONLY_KINDS: frozenset[OperationKind] = _kinds_where("read_only")
+DELETE_KINDS: frozenset[OperationKind] = _kinds_where("deletes_files") | _kinds_where("deletes_symbols")
+# Ops that create or remove entire files (no surgical content reuse).
+CREATES_OR_DELETES_KINDS: frozenset[OperationKind] = _kinds_where("creates_files") | _kinds_where("deletes_files")
+# Ops that write to disk in any form (modify / create / delete).
+FILE_WRITING_KINDS: frozenset[OperationKind] = (
+    _kinds_where("modifies_files") | _kinds_where("creates_files") | _kinds_where("deletes_files")
+)
+
+
 def is_propagation_kind(kind: OperationKind) -> bool:
     """True if *kind* is a propagation op (UPDATE_CALLERS / UPDATE_TESTS).
 

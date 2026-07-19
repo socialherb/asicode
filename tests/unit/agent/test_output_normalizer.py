@@ -2,6 +2,7 @@
 import textwrap
 from unittest.mock import patch
 
+from external_llm.agent.operation_models import OperationKind
 from external_llm.agent.output_normalizer import (
     DriftReport,
     dedup_imports,
@@ -93,14 +94,14 @@ class TestDetectTaskDrift:
         """DELETE operations on edit/fix request → drifted_kinds."""
         op = _make_op(kind="DELETE_SYMBOL_RANGE", path="a.py")
         r = detect_task_drift(["a.py"], [], [op], request_type="fix")
-        assert "DELETE_SYMBOL_RANGE" in r.drifted_kinds
+        assert "delete_symbol_range" in r.drifted_kinds
         assert r.severity == "medium"  # drift_kinds=3pts → medium (3-4)
 
     def test_delete_on_unknown_request_not_drifted(self):
         """'unknown' is in _is_edit_request set → still flagged."""
         op = _make_op(kind="DELETE_SYMBOL_RANGE", path="a.py")
         r = detect_task_drift(["a.py"], [], [op], request_type="unknown")
-        assert "DELETE_SYMBOL_RANGE" in r.drifted_kinds
+        assert "delete_symbol_range" in r.drifted_kinds
 
     def test_delete_on_non_edit_request_not_drifted(self):
         """DELETE on non-edit request (e.g. 'delete') → not drifted."""
@@ -170,6 +171,52 @@ class TestDetectTaskDrift:
         ]
         r = detect_task_drift(["a.py"], [], ops)
         assert r.untargeted_files == ["b.py"]  # deduped
+
+    # ── Regression: real OperationKind enum members + spec_new_files ───────
+    # These tests exercise the actual production enum members (not defensive
+    # uppercase strings) and the spec_new_files whitelist that prevents every
+    # CREATE_FILE op from scoring drift points.
+
+    def test_real_enum_create_file_in_new_files_not_flagged(self):
+        """Regression: CREATE_FILE on a path listed in spec_new_files is a
+        legitimate target, NOT drift.  Before the spec_new_files fix this
+        scored 2 points/file; a 2-new-file plan hit 'medium' and would block
+        execution."""
+        ops = [
+            _make_op(kind=OperationKind.CREATE_FILE, path="new_mod.py"),
+            _make_op(kind=OperationKind.CREATE_FILE, path="new_util.py"),
+        ]
+        r = detect_task_drift(
+            ["existing.py"], [], ops,
+            spec_new_files=["new_mod.py", "new_util.py"],
+        )
+        assert r.untargeted_files == []
+        assert r.has_drift is False
+        assert r.severity == "none"
+
+    def test_real_enum_create_file_not_in_new_files_still_drift(self):
+        """Guard: a CREATE_FILE on an unplanned path (not in target_files,
+        not in new_files) IS still drift — the fix only whitelists declared
+        new files."""
+        op = _make_op(kind=OperationKind.CREATE_FILE, path="rogue.py")
+        r = detect_task_drift(["a.py"], [], [op], spec_new_files=["planned.py"])
+        assert "rogue.py" in r.untargeted_files
+        assert r.has_drift is True
+
+    def test_real_operation_kind_members_exercised(self):
+        """Exercise the actual production OperationKind enum members (not
+        defensive uppercase strings) through the full drift path.  This is
+        the fidelity gap flagged in review: _make_op(kind='MODIFY_SYMBOL')
+        with a plain uppercase string never reproduces the str-Enum
+        value-vs-name comparison the production code performs."""
+        ops = [
+            _make_op(kind=OperationKind.READ_SYMBOL, path="untargeted.py"),   # read-only
+            _make_op(kind=OperationKind.MODIFY_SYMBOL, path="a.py"),         # on-target
+            _make_op(kind=OperationKind.RUN_SCANNER, path="scan_me.py"),     # read-only
+        ]
+        r = detect_task_drift(["a.py"], [], ops)
+        assert r.untargeted_files == []
+        assert r.has_drift is False
 
 
 # ══════════════════════════════════════════════════════════════════════════

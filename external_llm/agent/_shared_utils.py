@@ -174,9 +174,15 @@ def _walk_repo_files(root, max_files: int, cache: dict, keep) -> list:
                 results.append(Path(dirpath) / name)
                 if len(results) >= max_files:
                     _capped_put(cache, key, (_walk_time.monotonic(), results, True))
-                    return results
+                    # Slice + shallow-copy, mirroring the cache-HIT path above. Without
+                    # the copy we'd hand back the very list object stored in *cache*, so
+                    # a caller that .append()/.sort()s the result would pollute the cache
+                    # for every subsequent caller — the invariant documented at the HIT
+                    # path must hold on both paths.
+                    return list(results[:max_files])
     _capped_put(cache, key, (_walk_time.monotonic(), results, False))
-    return results
+    # See note above: return a copy, not the cached object.
+    return list(results[:max_files])
 
 
 def _walk_py_files(root, max_files: int) -> list:
@@ -1244,6 +1250,28 @@ def estimate_tokens(text: str) -> int:
     return _cjk_aware_tokens(text)
 
 
+def _cjk_tokens_from_jsonable(obj: object) -> int:
+    """Token estimate for an arbitrary JSON-serialisable object.
+
+    Dumps to JSON with ``ensure_ascii=False`` (so CJK stays as multi-byte
+    characters, one Python char each) then counts via the canonical byte-based
+    estimator :func:`_cjk_aware_tokens`.  This keeps every JSON-args / wholesale
+    path on the SAME fail-safe estimator as message content, so a CJK-heavy tool
+    payload (Korean edit content, CJK bash output, ...) can never be
+    under-counted into a context-overflow 400 — the exact failure this subsystem
+    exists to prevent.
+
+    The previous ``len(json.dumps(...)) // 3`` under-counted CJK ~2-3x because a
+    3-byte Korean char counted as ~1/3 token instead of ~1.5.  Over-counting
+    ASCII is safe and matches the documented budget philosophy.
+    """
+    try:
+        s = json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        s = str(obj)
+    return _cjk_aware_tokens(s)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Wire-block token registry (single source of truth for "which raw_content block
 # types we know how to count").  Consumed by ``_estimate_single_message_tokens``.
@@ -1269,7 +1297,7 @@ def _tok_tool_use(block: dict) -> int:
     n = 0
     inp = block.get('input')
     if isinstance(inp, dict):
-        n += len(json.dumps(inp, ensure_ascii=False, default=str)) // 3 + 1
+        n += _cjk_tokens_from_jsonable(inp)
     elif isinstance(inp, str):
         n += _cjk_aware_tokens(inp)
     tname = block.get('name', '')
@@ -1309,7 +1337,7 @@ def _tok_function_call(block: dict) -> int:
     """Gemini functionCall part (typed or content-key form)."""
     fc = block.get('functionCall') or block.get('function_call')
     if isinstance(fc, dict):
-        return len(json.dumps(fc, ensure_ascii=False, default=str)) // 3 + 1
+        return _cjk_tokens_from_jsonable(fc)
     return 0
 
 
@@ -1317,7 +1345,7 @@ def _tok_function_response(block: dict) -> int:
     """Gemini functionResponse part (typed or content-key form)."""
     fr = block.get('functionResponse') or block.get('function_response')
     if isinstance(fr, dict):
-        return len(json.dumps(fr, ensure_ascii=False, default=str)) // 3 + 1
+        return _cjk_tokens_from_jsonable(fr)
     return 0
 
 
@@ -1376,16 +1404,14 @@ _unknown_block_types_lock = threading.Lock()
 def _count_block_wholesale(block: dict) -> int:
     """Fail-safe tokenizer for an unrecognised wire block.
 
-    Dumps the entire block to JSON and counts it, guaranteeing we never
-    under-count a whole unknown block (under-counting is what causes the
-    context-overflow 400s this subsystem prevents).  Slight over-counting is
+    Dumps the entire block to JSON and counts it via the canonical byte-based
+    estimator (:func:`_cjk_tokens_from_jsonable`), guaranteeing we never
+    under-count a whole unknown block — including CJK payloads, which the old
+    ``chars // 3`` formula under-counted ~2-3x (under-counting is what causes
+    the context-overflow 400s this subsystem prevents).  Slight over-counting is
     always safe — it only trims the budget marginally sooner.
     """
-    try:
-        chars = len(json.dumps(block, ensure_ascii=False, default=str))
-    except Exception:
-        chars = sum(len(str(v)) for v in block.values()) if block else 0
-    return chars // 3 + 1
+    return _cjk_tokens_from_jsonable(block)
 
 
 def _warn_unknown_block_type(btype: str) -> None:
@@ -1443,6 +1469,30 @@ def reset_unknown_block_type_counts() -> dict[str, int]:
         return snapshot
 
 
+def _msg_token_fingerprint(m: object) -> tuple:
+    """Length-based signature of every field that feeds the token estimate.
+
+    A change in any of these lengths signals the cached ``_msg_token_estimate``
+    is stale and must be recomputed.  Length (not a deep hash) keeps the guard
+    cheap enough to run on every cache probe; it catches the realistic mutation
+    paths (replacement, trimming, append, stubbing a tool result) which all
+    change a container length.  Nested in-place edits that preserve every length
+    are not detected — but no current mutator produces those, and the
+    copy-on-write discipline remains the primary safety mechanism.
+    """
+    rc = getattr(m, 'raw_content', None)
+    tc = getattr(m, 'tool_calls', None)
+    images = getattr(m, 'images', None)
+    reasoning = getattr(m, 'reasoning_content', None)
+    return (
+        len(getattr(m, 'content', '') or ''),
+        len(rc) if isinstance(rc, (list, str)) else 0,
+        len(tc) if isinstance(tc, list) else 0,
+        len(images) if isinstance(images, list) else 0,
+        len(reasoning) if isinstance(reasoning, str) else (1 if reasoning else 0),
+    )
+
+
 def _estimate_single_message_tokens(m: object) -> int:
     """Compute and cache token estimate for a single message object.
 
@@ -1451,14 +1501,15 @@ def _estimate_single_message_tokens(m: object) -> int:
     and re-``json.dumps`` for messages that survive trimming.  The cache lives
     as long as the message object, which is exactly the turn lifetime.
 
-    .. warning::
-        The cache has **no invalidation mechanism**.  It is safe **only** because
-        every mutation path (``_evict_consumed_tool_results`` → ``_stub_tool_result``)
-        creates a **copy-on-write** via ``dataclasses.replace`` (new object, no cached
-        attr).  Any future in-place mutation of ``.content`` / ``.raw_content`` on an
-        already-estimated message **will** silently return a stale count.  If such a
-        path is added, invalidate the cache (``del m._msg_token_estimate``) in the
-        mutator or key the cache against a content-length fingerprint.
+    .. note::
+        The cache is self-healing: every probe compares a length fingerprint
+        (``_msg_token_fp``) of the counted fields against the current message and
+        recomputes on mismatch.  This catches in-place mutation of
+        ``.content`` / ``.raw_content`` / ``.tool_calls`` (replacement, trimming,
+        append) even if a future mutator bypasses the copy-on-write discipline
+        (``dataclasses.replace`` via ``_evict_consumed_tool_results`` ->
+        ``_stub_tool_result``) that remains the primary safety mechanism.
+        Nested edits that preserve every container length are not detected.
 
     Supports both ``LLMMessage`` objects (cache via attribute) and plain
     ``dict`` messages (always recompute — dict has no writable ``__dict__``).
@@ -1468,7 +1519,13 @@ def _estimate_single_message_tokens(m: object) -> int:
     if _can_cache:
         cached = getattr(m, '_msg_token_estimate', None)
         if cached is not None:
-            return cached
+            # Fingerprint guard: recompute if any counted field's length changed
+            # since the estimate was cached.  Self-heals in-place mutation that
+            # bypasses copy-on-write (see .. note:: above).  Lengths keep the
+            # guard cheap while catching every realistic mutation path.
+            if getattr(m, '_msg_token_fp', None) == _msg_token_fingerprint(m):
+                return cached
+            # fp mismatch -> fall through and recompute a fresh estimate.
 
     mt = 0
     # Content (CJK-aware) — skip when raw_content is present because it is the
@@ -1488,18 +1545,21 @@ def _estimate_single_message_tokens(m: object) -> int:
     reasoning_attr = getattr(m, 'reasoning_content', None)
     if reasoning_attr:
         mt += _cjk_aware_tokens(reasoning_attr if isinstance(reasoning_attr, str) else str(reasoning_attr))
-    # Tool calls (JSON args are programming text — chars//3 is adequate)
+    # Tool calls — args are routed through the canonical byte-based estimator so
+    # CJK-heavy payloads (Korean edit content, etc.) are not under-counted.  The
+    # tool/function *name* is an ASCII identifier; the +10 covers the JSON
+    # envelope and //3 is an adequate over-count for pure-ASCII names.
     tc = getattr(m, 'tool_calls', None)
     if tc:
         try:
             for t in tc:
                 args = t.get("args", t.get("function", {}).get("arguments", ""))
                 if isinstance(args, dict):
-                    mt += len(json.dumps(args, ensure_ascii=False, default=str)) // 3 + 1
+                    mt += _cjk_tokens_from_jsonable(args)
                 elif isinstance(args, str):
-                    mt += len(args) // 3 + 1
+                    mt += _cjk_aware_tokens(args)
                 elif args:
-                    mt += len(str(args)) // 3 + 1
+                    mt += _cjk_aware_tokens(str(args))
                 name = t.get("name", t.get("function", {}).get("name", ""))
                 if name:
                     mt += (len(name) + 10) // 3 + 1
@@ -1559,9 +1619,12 @@ def _estimate_single_message_tokens(m: object) -> int:
     if images:
         mt += len(images) * _IMAGE_BLOCK_TOKEN_ESTIMATE
 
-    # Cache on the message object for the turn lifetime (only for cacheable objects).
+    # Cache on the message object for the turn lifetime (only for cacheable
+    # objects).  Store a length fingerprint alongside so a later in-place
+    # mutation is detected by the cache probe above (self-healing guard).
     if _can_cache:
         m._msg_token_estimate = mt
+        m._msg_token_fp = _msg_token_fingerprint(m)
     return mt
 
 
@@ -1613,9 +1676,10 @@ def estimate_tokens_from_tool_schemas(tool_schemas: Optional[list]) -> int:
     except Exception:
         _chars = sum(len(str(s)) for s in tool_schemas)
     result = int(_chars / CHARS_PER_TOKEN) + 1
-    if len(_tool_schema_token_cache) >= 8:
-        _tool_schema_token_cache.clear()
-    _tool_schema_token_cache[_cache_id] = result
+    # FIFO-bounded via the shared SSOT helper (same family as the file-index and
+    # walk caches) — evicts only the oldest entry instead of nuking the whole
+    # cache on the 9th distinct schema, so recently-used schemas stay warm.
+    _capped_put(_tool_schema_token_cache, _cache_id, result, cap=8)
     return result
 
 
@@ -1646,6 +1710,13 @@ def context_message_cap(ctx_limit: int, safety_margin: int,
     return max(512, ctx_limit - _output_reserve - _tool_tokens)
 
 
+def _msg_role(m) -> str:
+    """Return the role of a message that may be an LLMMessage or a plain dict."""
+    if isinstance(m, dict):
+        return (m.get("role") or "")
+    return (getattr(m, "role", "") or "")
+
+
 def preemptive_trim(
     messages: list,
     max_tokens: int = MAX_SAFE_TOKENS,
@@ -1654,13 +1725,23 @@ def preemptive_trim(
 ) -> list:
     """Preemptively trim conversation history to stay within token limits.
 
-    Preserves system prompt (first message) + last N messages,
-    decrementing N until under cap. Returns trimmed list (or original if under limit).
+    Preserves the system prompt (first message) + a recent tail, shrinking the
+    tail until under cap. Returns trimmed list (or original if under limit).
 
     Uses CJK-aware estimation (``estimate_tokens_from_msgs``) so CJK-heavy
     conversations are not underestimated and do not provoke HTTP 400.
     Prefer ``_evict_consumed_tool_results`` (context-smart) over this blunt
     front-trim when the goal is gentle eviction.
+
+    The preserved tail is anchored on the most recent **user** message, not the
+    literal last message. The context builder appends trailing ``system``
+    messages after the current request (``[CURRENT REQUEST]`` marker, mode
+    notice, model-switch notice), so the literal last message is frequently a
+    ``system`` message. Anchoring on the last user turn guarantees the request
+    itself always survives trimming — dropping it would make every downstream
+    LLM call meaningless and breaks strict chat templates that require at least
+    one user message (e.g. Qwen3 / ``bonsai27b``:
+    ``raise_exception('No user query found in messages.')``).
 
     Args:
         messages: List of LLMMessage or dict message objects.
@@ -1675,10 +1756,26 @@ def preemptive_trim(
     if _est_tokens <= max_tokens:
         return messages
 
-    # Progressive trim: keep first (system) + last N messages
+    # Index of the most recent user message — the current request. It MUST be
+    # preserved; everything else here is about fitting around it.
+    _last_user_idx = -1
+    for _i in range(len(messages) - 1, -1, -1):
+        if _msg_role(messages[_i]) == "user":
+            _last_user_idx = _i
+            break
+    # When no user turn exists (unusual), fall back to the literal tail.
+    _tail_anchor = _last_user_idx if _last_user_idx >= 0 else len(messages) - 1
+
+    # Progressive trim: keep first (system) + a tail that always includes the
+    # last user message (plus any trailing system markers after it).
     _n = preserve_last
     while _n >= 0 and len(messages) > 1:
-        _raw = messages[:1] + messages[max(1, len(messages) - _n - 1):]
+        _natural_start = max(1, len(messages) - _n - 1)
+        _tail_start = min(_natural_start, _tail_anchor)
+        # Avoid duplicating messages[0] when the tail starts at index 0 (the
+        # first message is itself the user turn — no system to keep).
+        _head = messages[:1] if _tail_start >= 1 else []
+        _raw = _head + messages[_tail_start:]
         _kept_est = estimate_tokens_from_msgs(_raw)
         if _kept_est <= max_tokens:
             logger.warning(
@@ -1688,18 +1785,24 @@ def preemptive_trim(
             )
             return _raw
         if _n == 0:
-            # Still over limit with system + last 1 message → fall through to system-only fallback
+            # Still over limit even with system + last user turn → fall through
+            # to the last-user fallback (keeps the request; may be oversized).
             break
         _n -= 1
 
-    # Last resort: keep system message + last user/tool-result message.
-    # messages[:1] alone drops the current user turn entirely, which causes
-    # "messages must contain a user turn" errors on some providers and always
-    # loses the user's actual request.  Including the last message gives the API
-    # a complete (if oversized) request; the actual API limit and overflow
-    # backstop handle final enforcement.
-    # Guard against duplicate when len(messages)==1 (messages[:1] is msg[-1:]).
-    _fallback = messages[:1] if len(messages) <= 1 else messages[:1] + messages[-1:]
+    # Last resort: keep the system message + the last user message and anything
+    # trailing after it. A request without the current user query is useless and
+    # is rejected by strict templates, so we never drop it — the (possibly
+    # oversized) request is let through and the provider's own limit / overflow
+    # backstop handle final enforcement. When there is genuinely no user
+    # message, keep system + the literal last message.
+    if _last_user_idx >= 1:
+        _fallback = messages[:1] + messages[_last_user_idx:]
+    elif _last_user_idx == 0:
+        # User message is first (no system prompt); nothing safe to drop.
+        _fallback = list(messages)
+    else:
+        _fallback = messages[:1] if len(messages) <= 1 else messages[:1] + messages[-1:]
     _fallback_est = estimate_tokens_from_msgs(_fallback)
     logger.warning(
         "[%s] last resort: %d->%d tokens (%d->%d messages)",

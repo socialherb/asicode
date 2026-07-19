@@ -12,6 +12,7 @@ These tests also guard the behavioural contract: finished jobs are evicted
 before killing a running one, the kill still happens outside the manager
 lock, and the public API (get_info / list_jobs / kill / cleanup) is intact.
 """
+import sys
 import threading
 import time
 
@@ -232,3 +233,71 @@ def test_output_buffer_tail_cap():
     assert capped.endswith("TAIL_END")
     assert capped.startswith(bjm._TRUNCATION_MARKER)
     assert len(capped) <= bjm._OUTPUT_BUF_CAP + len(bjm._TRUNCATION_MARKER)
+
+
+def _noisy_proc(script: str):
+    """Popen whose child emits real macOS libmalloc stack-logging chatter.
+
+    ``MallocStackLogging=1`` makes libmalloc write its status lines to fd 2
+    before exec, so they land in the captured stderr pipe exactly as they do
+    when the parent has stack logging enabled by some non-environment route.
+    """
+    import os
+    import subprocess
+    env = os.environ.copy()
+    env["MallocStackLogging"] = "1"
+    return subprocess.Popen(
+        ["bash", "-c", script],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+        start_new_session=True, env=env,
+    )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="libmalloc noise is macOS-only")
+def test_malloc_noise_stripped_from_background_job_output():
+    """Regression: the blocking bash path filtered MallocStackLogging lines but
+    the timeout→background path did not, so the noise reappeared in every
+    `job output` / `job list` result. Both consumption points must filter."""
+    proc = _noisy_proc("echo REAL_OUT; echo REAL_ERR >&2; sleep 30")
+    mgr = BackgroundJobManager(max_jobs=5, reap_interval=9999.0)
+    try:
+        jid = mgr.start("noisy", proc)
+        deadline = time.monotonic() + 5
+        while "REAL_ERR" not in mgr.get_info(jid).stderr:
+            assert time.monotonic() < deadline, "REAL_ERR never arrived"
+            time.sleep(0.05)
+
+        # The raw buffer must actually contain noise, else the test is vacuous.
+        assert "MallocStackLogging" in mgr.get(jid)._stderr_buf, (
+            "no libmalloc noise produced — test would pass vacuously"
+        )
+
+        info = mgr.get_info(jid)
+        assert "MallocStackLogging" not in info.stderr
+        assert "REAL_ERR" in info.stderr, "real stderr destroyed by the filter"
+        assert "REAL_OUT" in info.stdout
+
+        listed = [j for j in mgr.list_jobs() if j.job_id == jid][0]
+        assert "MallocStackLogging" not in listed.stderr
+    finally:
+        proc.kill()
+        proc.wait()
+        mgr.shutdown()
+
+
+def test_strip_malloc_noise_is_line_exact():
+    """Only whole noise lines are dropped; a chunk-straddled noise line
+    self-heals because filtering runs on the accumulated buffer, not on the
+    per-read chunk."""
+    s = bjm.strip_malloc_noise
+    assert s("") == ""
+    assert s("clean\noutput\n") == "clean\noutput\n"
+    assert s("a\nsh(1) MallocStackLogging: z\nb\n") == "a\nb\n"
+    assert s("keep\r\nsh(2) MallocStackLogging: q\r\n") == "keep\r\n"
+    assert s("no trailing newline") == "no trailing newline"
+    # Half a noise line has no token yet, so it survives this drain...
+    half = "sh(1) MallocStack"
+    assert s(half) == half
+    # ...and is removed once the remainder lands in the same buffer.
+    assert s(half + "Logging: x\nkeep\n") == "keep\n"

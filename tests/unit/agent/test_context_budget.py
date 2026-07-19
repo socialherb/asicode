@@ -92,8 +92,11 @@ class TestResolveContextLimit:
         # deepseek-chat is deprecated alias for v4-flash non-thinking mode (1M)
         assert _resolve_context_limit("deepseek-chat") == _DEFAULT_CONTEXT_LIMIT
 
-    def test_glm_5_2_returns_1m_fallback(self):
-        assert _resolve_context_limit("glm-5.2") == _DEFAULT_CONTEXT_LIMIT
+    def test_glm_5_2_returns_1m(self):
+        # GLM-5.2 is the DEFAULT_MODEL; 1M context is verified (Z.ai docs) and now
+        # listed explicitly in _CONTEXT_LIMITS — NOT a fallback. Asserts the literal
+        # value so this is independent of any future _DEFAULT_CONTEXT_LIMIT change.
+        assert _resolve_context_limit("glm-5.2") == 1_000_000
 
     def test_glm_5_1_returns_200k(self):
         assert _resolve_context_limit("glm-5.1") == 200_000
@@ -254,15 +257,16 @@ class TestEstimateMessagesTokens:
         tool_calls = [{"id": "1", "function": {"name": "find_symbol", "arguments": "{}"}}]
         msg = make_msg("assistant", "", tool_calls=tool_calls)
         result = self.mgr.estimate_messages_tokens([msg])
-        # content="" → 0, tool call: name='find_symbol'(11)+10=21 → 8 tokens, args='{}'=2 → 1 token → total 9
-        assert result == 9
+        # content="" → 0, tool call: name='find_symbol'(11)+10=21 → //3+1 = 8 tokens,
+        # args dict {} → _cjk_tokens_from_jsonable("{}") = bytes//2+1 = 2 tokens → total 10
+        assert result == 10
 
     def test_multiple_tool_calls_overhead(self):
         tool_calls = [{"id": str(i)} for i in range(4)]
         msg = make_msg("assistant", "a" * 350, tool_calls=tool_calls)
         result = self.mgr.estimate_messages_tokens([msg])
-        # 176 (content) + 4 * 1 (each empty tool_call adds +1 for serialization overhead)
-        assert result == 180
+        # 176 (content) + 4 * 0 (empty-string args now count 0 via _cjk_aware_tokens)
+        assert result == 176
 
     def test_none_content_treated_as_empty(self):
         msg = LLMMessage(role="assistant", content=None)
@@ -1319,6 +1323,33 @@ class TestMsgTokenCache:
         est2 = estimate_tokens_from_msgs([msg])
         assert est1 == est2
 
+    def test_cache_invalidated_on_inplace_content_mutation(self):
+        """Self-healing guard: in-place mutation of ``.content`` bypasses the
+        stale cache.  Previously the cache had no invalidation and relied solely
+        on copy-on-write; this pins the fingerprint guard added to close that
+        latent landmine."""
+        from external_llm.agent._shared_utils import _estimate_single_message_tokens
+        msg = LLMMessage(role="user", content="short message")
+        before = _estimate_single_message_tokens(msg)
+        # Mutate in-place — no copy-on-write, simulating a future mutator that
+        # bypasses dataclasses.replace.
+        msg.content = "x" * 5000
+        after = _estimate_single_message_tokens(msg)
+        assert after > before, "stale cached estimate returned after in-place mutation"
+        # And the cached value was refreshed (matches the recomputed count).
+        assert getattr(msg, '_msg_token_estimate', None) == after
+
+    def test_cache_survives_unchanged_message(self):
+        """The fingerprint guard must NOT spuriously invalidate an unchanged
+        message — otherwise the cache is useless and json.dumps runs every call."""
+        from external_llm.agent._shared_utils import _estimate_single_message_tokens
+        msg = LLMMessage(role="user", content="stable content")
+        first = _estimate_single_message_tokens(msg)
+        # Touch an unrelated attribute; must not bust the cache.
+        msg._some_other_attr = 1
+        second = _estimate_single_message_tokens(msg)
+        assert second == first
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 15. P4: ContextBudgetManager tool-schema accounting
@@ -1564,6 +1595,65 @@ class TestP2PreemptiveTrimFallback:
         assert result[1] is m2
 
 
+class TestPreemptiveTrimPreservesLastUser:
+    """Regression: trim must never drop the most recent user message.
+
+    The design-chat context builder appends trailing ``system`` messages after
+    the current request (``[CURRENT REQUEST]`` marker, mode notice, model-switch
+    notice), so the literal last message is often a ``system`` message. The old
+    fallback ``messages[:1] + messages[-1:]`` then kept ``[system, system]`` and
+    dropped the request entirely — breaking strict chat templates that require at
+    least one user message (Qwen3 / ``bonsai27b``:
+    ``raise_exception('No user query found in messages.')``).
+    """
+
+    def test_trailing_system_messages_keep_user_query(self):
+        """[sys, sys, ..., user, sys_marker, sys_mode] must retain the user turn."""
+        from external_llm.agent._shared_utils import preemptive_trim
+        msgs = [
+            make_msg("system", "S" * 50_000),          # huge system → forces trim
+            make_msg("system", "divider"),
+            make_msg("assistant", "prev answer"),
+            make_msg("user", "what is 1+1?"),
+            make_msg("system", "[CURRENT REQUEST] ..."),
+            make_msg("system", "[MODE: General Chat] ..."),
+        ]
+        result = preemptive_trim(msgs, max_tokens=1000, preserve_last=2, tag="test")
+        roles = [m.role for m in result]
+        assert "user" in roles, f"User query dropped! roles={roles}"
+        # The preserved user message must be the actual request (identity kept).
+        assert make_msg("user", "what is 1+1?").content in [m.content for m in result if m.role == "user"]
+        # First message (system prompt) is still preserved when present.
+        assert result[0].role == "system"
+
+    def test_progressive_trim_keeps_user_when_near_tail(self):
+        """Even small preserve_last values must include the last user message."""
+        from external_llm.agent._shared_utils import preemptive_trim
+        msgs = [
+            make_msg("system", "S" * 50_000),
+            make_msg("user", "old question"),
+            make_msg("assistant", "old answer"),
+            make_msg("user", "current question"),
+            make_msg("system", "[CURRENT REQUEST] ..."),
+        ]
+        result = preemptive_trim(msgs, max_tokens=1000, preserve_last=2, tag="test")
+        contents = [m.content for m in result if m.role == "user"]
+        assert "current question" in contents, f"Current query dropped: {contents}"
+
+    def test_no_duplicate_when_user_is_first(self):
+        """When the user message is messages[0], fallback must not duplicate it."""
+        from external_llm.agent._shared_utils import preemptive_trim
+        msgs = [
+            make_msg("user", "x" * 100_000),
+            make_msg("assistant", "y" * 100_000),
+        ]
+        result = preemptive_trim(msgs, max_tokens=1000, preserve_last=2, tag="test")
+        # User is first and must not be duplicated; result keeps the user turn.
+        assert any(m.role == "user" for m in result)
+        user_count = sum(1 for m in result if m.role == "user")
+        assert user_count == 1, f"User message duplicated: {user_count}"
+
+
 class TestP3TTLResetInOverflow:
     """P3 regression: TTL-reset in _record_context_overflow must clear
     _context_window_overrides too (not just _override_meta)."""
@@ -1760,13 +1850,13 @@ class TestEstimatorReasoningContentNonStr:
 class TestToolSchemaTokenCacheEviction:
     """P2: _tool_schema_token_cache must evict (not freeze) when full.
 
-    The old 'if len < 8: insert' froze permanently at 8 entries — if a 9th
-    unique id appeared, the cache never inserted again. The new strategy
-    clears-on-full so fresh entries always enter the cache.
+    Uses the shared ``_capped_put`` FIFO helper — evicts only the OLDEST entry
+    when over cap, so recently-used schemas stay warm (unlike a whole-cache
+    clear).  The cap is 8.
     """
 
-    def test_cache_evicts_on_full(self):
-        """After 8 unique ids, the 9th triggers a clear; subsequent ids insert."""
+    def test_cache_evicts_oldest_past_cap(self):
+        """After cap(8) entries, the 9th evicts the OLDEST (FIFO), not all."""
         from external_llm.agent._shared_utils import (
             estimate_tokens_from_tool_schemas,
             _tool_schema_token_cache,
@@ -1776,19 +1866,15 @@ class TestToolSchemaTokenCacheEviction:
         lists = [[{"n": i}] for i in range(9)]
         for lst in lists:
             estimate_tokens_from_tool_schemas(lst)
-        # After 9, the cache was cleared at entry 9 (len 8→clear→insert)
-        # Now cache has 1 entry (the 9th object = lists[8])
-        assert len(_tool_schema_token_cache) == 1, (
-            f"After 9 unique ids with cap=8, expected 1 entry, "
-            f"got {len(_tool_schema_token_cache)}"
-        )
-        # lists[8] must be in cache (freshly inserted after clear)
-        cached = _tool_schema_token_cache.get(id(lists[8]))
-        assert cached is not None, "Freshly inserted entry must be in cache"
-        assert cached == estimate_tokens_from_tool_schemas(lists[8])
+        # FIFO cap=8 → exactly 8 entries retained; oldest (lists[0]) evicted.
+        assert len(_tool_schema_token_cache) == 8
+        assert id(lists[0]) not in _tool_schema_token_cache, "oldest entry should be evicted"
+        # The newest (lists[8]) and a middle entry (lists[4]) must survive.
+        assert id(lists[8]) in _tool_schema_token_cache
+        assert id(lists[4]) in _tool_schema_token_cache
 
-    def test_cache_hit_after_clear(self):
-        """After clear-on-full, a subsequent duplicate id must still hit."""
+    def test_cache_hit_for_surviving_entry(self):
+        """A surviving entry (within cap) must still hit the cache (no json.dumps)."""
         from external_llm.agent._shared_utils import (
             estimate_tokens_from_tool_schemas,
             _tool_schema_token_cache,
@@ -1797,19 +1883,14 @@ class TestToolSchemaTokenCacheEviction:
         import external_llm.agent._shared_utils as _su
 
         _tool_schema_token_cache.clear()
-        # Fill cache to cap
+        # Fill to cap exactly (8 distinct ids, none evicted).
         lists = [[{"n": i}] for i in range(8)]
         for lst in lists:
             estimate_tokens_from_tool_schemas(lst)
         assert len(_tool_schema_token_cache) == 8
 
-        # 9th unique object triggers clear + insert
-        lst_new = [{"n": 100}]
-        estimate_tokens_from_tool_schemas(lst_new)
-        assert len(_tool_schema_token_cache) == 1
-
-        # Now call with same lst_new — should hit cache (no json.dumps)
+        # Re-call with the LAST inserted list — should hit cache (no json.dumps).
         with patch.object(_su.json, "dumps", wraps=_su.json.dumps) as mock_dumps:
-            hit = estimate_tokens_from_tool_schemas(lst_new)
+            hit = estimate_tokens_from_tool_schemas(lists[7])
         mock_dumps.assert_not_called()
         assert hit is not None

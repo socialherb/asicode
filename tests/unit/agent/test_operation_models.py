@@ -7,6 +7,7 @@ import pytest
 from external_llm.agent.operation_models import (
     AssertionTier,
     ExecutorState,
+    FILE_WRITING_KINDS,
     FailureClass,
     GroundingSummary,
     IntentAssertion,
@@ -14,6 +15,7 @@ from external_llm.agent.operation_models import (
     Operation,
     OperationKind,
     OperationPlan,
+    READ_ONLY_KINDS,
     PlanMode,
     PlanPolicy,
     SemanticFitAction,
@@ -480,6 +482,51 @@ def test_operation_validate_run_scanner_with_scanner_name():
     err = Operation(id="op1", kind=OperationKind.RUN_SCANNER, path="x.py",
                     metadata={"scanner_name": "dead_block_scanner"}).validate()
     assert err is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# SSOT frozenset contract — guards the str-Enum value-vs-name landmine
+# (commit c10897a2).  OperationKind(str, Enum) members compare equal to their
+# LOWERCASE value, never their uppercase NAME.  Lane validators/normalizers
+# must test membership via these derived SSOT frozensets, not inline
+# uppercase-NAME string tuples (which are always-False → dead code).
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_read_only_kinds_includes_run_scanner():
+    """RUN_SCANNER was added to OP_KIND_POLICY as read_only — the derived
+    SSOT frozenset must auto-include it (guards the divergence sub-bug where
+    hand-maintained uppercase tuples forgot RUN_SCANNER)."""
+    assert OperationKind.RUN_SCANNER in READ_ONLY_KINDS
+    assert OperationKind.READ_SYMBOL in READ_ONLY_KINDS
+
+
+def test_str_enum_lowercase_value_matches_frozenset():
+    """Production contract: a real OperationKind member AND its lowercase
+    value string both match the SSOT frozenset, because str-Enum members
+    hash/compare equal to their value."""
+    assert OperationKind.READ_SYMBOL in READ_ONLY_KINDS
+    assert "read_symbol" in READ_ONLY_KINDS
+
+
+def test_uppercase_name_does_not_match_frozenset():
+    """LANDMINE guard: an uppercase NAME string ('READ_SYMBOL') does NOT
+    match the frozenset, because members compare equal to their lowercase
+    VALUE, not their NAME.  This documents WHY comparing op.kind against
+    uppercase-NAME tuples is a dead-code bug — the regression fixed in
+    c10897a2."""
+    assert "READ_SYMBOL" not in READ_ONLY_KINDS
+    assert "MODIFY_SYMBOL" not in FILE_WRITING_KINDS
+
+
+def test_read_only_kinds_disjoint_from_file_writing():
+    """No kind may be simultaneously read-only and file-writing."""
+    assert READ_ONLY_KINDS.isdisjoint(FILE_WRITING_KINDS)
+
+
+def test_file_writing_kinds_covers_modify_create_delete():
+    assert OperationKind.MODIFY_SYMBOL in FILE_WRITING_KINDS
+    assert OperationKind.CREATE_FILE in FILE_WRITING_KINDS
+    assert OperationKind.DELETE_FILE in FILE_WRITING_KINDS
 
 
 def test_operation_validate_insert_after_symbol_with_eof_fallback():

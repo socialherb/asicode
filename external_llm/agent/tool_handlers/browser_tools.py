@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 try:
     from playwright.sync_api import TimeoutError as _PlaywrightTimeout
     from playwright.sync_api import sync_playwright
+
     HAS_PLAYWRIGHT = True
 except ImportError:
     HAS_PLAYWRIGHT = False
@@ -64,8 +65,80 @@ except ImportError:
 # Pinning every Playwright call to one persistent worker thread guarantees
 # affinity (and incidentally serializes access to the single shared page).
 # The worker is created lazily on first submit and lives for the process.
-_BROWSER_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="browser-action")
-atexit.register(_BROWSER_EXECUTOR.shutdown, wait=False)
+_browser_executor_lock = threading.Lock()
+
+
+def _new_browser_executor() -> ThreadPoolExecutor:
+    """Create a fresh single-thread executor pinned for Playwright work.
+
+    Centralised so both the initial module-level executor and the wedge-recovery
+    path (_reset_browser_on_wedge) build an identical executor (same affinity
+    contract). Teardown is owned by a SINGLE module-level atexit handler
+    (_shutdown_browser_executor_at_exit) that always references the current
+    global — so repeated wedge recoveries do not pile up dead handlers, each of
+    which would retain a reference to its (stuck-worker) executor until exit.
+    """
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="browser-action")
+
+
+_BROWSER_EXECUTOR = _new_browser_executor()
+
+
+def _shutdown_browser_executor_at_exit() -> None:
+    """Shut down the current global browser executor at process exit.
+
+    Registered ONCE at import; always operates on whichever executor is current
+    at exit time (the module global is reassigned on wedge recovery). Replaces
+    the per-executor atexit.register that grew the handler list by one on every
+    wedge and held dead executors (with their orphaned worker threads).
+    """
+    try:
+        _BROWSER_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    except TypeError:  # cancel_futures is 3.9+; older interpreters lack it
+        _BROWSER_EXECUTOR.shutdown(wait=False)
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_browser_executor_at_exit)
+
+
+def _reset_browser_on_wedge() -> None:
+    """Recover from a hard-timeout wedge by abandoning the stuck worker.
+
+    Called when a browser action exceeds ``_BROWSER_HARD_TIMEOUT_SEC``: the
+    single dedicated worker is still blocked inside an uninterruptible
+    Playwright call, so every subsequent submit would queue behind it and time
+    out too — wedging the whole session until process restart.
+
+    We abandon the stuck worker (its thread + Playwright driver become orphans;
+    best-effort, reaped on process exit) and spin up a fresh executor. The
+    class-level browser refs are cleared WITHOUT calling ``.close()``:
+    Playwright's sync objects are thread-affine, so closing from this (caller)
+    thread would itself hang. The next ``_get_browser()`` lazily re-initialises
+    a brand-new browser on the new worker thread.
+    """
+    global _BROWSER_EXECUTOR
+    with _browser_executor_lock:
+        old = _BROWSER_EXECUTOR
+        try:
+            # cancel_futures (3.9+) drops queued submits; the *running* future
+            # cannot be interrupted, so its worker becomes an orphan by design.
+            old.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            old.shutdown(wait=False)
+        except Exception:
+            pass
+        _BROWSER_EXECUTOR = _new_browser_executor()
+        BrowserActionToolsMixin._page = None
+        BrowserActionToolsMixin._browser = None
+        BrowserActionToolsMixin._playwright = None
+    logger.warning(
+        "browser_action: hard timeout exceeded — abandoned the wedged worker "
+        "thread and recreated the browser executor; a new browser will start on "
+        "the next call."
+    )
+
 
 # Hard upper bound (seconds) for any single browser action on the dedicated
 # executor. Playwright per-call timeouts above only apply to the specific page
@@ -75,6 +148,33 @@ atexit.register(_BROWSER_EXECUTOR.shutdown, wait=False)
 # shared_pool worker that blocks on .result(). This is a safety net so a stuck
 # browser cannot wedge an entire agent session.
 _BROWSER_HARD_TIMEOUT_SEC = 120
+
+# Per-call Playwright timeout ceiling (ms). The LLM-supplied ``timeout`` arg is
+# unbounded, so a generous value (e.g. 180000 for a slow page) would exceed the
+# dedicated-executor hard timeout above: the hard timeout would fire FIRST,
+# abandoning the worker via ``_reset_browser_on_wedge`` and destroying the whole
+# browser session (login state, current page) — even though Playwright was still
+# happily waiting within the requested budget. Clamp every per-call timeout
+# below the hard ceiling (minus a margin) so a clean Playwright per-call timeout
+# always resolves before the wedge path, leaving the session intact.
+_PER_CALL_TIMEOUT_MARGIN_SEC = 5
+_PER_CALL_TIMEOUT_CEIL_MS = max((_BROWSER_HARD_TIMEOUT_SEC - _PER_CALL_TIMEOUT_MARGIN_SEC) * 1000, 1000)
+
+
+def _clamp_per_call_timeout_ms(requested: Any) -> int:
+    """Clamp a caller-requested Playwright timeout (ms) below the hard ceiling.
+
+    Returns at least 1000ms (Playwright rejects <= 0). Applied by every browser
+    action that forwards a ``timeout`` to Playwright (navigate/click/type/wait)
+    so the per-call timeout always resolves before ``_BROWSER_HARD_TIMEOUT_SEC``
+    would trigger a session-resetting wedge. Bad/non-int input falls back to the
+    standard 30000ms default.
+    """
+    try:
+        requested = int(requested)
+    except (TypeError, ValueError):
+        requested = 30000
+    return max(1000, min(requested, _PER_CALL_TIMEOUT_CEIL_MS))
 
 
 class BrowserActionToolsMixin:
@@ -99,7 +199,8 @@ class BrowserActionToolsMixin:
 
         if not action:
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error="'action' is required. Choose: navigate, click, type, extract, screenshot, evaluate, wait, close",
             )
 
@@ -107,7 +208,8 @@ class BrowserActionToolsMixin:
             with BrowserActionToolsMixin._pw_install_lock:
                 if not self._ensure_playwright_installed():
                     return self._make_result(
-                        ok=False, content="",
+                        ok=False,
+                        content="",
                         error=(
                             "Playwright is not available — automatic installation was "
                             "declined or failed.\n"
@@ -131,7 +233,8 @@ class BrowserActionToolsMixin:
         handler = _ACTIONS.get(action)
         if handler is None:
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=f"Unknown action: '{action}'. Available: {', '.join(sorted(_ACTIONS))}",
             )
 
@@ -140,12 +243,14 @@ class BrowserActionToolsMixin:
                 return handler(args)
             except _PlaywrightTimeout:
                 return self._make_result(
-                    ok=False, content="",
+                    ok=False,
+                    content="",
                     error="Playwright timeout: page or element did not load within the specified timeout.",
                 )
             except Exception as e:
                 return self._make_result(
-                    ok=False, content="",
+                    ok=False,
+                    content="",
                     error=f"Browser action '{action}' failed: {type(e).__name__}: {e}",
                 )
 
@@ -158,15 +263,21 @@ class BrowserActionToolsMixin:
         # per-call Playwright timeout and a hung page would otherwise block the
         # executor (and this caller) forever.
         try:
-            return _BROWSER_EXECUTOR.submit(_run).result(
-                timeout=_BROWSER_HARD_TIMEOUT_SEC
-            )
+            return _BROWSER_EXECUTOR.submit(_run).result(timeout=_BROWSER_HARD_TIMEOUT_SEC)
         except _FutureTimeout:
+            # The worker is still blocked inside the (uninterruptible) Playwright
+            # call, so this submit would wedge every later browser_action. Recover
+            # by abandoning the stuck worker and recreating the executor; a fresh
+            # browser starts on the next call. Without this, the session stays
+            # wedged until process restart.
+            _reset_browser_on_wedge()
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=(
                     f"Browser action '{action}' did not complete within "
-                    f"{_BROWSER_HARD_TIMEOUT_SEC}s. The page may be unresponsive."
+                    f"{_BROWSER_HARD_TIMEOUT_SEC}s. The page may be unresponsive; "
+                    f"the browser session has been reset — retry the action."
                 ),
             )
 
@@ -199,18 +310,20 @@ class BrowserActionToolsMixin:
         checkpoint/prompting is unavailable.
         """
         try:
-            result = self._tool_ask_user({
-                "question": (
-                    "Playwright (browser automation) is needed for the "
-                    "browser_action tool but is not installed.\n\n"
-                    "Install it now?\n"
-                    "  pip install playwright && playwright install chromium"
-                ),
-                "type": "confirm",
-                "options": ["yes", "no"],
-                "default": "no",
-                "reason": "Playwright required for browser_action tool",
-            })
+            result = self._tool_ask_user(
+                {
+                    "question": (
+                        "Playwright (browser automation) is needed for the "
+                        "browser_action tool but is not installed.\n\n"
+                        "Install it now?\n"
+                        "  pip install playwright && playwright install chromium"
+                    ),
+                    "type": "confirm",
+                    "options": ["yes", "no"],
+                    "default": "no",
+                    "reason": "Playwright required for browser_action tool",
+                }
+            )
             answer = result.metadata.get("answer", "no").lower().strip()
             return answer == "yes"
         except Exception as e:
@@ -243,12 +356,16 @@ class BrowserActionToolsMixin:
             )
             subprocess.run(
                 [sys.executable, "-m", "pip", "install", "playwright", *flags],
-                check=True, capture_output=True, timeout=120,
+                check=True,
+                capture_output=True,
+                timeout=120,
             )
             logger.info("Installing Chromium for Playwright...")
             subprocess.run(
                 [sys.executable, "-m", "playwright", "install", "chromium"],
-                check=True, capture_output=True, timeout=300,
+                check=True,
+                capture_output=True,
+                timeout=300,
             )
             return True
         except subprocess.CalledProcessError as e:
@@ -284,14 +401,27 @@ class BrowserActionToolsMixin:
         except ImportError as e:
             logger.error("Failed to import Playwright after installation: %s", e)
             return False
+
     # ── Browser lifecycle helpers ─────────────────────────────────────── #
 
     def _get_browser(self):
         """Lazy-init and return the shared Playwright browser instance."""
         if BrowserActionToolsMixin._browser is None:
             p = sync_playwright().start()
+            try:
+                BrowserActionToolsMixin._browser = p.chromium.launch(headless=True)
+            except Exception:
+                # launch() failed (missing browser binary, sandbox error, …).
+                # Stop the just-started Playwright driver so its node process
+                # does not leak — otherwise _browser stays None and the next
+                # call starts ANOTHER driver, accumulating orphans. Re-raise so
+                # the caller surfaces the real launch error.
+                try:
+                    p.stop()
+                except Exception:
+                    pass
+                raise
             BrowserActionToolsMixin._playwright = p
-            BrowserActionToolsMixin._browser = p.chromium.launch(headless=True)
         return BrowserActionToolsMixin._browser
 
     def _get_page(self):
@@ -326,9 +456,78 @@ class BrowserActionToolsMixin:
         BrowserActionToolsMixin._browser = None
         BrowserActionToolsMixin._playwright = None
 
+    def _render_and_eval(
+        self,
+        url: str,
+        js: str,
+        *,
+        timeout_ms: int = 20000,
+        wait_until: str = "networkidle",
+    ) -> Any:
+        """Navigate an ISOLATED throwaway page to ``url``, run ``js``, return its value.
+
+        Reusable browser primitive for backends that need a real (JS-rendering)
+        browser rather than an httpx scrape — currently ``search_web``'s Naver
+        engine. Two deliberate properties:
+
+        * **Isolated page.** Uses a fresh ``browser.new_page()`` that is closed
+          afterwards, NOT the shared ``_page``, so an automated background render
+          never clobbers the user's interactive ``browser_action`` session (open
+          tabs, login/cookie state).
+        * **Same executor contract as ``_tool_browser_action``.** Runs on the
+          dedicated single-thread ``_BROWSER_EXECUTOR`` (Playwright sync objects
+          are thread-affine) under the same ``_BROWSER_HARD_TIMEOUT_SEC`` +
+          wedge-recovery net, so a hung render cannot wedge the session.
+
+        Returns the JSON-serialisable value produced by ``js`` (whatever
+        ``page.evaluate`` returns). Raises ``RuntimeError`` when Playwright is
+        unavailable or the render wedges; Playwright per-call timeouts / eval
+        errors propagate as their own exception types for the caller to handle.
+        """
+        if not HAS_PLAYWRIGHT:
+            with BrowserActionToolsMixin._pw_install_lock:
+                if not self._ensure_playwright_installed():
+                    raise RuntimeError(
+                        "Playwright is not available (automatic install declined or failed)"
+                    )
+
+        per_call = _clamp_per_call_timeout_ms(timeout_ms)
+        if wait_until not in ("load", "domcontentloaded", "networkidle", "commit"):
+            wait_until = "networkidle"
+
+        def _run() -> Any:
+            browser = self._get_browser()
+            page = browser.new_page()  # isolated — never the shared _page
+            try:
+                page.goto(url, timeout=per_call, wait_until=wait_until)
+                return page.evaluate(js)
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
+        # Mirrors _tool_browser_action's submit contract: pin to the browser
+        # thread, cap with the hard timeout, and on a wedge abandon the stuck
+        # worker + recreate the executor (see _reset_browser_on_wedge) so later
+        # browser work is not blocked behind the hung render.
+        try:
+            return _BROWSER_EXECUTOR.submit(_run).result(timeout=_BROWSER_HARD_TIMEOUT_SEC)
+        except _FutureTimeout:
+            _reset_browser_on_wedge()
+            raise RuntimeError(
+                f"browser render did not complete within {_BROWSER_HARD_TIMEOUT_SEC}s; "
+                "the browser session was reset"
+            ) from None
+
     def _screenshot_dir(self) -> str:
-        """Return the screenshots directory (relative to repo root)."""
-        d = os.path.join(self.repo_root, "screenshots")
+        """Return the screenshots directory under ``.asicode`` (not the repo root).
+
+        Writing to ``<repo_root>/screenshots/`` polluted the user's working tree
+        and showed up in ``git status``; ``.asicode`` is the established tooling
+        scratch dir (memory.md, design_sessions, …), so screenshots live there.
+        """
+        d = os.path.join(self.repo_root, ".asicode", "screenshots")
         os.makedirs(d, exist_ok=True)
         return d
 
@@ -336,7 +535,7 @@ class BrowserActionToolsMixin:
 
     def _browser_navigate(self, args: dict[str, Any]) -> "ToolResult":
         url = str(args.get("url", "")).strip()
-        timeout = int(args.get("timeout", 30000))
+        timeout = _clamp_per_call_timeout_ms(args.get("timeout", 30000))
         max_chars = int(args.get("max_chars", 15000))
         max_chars = max(1000, min(max_chars, 50000))
 
@@ -356,19 +555,26 @@ class BrowserActionToolsMixin:
         text = page.inner_text("body")
         title = page.title()
 
-        if len(text) > max_chars:
+        # Capture the real content length BEFORE appending the truncation marker
+        # so metadata["length"] reflects actual content (not the ~90-char
+        # informational suffix) and "total_length" tells the caller how much was
+        # clipped — mirroring web_fetch's reported_len/total_length contract.
+        total_len = len(text)
+        reported_len = min(total_len, max_chars)
+        if total_len > max_chars:
             text = text[:max_chars] + f"\n\n...[TRUNCATED at {max_chars} chars]..."
 
         final_url = page.url
         result = f"Title: {title}\nURL: {final_url}\n\n{text}"
         return self._make_result(
-            ok=True, content=result,
-            metadata={"title": title, "url": final_url, "length": len(text)},
+            ok=True,
+            content=result,
+            metadata={"title": title, "url": final_url, "length": reported_len, "total_length": total_len},
         )
 
     def _browser_click(self, args: dict[str, Any]) -> "ToolResult":
         selector = str(args.get("selector", "")).strip()
-        timeout = int(args.get("timeout", 30000))
+        timeout = _clamp_per_call_timeout_ms(args.get("timeout", 30000))
 
         if not selector:
             return self._make_result(ok=False, content="", error="'selector' is required for click action")
@@ -378,14 +584,15 @@ class BrowserActionToolsMixin:
         page.wait_for_load_state("domcontentloaded")
 
         return self._make_result(
-            ok=True, content=f"Clicked '{selector}'",
+            ok=True,
+            content=f"Clicked '{selector}'",
             metadata={"selector": selector},
         )
 
     def _browser_type(self, args: dict[str, Any]) -> "ToolResult":
         selector = str(args.get("selector", "")).strip()
         text = args.get("text", "")
-        timeout = int(args.get("timeout", 30000))
+        timeout = _clamp_per_call_timeout_ms(args.get("timeout", 30000))
 
         if not selector:
             return self._make_result(ok=False, content="", error="'selector' and 'text' are required for type action")
@@ -395,7 +602,8 @@ class BrowserActionToolsMixin:
 
         snippet = text[:50] + "..." if len(text) > 50 else text
         return self._make_result(
-            ok=True, content=f"Typed '{snippet}' into '{selector}'",
+            ok=True,
+            content=f"Typed '{snippet}' into '{selector}'",
             metadata={"selector": selector, "text_length": len(text)},
         )
 
@@ -407,13 +615,18 @@ class BrowserActionToolsMixin:
 
         max_chars = int(args.get("max_chars", 15000))
         max_chars = max(1000, min(max_chars, 50000))
-        if len(text) > max_chars:
+        # See _browser_navigate: report real content length + total_length, not
+        # the marker-inflated len(text).
+        total_len = len(text)
+        reported_len = min(total_len, max_chars)
+        if total_len > max_chars:
             text = text[:max_chars] + f"\n\n...[TRUNCATED at {max_chars} chars]..."
 
         result = f"Title: {title}\nURL: {url}\n\n{text}"
         return self._make_result(
-            ok=True, content=result,
-            metadata={"title": title, "url": url, "length": len(text)},
+            ok=True,
+            content=result,
+            metadata={"title": title, "url": url, "length": reported_len, "total_length": total_len},
         )
 
     def _browser_screenshot(self, args: dict[str, Any]) -> "ToolResult":
@@ -424,7 +637,8 @@ class BrowserActionToolsMixin:
         page.screenshot(path=filepath, full_page=True)
 
         return self._make_result(
-            ok=True, content=f"Screenshot saved to {filepath}",
+            ok=True,
+            content=f"Screenshot saved to {filepath}",
             metadata={"filepath": filepath, "url": page.url},
         )
 
@@ -438,13 +652,14 @@ class BrowserActionToolsMixin:
         result = page.evaluate(js)
 
         return self._make_result(
-            ok=True, content=str(result),
+            ok=True,
+            content=str(result),
             metadata={"result_type": type(result).__name__},
         )
 
     def _browser_wait(self, args: dict[str, Any]) -> "ToolResult":
         selector = args.get("selector")
-        timeout = int(args.get("timeout", 30000))
+        timeout = _clamp_per_call_timeout_ms(args.get("timeout", 30000))
 
         page = self._get_page()
 
@@ -452,6 +667,8 @@ class BrowserActionToolsMixin:
             page.wait_for_selector(str(selector), timeout=timeout)
             return self._make_result(ok=True, content=f"Selector '{selector}' appeared.")
         else:
+            # Clamped above, so a no-selector wait can never sleep past the hard
+            # executor ceiling (which would trip the session-resetting wedge).
             wait_ms = max(timeout, 1)
             time.sleep(wait_ms / 1000)
             return self._make_result(

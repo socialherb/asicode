@@ -37,6 +37,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Optional
 
+from ._shared_utils import _capped_put
+
 if TYPE_CHECKING:  # avoid hard import at module load
     from .call_graph import CallGraphIndexer
 # ── index cache ─────────────────────────────────────────────────────────────
@@ -44,7 +46,12 @@ if TYPE_CHECKING:  # avoid hard import at module load
 # Cache it so repeated select_affected_tests calls within a short window
 # (e.g. multiple quality-gate firings per agent run) don't re-parse
 # every file each time.
+#
+# Bounded via _capped_put (FIFO cap 8) so long-lived processes visiting many
+# repos don't accumulate stale entries indefinitely (matching the
+# _WALK_CACHE / _PY_WALK_CACHE / _FILE_INDEX_CACHE pattern).
 _index_cache: dict[str, tuple[dict[str, list[str]], dict[str, list[str]], float]] = {}
+_INDEX_CACHE_CAP = 8
 _INDEX_CACHE_TTL = 600  # seconds — safe to be generous; invalidate_index() is event-driven
 
 
@@ -61,7 +68,7 @@ def _build_or_get_index(repo_root: Path) -> tuple[dict[str, list[str]], dict[str
     if cached is not None and now - cached[2] < _INDEX_CACHE_TTL:
         return cached[0], cached[1]
     idx = _build_test_stem_index(repo_root)
-    _index_cache[key] = (*idx, now)
+    _capped_put(_index_cache, key, (*idx, now), cap=_INDEX_CACHE_CAP)
     return idx
 
 _MAX_CALLGRAPH_DEPTH = 2   # callers + callers-of-callers

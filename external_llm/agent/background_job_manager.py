@@ -38,6 +38,31 @@ def _cap_tail(buf: str) -> str:
     return _TRUNCATION_MARKER + buf[-_OUTPUT_BUF_CAP:]
 
 
+_MALLOC_NOISE_TOKEN = "MallocStackLogging"
+
+
+def strip_malloc_noise(text: str) -> str:
+    """Drop macOS libmalloc stack-logging chatter from captured stderr.
+
+    A forked child inherits the parent's malloc stack-logging state and
+    libmalloc writes its status lines to fd 2 *before* exec — so they land in
+    the captured stderr pipe and masquerade as command output. Unsetting the
+    ``MallocStackLogging*`` env vars on the child does not suppress them when
+    logging was enabled on the parent by some route other than the
+    environment, so filtering is the load-bearing mitigation.
+
+    Applied to the *accumulated* buffer at read time rather than to each pipe
+    chunk: a non-blocking read can split a noise line in half, and re-filtering
+    the whole buffer lets the straddled line self-heal once the rest arrives.
+    """
+    if not text or _MALLOC_NOISE_TOKEN not in text:
+        return text
+    return "".join(
+        line for line in text.splitlines(keepends=True)
+        if _MALLOC_NOISE_TOKEN not in line
+    )
+
+
 def recover_communicate_partial(proc) -> None:
     """Salvage output ``communicate(timeout=...)`` consumed before TimeoutExpired.
 
@@ -324,7 +349,7 @@ class BackgroundJobManager:
                 pass
 
         stdout = job._stdout_buf
-        stderr = job._stderr_buf
+        stderr = strip_malloc_noise(job._stderr_buf)
 
         return BackgroundJobInfo(
             job_id=job_id,
@@ -383,7 +408,7 @@ class BackgroundJobManager:
             except Exception:
                 pass
             stdout = job._stdout_buf
-            stderr = job._stderr_buf
+            stderr = strip_malloc_noise(job._stderr_buf)
             infos.append(BackgroundJobInfo(
                 job_id=job_id,
                 command=command,

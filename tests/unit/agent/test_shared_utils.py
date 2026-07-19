@@ -689,3 +689,45 @@ def test_walk_repo_files_complete_cache_serves_smaller_cap_without_overshoot(tmp
         f"{len(small)} files for a max_files=3 request"
     )
     assert small is not big  # still a distinct object (shallow copy after slice)
+
+
+def test_walk_repo_files_miss_path_returns_copy_not_cached_object(tmp_path):
+    """Regression: the cache-MISS paths previously returned the very list object
+    stored in *cache* (only the HIT path returned a shallow copy). The FIRST
+    caller to populate a cache entry therefore held the live cached object and
+    could .append()/.sort() it, silently corrupting the cache for every later
+    caller — exactly the pollution the HIT-path copy exists to prevent. Both
+    MISS paths (truncated early-exit AND complete walk) must now return a copy."""
+    from pathlib import Path
+
+    from external_llm.agent._shared_utils import _walk_repo_files
+
+    # ── Case A: truncated early-exit miss path (len(results) == max_files) ──
+    for i in range(5):
+        (tmp_path / f"a{i}.py").write_text("x = 1\n")
+    cache: dict = {}
+    first = _walk_repo_files(tmp_path, 3, cache, lambda n: n.endswith(".py"))
+    assert len(first) == 3
+    cached_obj = cache[str(tmp_path)][1]
+    assert first is not cached_obj, (
+        "Truncated miss path must return a COPY, not the cached list object"
+    )
+    # Mutate the returned copy; the cache entry must be unaffected.
+    first.append(Path("/polluted.py"))
+    assert Path("/polluted.py") not in cache[str(tmp_path)][1], (
+        "Caller .append() on the returned list leaked into the cache"
+    )
+
+    # ── Case B: complete-walk miss path (walk finishes below max_files) ──
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "b.py").write_text("y = 1\n")
+    cache2: dict = {}
+    complete = _walk_repo_files(sub, 100, cache2, lambda n: n.endswith(".py"))
+    assert len(complete) == 1
+    cached_obj2 = cache2[str(sub)][1]
+    assert complete is not cached_obj2, (
+        "Complete-walk miss path must return a COPY, not the cached list object"
+    )
+    complete.append(Path("/polluted2.py"))
+    assert Path("/polluted2.py") not in cache2[str(sub)][1]

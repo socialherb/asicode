@@ -1230,6 +1230,23 @@ def _undo_run_changes(repo_root: str, baseline: dict) -> tuple[list[str], list[s
     return undone, failed
 
 
+def _fmt_elapsed(elapsed: float) -> str:
+    """Format a wall-clock duration — shared duration formatter.
+
+    The single source for every CLI-facing duration: the per-turn status line
+    and ``_print_session_summary`` both call this.  Sub-second precision for the
+    < 60s case (e.g. ``8.2s``); minutes use ``1m 12s`` and hours zero-pad the
+    minutes field (``1h 02m``).
+    """
+    if elapsed < 60:
+        return f"{elapsed:.1f}s"
+    mins, secs = divmod(int(elapsed), 60)
+    hrs, mins = divmod(mins, 60)
+    if hrs:
+        return f"{hrs}h {mins:02d}m"
+    return f"{mins}m {secs}s"
+
+
 def _print_session_summary(session_tokens: dict, t0: float) -> None:
     """One-line summary right before session end (elapsed · ↑↓ tokens). Silent if no usage.
 
@@ -1243,9 +1260,7 @@ def _print_session_summary(session_tokens: dict, t0: float) -> None:
     ct = session_tokens.get("completion", 0)
     if not (pt or ct):
         return
-    mins, secs = divmod(int(time.monotonic() - t0), 60)
-    hrs, mins = divmod(mins, 60)
-    dur = f"{hrs}h {mins}m" if hrs else (f"{mins}m {secs}s" if mins else f"{secs}s")
+    dur = _fmt_elapsed(time.monotonic() - t0)
     _print(
         f"  session  {dur}  ·  ↑{_abbrev_tokens(pt)} ↓{_abbrev_tokens(ct)} tokens",
         _C["muted"],
@@ -1312,6 +1327,9 @@ _KNOWN_MODELS: dict[str, list[str]] = {
         "deepseek-v4-pro",
     ],
     "openai": [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
         "gpt-4o",
         "gpt-4o-mini",
         "o3",
@@ -7588,6 +7606,15 @@ def run_repl(args: argparse.Namespace) -> None:
                                     _input_key = ""
                                 if _input_key:
                                     _ak = _input_key
+                                    # Persist the key so it survives a re-switch in the same
+                                    # session AND a CLI restart — mirrors the initial-setup
+                                    # path (which sets os.environ + writes .env). Without this
+                                    # the key lives only in the local `_ak` var and the prompt
+                                    # re-appears on every /model switch / restart.
+                                    if _ak_var:
+                                        os.environ[_ak_var] = _input_key
+                                        if repo_root:
+                                            _save_key_to_dotenv(repo_root, _ak_var, _input_key)
                                     _print(f"  using inline API key for {_new_provider}", _C["green"])
                                 else:
                                     # Cancel: restore original provider/model
@@ -8572,7 +8599,7 @@ def run_repl(args: argparse.Namespace) -> None:
             # the ongoing LLM response without interruption, then stops at next checkpoint (AgentCancelled).
             # Result collection/session recording happens in _finalize_pending_design_chat()
             # right before next input — ensures interrupt note is recorded before new user turn.
-            _dc_box: dict = {"result": None, "error": None}
+            _dc_box: dict = {"result": None, "error": None, "elapsed": 0.0}
 
             def _dc_worker(_box=_dc_box, _loop=design_loop, _msgs=_messages_for_llm,
                            _cb=design_cb, _mode=_current_chat_mode,
@@ -8584,6 +8611,7 @@ def run_repl(args: argparse.Namespace) -> None:
                     # webapp/design_chat.py does incremental rendering via design_token, but
                     # CLI path has no content handler in _ProgressPrinter, so enabling
                     # streaming would only add overhead.
+                    _t_dc0 = time.monotonic()
                     _box["result"] = _loop.respond(
                         _msgs,
                         stream_callback=_cb,
@@ -8594,8 +8622,15 @@ def run_repl(args: argparse.Namespace) -> None:
                         thinking_mode=_thinking,
                         reasoning_effort=_effort,
                     )
+                    _box["elapsed"] = time.monotonic() - _t_dc0
                 except Exception as _we:
                     _box["error"] = _we
+                    # Record partial elapsed so interrupted/failed turns still
+                    # show how long the loop ran in the status line.
+                    try:
+                        _box["elapsed"] = time.monotonic() - _t_dc0
+                    except NameError:
+                        pass
 
             _dc_thread = threading.Thread(target=_dc_worker, daemon=True)
             _dc_thread.start()
@@ -8702,6 +8737,12 @@ def run_repl(args: argparse.Namespace) -> None:
                 _groups.append(f"tok ↑{_abbrev_tokens(_pt)}  ↓{_abbrev_tokens(_ct)}")
             if _crt and _pt:
                 _groups.append(f"cache {_hit_pct:.0f}%")
+            # Tool-loop wall-clock duration — per-turn latency (measured inside the
+            # design-chat worker around loop.respond(), so it excludes thread
+            # spawn/join overhead). Always present on a completed turn.
+            _dc_elapsed = _dc_box.get("elapsed", 0.0) or 0.0
+            if _dc_elapsed > 0:
+                _groups.append(_fmt_elapsed(_dc_elapsed))
             # Session on separate line — wrapping past 80 chars breaks left alignment
             if _groups:
                 _print(f"  {' │ '.join(_groups)}", _C["muted"])
@@ -9861,6 +9902,16 @@ def main() -> None:
         description="asicode Interactive CLI — direct engine connection",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
+    )
+    from utils.version_check import get_current_version as _get_ver
+    _ver = _get_ver()
+    parser.add_argument(
+        "--version", action="version",
+        version=(
+            f"asicode {_ver}"
+            if _ver != "0.0.0"
+            else "asicode 0.0.0 (uninstalled source checkout — pip install for a real version)"
+        ),
     )
     parser.add_argument("--repo", "-r", metavar="PATH",
                         help="Repository root path (default: current directory)")

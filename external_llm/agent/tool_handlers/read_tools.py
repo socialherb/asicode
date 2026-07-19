@@ -247,6 +247,20 @@ class ReadToolsMixin:
                 _tok = CodeTokenizer()
                 _qtokens = _tok.tokenize(pattern)
                 if _qtokens:
+                    # Pre-truncate to bound BM25 cost for pathological match sets.
+                    # BM25 on 50k+ lines is O(n*q) CPU — pre-cutting to a sensible
+                    # cap keeps ranking quality (top N out of shuffled filesystem
+                    # order ≅ top N out of K*N) while bounding worst-case time.
+                    # We take only the first max_results*20 or 5000 (whichever is
+                    # larger) lines, which comfortably covers the top max_results
+                    # (≤500) after re-ranking.  The tail is appended unsorted at the
+                    # end — it will be truncated away by the max_results cap below.
+                    _bm25_cap = max(max_results * 20, 5000)
+                    if len(lines) > _bm25_cap:
+                        _tail = lines[_bm25_cap:]
+                        lines = lines[:_bm25_cap]
+                    else:
+                        _tail = []
                     _tokenized = [_tok.tokenize(_item_) for _item_ in lines]
                     _doc_tc: list[dict[str, int]] = [dict(Counter(t)) for t in _tokenized]
                     _doc_lens = [len(t) for t in _tokenized]
@@ -259,7 +273,9 @@ class ReadToolsMixin:
                         _bm25(_qtokens, _doc_tc[i], _doc_lens[i], _df, _n, _avgdl)
                         for i in range(_n)
                     ]
-                    lines = [_item_ for _, _item_ in sorted(zip(_scores, lines, strict=False), reverse=True)]
+                    lines = [lines[i] for i in sorted(range(_n), key=lambda i: _scores[i], reverse=True)]
+                    if _tail:
+                        lines.extend(_tail)
 
             truncated = len(lines) > max_results
             total = len(lines)

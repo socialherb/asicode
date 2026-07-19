@@ -1,4 +1,4 @@
-name: Lint (F401/F811/F821 baseline-diff)
+name: Lint (F401/F811/F821 baseline-diff + F823 zero-tolerance)
 
 on:
   push:
@@ -40,3 +40,11 @@ jobs:
         # per <path>::<name> group — drift-proof, so editing lines above a
         # baselined redefinition never false-positives.
         run: python scripts/check_f811_no_new.py
+
+      - name: Check ZERO F823 referenced-before-assignment
+        # NO baseline (unlike the three above): the repo was at zero when this
+        # was added and F823 is always a real bug — a missing `global`/`nonlocal`
+        # that turns an outer-scope read into a runtime UnboundLocalError.
+        # Motivating incident: a 500 on /stats/rg-fallback that ruff had been
+        # reporting all along, invisible because only F821/F401/F811 were gated.
+        run: python scripts/check_f823_none.py

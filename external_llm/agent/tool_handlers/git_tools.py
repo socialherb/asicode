@@ -13,6 +13,7 @@ from ..background_job_manager import (
     BackgroundJobManager,
     get_global_background_job_manager,
     recover_communicate_partial,
+    strip_malloc_noise,
 )
 from ...common.subprocess_utils import run_bounded_subprocess as _run_bounded_subprocess
 
@@ -792,12 +793,7 @@ class ShellToolsMixin:
                 )
 
             stdout = stdout_data or ""
-            raw_stderr = stderr_data or ""
-            filtered_stderr_lines = [
-                line for line in (raw_stderr.splitlines() if raw_stderr else [])
-                if "MallocStackLogging" not in (line or "")
-            ]
-            stderr = "\n".join(filtered_stderr_lines).strip()
+            stderr = strip_malloc_noise(stderr_data or "").strip()
 
             parts_out = []
             if stdout:
@@ -821,7 +817,7 @@ class ShellToolsMixin:
             #   - rg/grep --with-filename: exits abnormally after match due to internal error (SIGPIPE etc.)
             # stderr and exit code are included in content for LLM visibility.
             # If stdout is empty and exit code != 0, treat as a real failure.
-            ok = proc.returncode == 0 or (proc.returncode == 1 and not stderr) or bool(stdout.strip())
+            ok = proc.returncode == 0 or (proc.returncode == 1 and not stderr) or (proc.returncode >= 128 and bool(stdout.strip()))
 
             # ── pytest missing-plugin recovery ────────────────────────────────
             # A non-zero exit with "unrecognized arguments" in stderr, for a pytest

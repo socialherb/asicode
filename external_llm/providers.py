@@ -87,6 +87,53 @@ def _ollama_think_value(model: str, thinking_mode: Optional[bool],
     return bool(thinking_mode) if thinking_mode is not None else None
 
 
+def _normalize_ollama_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge all ``system``-role messages into a single system message at index 0.
+
+    Some Ollama chat templates (notably the Qwen3 family, e.g. ``bonsai27b``)
+    enforce that a ``system`` message may ONLY appear as the very first message.
+    A second system message — even a bare divider line — makes the Jinja
+    template raise an exception and the whole request is rejected with HTTP 400::
+
+        raise_exception('System message must be at the beginning.')
+
+    The agent's context builder emits several consecutive ``system`` messages
+    (core prompt, divider, repo root, project context, design insights, ...).
+    Cloud providers tolerate multiple system messages, but strict local
+    templates do not, so this normalisation is Ollama-specific.
+
+    Collapses every ``system`` message into one at the front (content joined by
+    newlines), preserving the relative order of all non-system messages. Safe
+    no-op when there are 0 or 1 system messages.
+    """
+    system_parts: list[str] = []
+    rest: list[dict[str, Any]] = []
+    first_sys: Optional[dict[str, Any]] = None
+    sys_count = 0
+    for m in messages:
+        if m.get("role") == "system":
+            sys_count += 1
+            content = m.get("content")
+            if content:
+                system_parts.append(content)
+            if first_sys is None:
+                first_sys = m
+        else:
+            rest.append(m)
+    # No system at all, or exactly one already at index 0 → already valid.
+    if sys_count <= 1 and (not messages or messages[0].get("role") == "system"):
+        return messages
+    if not system_parts:
+        return messages
+    merged: dict[str, Any] = {"role": "system", "content": "\n".join(system_parts)}
+    # Preserve non-payload keys (e.g. 'images') from the first system message.
+    if first_sys:
+        for k, v in first_sys.items():
+            if k not in ("role", "content"):
+                merged[k] = v
+    return [merged] + rest
+
+
 def _is_gemini_3(model: str) -> bool:
     """Return True for Gemini 3 series models that use thinkingLevel (not thinkingBudget).
 
@@ -1574,6 +1621,10 @@ class OllamaClient(LLMClient):
                     m_dict["content"] = image_text + ("\n" + msg.content if msg.content else "")
             ollama_messages.append(m_dict)
 
+        # Collapse all system messages into one at index 0 — strict templates
+        # (e.g. Qwen3 / bonsai27b) reject any system message that is not first.
+        ollama_messages = _normalize_ollama_system_messages(ollama_messages)
+
         payload = {
             "model": model,
             "messages": ollama_messages,
@@ -1586,17 +1637,19 @@ class OllamaClient(LLMClient):
         if max_tokens:
             payload["options"]["num_predict"] = max_tokens
 
-        # Auto-expand context window for small models to avoid Ollama truncating the
-        # system prompt. Tuned for M1/M2 8GB unified memory - weights + KV cache
-        # must fit in ~6GB (macOS + process overhead takes ~2GB).
+        # Auto-set num_ctx so Ollama does not truncate the system prompt. The
+        # floor is 8192 for EVERY model: asicode's system prefix (core_prompt +
+        # project.md + design_insights) is ~5272 tokens (measured via
+        # _cjk_aware_tokens), which already OVERFLOWS Ollama's 4096 default and
+        # would 400 ("exceeds context size") before any user content is added.
+        # NOTE: earlier size-based tiers (e.g. 13B+ -> 4096, 8B-12B -> 6144) were
+        # never implemented in code AND are not viable — both are below the 5272
+        # token prefix, so applying them would make asicode unbootable.
         # KV cache grows linearly with num_ctx; roughly:
         #   KV_GB = num_ctx * num_layers * kv_heads * head_dim * 4 / 1e9
-        # Tiers (8GB Mac optimal):
-        #   <1.7B   -> 8192  (weights <1GB, KV ~0.5GB, safe)
-        #   1.7B-4B -> 8192  (weights ~3.4GB, KV ~0.5GB, total ~3.9GB)
-        #   4B-8B   -> 8192  (weights ~4.7GB, KV ~1GB, total ~5.7GB)
-        #   8B-12B  -> 6144  (weights ~5.2GB, KV ~0.75GB, total ~6GB)
-        #   13B+    -> 4096  (weights >7GB, KV must be tiny)
+        # On memory-constrained hardware (8GB unified memory), users who need a
+        # different value set num_ctx in the Modelfile — priority 0 in
+        # _num_ctx_for_model reads it from /api/show at runtime.
         #
         if "num_ctx" not in kwargs:
             _num_ctx = self._num_ctx_for_model(model)
@@ -1798,17 +1851,22 @@ class OllamaClient(LLMClient):
             raise LLMAPIError(f"Ollama request failed: {e}") from e
 
     def _num_ctx_for_model(self, model: str) -> Optional[int]:
-        """Return appropriate num_ctx for a given model name, or None if unknown.
+        """Return appropriate num_ctx for a given model name.
 
         Priority:
-          0. Dynamic query from Ollama /api/show (Option B) — if the model has an
-             explicit ``num_ctx`` set in its Modelfile, use it.  This allows users
-             to customize context size via ``ollama run /set num_ctx X /save``.
+          0. Dynamic query from Ollama /api/show — if the model has an
+             explicit ``num_ctx`` set in its Modelfile, use it.  This allows
+             users to customize context size via ``ollama run /set num_ctx X /save``.
           1. Explicit registry override (OLLAMA_NUM_CTX_OVERRIDES) — for tags
-             that don't encode a parseable size.  Currently empty — users should
-             set num_ctx via Modelfile for persistent custom values.
-          2. Return None — Ollama uses its own default (OLLAMA_CONTEXT_LENGTH or
-             model-specific default).
+             whose Modelfile lacks num_ctx and the 8192 floor is wrong.  Currently
+             empty — users should set num_ctx via Modelfile for persistent values.
+          2. Sensible fallback (8192) — Ollama's own default (4096) is too small
+             for asicode's system prompt: the measured prefix (core_prompt +
+             project.md + design_insights) is ~5272 tokens, so unknown models
+             would otherwise 400 on "exceeds context size".  8192 is the floor
+             for every model (NOT size-based — see the note in chat()).  Users
+             wanting more (e.g. bonsai27b = 256K Qwen3, Q1_0 → 32768) or less
+             should set num_ctx via Modelfile (priority 0).
         """
         # 0. Dynamic query from Ollama API (Option B)
         from external_llm.ollama_api import query_ollama_num_ctx
@@ -1824,8 +1882,22 @@ class OllamaClient(LLMClient):
         if override is not None:
             return override
 
-        # 2. No fallback — Ollama will use its own default num_ctx
-        return None
+        # 2. Sensible fallback — Ollama's 4096 default is too small for asicode's
+        #    system prompt.  8192 guarantees asicode boots for any unknown model;
+        #    users can override via Modelfile (priority 0) for larger/smaller values.
+        #    NOTE: this overrides the Ollama server's ``OLLAMA_CONTEXT_LENGTH`` env.
+        #    Previously this branch returned None and let the server decide (so the
+        #    env was respected), but that path silently 400'd on asicode's ~5272-token
+        #    system prefix under Ollama's 4096 default.  Users relying on the env for
+        #    a larger window should set num_ctx in the Modelfile (priority 0) instead.
+        #    The architectural context_length from /api/show (e.g. qwen35.context_length
+        #    =262144) is intentionally NOT used as a floor — it is the model's
+        #    theoretical maximum, not a memory-safe value on constrained hardware
+        #    (128K KV cache would OOM an 8GB box), and a correct per-device cap cannot
+        #    be inferred without VRAM/slot knowledge.
+        fallback = 8192
+        logger.debug("num_ctx=%d fallback (no Modelfile/registry) for model %s", fallback, model)
+        return fallback
 
     def chat_with_tools(
         self,
@@ -1901,6 +1973,10 @@ class OllamaClient(LLMClient):
             else:
                 # system / user
                 ollama_messages.append({"role": msg.role, "content": msg.content or ""})
+
+        # Collapse all system messages into one at index 0 — strict templates
+        # (e.g. Qwen3 / bonsai27b) reject any system message that is not first.
+        ollama_messages = _normalize_ollama_system_messages(ollama_messages)
 
         # Convert tools to Ollama format (same as OpenAI)
         ollama_tools = [

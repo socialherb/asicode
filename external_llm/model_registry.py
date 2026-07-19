@@ -12,9 +12,11 @@ Matching rules:
   - OLLAMA_VISION_KEYWORDS uses substring matching (keyword in name), not exact tags.
   - CLOUD_PROVIDER_PREFIXES and MODEL_ANSWER_MAX_TOKENS are checked in order;
     first match wins — put more specific entries before general ones.
-  - Size-based fallback for num_ctx lives in providers.py (_num_ctx_for_model)
-    and handles standard tag names like "qwen3:8b". Only non-parseable tags
-    (like ":e2b") need entries in OLLAMA_NUM_CTX_OVERRIDES.
+  - num_ctx resolution lives in providers.py (_num_ctx_for_model): priority 0
+    reads the model's Modelfile via Ollama /api/show, priority 1 is
+    OLLAMA_NUM_CTX_OVERRIDES, priority 2 is a flat 8192 floor (asicode's system
+    prefix is ~5272 tokens, above Ollama's 4096 default). There is NO tag-name
+    size parsing — the old "handles qwen3:8b" claim was never implemented.
 """
 
 from __future__ import annotations
@@ -47,9 +49,10 @@ def _check_model_capability_cached(model_name: str, capability: str) -> bool:
 
 
 # ── Ollama: Explicit num_ctx overrides ────────────────────────────────────────
-# For models whose tag doesn't encode their size (e.g., ":e2b", ":e4b").
-# Standard tags like "qwen3:8b" are handled by the size-based fallback in
-# providers.py — no entry needed here.
+# For models whose Modelfile lacks num_ctx. Most models set num_ctx via Modelfile
+# (priority 0 in _num_ctx_for_model reads it from /api/show); the flat 8192 floor
+# (priority 2) covers the rest. This override dict is the middle escape hatch for
+# tags that need a value the Modelfile does not provide — NOT size parsing.
 #
 # Entries are intentionally empty.  Users who need custom num_ctx should set
 # it via Modelfile: ``ollama run /set num_ctx X /save``.  asicode reads it

@@ -357,7 +357,7 @@ class ToolRegistry(
       ShellToolsMixin     — shell_exec (bash)
       TestToolsMixin    — run_tests, run_lint
       AgentToolsMixin   — update_memory, delegate_to_helper
-      WebSearchToolsMixin — search_web (DuckDuckGo/Brave/SearXNG)
+      WebSearchToolsMixin — search_web (SearXNG/Brave/DuckDuckGo/Naver-browser)
     """
 
     # Directories pruned when counting source files for language detection.

@@ -19,10 +19,26 @@ from typing import Optional
 
 from ..languages import LanguageId
 from ..common.atomic_io import atomic_write_text
+from .operation_models import DELETE_KINDS, FILE_WRITING_KINDS
 
 # ── Task drift detection ───────────────────────────────────────────────────
 # Detects when the agent's plan operations drift from the original spec.
 # Runs after plan creation, before execution.
+
+
+def _kind_value(kind) -> str:
+    """Normalize an op kind to its canonical lowercase value string.
+
+    Robust to three input forms — a real ``OperationKind`` member (production),
+    a lowercase value string ("modify_symbol"), or a defensive uppercase NAME
+    string ("MODIFY_SYMBOL").  ``None``/unknown → "".  The result compares
+    correctly against the SSOT enum-member frozensets because str-Enum members
+    hash/compare equal to their lowercase value.
+    """
+    if kind is None:
+        return ""
+    val = kind.value if hasattr(kind, "value") else str(kind)
+    return val.lower() if isinstance(val, str) else str(val).lower()
 
 
 @dataclass
@@ -41,14 +57,17 @@ def detect_task_drift(
     spec_target_symbols: Optional[list[str]],
     plan_operations: list,
     request_type: str = "",
-    reference_files: Optional[list[str]] = None,
-    reference_symbols: Optional[list[str]] = None,
+    spec_new_files: Optional[list[str]] = None,
 ) -> DriftReport:
     """Detect task drift between spec targets and plan operations.
 
     Checks:
-    1. Untargeted files: operations touch files not in spec.target_files
-       (lenient: allow if the file is in new_files or is a test file)
+    1. Untargeted files: file-writing operations touch files not in
+       ``spec_target_files`` ∪ ``spec_new_files``.  New files the plan is
+       allowed to create (``spec_new_files``) are legitimate targets — without
+       this allowance every CREATE_FILE op would score 2 drift points and a
+       2-file plan would hit "medium" severity, blocking execution.  Matches
+       candidate_ranker's ``set(spec.target_files + spec.new_files)`` union.
     2. Drifted kinds: operation kinds inconsistent with request_type
        (e.g., DELETE_SYMBOL_RANGE on a "fix" request)
 
@@ -73,6 +92,11 @@ def detect_task_drift(
         return os.path.normpath(p)
 
     target_files = {_norm(tf) for tf in (spec_target_files or [])}
+    # New files the plan is allowed to create are never "untargeted" — they
+    # are legitimate targets by construction.  Without this union, every
+    # CREATE_FILE op would score 2 drift points and a 2-file plan would hit
+    # "medium" severity, blocking execution.
+    allowed_files = target_files | {_norm(nf) for nf in (spec_new_files or [])}
 
     # Collect operation targets
     ops_files: set = set()
@@ -84,26 +108,19 @@ def detect_task_drift(
         if _norm_path:
             ops_files.add(_norm_path)
         if _kind is not None:
-            _kind_str = _kind.value if hasattr(_kind, "value") else str(_kind)
-            ops_kinds.add(_kind_str)
+            ops_kinds.add(_kind_value(_kind))
 
     # 1. Untargeted files (ops touch files not in spec)
-    # Allow READ_SYMBOL ops as they are analysis, not modification
-    _WRITE_KINDS = {
-        "MODIFY_SYMBOL", "INSERT_AFTER_SYMBOL", "INSERT_AFTER_LINE",
-        "DELETE_SYMBOL_RANGE",
-        "ANCHOR_EDIT", "INSERT_IMPORT", "REMOVE_IMPORT", "REMOVE_IMPORT_NAME", "CREATE_FILE",
-        "OVERWRITE_FILE", "REPLACE_FILE", "DELETE_FILE", "SUMMARIZE_ANALYSIS",
-    }
+    # Only file-writing ops are checked; read-only ops (READ_SYMBOL, …) are
+    # analysis, not modification.  FILE_WRITING_KINDS is the SSOT enum-member
+    # frozenset — str-Enum members match by lowercase value, never uppercase NAME.
     _untargeted_write_files: set = set()
     for op in plan_operations:
-        _kind_str = getattr(op, "kind", None)
-        _kind_str = _kind_str.value if hasattr(_kind_str, "value") else str(_kind_str)
-        if _kind_str not in _WRITE_KINDS:
+        if _kind_value(getattr(op, "kind", None)) not in FILE_WRITING_KINDS:
             continue
         _path = getattr(op, "path", None) or ""
         _norm_path = _norm(_path) if _path else ""
-        if _norm_path and _norm_path not in target_files:
+        if _norm_path and _norm_path not in allowed_files:
             _untargeted_write_files.add(_norm_path)
 
     if _untargeted_write_files:
@@ -114,11 +131,12 @@ def detect_task_drift(
     # TASK_DRIFT now only checks file-level and kind-level drift.
 
     # 3. Drifted kinds: detect DELETE operations on non-delete requests
-    _DELETE_KINDS = {"DELETE_SYMBOL_RANGE", "DELETE_FILE"}
-    _has_delete = bool(ops_kinds & _DELETE_KINDS)
+    # DELETE_KINDS is the SSOT enum-member frozenset; ops_kinds holds lowercase
+    # value strings, which intersect correctly with str-Enum members.
+    _has_delete = bool(ops_kinds & DELETE_KINDS)
     _is_edit_request = request_type in ("modify", "edit", "fix", "refactor", "", "unknown")
     if _has_delete and _is_edit_request:
-        _delete_kinds_found = sorted(ops_kinds & _DELETE_KINDS)
+        _delete_kinds_found = sorted(ops_kinds & DELETE_KINDS)
         report.drifted_kinds = _delete_kinds_found
 
     # ── Severity classification ────────────────────────────────────────────

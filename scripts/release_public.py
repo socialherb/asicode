@@ -45,7 +45,16 @@ import export_public  # noqa: E402  (reuse the exclusion rules verbatim)
 
 
 def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    """Run a subprocess with a 120s timeout. On timeout, abort immediately."""
+    try:
+        return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        cmd = " ".join(str(a) for a in args)
+        print(
+            f"fatal: '{cmd}' timed out after 120s — aborting release.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def _version() -> str:
@@ -148,7 +157,10 @@ def main() -> int:
             print(f"error: push failed:\n{p.stderr}", file=sys.stderr)
             return 1
         if "--tag" in flags:
-            _run(["git", "push", "origin", f"v{version}"], public)
+            t = _run(["git", "push", "origin", f"v{version}"], public)
+            if t.returncode != 0:
+                print(f"error: tag push failed:\n{t.stderr}", file=sys.stderr)
+                return 1
         print(f"pushed {branch} to origin")
     else:
         print(f"not pushed — review with:  git -C {public} show --stat HEAD\n"

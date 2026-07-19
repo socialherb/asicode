@@ -1,10 +1,14 @@
 # See https://pre-commit.com for installation and usage
 # Install:  pipx install pre-commit && pre-commit install
 #
-# This gate mirrors .github/workflows/lint.yml EXACTLY: the three ruff
-# baseline-diff checks (F821/F401/F811). It catches lint-baseline drift
-# (e.g. the F811 line-scoped key shifting when a baselined file is edited
-# above a redefinition) BEFORE the public CI does.
+# This gate mirrors .github/workflows/lint.yml EXACTLY: three ruff
+# baseline-diff checks (F821/F401/F811) plus one zero-tolerance check (F823).
+# It catches lint-baseline drift (e.g. the F811 line-scoped key shifting when a
+# baselined file is edited above a redefinition) BEFORE the public CI does.
+#
+# F823 has no baseline: the repo was at zero when the check was added, and the
+# rule has no legitimate use (it is always a missing `global`/`nonlocal`). See
+# scripts/check_f823_none.py for the production bug that motivated it.
 #
 # Why not full `ruff` / `ruff-format` / `pyright`? pyproject selects
 # E/F/I/N/UP/W/B/ASYNC/RUF but ~1377 un-baselined lint violations and ~982
@@ -31,5 +35,11 @@ repos:
         name: F811 (redefinition of unused) baseline-diff
         language: system
         entry: python3 scripts/check_f811_no_new.py
+        pass_filenames: false
+        always_run: true
+      - id: no-f823
+        name: F823 (referenced before assignment) zero-tolerance
+        language: system
+        entry: python3 scripts/check_f823_none.py
         pass_filenames: false
         always_run: true

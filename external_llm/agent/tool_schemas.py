@@ -941,7 +941,10 @@ SCHEMA_WEB_FETCH = {
         "Fetch and read content from a URL. Returns the page content as formatted text. "
         "Use when you need the full content of a web page, library documentation, API spec, "
         "or any URL you found via search_web. "
-        "NOT for: search (use search_web instead), local files, authenticated/gated content."
+        "NOT for: search (use search_web instead), local files, authenticated/gated content.\n\n"
+        "HTML is converted to readable text with paragraph structure preserved. If output is "
+        "TRUNCATED, the marker tells you the exact start_index to pass on the next call to "
+        "continue reading the rest — nothing is permanently unreachable."
     ),
     "parameters": {
         "type": "object",
@@ -954,6 +957,15 @@ SCHEMA_WEB_FETCH = {
                 "type": "integer",
                 "description": "Maximum characters to return (1000-50000, default 15000).",
                 "default": 15000,
+            },
+            "start_index": {
+                "type": "integer",
+                "description": (
+                    "Character offset to begin reading at (default 0). Use this to continue "
+                    "reading past a previous TRUNCATION — the truncation marker reports the "
+                    "exact value to pass here."
+                ),
+                "default": 0,
             },
         },
         "required": ["url"],
@@ -1059,7 +1071,8 @@ SCHEMA_BROWSER_ACTION = {
             "timeout": {
                 "type": "integer",
                 "description": (
-                    "Timeout in milliseconds for navigation/click/wait (default: 30000). "
+                    "Timeout in milliseconds for navigation/click/wait (default: 30000, "
+                    "clamped at ~115s max — values above this are silently reduced). "
                     "Failure ceiling, not a target — keep the default for heavy SPAs. "
                     "To return faster, use wait_until='domcontentloaded', NOT a shorter timeout."
                 ),

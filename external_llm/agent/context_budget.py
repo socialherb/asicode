@@ -57,7 +57,11 @@ _CONTEXT_LIMITS: dict[str, int] = {
     # DeepSeek — original deepseek-r1 (64K context); deepseek-chat/reasoner are
     # deprecated aliases for deepseek-v4-flash thinking/non-thinking → 1M fallback.
     "deepseek-r1":       64_000,
-    # Zhipu GLM (zai + opencode) — glm-5.2 is 1M (fallback); glm-5/5.1/5-turbo 200K; glm-4.7 128K
+    # Zhipu GLM (zai + opencode). glm-5.2 is the DEFAULT_MODEL and 1M is verified
+    # (Z.ai docs: "Context Length: 1M" — generational leap from the 200K family).
+    # Listed EXPLICITLY (not via _DEFAULT fallback) so the default model's window
+    # cannot silently drift if _DEFAULT_CONTEXT_LIMIT changes. glm-5/5.1/5-turbo 200K; glm-4.7 128K.
+    "glm-5.2":          1_000_000,
     "glm-5.1":          200_000,
     "glm-5-turbo":      200_000,
     "glm-5":            200_000,

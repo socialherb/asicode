@@ -1279,20 +1279,15 @@ class PlannerPipelineMixin:
         # Compare plan operations against spec to detect when the agent
         # drifts from the original request (modifying unrelated files,
         # targeting wrong symbols, using wrong operation kinds).
-        _ref_files = list(getattr(_spec, "reference_files", None) or []) if _spec is not None else []
-        # reference_files: exclude read-only source files from drift
-        # detection so the system does not flag them as "missing targets".
         if _spec is not None:
             try:
                 from .output_normalizer import detect_task_drift
-                _drift_ref_syms = list(getattr(_spec, "reference_symbols", None) or [])
                 _drift_report = detect_task_drift(
                     spec_target_files=list(getattr(_spec, "target_files", None) or []),
                     spec_target_symbols=list(getattr(_spec, "target_symbols", None) or []),
                     plan_operations=list(op_plan.operations or []),
                     request_type=getattr(_spec, "request_type", "") or "",
-                    reference_symbols=_drift_ref_syms,
-                    reference_files=_ref_files,
+                    spec_new_files=list(getattr(_spec, "new_files", None) or []),
                 )
                 if _drift_report.has_drift:
                     logger.warning(
@@ -1353,21 +1348,31 @@ class PlannerPipelineMixin:
         _pre_requires_changes = _pre_pp.requires_code_changes if _pre_pp is not None else False
         _atm_no_edit = False
         if _pre_requires_changes and op_plan.operations:
-            from external_llm.editor._editor_core.lane.operation_executor import _EDIT_OP_KINDS as _PRECHECK_EDIT_KINDS
-            _pre_has_edit_op = any(
-                op.kind in _PRECHECK_EDIT_KINDS for op in op_plan.operations
-            )
-            _pre_is_phase1 = (
-                op_plan.execution_phase == ExecutionPhase.PHASE1_ANALYSIS
-                and op_plan.requires_phase2
-            )
-            if not _pre_has_edit_op and not _pre_is_phase1:
-                logger.info(
-                    "[PLAN_VALIDITY] plan has no edit ops despite "
-                    "requires_code_changes=True (policy=%r ops=%d)",
-                    _pre_policy_kind, len(op_plan.operations),
+            try:
+                from external_llm.editor._editor_core.lane.operation_executor import (
+                    _EDIT_OP_KINDS as _PRECHECK_EDIT_KINDS,
                 )
-                _atm_no_edit = True
+            except ImportError:
+                # lane is excluded from the public wheel — degrade gracefully
+                # by skipping the analyze_then_modify precheck (conservative:
+                # leave _atm_no_edit=False). Mirrors the lane-import guards in
+                # planner_lane_facade.py and run_store.py.
+                _PRECHECK_EDIT_KINDS = None
+            if _PRECHECK_EDIT_KINDS is not None:
+                _pre_has_edit_op = any(
+                    op.kind in _PRECHECK_EDIT_KINDS for op in op_plan.operations
+                )
+                _pre_is_phase1 = (
+                    op_plan.execution_phase == ExecutionPhase.PHASE1_ANALYSIS
+                    and op_plan.requires_phase2
+                )
+                if not _pre_has_edit_op and not _pre_is_phase1:
+                    logger.info(
+                        "[PLAN_VALIDITY] plan has no edit ops despite "
+                        "requires_code_changes=True (policy=%r ops=%d)",
+                        _pre_policy_kind, len(op_plan.operations),
+                    )
+                    _atm_no_edit = True
 
         # ── Checkpoint: snapshot repo state before write operations ──
         # Default ON, *scoped*: only the files the plan targets (op.path) are
