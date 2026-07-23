@@ -204,3 +204,50 @@ class TestNumCtxForModelFallback:
     def test_priority1_registry_wins_over_floor(self, _reg, _api):
         """Priority 1 (OLLAMA_NUM_CTX_OVERRIDES) beats the 8192 floor."""
         assert self._client()._num_ctx_for_model("gemma:e2b") == 6144
+
+    # ── Estimation-aware fallback (priority 2) ─────────────────────────────
+
+    @patch("external_llm.ollama_api.query_ollama_num_ctx", return_value=None)
+    @patch("external_llm.model_registry.get_ollama_num_ctx", return_value=None)
+    def test_estimation_with_llmmessage_raises_above_floor(self, _reg, _api):
+        """Real LLMMessage with large content triggers estimation > 8192."""
+        from external_llm.client import LLMMessage
+        msgs = [LLMMessage(role="user", content="x" * 50000)]
+        est = self._client()._num_ctx_for_model("test:latest", messages=msgs)
+        assert est > 8192
+        assert est <= 32768
+
+    @patch("external_llm.ollama_api.query_ollama_num_ctx", return_value=None)
+    @patch("external_llm.model_registry.get_ollama_num_ctx", return_value=None)
+    def test_estimation_caps_at_32768(self, _reg, _api):
+        """Extremely large messages cap at 32768, never above."""
+        from external_llm.client import LLMMessage
+        msgs = [LLMMessage(role="user", content="x" * 1_000_000)]
+        est = self._client()._num_ctx_for_model("test:latest", messages=msgs)
+        assert est <= 32768
+
+    @patch("external_llm.ollama_api.query_ollama_num_ctx", return_value=None)
+    @patch("external_llm.model_registry.get_ollama_num_ctx", return_value=None)
+    def test_estimation_with_dict_messages(self, _reg, _api):
+        """Dict messages are also estimated (regression: chat() was silently 0)."""
+        msgs = [{"role": "user", "content": "x" * 50000}]
+        est = self._client()._num_ctx_for_model("test:latest", messages=msgs)
+        assert est > 8192
+        assert est <= 32768
+
+    @patch("external_llm.ollama_api.query_ollama_num_ctx", return_value=4096)
+    def test_explicit_modelfile_not_raised_by_estimation(self, _api):
+        """Priority 0 Modelfile value honoured exactly, even if estimate > it."""
+        from external_llm.client import LLMMessage
+        msgs = [LLMMessage(role="user", content="x" * 50000)]
+        est = self._client()._num_ctx_for_model("test:latest", messages=msgs)
+        assert est == 4096  # Modelfile wins, estimation not applied
+
+    @patch("external_llm.ollama_api.query_ollama_num_ctx", return_value=None)
+    @patch("external_llm.model_registry.get_ollama_num_ctx", return_value=6144)
+    def test_explicit_registry_not_raised_by_estimation(self, _reg, _api):
+        """Priority 1 registry value honoured exactly, even if estimate > it."""
+        from external_llm.client import LLMMessage
+        msgs = [LLMMessage(role="user", content="x" * 50000)]
+        est = self._client()._num_ctx_for_model("test:latest", messages=msgs)
+        assert est == 6144  # Registry wins, estimation not applied

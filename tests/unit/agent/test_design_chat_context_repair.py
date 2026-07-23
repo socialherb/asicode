@@ -1,9 +1,10 @@
 """Regression: DCL _apply_context_hard_cap must repair orphaned tool messages
 left by count-based preemptive_trim.
 
-preemptive_trim slices ``messages[:1] + messages[-(N+1):]`` without regard for
-assistant(tool_calls) <-> role="tool" pairs. When the trim boundary splits such
-a pair, the kept tail starts with an orphaned role="tool" message whose
+preemptive_trim keeps ``messages[:1]`` (system) + a recent tail anchored on the
+most recent user message (see ``_shared_utils.preemptive_trim``), without regard
+for assistant(tool_calls) <-> role="tool" pairs. When the trim boundary splits
+such a pair, the kept tail starts with an orphaned role="tool" message whose
 preceding assistant(tool_calls) was dropped. OpenAI/DeepSeek/Anthropic reject
 this with HTTP 400 ("orphaned tool_result" / "messages must alternate").
 
@@ -163,15 +164,21 @@ class TestRealPreemptiveTrimOrphan:
     def test_large_session_split_pair_repaired(self):
         """A long orchestration session where real preemptive_trim naturally splits
         an assistant(tool_calls)<->tool pair must produce a repaired (HTTP-400-safe)
-        sequence. deepseek-r1: limit=64000, cap~59904 -> need est>59904 (>~180k chars)."""
-        system = LLMMessage(role="system", content="sys")
-        big_filler = LLMMessage(role="user", content="Z" * 200_000)  # pushes over cap
-        asst1 = _asst(["tc1"], content="analyze")     # trimmed (mid-list)
-        tool1 = _tool("tc1", "tool_result_tc1")        # orphan candidate
-        asst2 = _asst(["tc2"], content="next")
-        tool2 = _tool("tc2", "tool_result_tc2")
+        sequence.
 
-        msgs = [system, big_filler, asst1, tool1, asst2, tool2]
+        The oversized turn is the ASSISTANT ahead of the current request, not the
+        request itself: preemptive_trim anchors its kept tail on the most recent
+        *user* message (f8f3540c — a request without its user query 400s on strict
+        chat templates), so a giant user message would just be preserved whole and
+        nothing would trim. Here the huge ``asst1`` is dropped instead, orphaning
+        its ``tool1`` result at the trim boundary — the real end-to-end path this
+        repair guards. deepseek-r1: limit=64000, cap~59904 (asst1 ~100k tokens)."""
+        system = LLMMessage(role="system", content="sys")
+        asst1 = _asst(["tc1"], content="Z" * 200_000)  # oversized -> dropped by trim
+        tool1 = _tool("tc1", "tool_result_tc1")         # orphaned at the trim boundary
+        user_req = LLMMessage(role="user", content="current request")  # preserved anchor
+
+        msgs = [system, asst1, tool1, user_req]
         result = dcl._apply_context_hard_cap(msgs, model="deepseek-r1")
 
         assert is_http400_safe(result), (
@@ -179,5 +186,11 @@ class TestRealPreemptiveTrimOrphan:
             f"{[getattr(m, 'role', '') for m in result]}")
         roles = [getattr(m, "role", "") for m in result]
         assert roles[0] == "system"
-        # the big filler must have been trimmed (otherwise nothing happened)
-        assert "Z" * 100 not in (getattr(result[1], "content", "") or "")
+        # f8f3540c invariant: the current user request always survives the trim.
+        assert roles[-1] == "user"
+        assert getattr(result[-1], "content", "") == "current request"
+        # the oversized assistant turn (not the request) was trimmed — otherwise
+        # nothing happened and the split-pair path was never exercised.
+        assert not any("Z" * 100 in (getattr(m, "content", "") or "") for m in result)
+        # the tool result orphaned by the split was repaired away (no bare tool).
+        assert "tool" not in roles

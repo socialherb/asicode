@@ -471,10 +471,10 @@ class SymbolSearcher:
             # which may belong to a different class earlier in the file.
             # Guard: root may be a directory (e.g. "playground/galaga"), not a file.
             # _find_in_python calls read_text() which raises IsADirectoryError.
-            if root.is_file() and root.suffix == ".py":
+            if root.is_file() and LanguageId.from_path(str(root)) == LanguageId.PYTHON:
                 parent_results = self._find_in_python_cached(root, search_name, kind,
                                                              parent_class=parent_class)
-            elif root.is_file() and root.suffix == ".go":
+            elif root.is_file() and LanguageId.from_path(str(root)) == LanguageId.GO:
                 parent_results = self._find_in_go(root, search_name, kind,
                                                   parent_class=parent_class)
             else:
@@ -511,7 +511,7 @@ class SymbolSearcher:
                             return [parent_defs[0]]
 
         # ── Python AST scan ──────────────────────────────────────────────────
-        py_files = [root] if root.is_file() and root.suffix == ".py" else _walk_py_files(root)
+        py_files = [root] if root.is_file() and LanguageId.from_path(str(root)) == LanguageId.PYTHON else _walk_py_files(root)
         for pf in py_files:
             results.extend(self._find_in_python_cached(pf, search_name, kind))
             if len(results) >= _cfg.counts.SEARCH_RESULTS_CAP:
@@ -812,7 +812,7 @@ class SymbolSearcher:
         except Exception:
             return []  # non-critical — never block execution
 
-        if p.suffix == ".py":
+        if LanguageId.from_path(str(p)) == LanguageId.PYTHON:
             return self._outline_python(p, rel)
         elif LanguageId.from_path(str(p)) in (LanguageId.TYPESCRIPT, LanguageId.JAVASCRIPT):
             try:
@@ -1040,8 +1040,14 @@ class SymbolSearcher:
         provider = LanguageRegistry.instance().get(str(file_path))
         if provider is not None:
             for sp in provider.get_symbol_patterns(kind="any"):
-                # Convert {name} placeholder to capture group for outline mode
-                outline_regex = sp.regex.replace("{name}", "(\\w+)")
+                # Convert {name} placeholder to capture group for outline mode.
+                # Use the pattern's OWN name_capture (default \w+) — NOT a hardcoded
+                # \w+ — so providers that capture broader names work here too: Lua
+                # [\w.:]+ for dotted/colon methods (M.foo / Account:bar), CSS [-\w]+
+                # for kebab-case. With a hardcoded \w+ the dotted form silently failed
+                # to match (the whole regex aborted at the '.'), dropping the symbol.
+                # This MUST mirror the repo-index substitution in _nonpy_index_for.
+                outline_regex = sp.regex.replace("{name}", f"({sp.name_capture})")
                 patterns.append((outline_regex, sp.kind))
         else:
             # Fallback for languages without a registered provider (Rust, etc.)

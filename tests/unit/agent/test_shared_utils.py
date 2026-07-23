@@ -617,6 +617,50 @@ def test_walk_ts_js_consumes_TS_JS_EXTENSIONS_constant(tmp_path, monkeypatch):
     assert "b.customext" in got, "walker must read _TS_JS_EXTENSIONS at call time"
     assert "a.ts" not in got, "walker must not carry a stale inline extension list"
 
+
+def test_walk_extension_constants_derived_from_family_groups():
+    """_TS_JS_EXTENSIONS / _PY_EXTENSIONS must be derived from the
+    _LANGUAGE_EXTENSION_GROUPS SSOT, not hardcoded literals. A hardcoded tuple
+    drifted from the SSOT and silently dropped .mts/.cts/.mjs/.cjs/.pyi from
+    find_symbol / call_graph (confirmed regression). This pins the derivation so
+    re-hardcoding (or adding a family extension without the walker picking it up)
+    fails loudly."""
+    from external_llm.agent import _shared_utils as su
+    from external_llm.languages.models import _LANGUAGE_EXTENSION_GROUPS
+
+    ts_js_group = next(g for g in _LANGUAGE_EXTENSION_GROUPS if ".ts" in g)
+    py_group = next(g for g in _LANGUAGE_EXTENSION_GROUPS if ".py" in g)
+    assert set(su._TS_JS_EXTENSIONS) == set(ts_js_group)
+    assert set(su._PY_EXTENSIONS) == set(py_group)
+    # The drift class that motivated this: modern JS/TS + Python stub extensions.
+    for ext in (".mts", ".cts", ".mjs", ".cjs"):
+        assert ext in su._TS_JS_EXTENSIONS, f"{ext} must be in the JS/TS walker set"
+    assert ".pyi" in su._PY_EXTENSIONS, ".pyi must be in the Python walker set"
+
+
+def test_walk_ts_js_files_covers_modern_extensions(tmp_path):
+    """_walk_ts_js_files must discover .mts/.cts/.mjs/.cjs files, not just the
+    legacy .ts/.tsx/.js/.jsx quartet."""
+    from external_llm.agent import _shared_utils as su
+
+    for ext in (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"):
+        (tmp_path / f"mod{ext}").write_text("x = 1\n")
+    su._TS_WALK_CACHE.clear()
+    got = {p.suffix for p in su._walk_ts_js_files(tmp_path, max_files=100)}
+    assert got == {".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"}
+
+
+def test_walk_py_files_covers_type_stubs(tmp_path):
+    """_walk_py_files must discover .pyi type-stub files, not just .py."""
+    from external_llm.agent import _shared_utils as su
+
+    (tmp_path / "real.py").write_text("x = 1\n")
+    (tmp_path / "stub.pyi").write_text("y: int\n")
+    su._PY_WALK_CACHE.clear()
+    got = {p.name for p in su._walk_py_files(tmp_path, max_files=100)}
+    assert got == {"real.py", "stub.pyi"}
+
+
 def test_walk_repo_files_returns_cached_on_second_call(tmp_path):
     """Second call within TTL returns a copy of the cached result — same contents,
     distinct object (shallow copy prevents cache pollution from caller mutations)."""

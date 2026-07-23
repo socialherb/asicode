@@ -163,7 +163,9 @@ def _run_collaborate(args: argparse.Namespace) -> None:
     repo_root = os.getcwd()
 
     # Initialize ToolRegistry
-    agent_config = AgentConfig()
+    # Trusted local CLI: allow read tools to cross the repo boundary (the bash
+    # tool already can). Same trust level applies to the local MCP-server path below.
+    agent_config = AgentConfig(unrestricted_read=True)
     registry = ToolRegistry(repo_root=repo_root, config=agent_config)
 
     # Setup streaming display
@@ -241,7 +243,9 @@ def _run_mcp(args: argparse.Namespace) -> None:
             print()
 
     elif args.mcp_command == "start":
-        agent_config = AgentConfig()
+        # Local MCP server serving the user's own MCP client — same trust level as
+        # the interactive CLI above, so read tools may cross the repo boundary.
+        agent_config = AgentConfig(unrestricted_read=True)
         registry = ToolRegistry(repo_root=repo_root, config=agent_config)
 
         print(f"Starting asicode MCP server ({args.mode} mode)...")

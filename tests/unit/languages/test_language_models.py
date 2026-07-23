@@ -29,8 +29,11 @@ def test_known_language_returns_own_family():
     assert caller_search_extensions("build.scala") == [".sc", ".scala"]
     assert caller_search_extensions("script.sc") == [".sc", ".scala"]
     assert caller_search_extensions("config.lua") == [".lua"]
-    assert caller_search_extensions("run.sh") == [".bash", ".sh"]
-    assert caller_search_extensions("run.bash") == [".bash", ".sh"]
+    assert caller_search_extensions("run.sh") == [".bash", ".ksh", ".sh", ".zsh"]
+    assert caller_search_extensions("run.bash") == [".bash", ".ksh", ".sh", ".zsh"]
+    # zsh/ksh join the bash callability family (share the bash grammar).
+    assert caller_search_extensions("run.zsh") == [".bash", ".ksh", ".sh", ".zsh"]
+    assert caller_search_extensions("run.ksh") == [".bash", ".ksh", ".sh", ".zsh"]
 
 
 def test_python_family_includes_type_stubs():
@@ -110,7 +113,7 @@ def test_group_indices_are_stable():
     assert _get_language_group(".swift") == 10                           # Swift
     assert _get_language_group(".scala") == _get_language_group(".sc") == 11  # Scala
     assert _get_language_group(".lua") == 12                             # Lua
-    assert _get_language_group(".sh") == _get_language_group(".bash") == 13  # Bash
+    assert _get_language_group(".sh") == _get_language_group(".bash") == _get_language_group(".zsh") == _get_language_group(".ksh") == 13  # Bash
 
 
 def test_unknown_extension_returns_minus_one():

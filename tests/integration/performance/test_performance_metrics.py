@@ -81,10 +81,38 @@ class TestPerformanceMetrics:
         """Test recording failed agent result."""
         pass
 
-    @pytest.mark.skip(reason="Tool error recording not implemented in PerformanceCollector")
     def test_tool_call_error_recording(self):
-        """Test recording tool call errors."""
-        pass
+        """Test recording tool call errors (failed=not result.ok path).
+
+        Previously a documented gap: ``record_tool_call`` had no ``failed``
+        parameter and ``ToolMetrics`` had no ``failures`` counter, so a failed
+        tool call (rolled-back write, missing-file read) was counted identically
+        to a success — hiding the most important autonomous-agent health signal.
+        Mirrors ``LLMMetrics.failures`` / ``record_llm_call(failed=...)``.
+        """
+        collector = PerformanceCollector()
+
+        # apply_patch: 2 calls, 1 failed (rolled-back write)
+        collector.record_tool_call("apply_patch", execution_time=0.2, cache_hit=False, failed=False)
+        collector.record_tool_call("apply_patch", execution_time=0.15, cache_hit=False, failed=True)
+
+        # read_file: 3 calls, 1 failed (missing file)
+        collector.record_tool_call("read_file", execution_time=0.01, cache_hit=False, failed=False)
+        collector.record_tool_call("read_file", execution_time=0.02, cache_hit=False, failed=False)
+        collector.record_tool_call("read_file", execution_time=0.005, cache_hit=False, failed=True)
+
+        summary = collector.get_summary()
+        tool_metrics = summary["tool_metrics"]
+
+        ap = tool_metrics["apply_patch"]
+        assert ap["call_count"] == 2
+        assert ap["failures"] == 1
+        assert ap["failure_rate"] == 0.5
+
+        rf = tool_metrics["read_file"]
+        assert rf["call_count"] == 3
+        assert rf["failures"] == 1
+        assert abs(rf["failure_rate"] - (1 / 3)) < 0.001
 
     def test_multiple_tool_calls(self):
         """Test recording multiple tool calls."""

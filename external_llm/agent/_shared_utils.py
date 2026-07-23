@@ -11,6 +11,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+import functools
 import json
 import os
 import re as _re
@@ -19,6 +20,8 @@ import warnings
 from pathlib import Path
 from typing import Any, Optional
 
+from external_llm.languages.comment_syntax import CommentSyntax, comment_syntax_for
+from external_llm.languages.models import _LANGUAGE_EXTENSION_GROUPS
 from .operation_models import OpStatus
 
 
@@ -59,10 +62,36 @@ assert _FAIL_STATUSES.issuperset(
     f"{ {s for s in OpStatus if ('FAIL' in s.name or 'ERROR' in s.name) and s not in _FAIL_STATUSES} }"
 )
 
-# TS/JS file extensions (source of truth — no local redefinitions in consumers)
-# tuple (not frozenset) so it is usable directly with str.endswith();
-# this is the single source of truth consumed by _walk_ts_js_files below.
-_TS_JS_EXTENSIONS: tuple = ('.ts', '.tsx', '.js', '.jsx')
+# File-extension sets for the repo walkers, derived from the language-family
+# SSOT (_LANGUAGE_EXTENSION_GROUPS in languages/models.py). A hardcoded tuple
+# here drifted from that SSOT: .pyi (Python) and .mts/.cts/.mjs/.cjs (JS/TS)
+# were first-class in _EXT_MAP + provider globs + _LANGUAGE_EXTENSION_GROUPS but
+# absent from the walkers — so find_symbol / call_graph silently returned
+# nothing for symbols defined in those files (confirmed regression: a function
+# in mod.mts or a class in stub.pyi was invisible to find_symbol). Deriving
+# from the family groups keeps the walkers structurally in sync with every
+# other SSOT dimension: adding an extension to a family now propagates here
+# automatically. tuple (not frozenset) so it is usable directly with
+# str.endswith(); sorted for deterministic ordering.
+
+# Guard for the SSOT-derived constants below: if the .ts or .py group
+# is ever removed from _LANGUAGE_EXTENSION_GROUPS, the next(..., None)
+# would silently return None, and "None or f()" would call this. Raise
+# a clear error rather than crashing at module level with StopIteration.
+def _STOP_ITER_FALLBACK(name: str) -> None:
+    raise RuntimeError(
+        f"SSOT invariant broken: no group containing {name} found in "
+        f"_LANGUAGE_EXTENSION_GROUPS"
+    )
+
+_TS_JS_EXTENSIONS: tuple = tuple(sorted(
+    next((g for g in _LANGUAGE_EXTENSION_GROUPS if ".ts" in g), None)
+    or _STOP_ITER_FALLBACK("_TS_JS_EXTENSIONS (.ts)")
+))
+_PY_EXTENSIONS: tuple = tuple(sorted(
+    next((g for g in _LANGUAGE_EXTENSION_GROUPS if ".py" in g), None)
+    or _STOP_ITER_FALLBACK("_PY_EXTENSIONS (.py)")
+))
 
 # ── Shared repo file walkers ─────────────────────────────────────────────────
 # Consolidated here so symbol_search and call_graph share ONE walk
@@ -73,6 +102,7 @@ _TS_JS_EXTENSIONS: tuple = ('.ts', '.tsx', '.js', '.jsx')
 # each — so both consumers now also exclude venv/site-packages/*.egg-info dirs
 # that call_graph previously indexed.
 import time as _walk_time
+from ..languages import LanguageId
 
 _WALK_SKIP_DIRS: frozenset = frozenset({
     ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache",
@@ -190,7 +220,7 @@ def _walk_py_files(root, max_files: int) -> list:
 
     Results are cached per root for ``_WALK_CACHE_TTL`` seconds.
     """
-    return _walk_repo_files(root, max_files, _PY_WALK_CACHE, lambda n: n.endswith(".py"))
+    return _walk_repo_files(root, max_files, _PY_WALK_CACHE, lambda n: n.endswith(_PY_EXTENSIONS))
 
 
 def _walk_ts_js_files(root, max_files: int) -> list:
@@ -384,6 +414,361 @@ def _brace_match_depth(text: str, start: int, initial_depth: int = 1) -> int:
     return len(text)
 
 
+def _scan_to_line_state(
+    lines,
+    end_lineno: int,
+    comment_syntax: Optional[CommentSyntax] = None,
+) -> tuple[Optional[str], bool, Optional[str]]:
+    """Scan ``lines[0:end_lineno]`` and return the literal/block-comment state
+    ENTERING line ``end_lineno`` — ``(in_str, in_triple, block_close)``.
+
+    Seeds :func:`_net_bracket_delta` (and the F2 forward scan) with correct
+    prior-line context so a ``replace_line`` whose anchor sits INSIDE a
+    multi-line block comment (``/* */``, Lua ``--[[ ]]``) or triple-quoted
+    string is not mis-counted. Without this seed the per-line tally treats the
+    anchor's brackets as real code, falsely tripping the F2 expansion and
+    ``del``-ing the real code after the comment (confirmed data-loss vector;
+    the forward scan likewise started from empty state and mis-identified the
+    close line).
+
+    Cost is O(end_lineno) line scans — acceptable for an interactive edit op,
+    and the common case (anchor in normal code) simply yields the empty state
+    ``(None, False, None)`` (measured <45ms even for a 10k-line file).
+
+    .. note:: Unclosed-quote fallback. A non-triple single/double quote that
+       stays open across a line boundary is NEVER a legitimate multi-line
+       literal in any supported language — multi-line literals use
+       triple-quotes (tracked via ``in_triple``) or backticks (JS/TS template
+       literals, kept as ``in_str='`'``). An open ``'``/``"`` at end-of-prefix
+       is therefore either a Rust *lifetime* (``'a``, ``'static`` — a single
+       ``'`` with no closer, which the scanner cannot distinguish from a char
+       literal without a real grammar) or a genuine syntax error. Returning a
+       poisoned seed in that case lets the F2 forward scan mis-identify the
+       close line and ``del`` real code (confirmed: an odd-count lifetime above
+       the anchor deletes a victim line below it). Falling back to the empty
+       seed is provably safe — no valid code is affected — and closes the
+       documented Rust residual risk without a per-language special case.
+       Triple-quote and block-comment seeds are unaffected (they are legit
+       multi-line constructs); only the non-triple ``'``/``"`` case resets.
+    """
+    if comment_syntax is None:
+        comment_syntax = comment_syntax_for(LanguageId.UNKNOWN)
+    _in_str, _in_triple, _block_close = None, False, None
+    for _i in range(0, min(end_lineno, len(lines))):
+        _, _in_str, _in_triple, _block_close = _scan_line_brackets_delta(
+            lines[_i], _in_str, _in_triple, _block_close, comment_syntax
+        )
+    # Defensive fallback: an open non-triple ' / " crossing a line boundary is a
+    # Rust lifetime or a syntax error, never a legit literal — a poisoned seed
+    # here is a confirmed data-loss vector (F2 forward scan mis-identifies the
+    # close line). Triple-quote (`in_triple`) and backtick seeds are legit and
+    # kept; only the non-triple ' / " case resets to the empty state.
+    if _in_str in ('"', "'") and not _in_triple:
+        return None, False, None
+    return _in_str, _in_triple, _block_close
+
+
+def _net_bracket_delta(
+    text: str,
+    comment_syntax: Optional[CommentSyntax] = None,
+    *,
+    in_str: Optional[str] = None,
+    in_triple: bool = False,
+    block_close: Optional[str] = None,
+) -> int:
+    """Net bracket delta (``{}``, ``()``, ``[]``) outside string/comment content.
+
+    Language-aware via *comment_syntax* (a typed policy from
+    :mod:`external_llm.languages.comment_syntax`, looked up per-file via
+    :func:`comment_syntax_for`): the scanner skips exactly the line- and
+    block-comment tokens the target language uses — e.g. ``#`` for Python/Ruby/
+    Bash, ``//`` + ``/* */`` for the C-family, BOTH for PHP, ``--`` for Lua.
+
+    This replaces the prior binary ``c_style_comments`` flag, which classified
+    every non-Python language as C-style and thus mis-counted brackets inside
+    ``#`` comments for Ruby / Bash / PHP (genuine ``#``-comment languages) — a
+    latent data-loss vector (a bracket in a ``#`` comment was counted, falsely
+    tripping the guard and triggering the F2 multi-line expansion that ``del``
+    real code). Centralising the classification in a typed policy means a new
+    language can never silently re-introduce the bug: its ``LanguageId`` simply
+    maps to its ``CommentSyntax``.
+
+    *comment_syntax* defaults to ``None`` (skip no comments) — the safest
+    default, since counting a bracket inside a comment is far less dangerous
+    than wrongly skipping a bracket inside real code. Callers that care about
+    comment-awareness MUST pass an explicit policy.
+
+    String/char/template literals (with escape and triple-quote handling) are
+    ALWAYS skipped, regardless of language.
+
+    The optional *in_str* / *in_triple* / *block_close* seed the scanner with
+    the prior-line state (computed by :func:`_scan_to_line_state`) so a line
+    that sits INSIDE a multi-line block comment or triple-quoted string opened
+    on an earlier line is counted correctly — its brackets are part of the
+    literal/comment, not real code. Without this, a ``replace_line`` whose
+    anchor is inside a ``/* */`` block would mis-trigger the F2 expansion and
+    ``del`` the real code after the comment (confirmed data-loss vector).
+
+    .. note:: Rust lifetime limitation — a single ``'`` opens a char/string
+       literal for ALL languages, which is correct for C/C++/Java (``'a'``),
+       JS/TS/Go (``'...'``) and Python (``'...'``). But Rust *lifetimes*
+       (``'a``, ``'static``) use a SINGLE quote with no closing quote, so the
+       scanner enters an unterminated "string" and swallows any subsequent
+       bracket — e.g. ``foo::<'a>(x)`` tallies as ``0`` instead of ``+1`` (the
+       ``(`` is consumed). This is a per-line false negative kept intentionally:
+       distinguishing a lifetime from a char literal needs a real grammar, and a
+       heuristic would risk re-introducing the exact mis-count for char literals
+       in every OTHER language. Impact is now BENIGN: at worst a missed
+       bracket-balance guard (→ a possible syntax error, never data loss),
+       because the guard compares ``_old_delta`` vs ``_new_delta`` on the same
+       line and a miss simply skips the F2 expansion. The dangerous case — a
+       poisoned seed reaching the anchor from an odd-count lifetime ABOVE it and
+       mis-directing the F2 forward scan to ``del`` a victim line — is closed by
+       :func:`_scan_to_line_state`'s unclosed-quote fallback (a non-triple
+       ``'``/``"`` open at a line boundary is reset to the empty seed).
+
+    Returns the net count of opening minus closing brackets across all three
+    bracket families, ignoring any bracket that appears inside a literal or
+    comment. This is the SSOT per-line bracket tally for the bracket-balance
+    guard in ``anchor_edit`` (``replace_line``) — both the tool path
+    (``write_tools._tool_anchor_edit``) and the editor path
+    (``symbol_handlers_anchor._handle_anchor_edit``) consume it so the two
+    cannot desync.
+    """
+    if comment_syntax is None:
+        comment_syntax = comment_syntax_for(LanguageId.UNKNOWN)
+    _line_tokens = comment_syntax.line_tokens
+    _block_pairs = comment_syntax.block_pairs
+
+    _delta = 0
+    _in_str = in_str
+    _in_triple = in_triple
+    _esc = False
+    _j = 0
+    _n = len(text)
+    # Entering mid-block-comment: skip to the block's close token first. The
+    # whole line up to the close is comment content (brackets ignored); if the
+    # close is not on this line, the entire line is inside the comment.
+    if block_close is not None:
+        _end = text.find(block_close)
+        if _end < 0:
+            return 0
+        _j = _end + len(block_close)
+    while _j < _n:
+        _ch = text[_j]
+        if _in_str is not None:
+            # Inside a string literal. A backslash escapes the next character;
+            # we track escape state with ``_esc`` rather than the naive
+            # ``prev != '\\'`` look-back, which mis-counts ``"C:\\"`` (an escaped
+            # backslash — the trailing ``"`` is a real closer) and leaves the
+            # literal open, swallowing the code after it. Mirrors the verified
+            # escape state machine in :mod:`external_llm.providers`.
+            if _in_triple:
+                if not _esc and text[_j:_j + 3] == _in_str * 3:
+                    _in_str = None
+                    _in_triple = False
+                    _esc = False
+                    _j += 3
+                    continue
+            elif not _esc and _ch == _in_str:
+                _in_str = None
+                _esc = False
+                _j += 1
+                continue
+            if _esc:
+                _esc = False
+            elif _ch == '\\':
+                _esc = True
+            _j += 1
+            continue
+        # Not inside a literal: a quote opens one (incl. triple), else fall
+        # through to comment / bracket accounting.
+        if _ch in ('"', "'", '`'):
+            if _j + 2 < _n and text[_j:_j + 3] == _ch * 3:
+                _in_str = _ch
+                _in_triple = True
+                _esc = False
+                _j += 3
+                continue
+            _in_str = _ch
+            _in_triple = False
+            _esc = False
+            _j += 1
+            continue
+        # Block comments — checked BEFORE line tokens so a block open
+        # that shares a prefix with a line token (Lua '--[[' vs '--')
+        # wins. (Also handles PHP '/* */' alongside its '#' line token.)
+        _skipped = False
+        for _open, _close in _block_pairs:
+            if text[_j:_j + len(_open)] == _open:
+                _end = text.find(_close, _j + len(_open))
+                _j = _n if _end < 0 else _end + len(_close)
+                _skipped = True
+                break
+        if _skipped:
+            continue
+        # Line comments — '#' (Python/Ruby/Bash/php), '//' (C-family),
+        # '--' (Lua); PHP matches BOTH '#' and '//'.
+        for _tok in _line_tokens:
+            if text[_j:_j + len(_tok)] == _tok:
+                _nl = text.find('\n', _j)
+                _j = _n if _nl < 0 else _nl
+                _skipped = True
+                break
+        if _skipped:
+            continue
+        if _ch in '({[':
+            _delta += 1
+        elif _ch in ')}]':
+            _delta -= 1
+        _j += 1
+    return _delta
+
+
+def _scan_line_brackets_delta(
+    line: str,
+    in_str: Optional[str],
+    in_triple: bool,
+    block_close: Optional[str],
+    comment_syntax: Optional[CommentSyntax] = None,
+) -> tuple[int, Optional[str], bool, Optional[str]]:
+    """Scan ONE line for net bracket delta, carrying string/comment state.
+
+    Stateful companion to :func:`_net_bracket_delta` for the multi-line F2
+    bracket-expansion scan in ``anchor_edit(replace_line)``. The per-line
+    ``_net_bracket_delta`` is stateless (resets string state each call), so it
+    CANNOT walk consecutive lines where a string or block-comment that opened
+    on a prior line is still open. This helper threads that state
+    (``in_str`` / ``in_triple`` / ``block_close``) across line boundaries so the
+    expansion scan never mis-counts a bracket living inside a multi-line
+    construct — which previously caused it to mis-identify the close line and
+    ``del`` real code (e.g. a ``)`` inside a Python ``#`` comment was counted,
+    terminating the scan early and deleting the function's real arguments).
+
+    Language-aware via *comment_syntax* (a typed policy; see
+    :func:`_net_bracket_delta`). The ``block_close`` state carries the CLOSE
+    token of whichever block comment is currently open (e.g. ``*/`` for a
+    C-family block, ``]]`` for a Lua long comment), or ``None`` when no
+    block comment is open. Carrying the close token (rather than a bare bool)
+    means languages with different block-comment styles coexist correctly.
+    Triple-quoted strings carry their open state across lines too.
+
+    Returns ``(delta, in_str, in_triple, block_close)`` — the state to pass
+    into the next line's call.
+    """
+    if comment_syntax is None:
+        comment_syntax = comment_syntax_for(LanguageId.UNKNOWN)
+    _line_tokens = comment_syntax.line_tokens
+    _block_pairs = comment_syntax.block_pairs
+
+    _delta = 0
+    _esc = False
+    _j = 0
+    _n = len(line)
+    while _j < _n:
+        _ch = line[_j]
+        # 1. Inside a block comment: look ONLY for its close token.
+        if block_close is not None:
+            if line[_j:_j + len(block_close)] == block_close:
+                _j += len(block_close)
+                block_close = None
+                continue
+            _j += 1
+            continue
+        # 2. Inside a string literal. ``_esc`` tracks backslash escapes within
+        #    the line (mirrors :func:`_net_bracket_delta`); it is reset to False
+        #    at the start of every line rather than threaded across boundaries,
+        #    because ``\<newline>`` in a multi-line literal is a line
+        #    continuation (the backslash escapes the newline, not the first
+        #    char of the next line), so each line starts unescaped.
+        if in_str is not None:
+            if in_triple:
+                if not _esc and line[_j:_j + 3] == in_str * 3:
+                    in_str = None
+                    in_triple = False
+                    _esc = False
+                    _j += 3
+                    continue
+            elif not _esc and _ch == in_str:
+                in_str = None
+                _esc = False
+                _j += 1
+                continue
+            if _esc:
+                _esc = False
+            elif _ch == '\\':
+                _esc = True
+            _j += 1
+            continue
+        # 3. String/template-literal open.
+        if _ch in ('"', "'", '`'):
+            if _j + 2 < _n and line[_j:_j + 3] == _ch * 3:
+                in_str = _ch
+                in_triple = True
+                _esc = False
+                _j += 3
+                continue
+            in_str = _ch
+            in_triple = False
+            _esc = False
+            _j += 1
+            continue
+        # 4. Block-comment open — checked BEFORE line tokens so a block open
+        #    that shares a prefix with a line token (Lua '--[[' vs '--') wins.
+        _skipped = False
+        for _open, _close in _block_pairs:
+            if line[_j:_j + len(_open)] == _open:
+                _rest = line[_j + len(_open):]
+                _end = _rest.find(_close)
+                if _end >= 0:
+                    _j = _j + len(_open) + _end + len(_close)
+                else:
+                    block_close = _close
+                    _j = _j + len(_open)
+                _skipped = True
+                break
+        if _skipped:
+            continue
+        # 5. Line comment — rest of line ignored.
+        for _tok in _line_tokens:
+            if line[_j:_j + len(_tok)] == _tok:
+                _j = _n  # break out of the while loop
+                _skipped = True
+                break
+        if _skipped:
+            continue
+        # 6. Brackets.
+        if _ch in '({[':
+            _delta += 1
+        elif _ch in ')}]':
+            _delta -= 1
+        _j += 1
+    return _delta, in_str, in_triple, block_close
+
+
+# Hoisted compiled regexes for the TS/JS class anchor-fallback helpers below.
+# _find_class_body_range / _ts_class_scan_methods are invoked per class during
+# anchor resolution; re-compiling on every call was pure overhead. The method
+# regex is fully static. The class-header regex embeds the (escaped) class name,
+# so it is memoised per name via lru_cache — this preserves the exact "search for
+# the literal name" behaviour (correct even when other classes precede the
+# target) without paying a re-compile each call.
+_TS_CLASS_METHOD_RE = _re.compile(
+    r'^\s*(?:public|private|protected|static|readonly|async|\s)*\s*'
+    r'(?:get\s+|set\s+)?'
+    r'(?P<name>[a-zA-Z_$]\w*)\s*[(<]'
+)
+
+
+@functools.lru_cache(maxsize=128)
+def _ts_class_header_re(class_name: str):
+    return _re.compile(
+        rf"(?:export\s+)?(?:abstract\s+)?class\s+{_re.escape(class_name)}\s*"
+        r"(?:extends\s+\S+(?:\s*,\s*\S+)*\s*)?"
+        r"(?:implements\s+\S+(?:\s*,\s*\S+)*\s*)?\{"
+    )
+
+
 def _find_class_body_range(source: str, class_name: str) -> Optional[tuple]:
     """Find a class's body byte range in TS/JS source, handling strings/comments.
 
@@ -393,13 +778,7 @@ def _find_class_body_range(source: str, class_name: str) -> Optional[tuple]:
     Unlike naive brace counting, this helper uses ``_brace_match_depth`` to
     skip braces inside string literals, template literals, and comments.
     """
-    import re
-    _class_header_re = re.compile(
-        rf"(?:export\s+)?(?:abstract\s+)?class\s+{re.escape(class_name)}\s*"
-        r"(?:extends\s+\S+(?:\s*,\s*\S+)*\s*)?"
-        r"(?:implements\s+\S+(?:\s*,\s*\S+)*\s*)?\{"
-    )
-    _match = _class_header_re.search(source)
+    _match = _ts_class_header_re(class_name).search(source)
     if not _match:
         return None
 
@@ -416,7 +795,6 @@ def _ts_class_scan_methods(source: str, class_name: str) -> Optional[tuple[int, 
     1-indexed. Returns None if class or no method found.
     Uses regex-based detection — sufficient for anchor-fallback purposes.
     """
-    import re as _re
     _body = _find_class_body_range(source, class_name)
     if _body is None:
         return None
@@ -426,15 +804,10 @@ def _ts_class_scan_methods(source: str, class_name: str) -> Optional[tuple[int, 
     if not _class_body_lines:
         return None
 
-    _method_re = _re.compile(
-        r'^\s*(?:public|private|protected|static|readonly|async|\s)*\s*'
-        r'(?:get\s+|set\s+)?'
-        r'(?P<name>[a-zA-Z_$]\w*)\s*[(<]'
-    )
     _last_method = None  # (line_1idx_in_source, name)
     _current_line_1idx = source[:_body_start_byte].count('\n') + 1
     for _line_text in _class_body_lines:
-        _m = _method_re.match(_line_text)
+        _m = _TS_CLASS_METHOD_RE.match(_line_text)
         if _m:
             _name = _m.group('name')
             if _name not in ('constructor', 'new', class_name):
@@ -1493,6 +1866,18 @@ def _msg_token_fingerprint(m: object) -> tuple:
     )
 
 
+def _msg_field(m: object, field: str, default: Any = '') -> Any:
+    """Read *field* from an LLMMessage (attribute) or plain dict (key).
+
+    Dict messages (Ollama wire format) use ``m[key]`` access; LLMMessage
+    objects use ``getattr``.  This union lets ``_estimate_single_message_tokens``
+    support both types without callers having to normalise first.
+    """
+    if isinstance(m, dict):
+        return m.get(field, default)
+    return getattr(m, field, default)
+
+
 def _estimate_single_message_tokens(m: object) -> int:
     """Compute and cache token estimate for a single message object.
 
@@ -1532,8 +1917,8 @@ def _estimate_single_message_tokens(m: object) -> int:
     # authoritative wire form; content is a derived mirror. Counting both would
     # double-count assistant text (anthropic/zai/native assistant messages include
     # the same text in both content and raw_content text blocks).
-    content = getattr(m, 'content', '') or ''
-    rc = getattr(m, 'raw_content', None)
+    content = _msg_field(m, 'content', '') or ''
+    rc = _msg_field(m, 'raw_content', None)
     # Type-guard: raw_content is typed Optional[list[dict]]; a non-list truthy
     # value (type violation, stray JSON string) must NOT be treated as
     # "content is covered" — that would under-count the message to ~0 tokens,
@@ -1542,14 +1927,14 @@ def _estimate_single_message_tokens(m: object) -> int:
         mt += _cjk_aware_tokens(content)
     # Reasoning content (DeepSeek reasoner) — separate field sent on wire alongside content.
     # NOT covered by raw_content; this is a parallel attribute that always needs counting.
-    reasoning_attr = getattr(m, 'reasoning_content', None)
+    reasoning_attr = _msg_field(m, 'reasoning_content', None)
     if reasoning_attr:
         mt += _cjk_aware_tokens(reasoning_attr if isinstance(reasoning_attr, str) else str(reasoning_attr))
     # Tool calls — args are routed through the canonical byte-based estimator so
     # CJK-heavy payloads (Korean edit content, etc.) are not under-counted.  The
     # tool/function *name* is an ASCII identifier; the +10 covers the JSON
     # envelope and //3 is an adequate over-count for pure-ASCII names.
-    tc = getattr(m, 'tool_calls', None)
+    tc = _msg_field(m, 'tool_calls', None)
     if tc:
         try:
             for t in tc:
@@ -1615,7 +2000,7 @@ def _estimate_single_message_tokens(m: object) -> int:
                 mt += _count_block_wholesale(block)
                 _warn_unknown_block_type(btype)
     # Images (provider-cap flat estimate — see _IMAGE_BLOCK_TOKEN_ESTIMATE docstring)
-    images = getattr(m, 'images', None)
+    images = _msg_field(m, 'images', None)
     if images:
         mt += len(images) * _IMAGE_BLOCK_TOKEN_ESTIMATE
 

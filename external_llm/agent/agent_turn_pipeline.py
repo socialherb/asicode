@@ -1483,6 +1483,17 @@ class TurnPipelineMixin:
             call_id = pc["call_id"]
             result = results[i]
 
+            # Record tool-call metric to the per-loop collector for accurate
+            # per-turn summary isolation. The global collector (dashboard) is
+            # fed by the dispatch wrapper in tool_registry.py — separate sinks
+            # so concurrent sessions do not contaminate each other's summary.
+            _cache_hit = result.metadata.get("cache_hit", False) if result.metadata else False
+            self.performance_collector.record_tool_call(
+                tool_name, result.execution_time,
+                cache_hit=_cache_hit,
+                failed=not result.ok,
+            )
+
             # Read-only early finish detection
             if read_only_request and not write_tool_used:
                 early_result = self._try_readonly_early_finish(
@@ -1532,10 +1543,16 @@ class TurnPipelineMixin:
                         early_return=early_result,
                     )
 
-            cache_hit = result.metadata.get("cache_hit", False)
-            self.performance_collector.record_tool_call(
-                tool_name, result.execution_time, cache_hit
-            )
+            # Tool-call metrics are recorded at two sites, but to DIFFERENT
+            # collectors, so there is no double-counting for any single
+            # consumer:
+            #   1) This pipeline loop → self.performance_collector (per-loop,
+            #      session-isolated, feeds the per-turn summary).
+            #   2) The dispatch wrapper (tool_registry.py) → global collector,
+            #      feeds the webapp dashboard.
+            # The single-choke-point principle applies per sink. Concurrent
+            # sessions each have their own per-loop collector, so no
+            # contamination.
 
             _loop_key = make_tool_signature(tool_name, tool_args)
             # Settle any recall hint fired on a PRIOR tool result this run: if a

@@ -370,7 +370,9 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
     # ── File globs ────────────────────────────────────────────────────────
 
     def get_file_globs(self) -> list[str]:
-        return ["*.ts", "*.tsx"]
+        # .mts/.cts are TypeScript ESM/CJS module variants — first-class in
+        # _EXT_MAP / the JS-TS family / _EXT_TO_GRAMMAR_KEY (all → typescript).
+        return ["*.ts", "*.tsx", "*.mts", "*.cts"]
 
     # ── Lint / test commands ──────────────────────────────────────────────
 

@@ -50,6 +50,13 @@ _EXT_MAP = {
     ".lua": "LUA",
     ".sh": "BASH",
     ".bash": "BASH",
+    # zsh / ksh are '#'-comment shells that share the bash grammar's common
+    # subset.  Without these entries they fell to UNKNOWN → no comment skipping
+    # → a '#' comment bracket was over-counted, re-opening the same F2
+    # multi-line-expansion data-loss class this family classification prevents
+    # (see test_zsh_ksh_resolve_to_bash_comment_syntax).
+    ".zsh": "BASH",
+    ".ksh": "BASH",
 }
 
 # Language "callability families": groups of file extensions whose definitions
@@ -83,7 +90,7 @@ _LANGUAGE_EXTENSION_GROUPS: list[frozenset[str]] = [
     frozenset({".swift"}),                                       # Swift
     frozenset({".scala", ".sc"}),                                # Scala
     frozenset({".lua"}),                                         # Lua
-    frozenset({".sh", ".bash"}),                                 # Bash
+    frozenset({".sh", ".bash", ".zsh", ".ksh"}),                 # Bash
 ]
 
 

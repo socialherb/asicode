@@ -31,6 +31,7 @@ class LanguageRegistry:
         from .javascript_provider import JavaScriptSyntaxProvider
         from .json_provider import JsonSyntaxProvider
         from .kotlin_provider import KotlinSyntaxProvider
+        from .lua_provider import LuaSyntaxProvider
         from .php_provider import PhpSyntaxProvider
         from .python_provider import PythonSyntaxProvider
         from .ruby_provider import RubySyntaxProvider
@@ -40,6 +41,7 @@ class LanguageRegistry:
         # fallback (_find_in_other_langs): every non-Python language now has
         # a provider, so the index is the single source of truth.
         from .rust_provider import RustSyntaxProvider
+        from .scala_provider import ScalaSyntaxProvider
         from .swift_provider import SwiftSyntaxProvider
         from .typescript_provider import TypeScriptSyntaxProvider
         self.register(PythonSyntaxProvider())
@@ -57,6 +59,8 @@ class LanguageRegistry:
         self.register(PhpSyntaxProvider())
         self.register(SwiftSyntaxProvider())
         self.register(BashSyntaxProvider())
+        self.register(LuaSyntaxProvider())
+        self.register(ScalaSyntaxProvider())
         # gcc/g++ (or clang/clang++) validation when the toolchain is present;
         # tree-sitter fallback otherwise. Covers both C and C++.
         self.register(CSyntaxProvider())

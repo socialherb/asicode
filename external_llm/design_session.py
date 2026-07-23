@@ -262,8 +262,13 @@ class DesignSessionManager:
                 # Reap zombie in_progress turns from abnormally terminated parallel
                 # terminals (or past lives of this process) — runs after adopt, before
                 # append, so both the new assistant turn and the cleanup are in one
-                # atomic write.
-                self._reap_zombie_in_progress(session)
+                # atomic write. Guarded for consistency with _save(): a corrupt
+                # timestamp (e.g. explicit null on a manually edited turn) would
+                # otherwise raise out of add_turn and abort the turn append.
+                try:
+                    self._reap_zombie_in_progress(session)
+                except Exception as e:
+                    logger.warning("reap_zombie failed for %s: %s", session_id, e)
                 if role == "assistant":
                     self._clear_in_progress(session)
                     # Writing a new assistant turn means the previous turn's
@@ -602,6 +607,10 @@ class DesignSessionManager:
     @staticmethod
     def _safe_id(session_id: str) -> str:
         return "".join(c for c in session_id if c.isalnum() or c in "-_")
+
+    def archive_path(self, session_id: str) -> Path:
+        """Public accessor for a session's archive path (for cache signatures)."""
+        return self._archive_path(session_id)
 
     def _archive_path(self, session_id: str) -> Path:
         return self.sessions_dir / f"{self._safe_id(session_id)}.archive.jsonl"

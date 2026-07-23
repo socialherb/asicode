@@ -4990,7 +4990,13 @@ Approve if the change correctly implements what was asked without breaking exist
             on_stack.remove(v)
             stack.pop()
 
-        remaining = set(task_map.keys()) - set(order)
+        # Deterministic traversal order: ``remaining`` is a set whose iteration
+        # order is hash-seed dependent, which would make the recorded cycle
+        # ROTATION (and downstream _break_cycles edge selection under score
+        # ties) non-reproducible across processes — same input, different
+        # scheduling. Sorting normalizes the rotation without changing the SET
+        # of cycles found (DFS discovers the same SCCs regardless of root).
+        remaining = sorted(set(task_map.keys()) - set(order))
         for tid in remaining:
             if tid not in visited:
                 dfs(tid)
@@ -5042,23 +5048,46 @@ Approve if the change correctly implements what was asked without breaking exist
 
             for i, tid in enumerate(cycle):
                 next_tid = cycle[(i + 1) % len(cycle)]
-                if next_tid in modified_map[tid].dependencies:
+                # Edge direction: the recorded cycle is in DFS-adjacency order
+                # (``adj[dep].append(task_id)`` in _detect_cycles_kahn), so an
+                # edge ``tid -> next_tid`` here means ``next_tid`` DEPENDS ON
+                # ``tid`` — the live edge therefore lives in
+                # ``modified_map[next_tid].dependencies``, NOT deps[tid]. The
+                # prior reversed check matched nothing along the recorded
+                # direction, so this heuristic NEVER removed an edge and every
+                # cycle fell through to the blunt fallback below — which on
+                # tangled graphs ALSO failed, returning None and forcing the
+                # caller into sequential execution (lost parallelism).
+                if tid in modified_map[next_tid].dependencies:
                     # Score based on priority difference and task importance
                     prio_diff = abs(modified_map[tid].priority - modified_map[next_tid].priority)
                     score = prio_diff * 10 + len(modified_map[tid].assigned_files)
 
-                    if score < weakest_score:
+                    # Deterministic tie-break: when scores are equal, pick the
+                    # lexicographically smallest (tid, next_tid) edge so the
+                    # SAME edge is removed regardless of the recorded cycle's
+                    # rotation. Combined with the sorted ``remaining`` in
+                    # _detect_cycles_kahn this makes cycle-breaking fully
+                    # reproducible (same input → same edges removed). Without
+                    # it, a tied cycle removes whichever minimum edge happened
+                    # to be enumerated first — process-dependent.
+                    if (
+                        score < weakest_score
+                        or (score == weakest_score and weakest is not None and (tid, next_tid) < weakest)
+                    ):
                         weakest_score = score
                         weakest = (tid, next_tid)
 
             # Remove the weakest dependency
             if weakest:
-                source_tid, target_tid = weakest
-                if target_tid in modified_map[source_tid].dependencies:
-                    modified_map[source_tid].dependencies.remove(target_tid)
+                # ``weakest`` is (tid, next_tid) where next_tid DEPENDS ON tid,
+                # so drop tid from next_tid's dependency list.
+                source_tid, target_tid = weakest  # target depends on source
+                if source_tid in modified_map[target_tid].dependencies:
+                    modified_map[target_tid].dependencies.remove(source_tid)
                     logger.info(
                         "Broke cycle by removing dependency %s → %s (score: %s)",
-                        source_tid, target_tid, weakest_score
+                        target_tid, source_tid, weakest_score
                     )
 
         # Verify acyclicity (the order itself is discarded — the caller
@@ -5070,18 +5099,23 @@ Approve if the change correctly implements what was asked without breaking exist
         else:
             logger.warning("Could not break all cycles with minimal removal, remaining: %s", new_cycles)
             # Fallback: break cycles by removing all intra-cycle outgoing
-            # edges from the FIRST node only. This guarantees the cycle is
-            # broken while preserving ordering for all other nodes.
+            # edges that POINT TO the first node — i.e. cycle members that
+            # DEPEND ON it. Same direction correction as the weakest step: an
+            # edge _break_node -> other means other depends on _break_node, so
+            # the live edge lives in modified_map[other].dependencies. (The
+            # prior reversed check removed _break_node's OWN deps, which often
+            # included no cycle member, leaving the cycle intact and returning
+            # None on tangled graphs.)
             for cycle in new_cycles:
                 _break_node = cycle[0]
                 _removed = 0
                 for other in cycle:
-                    if other != _break_node and other in modified_map[_break_node].dependencies:
-                        modified_map[_break_node].dependencies.remove(other)
+                    if other != _break_node and _break_node in modified_map[other].dependencies:
+                        modified_map[other].dependencies.remove(_break_node)
                         _removed += 1
                 if _removed:
                     logger.info(
-                        "Force-removed %d intra-cycle deps from %s to break cycle %s",
+                        "Force-removed %d intra-cycle deps on %s to break cycle %s",
                         _removed, _break_node, cycle,
                     )
             # Check again

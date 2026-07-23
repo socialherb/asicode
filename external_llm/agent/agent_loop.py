@@ -7,6 +7,7 @@ Falls back to text-based tool simulation for providers that don't support functi
 from __future__ import annotations
 
 import ast
+import dataclasses
 import json
 import logging
 import os
@@ -63,7 +64,7 @@ from .context_budget import (
 from .failure_classifier import FailureClassifier
 from .json_repair import repair_json_brackets, try_parse_json
 from .operation_models import OperationKind, PlanMode, StageContext
-from .performance_metrics import PerformanceCollector
+from .performance_metrics import PerformanceCollector, get_global_collector
 
 # NOTE: PlannerAgent / OperationExecutor live in the (permanently-disabled) PLANNER
 # lane. They are imported through the single choke-point facade so that a future
@@ -429,7 +430,18 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 self.plan = saved_state.plan
                 self.context = saved_state.context
                 logger.info(f"Loaded saved state for session_id={session_id}")
-        self.performance_collector = PerformanceCollector()
+        # Per-loop PerformanceCollector for session-isolated per-turn
+        # summaries. The webapp dashboard reads the global collector
+        # (get_global_collector(), which receives ALL sessions' data via
+        # ''record_llm_call'' at the agent_loop level and ''record_tool_call''
+        # from the dispatch wrapper), while each loop's own collector provides
+        # correct isolated metrics for the per-turn ``metadata["performance"]``.
+        # This decoupling closes the previous split-brain (dashboard blind to
+        # LLM metrics, per-turn summary blind to cache/rag) WITHOUT the
+        # concurrent-session isolation regression of a shared singleton.
+        self.performance_collector = PerformanceCollector(
+            session_id=self.session_id,
+        )
         self._failure_classifier = FailureClassifier()
 
         self._tool_success_memory = {}
@@ -942,14 +954,21 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 "detail": f"Delegating to agent ({_del_label}): {scope.goal[:100]}",
             })
 
-            scoped_config = AgentConfig(
+            # Derive the delegate config from the PARENT config so ALL trust /
+            # behaviour fields (unrestricted_read, developer_llm_client,
+            # developer_model, stream_callback, cancel_event, and any future
+            # field) are inherited — only the four delegation-specific fields
+            # below are overridden. A fresh AgentConfig(...) would silently reset
+            # every unlisted field to its library default, which is how the
+            # unrestricted_read regression slipped in originally.
+            # (Same pattern as asi.py's _orch_cfg derivation.)
+            scoped_config = dataclasses.replace(
+                self.config,
                 max_turns=scope.max_turns,
                 planning_enabled=False,
                 self_review_enabled=False,
                 rag_enabled=False,
             )
-            scoped_config.stream_callback = self.config.stream_callback
-            scoped_config.cancel_event = self.config.cancel_event
 
             scoped_loop = AgentLoop(
                 llm_client=_del_llm_client,
@@ -2139,7 +2158,6 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
             _profile.apply(self.config)
             logger.info("Agent profile applied: %s", _profile.name)
 
-        self.performance_collector.session_id = _session_id
         self.performance_collector.start_session()
 
         route = getattr(self.config, 'route_decision', None)
@@ -2881,6 +2899,32 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         """Try to parse JSON with 3-tier repair via shared :func:`try_parse_json`."""
         return try_parse_json(text)
 
+    def _record_llm_call_both(
+        self,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        execution_time_ms: float = 0,
+        failed: bool = False,
+    ) -> None:
+        """Record LLM call to per-loop AND global collectors.
+
+        Dual-sink design: per-loop (session-isolated, per-turn summary) +
+        global (dashboard aggregation). The two are independent collectors
+        — no double-counting.
+        """
+        self.performance_collector.record_llm_call(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            execution_time_ms=execution_time_ms,
+            failed=failed,
+        )
+        get_global_collector().record_llm_call(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            execution_time_ms=execution_time_ms,
+            failed=failed,
+        )
+
     def _retry_on_rate_limit(
         self,
         callable_func: Callable[[], dict[str, Any]],
@@ -2916,6 +2960,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
             event_name: str,
             error_type: str,
             event_message: str,
+            loop_t0: float,
             **extra: Any,
         ) -> None:
             """Common retry-&exhausted handler for LLMConnectionError / LLMRateLimitError."""
@@ -2949,10 +2994,25 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 if extra:
                     payload.update(extra)
                 self._cb("error", payload)
+                # Record the final failure after all retries are exhausted —
+                # this is the single logical LLM call that ultimately failed.
+                # execution_time_ms covers the WHOLE retry span (call attempts +
+                # backoff waits) so the dashboard's avg_time_ms is not biased
+                # toward 0 by failed calls. Mirrors design-chat's _call_start
+                # pattern; loop_t0 was captured before the retry for-loop.
+                self._record_llm_call_both(
+                    failed=True,
+                    execution_time_ms=round((time.monotonic() - loop_t0) * 1000),
+                )
                 raise e
 
         max_retries = 3
         retry_delays = [10, 20, 40]  # Exponential backoff: 10s, 20s, 40s
+
+        # Capture the whole retry span's start so an exhausted retry records the
+        # true wall-time (attempt calls + backoff waits) instead of 0 — keeps
+        # avg_time_ms honest when failures occur.
+        loop_t0 = time.monotonic()
 
         for attempt in range(max_retries + 1):  # +1 for the initial attempt
             # Check for cancellation before each retry attempt
@@ -2985,12 +3045,11 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 # Do NOT set prompt_tokens=0 here — that would distort log metrics (pt=0 issue).
                 # When the split is unavailable, we use total as prompt_tokens for accounting.
 
-                # Record LLM call metrics
-                self.performance_collector.record_llm_call(
+                self._record_llm_call_both(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     execution_time_ms=execution_time_ms,
-                    failed=False
+                    failed=False,
                 )
 
                 # Diagnostic: log reasoning_tokens when available (DeepSeek)
@@ -3014,6 +3073,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                     e, attempt, max_retries, delay,
                     "connection_retry", "connection",
                     f"Connection error, retrying in {delay}s...",
+                    loop_t0=loop_t0,
                 )
             except LLMRateLimitError as e:
                 # Honor the server's Retry-After hint when present (providers
@@ -3026,6 +3086,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                     "rate_limit_retry", "rate_limit",
                     f"Rate limit hit, retrying in {delay}s...",
                     retries_exhausted=True,
+                    loop_t0=loop_t0,
                 )
 
             except LLMServerUnavailableError as e:
@@ -3034,6 +3095,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                     e, attempt, max_retries, delay,
                     "server_retry", "server_unavailable",
                     f"Server unavailable, retrying in {delay}s...",
+                    loop_t0=loop_t0,
                 )
 
             except Exception as e:
@@ -3057,6 +3119,14 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                     "message": f"LLM API error: {e}",
                     "error_type": "api",
                 })
+                # Record the non-retriable LLM failure before propagating.
+                # execution_time_ms reflects this attempt's wall-time (start_time
+                # was captured at the top of the try block) so failed non-retriable
+                # calls don't bias avg_time_ms toward 0.
+                self._record_llm_call_both(
+                    failed=True,
+                    execution_time_ms=round((time.monotonic() - start_time) * 1000),
+                )
                 raise
 
     # Message management

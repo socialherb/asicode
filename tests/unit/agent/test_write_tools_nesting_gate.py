@@ -41,7 +41,7 @@ class _Harness(WriteToolsMixin):
     def _run_syntax_check_for_file(self, path):
         return {"ok": True, "skipped": True, "reason": "test"}
 
-    def _secure_path(self, path):
+    def _secure_path(self, path, *, confine=False):
         from pathlib import Path as _Path
 
         resolved = _Path(self.repo_root) / path

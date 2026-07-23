@@ -100,6 +100,44 @@ def test_jsonc_comment_inside_string_not_stripped(provider):
     assert result.ok is True
 
 
+def test_jsonc_block_comment_single_line(provider):
+    # /* */ block comments are standard JSONC (tsconfig.json, VS Code settings)
+    content = '{ /* config */ "strict": true }'
+    result = provider.validate_syntax("tsconfig.jsonc", content)
+    assert result.ok is True
+
+
+def test_jsonc_block_comment_multi_line(provider):
+    # Block comment spanning multiple lines must have state carried across lines
+    content = '{\n  /* multi\n     line comment */ "strict": true\n}'
+    result = provider.validate_syntax("tsconfig.jsonc", content)
+    assert result.ok is True
+
+
+def test_jsonc_mixed_line_and_block_comments(provider):
+    content = (
+        '{\n'
+        '  // header\n'
+        '  /* block */ "a": 1,\n'
+        '  "b": "http://x" // url\n'
+        '}'
+    )
+    result = provider.validate_syntax("settings.jsonc", content)
+    assert result.ok is True
+
+
+def test_jsonc_block_comment_inside_string_not_stripped(provider):
+    # /* */ inside a string literal must NOT be treated as a comment
+    content = '{"a": "/* keep */"}'
+    result = provider.validate_syntax("x.jsonc", content)
+    assert result.ok is True
+
+
+def test_jsonc_unclosed_block_comment_is_invalid(provider):
+    # An unterminated /* leaves the rest of the content consumed -> parse error
+    content = '{"a": 1 /* never closed'
+    result = provider.validate_syntax("bad.jsonc", content)
+    assert result.ok is False
 def test_plain_json_comment_is_invalid(provider):
     # .json files don't strip comments, so this is a parse error
     content = '{"a": 1 // comment\n}'

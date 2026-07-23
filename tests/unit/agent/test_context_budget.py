@@ -1298,15 +1298,18 @@ class TestMsgTokenCache:
         assert getattr(msg, '_msg_token_estimate', None) == first
 
     def test_plain_dict_does_not_cache(self):
-        """Plain dict messages are handled without caching (no __dict__)."""
+        """Plain dict messages are handled without caching (no __dict__).
+
+        Regression: the function previously used ``getattr`` only, which silently
+        returned 0 for all dict messages — including those with substantial
+        ``content``.  Now ``_msg_field`` reads via ``.get(key)``, so content is
+        correctly estimated while caching remains opt-in for LLMMessage objects.
+        """
         from external_llm.agent._shared_utils import _estimate_single_message_tokens
-        # Plain dict messages don't support getattr — content defaults to ''
-        # and tool_calls/raw_content are not found via getattr.  This is a
-        # pre-existing limitation; the function was designed for LLMMessage.
         msg = {"role": "user", "content": "hello"}
         est = _estimate_single_message_tokens(msg)
-        assert est == 0  # getattr('content', '') → '' on dict → 0 tokens
-        # Plain dict should NOT have the cache attribute
+        assert est > 0  # dict content is now correctly estimated
+        # Plain dict should NOT have the cache attribute (no __dict__)
         assert not hasattr(msg, '_msg_token_estimate')
 
     def test_estimate_tokens_from_msgs_uses_cache(self):

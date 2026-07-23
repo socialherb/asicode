@@ -14,7 +14,15 @@ from typing import TYPE_CHECKING, Any, Optional
 from ...common.atomic_io import atomic_write_text
 from ...common.repo_files import git_list_repo_files
 from ...languages import LanguageId
-from .._shared_utils import _capped_put, compile_quiet, extract_files_from_patch
+from ...languages.comment_syntax import comment_syntax_for
+from .._shared_utils import (
+    _capped_put,
+    _net_bracket_delta,
+    _scan_line_brackets_delta,
+    _scan_to_line_state,
+    compile_quiet,
+    extract_files_from_patch,
+)
 from ...languages._normalize import normalize_key
 
 if TYPE_CHECKING:
@@ -2136,7 +2144,7 @@ class WriteToolsMixin:
 
         try:
             from external_llm.agent.symbol_modify_tool import modify_symbol as _do_modify
-            sec = self._secure_path(target["file_path"])
+            sec = self._secure_path(target["file_path"], confine=True)
             if sec is None:
                 return self._make_result(ok=False, content="", error=f"Path traversal blocked: {target['file_path']}")
             abs_path = str(sec)
@@ -5173,7 +5181,7 @@ class WriteToolsMixin:
         if not code:
             return self._make_result(ok=False, content="", error="'code' is required")
 
-        sec = self._secure_path(file_path)
+        sec = self._secure_path(file_path, confine=True)
         if sec is None:
             return self._make_result(ok=False, content="", error=f"Path traversal blocked: {file_path}")
         abs_path = str(sec)
@@ -5325,7 +5333,7 @@ class WriteToolsMixin:
             )
 
         # Resolve file path
-        sec = self._secure_path(file_path)
+        sec = self._secure_path(file_path, confine=True)
         if sec is None:
             return self._make_result(ok=False, content="", error=f"Path blocked (outside repo): {file_path}")
         abs_path = str(sec)
@@ -5948,50 +5956,28 @@ class WriteToolsMixin:
                 else:
                     _new_line = "\n"
 
-                # Bracket-balance guard (single-line replace only)
-                def _bracket_delta(_s: str) -> int:
-                    """Count bracket delta ignoring string/comment content."""
-                    _delta = 0
-                    _in_str = None
-                    _in_triple = False
-                    _j = 0
-                    while _j < len(_s):
-                        _ch = _s[_j]
-                        if _in_str is not None:
-                            if _in_triple and _s[_j:_j+3] == _in_str * 3:
-                                _in_str = None
-                                _in_triple = False
-                                _j += 3
-                                continue
-                            elif not _in_triple and _ch == _in_str and (_j == 0 or _s[_j-1] != '\\'):
-                                _in_str = None
-                        else:
-                            if _ch in ('"', "'", '`'):
-                                if _j + 2 < len(_s) and _s[_j:_j+3] == _ch * 3:
-                                    _in_str = _ch
-                                    _in_triple = True
-                                    _j += 3
-                                    continue
-                                _in_str = _ch
-                            elif _ch == '#':
-                                break  # rest of line is comment
-                            elif _ch == '{':
-                                _delta += 1
-                            elif _ch == '}':
-                                _delta -= 1
-                            elif _ch == '(':
-                                _delta += 1
-                            elif _ch == ')':
-                                _delta -= 1
-                            elif _ch == '[':
-                                _delta += 1
-                            elif _ch == ']':
-                                _delta -= 1
-                        _j += 1
-                    return _delta
-
-                _old_delta = _bracket_delta(_old_line)
-                _new_delta = _bracket_delta(_new_line)
+                # Bracket-balance guard (single-line replace only).
+                # _net_bracket_delta is the SSOT per-line bracket tally
+                # (_shared_utils): comment/string-aware via a typed CommentSyntax
+                # policy (comment_syntax_for(lang_id)), so an unbalanced '(' in a
+                # '// note (' (JS/TS/Go/C/...), a '# note (' (Python/Ruby/Bash/PHP),
+                # or a '-- note (' (Lua) comment no longer falsely trips the guard
+                # nor triggers a spurious multi-line expansion that could delete
+                # real code. Replaces the prior binary ``is not PYTHON`` flag which
+                # mis-classified Ruby/Bash/PHP (real '#'-comment languages) as
+                # C-style and mis-counted brackets inside their '#' comments.
+                _comment = comment_syntax_for(lang_id)
+                # Seed the per-line tally with the prior-line state (via
+                # _scan_to_line_state) so an anchor sitting INSIDE a multi-line
+                # block comment or triple-quoted string is counted correctly —
+                # its brackets are literal/comment content, not real code.
+                # Without this seed a replace_line inside a /* */ block would
+                # mis-trigger the F2 expansion and del real code after the
+                # comment (the stateless tally saw the anchor's brackets as
+                # real, and the forward scan started from empty state).
+                _s0, _t0, _bc0 = _scan_to_line_state(lines, anchor_lineno, _comment)
+                _old_delta = _net_bracket_delta(_old_line, _comment, in_str=_s0, in_triple=_t0, block_close=_bc0)
+                _new_delta = _net_bracket_delta(_new_line, _comment, in_str=_s0, in_triple=_t0, block_close=_bc0)
 
                 if _old_delta != _new_delta:
                     # Guard: snippet starts with '}' → continuation fragment
@@ -6010,42 +5996,29 @@ class WriteToolsMixin:
                     _needed_balance = _new_delta
                     _scan_balance = _old_delta
                     _close_line = None
-                    _in_str = None
-                    _in_triple = False
+                    # Stateful comment-aware scan: thread string/block-comment
+                    # state across lines via _scan_line_brackets_delta (SSOT in
+                    # _shared_utils) so a bracket inside a Python '#' comment, a
+                    # C-family '/* */' block comment, or a triple-quoted string is
+                    # never mis-counted. The prior inline scanner only handled '//'
+                    # line comments and could mis-identify the close line — then
+                    # `del` real code (e.g. a ')' in a Python '#' comment
+                    # terminated the scan early, deleting the function's real
+                    # arguments). ``_block_close`` carries the open block comment's
+                    # CLOSE token (e.g. '*/', ']]') across lines.
+                    #
+                    # The scan starts from the state AFTER the new anchor line
+                    # (seeded with the same prior-line context), so a multi-line
+                    # construct opened on/before the anchor is tracked correctly —
+                    # not from an empty state that would mis-identify the close.
+                    _, _in_str, _in_triple, _block_close = _scan_line_brackets_delta(
+                        _new_line, _s0, _t0, _bc0, _comment
+                    )
                     for _scan_i in range(anchor_lineno + 1, min(len(lines), anchor_lineno + 500)):
-                        _sl = lines[_scan_i]
-                        _j = 0
-                        while _j < len(_sl):
-                            _ch = _sl[_j]
-                            if _in_str is not None:
-                                if _in_triple and _sl[_j:_j+3] == _in_str * 3:
-                                    _in_str = None
-                                    _in_triple = False
-                                    _j += 3
-                                    continue
-                                elif not _in_triple and _ch == _in_str and (_j == 0 or _sl[_j-1] != '\\'):
-                                    _in_str = None
-                            else:
-                                if _ch in ('"', "'", '`'):
-                                    if _j + 2 < len(_sl) and _sl[_j:_j+3] == _ch * 3:
-                                        _in_str = _ch
-                                        _in_triple = True
-                                        _j += 3
-                                        continue
-                                    _in_str = _ch
-                                elif _ch == '{':
-                                    _scan_balance += 1
-                                elif _ch == '}':
-                                    _scan_balance -= 1
-                                elif _ch == '(':
-                                    _scan_balance += 1
-                                elif _ch == ')':
-                                    _scan_balance -= 1
-                                elif _ch == '[':
-                                    _scan_balance += 1
-                                elif _ch == ']':
-                                    _scan_balance -= 1
-                            _j += 1
+                        _ld, _in_str, _in_triple, _block_close = _scan_line_brackets_delta(
+                            lines[_scan_i], _in_str, _in_triple, _block_close, _comment
+                        )
+                        _scan_balance += _ld
                         if _scan_balance == _needed_balance:
                             _close_line = _scan_i
                             break

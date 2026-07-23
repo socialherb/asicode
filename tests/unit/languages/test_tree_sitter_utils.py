@@ -219,6 +219,73 @@ class TestGrammarMapConsistency:
             f"groups only: {sorted(family_exts - ast_ext_map)}"
         )
 
+    def test_provider_globs_cover_ext_map(self):
+        """SSOT 4-way: every provider's ``get_file_globs()`` must exactly cover
+        the ``_EXT_MAP`` extensions for that provider's LanguageId.
+
+        The fourth dimension of the consistency invariant (alongside _EXT_MAP /
+        _LANGUAGE_EXTENSION_GROUPS / _EXT_TO_GRAMMAR_KEY).  Provider globs drive
+        symbol-index discovery (``rg --files --glob`` in symbol_search); an
+        extension that is mapped (resolution works on a given path) and
+        parseable (grammar key present) but NOT globbed is silently dropped from
+        the name→location index — find_symbol / modify_symbol by name miss it.
+        This is the exact bug class where .zsh/.ksh were added to three tables
+        but the bash provider's globs were forgotten (and the pre-existing
+        .pyi / .mts / .cts drift of the same kind).
+        """
+        from collections import defaultdict
+
+        from external_llm.languages.registry import LanguageRegistry
+
+        # _EXT_MAP values are uppercase LanguageId *names* ("PYTHON"); match via
+        # provider.language_id().name (NOT .value, which is lowercase "python").
+        exts_by_lang: dict[str, set[str]] = defaultdict(set)
+        for ext, lang in _EXT_MAP.items():
+            exts_by_lang[lang].add(ext)
+
+        problems: list[str] = []
+        for provider in LanguageRegistry.instance()._providers.values():
+            lang = provider.language_id().name
+            mapped = exts_by_lang.get(lang, set())
+            # "*.py" → ".py"
+            globbed = {glob[1:] for glob in provider.get_file_globs()}
+            if mapped != globbed:
+                problems.append(
+                    f"  {lang}: _EXT_MAP={sorted(mapped)} globs={sorted(globbed)}"
+                )
+        assert not problems, (
+            "provider glob drift — get_file_globs() must match _EXT_MAP per "
+            "LanguageId:\n" + "\n".join(problems)
+        )
+
+    def test_every_ext_map_language_has_provider(self):
+        """SSOT 5-way: every ``_EXT_MAP`` language must have a registered provider.
+
+        The companion ``test_provider_globs_cover_ext_map`` only iterates over
+        *registered* providers, so it is blind to a language that appears in
+        ``_EXT_MAP`` (resolution works) and even in ``_EXT_TO_GRAMMAR_KEY``
+        (grammar queries + AST extraction work) but has **no provider at all**
+        — exactly the LUA/SCALA "half-wired" state where ``_nonpy_index_for``
+        (which iterates registered providers) never reached those files and
+        ``find_symbol`` / ``modify_symbol`` returned empty with no signal.
+
+        Closing this blind spot structurally: adding a language to ``_EXT_MAP``
+        now requires a provider or the build fails.
+        """
+        from external_llm.languages.registry import LanguageRegistry
+
+        registered = {
+            p.language_id().name
+            for p in LanguageRegistry.instance()._providers.values()
+        }
+        mapped = set(_EXT_MAP.values())
+        missing = mapped - registered
+        assert not missing, (
+            f"languages in _EXT_MAP with no registered provider — "
+            f"find_symbol/modify_symbol silently return empty for these: "
+            f"{sorted(missing)}"
+        )
+
 
 class TestKindMapConsistency:
     """SSOT drift guard for node-type → kind mapping.

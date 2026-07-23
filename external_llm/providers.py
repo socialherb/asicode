@@ -27,6 +27,9 @@ from .client import (
 from .output_parser import parse_tool_args
 
 logger = logging.getLogger(__name__)
+_num_ctx_overshoot_warned: set[tuple[str, int]] = set()
+"""Tracks (model, cap) pairs that have already logged the overshoot warning
+so it fires only once per (model, cap) combination per process."""
 # ── Gemini finish_reason normalization ────────────────────────────────────
 # Google's Gemini API returns UPPERCASE finishReason values (STOP, MAX_TOKENS, SAFETY, etc.)
 # while all consumers (agent_loop, intent_resolver, agent_phase_manager) check lowercase
@@ -1652,7 +1655,10 @@ class OllamaClient(LLMClient):
         # _num_ctx_for_model reads it from /api/show at runtime.
         #
         if "num_ctx" not in kwargs:
-            _num_ctx = self._num_ctx_for_model(model)
+            # Pass the original LLMMessage objects so the estimation-aware fallback
+            # can size num_ctx to the actual prompt (dict messages have no .content
+            # attr and would silently estimate 0 — see _num_ctx_for_model priority 2).
+            _num_ctx = self._num_ctx_for_model(model, messages=messages)
             if _num_ctx is not None:
                 payload["options"]["num_ctx"] = _num_ctx
                 logger.debug("Auto-set num_ctx=%d for model %s", _num_ctx, model)
@@ -1850,7 +1856,13 @@ class OllamaClient(LLMClient):
             logger.error("Ollama request failed: %s", e)
             raise LLMAPIError(f"Ollama request failed: {e}") from e
 
-    def _num_ctx_for_model(self, model: str) -> Optional[int]:
+    def _num_ctx_for_model(
+        self,
+        model: str,
+        messages: Optional[list] = None,
+        tools: Optional[list] = None,
+        generation_budget: int = 2048,
+    ) -> Optional[int]:
         """Return appropriate num_ctx for a given model name.
 
         Priority:
@@ -1860,13 +1872,23 @@ class OllamaClient(LLMClient):
           1. Explicit registry override (OLLAMA_NUM_CTX_OVERRIDES) — for tags
              whose Modelfile lacks num_ctx and the 8192 floor is wrong.  Currently
              empty — users should set num_ctx via Modelfile for persistent values.
-          2. Sensible fallback (8192) — Ollama's own default (4096) is too small
-             for asicode's system prompt: the measured prefix (core_prompt +
-             project.md + design_insights) is ~5272 tokens, so unknown models
-             would otherwise 400 on "exceeds context size".  8192 is the floor
-             for every model (NOT size-based — see the note in chat()).  Users
-             wanting more (e.g. bonsai27b = 256K Qwen3, Q1_0 → 32768) or less
-             should set num_ctx via Modelfile (priority 0).
+          2. Estimation-aware fallback.  The flat 8192 floor guaranteed asicode
+             boots for plain ``chat()`` (system prefix ≈ 5272 tokens), but the
+             TOOL-CALLING path (``chat_with_tools``) serialises the full tool
+             schema array into the prompt — measured at ~13k tokens for 29 tools.
+             Prefix (5272) + schema (12996) ≈ 18.3k > 8192, so agent / design-chat
+             400'd on "exceeds context size" exactly where commit 2d9f7cb2 thought
+             it was fixed (that commit only covered the non-tool ``chat()`` path).
+
+             The fallback therefore sizes from the ACTUAL request when
+             ``messages``/``tools`` are supplied:
+                 max(8192, est_msgs + est_tools + generation_budget)
+             rounded up to a 512 boundary and capped at a memory-safe ceiling
+             (32768 — same value bonsai27b uses).  Explicit Modelfile/registry
+             values (priorities 0/1) are still honoured EXACTLY and are NOT
+             raised: a user who deliberately sets a small num_ctx for memory
+             reasons gets exactly that, even if the estimate exceeds it.  The
+             estimation only narrows the gap on the *unknown-model* fallback path.
         """
         # 0. Dynamic query from Ollama API (Option B)
         from external_llm.ollama_api import query_ollama_num_ctx
@@ -1882,20 +1904,54 @@ class OllamaClient(LLMClient):
         if override is not None:
             return override
 
-        # 2. Sensible fallback — Ollama's 4096 default is too small for asicode's
-        #    system prompt.  8192 guarantees asicode boots for any unknown model;
-        #    users can override via Modelfile (priority 0) for larger/smaller values.
-        #    NOTE: this overrides the Ollama server's ``OLLAMA_CONTEXT_LENGTH`` env.
-        #    Previously this branch returned None and let the server decide (so the
-        #    env was respected), but that path silently 400'd on asicode's ~5272-token
-        #    system prefix under Ollama's 4096 default.  Users relying on the env for
-        #    a larger window should set num_ctx in the Modelfile (priority 0) instead.
-        #    The architectural context_length from /api/show (e.g. qwen35.context_length
-        #    =262144) is intentionally NOT used as a floor — it is the model's
-        #    theoretical maximum, not a memory-safe value on constrained hardware
-        #    (128K KV cache would OOM an 8GB box), and a correct per-device cap cannot
-        #    be inferred without VRAM/slot knowledge.
+        # 2. Estimation-aware fallback.
         fallback = 8192
+
+        # Size from the actual request payload when callers pass it.  This is the
+        # only path that knows about tool schemas, so it is the ONLY way to avoid
+        # the tool-path overflow.  Lazy import keeps providers.* free of a
+        # module-load-time dependency on agent.* (agent imports providers).
+        if messages is not None:
+            try:
+                from external_llm.agent._shared_utils import (
+                    estimate_tokens_from_msgs,
+                    estimate_tokens_from_tool_schemas,
+                )
+                est = estimate_tokens_from_msgs(messages) + generation_budget
+                if tools:
+                    est += estimate_tokens_from_tool_schemas(tools)
+                if est > fallback:
+                    # Round up to a 512 boundary so small per-turn token drift
+                    # does not ratchet num_ctx every call (KV-cache friendliness).
+                    _CAP = 32768  # memory-safe ceiling for unknown models
+                    clamped = ((est + 511) // 512) * 512
+                    if est > _CAP:
+                        fallback = _CAP
+                        _warn_key = (model, _CAP)
+                        if _warn_key not in _num_ctx_overshoot_warned:
+                            _num_ctx_overshoot_warned.add(_warn_key)
+                            logger.warning(
+                                "Estimated prompt ~%d tokens exceeds memory-safe cap %d "
+                                "for model %s. Consider setting num_ctx in Modelfile via "
+                                "'ollama run /set num_ctx <higher> /save'. (clamped to %d)",
+                                est, _CAP, model, _CAP,
+                            )
+                        else:
+                            logger.debug(
+                                "Estimated prompt ~%d tokens exceeds cap %d for model %s "
+                                "(warned once, clamped to %d)", est, _CAP, model, _CAP,
+                            )
+                    else:
+                        fallback = clamped
+                    logger.debug(
+                        "num_ctx=%d estimation-based fallback for model %s "
+                        "(est=%d: msgs+tools+budget)", fallback, model, est,
+                    )
+            except Exception:
+                # Estimation must never break num_ctx resolution — the flat
+                # 8192 floor is still correct for plain chat.  Soft-fail.
+                logger.debug("num_ctx estimation failed for %s; using flat floor", model, exc_info=True)
+
         logger.debug("num_ctx=%d fallback (no Modelfile/registry) for model %s", fallback, model)
         return fallback
 
@@ -2001,8 +2057,11 @@ class OllamaClient(LLMClient):
         if max_tokens:
             payload["options"]["num_predict"] = max_tokens
 
-        # Apply per-model context window sizing (same heuristics as chat())
-        num_ctx = self._num_ctx_for_model(model)
+        # Apply per-model context window sizing.  Pass BOTH messages and tools:
+        # the tool-schema array is serialised into the prompt (~13k tokens for
+        # the full registry) and must be counted, otherwise the flat 8192 floor
+        # 400s on "exceeds context size" before generation starts.
+        num_ctx = self._num_ctx_for_model(model, messages=messages, tools=tools)
         if num_ctx is not None:
             payload["options"]["num_ctx"] = num_ctx
             logger.debug("Auto-set num_ctx=%d for %s (chat_with_tools)", num_ctx, model)

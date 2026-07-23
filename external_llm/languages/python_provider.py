@@ -204,7 +204,10 @@ class PythonSyntaxProvider(SyntaxProvider):
     # ── File globs ────────────────────────────────────────────────────────
 
     def get_file_globs(self) -> list[str]:
-        return ["*.py"]
+        # .pyi type stubs declare the same symbols as .py implementations and
+        # are first-class in _EXT_MAP / the Python callability family
+        # (see test_python_family_includes_type_stubs) — index them too.
+        return ["*.py", "*.pyi"]
 
     # ── Lint / test commands ──────────────────────────────────────────────
 

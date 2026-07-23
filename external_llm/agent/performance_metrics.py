@@ -6,12 +6,17 @@ cache hit rates, and other performance metrics for profiling and optimization.
 
 Thread-safe cache hit rate tracking with comprehensive metrics collection.
 """
+import logging
 import threading
 import time
 import uuid
 import weakref
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from .config.thresholds import config as _threshold_config
+
+logger = logging.getLogger(__name__)
 
 
 class CacheHitRateMetrics:
@@ -111,6 +116,17 @@ class ToolMetrics:
     _time_max: float = 0.0
     cache_hits: int = 0
     cache_misses: int = 0
+    failures: int = 0
+
+    # NOTE on the ``failures`` counter: ``record_tool_call`` is invoked at two
+    # sites (ToolRegistry.execute_tool dispatch + the agent turn pipeline), both
+    # of which previously ignored ``result.ok`` — a failed tool call (e.g. a
+    # rolled-back write, a read of a missing file) was counted identically to a
+    # success. ``LLMMetrics`` has carried ``failures`` since inception; the tool
+    # side was an asymmetry that hid the single most important health signal for
+    # an autonomous agent (which tool fails how often). ``failure_rate`` below
+    # and the per-tool ``failures``/``failure_rate`` keys in get_summary() close
+    # that gap. A failure is ``not result.ok`` at the record site.
 
     def record(self, execution_time: float) -> None:
         """Update running aggregates with one sample.
@@ -141,6 +157,14 @@ class ToolMetrics:
     def cache_hit_rate(self) -> float:
         total = self.cache_hits + self.cache_misses
         return self.cache_hits / total if total > 0 else 0
+
+    @property
+    def failure_rate(self) -> float:
+        # Mirrors LLMMetrics.failures semantics: a failure is ``not result.ok``
+        # at the record site. Rate denominator is total_calls (every recorded
+        # call, success or failure), consistent with how the LLM failure rate is
+        # implicitly ``llm_metrics.failures / llm_metrics.calls``.
+        return self.failures / self.total_calls if self.total_calls > 0 else 0.0
 
 
 @dataclass
@@ -225,12 +249,24 @@ class PerformanceCollector:
         """End performance measurement session"""
         self.end_time = time.monotonic()
 
-    def record_tool_call(self, tool_name: str, execution_time: float, cache_hit: bool = False):
+    def record_tool_call(
+        self,
+        tool_name: str,
+        execution_time: float,
+        cache_hit: bool = False,
+        failed: bool = False,
+    ):
         """Record a tool call with execution time.
 
         Thread-safe: concurrent read tools in design_chat_loop's parallel batch
         all record through here, so the tool_metrics dict mutation and the
         per-ToolMetrics running-counter updates must be guarded by ``self._lock``.
+
+        ``failed`` is ``not result.ok`` at the call site — a rolled-back write,
+        a missing-file read, an unknown tool, etc. It feeds the per-tool
+        ``failures`` counter (and ``failure_rate`` in :meth:`get_summary`),
+        closing the asymmetry with :meth:`record_llm_call`'s ``failed`` param /
+        ``LLMMetrics.failures``. Defaults to ``False`` for backward compat.
 
         ``cache_hit`` is the **ToolResultCache** hit flag (set by dispatch on a
         cache HIT; ``result.metadata["cache_hit"]``). It is NOT a file-cache hit.
@@ -257,6 +293,9 @@ class PerformanceCollector:
                 metrics.cache_hits += 1
             else:
                 metrics.cache_misses += 1
+            if failed:
+                # Mirrors record_llm_call()'s ``if failed: failures += 1``.
+                metrics.failures += 1
 
     def record_rag_cache(self, hit: bool):
         """Record RAG cache hit or miss"""
@@ -329,6 +368,8 @@ class PerformanceCollector:
                     'cache_hit_rate': (_m.cache_hits / _cm_total) if _cm_total > 0 else 0.0,
                     'cache_hits': _m.cache_hits,
                     'cache_misses': _m.cache_misses,
+                    'failures': _m.failures,
+                    'failure_rate': (_m.failures / _calls) if _calls > 0 else 0.0,
                     'total_calls': _calls,
                 }
             llm_calls = self.llm_metrics.calls
@@ -386,6 +427,35 @@ class PerformanceCollector:
         # Calculate averages
         avg_rag_search_time = rag_time_ms / rag_searches if rag_searches > 0 else 0
 
+        # Top failing tools — derived (pure) from the already-built tool_summary so
+        # the dashboard card, the per-turn summary, and warn_failing_tools() all
+        # read ONE computation (no second filtering site to drift from). Gates on
+        # BOTH failure_rate and min_calls (config) so a single transient failure
+        # on a cold tool (1/1 = 100%) does not trip it.
+        failing_tools = top_failing_tools(
+            tool_summary,
+            threshold=_threshold_config.scores.TOOL_FAILURE_RATE_WARN,
+            min_calls=_threshold_config.scores.TOOL_FAILURE_WARN_MIN_CALLS,
+        )
+
+        # Overall cache hit-rate across ALL live cache channels. tool_result_cache is
+        # the largest by volume (every cacheable tool call flows through it), so it
+        # MUST be in the sum — excluding it made the headline reflect only rag+vector
+        # (file is always 0: legacy shape with no feeder). tool_result_cache_stats may
+        # be None when no cache is registered; treat as a zero contribution.
+        _trc = tool_result_cache_stats
+        _trc_hits = _trc["hits"] if _trc else 0
+        _trc_total = (_trc["hits"] + _trc["misses"]) if _trc else 0
+        _all_hits = (
+            cache_stats['file']['hits'] + cache_stats['rag']['hits']
+            + cache_stats['vector']['hits'] + _trc_hits
+        )
+        _all_total = (
+            cache_stats['file']['total'] + cache_stats['rag']['total']
+            + cache_stats['vector']['total'] + _trc_total
+        )
+        overall_hit_rate = _all_hits / _all_total if _all_total > 0 else 0
+
         return {
             'session_id': self.session_id,
             'total_execution_time_seconds': total_execution_time,
@@ -403,16 +473,16 @@ class PerformanceCollector:
 
             'tool_metrics': tool_summary,
 
+            # Sorted list of {name, failures, total_calls, failure_rate} for tools
+            # exceeding the configured health gates — empty when nothing is failing.
+            'failing_tools': failing_tools,
+
             'cache_metrics': {
                 'file_cache': cache_stats['file'],
                 'rag_cache': cache_stats['rag'],
                 'vector_cache': cache_stats['vector'],
                 'tool_result_cache': tool_result_cache_stats,
-                'overall_hit_rate': (
-                    (cache_stats['file']['hits'] + cache_stats['rag']['hits'] + cache_stats['vector']['hits']) /
-                    (cache_stats['file']['total'] + cache_stats['rag']['total'] + cache_stats['vector']['total'])
-                                        if (cache_stats['file']['total'] + cache_stats['rag']['total'] + cache_stats['vector']['total']) > 0 else 0
-                )
+                'overall_hit_rate': overall_hit_rate
             },
 
             'rag_metrics': {
@@ -423,18 +493,138 @@ class PerformanceCollector:
         }
 
 
+# ── failure_rate consumers ─────────────────────────────────────────────────
+# ``ToolMetrics.failure_rate`` (and the per-tool ``failures``/``failure_rate``
+# keys in get_summary()) were a dead signal: produced but never read by any
+# decision logic or UI. The two helpers below make it observable —
+# ``top_failing_tools`` is the pure derivation (SSOT for the dashboard card AND
+# the embedded ``failing_tools`` summary key); ``warn_failing_tools`` is the
+# deduped server-side warning the SSE broadcaster emits so operators see a
+# degraded tool without opening the dashboard.
+
+
+def top_failing_tools(
+    tool_metrics: dict,
+    *,
+    threshold: float,
+    min_calls: int,
+    top_n: int = 5,
+) -> list[dict]:
+    """Return the tools whose ``failure_rate`` ≥ ``threshold`` AND
+    ``total_calls`` ≥ ``min_calls``, sorted by failure_rate desc then failures
+    desc (deterministic tie-break), capped at ``top_n``.
+
+    Pure: takes the ``tool_metrics`` dict shape produced by ``get_summary()``
+    (values carry ``failures``/``total_calls``/``failure_rate``) and returns a
+    fresh list of ``{name, failures, total_calls, failure_rate}``. No collector
+    instance is required, so this is callable from tests, the per-turn summary,
+    and the self-improve orchestrator without holding the collector lock.
+
+    The ``min_calls`` gate is load-bearing: without it, a single transient
+    failure on a tool called once (rate 1.0) would permanently flag it. The
+    ``threshold`` is the health gate (config.scores.TOOL_FAILURE_RATE_WARN).
+    """
+    out: list[dict] = []
+    for name, m in tool_metrics.items():
+        calls = m.get("total_calls", 0) if isinstance(m, dict) else 0
+        if calls < min_calls:
+            continue
+        failures = m.get("failures", 0) if isinstance(m, dict) else 0
+        if failures <= 0:
+            continue
+        rate = m.get("failure_rate", (failures / calls if calls else 0.0)) if isinstance(m, dict) else 0.0
+        if rate < threshold:
+            continue
+        out.append({
+            "name": name,
+            "failures": failures,
+            "total_calls": calls,
+            "failure_rate": rate,
+        })
+    # Sort: highest rate first; ties broken by raw failure count, then name for
+    # determinism (stable across summary recomputations).
+    out.sort(key=lambda t: (-t["failure_rate"], -t["failures"], t["name"]))
+    return out[:top_n]
+
+
+# Module-level dedup state for warn_failing_tools(). The SSE broadcaster polls
+# get_summary() every 2s; without dedup the same degraded tool would log every
+# tick. A tool is warned ONCE per "failing streak": it re-arms (becomes
+# warnable again) the moment it drops out of the failing set, so a later
+# regression re-warns. Guarded so concurrent broadcasters (there is only one,
+# but the lock keeps the contract honest) don't double-log.
+_warned_failing_tools: set[str] = set()
+_warned_failing_tools_lock = threading.Lock()
+
+
+def _reset_warned_failing_tools() -> None:
+    """Clear the warn-dedup set (test-only: gives each test a clean slate)."""
+    with _warned_failing_tools_lock:
+        _warned_failing_tools.clear()
+
+
+def warn_failing_tools(summary: dict, *, log=logger.warning) -> int:
+    """Emit a deduped ``warning`` log for each tool in
+    ``summary['failing_tools']`` not yet warned this failing streak.
+
+    Returns the count of newly-warned tools (0 when nothing new). ``log`` is
+    injectable so tests can capture without touching the root logger; it
+    receives a single pre-formatted ``str`` (NOT printf-style ``*args``), so any
+    ``(str) -> None`` callable works (``logger.warning``, ``list.append``, …).
+
+    Re-arm semantics: the dedup set is rebuilt from the CURRENT failing set each
+    call, so a tool that recovers (leaves the set) becomes warnable again — a
+    subsequent regression re-warns rather than being silently suppressed.
+
+    Single-consumer contract: the dedup state is ONE module-global set, so this
+    function is intended for the SSE broadcaster ONLY. A second caller with a
+    different summary would overwrite the re-arm bookkeeping. Logic consumers
+    (self-improve orchestrator, per-turn summary, tests) must read the PURE
+    ``top_failing_tools()`` derivation (or ``summary['failing_tools']``) directly —
+    those carry no state and are safe to call from anywhere.
+    """
+    failing = summary.get("failing_tools") or []
+    current = {t.get("name") for t in failing if t.get("name")}
+    with _warned_failing_tools_lock:
+        newly = current - _warned_failing_tools
+        # Rebuild from current: tools no longer failing drop out (re-arm); tools
+        # still failing stay (suppressed). This is the whole dedup in one line.
+        _warned_failing_tools.clear()
+        _warned_failing_tools.update(current)
+    for t in failing:
+        name = t.get("name")
+        if name in newly:
+            log(
+                "tool '%s' failure_rate %.0f%% (%d/%d calls) exceeds health threshold"
+                % (
+                    name,
+                    t.get("failure_rate", 0.0) * 100.0,
+                    t.get("failures", 0),
+                    t.get("total_calls", 0),
+                )
+            )
+    return len(newly)
+
+
 # Global collector for easy access
 _global_collector: Optional[PerformanceCollector] = None
 _global_collector_lock = threading.Lock()
 
 
 def get_global_collector() -> PerformanceCollector:
-    """Get or create global performance collector (thread-safe DCL)"""
+    """Get or create global performance collector (thread-safe DCL).
+
+    The global collector is a process-lifetime singleton used for dashboard
+    aggregation (stats.py SSE broadcaster). It auto-starts an uptime timer
+    so the dashboard sees ``total_execution_time_seconds`` ≈ process uptime
+    even after per-loop collectors were restored for session isolation.
+    """
     global _global_collector
     if _global_collector is None:
         with _global_collector_lock:
             if _global_collector is None:
                 _global_collector = PerformanceCollector()
+                _global_collector.start_session()
     return _global_collector
 
 

@@ -62,6 +62,20 @@ def _version() -> str:
     return m.group(1) if m else "0.0.0"
 
 
+def _changelog_has_version(version: str) -> bool:
+    """True if CHANGELOG.md contains a ``## [<version>]`` section header.
+
+    Catches the recurring 'bumped version, forgot CHANGELOG' gap — the log had
+    been stuck at an old release across several version bumps because nothing
+    enforced the entry.  Versions are digits/dots, so a plain substring match
+    on ``## [0.2.12]`` is exact and unambiguous.
+    """
+    cl = REPO / "CHANGELOG.md"
+    if not cl.exists():
+        return False
+    return f"## [{version}]" in cl.read_text(errors="replace")
+
+
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
@@ -92,6 +106,22 @@ def main() -> int:
     if pub_dirty:
         print(f"error: public repo {public} has uncommitted changes — resolve first.",
               file=sys.stderr)
+        return 1
+
+    # ── CHANGELOG gate: the version being released must have an entry ───────
+    # Computed once here and reused for the commit message below.
+    version = _version()
+    if not _changelog_has_version(version):
+        import datetime as _dt
+        print(
+            f"error: CHANGELOG.md has no '## [{version}]' section for this release.\n"
+            "A bumped version without a changelog entry is exactly the gap this gate "
+            "exists for. Add a section, e.g.:\n"
+            f'  ## [{version}] — {_dt.date.today().isoformat()}\n'
+            "    ### Added / ### Changed / ### Fixed ...\n"
+            "Draft from recent commits:  git log --oneline $(git tag | sort -V | tail -1)..HEAD\n",
+            file=sys.stderr,
+        )
         return 1
 
     # ── 1) Export snapshot to a temp dir ───────────────────────────────────
@@ -136,7 +166,6 @@ def main() -> int:
         print("nothing to release: public repo already matches the snapshot")
         return 0
 
-    version = _version()
     src_head = _run(["git", "rev-parse", "--short", "HEAD"], REPO).stdout.strip()
     msg = f"release: v{version} (source snapshot {src_head})"
     r = _run(["git", "commit", "-m", msg], public)

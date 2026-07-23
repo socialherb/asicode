@@ -580,3 +580,156 @@ class TestFindReferencesValueErrorResilience:
         searcher = SymbolSearcher(str(tmp_path))
         refs = searcher.find_references("logger")
         assert len(refs) >= 1, "One bad line must not discard valid results"
+
+
+class TestLuaScalaHalfWiredRegression:
+    """LUA/SCALA were "half-wired": LanguageId, _EXT_MAP, grammar queries and
+    comment_syntax all existed, but no provider was registered.  _nonpy_index_for
+    iterates *registered* providers, so .lua/.scala files were never reached and
+    find_symbol / get_file_outline returned empty with no signal.  Registering
+    LuaSyntaxProvider / ScalaSyntaxProvider closes that silent-empty gap.
+    """
+
+    LUA_CODE = textwrap.dedent("""\
+        local M = {}
+        function M.greet(name)
+            print(name)
+        end
+        local function configure()
+            return true
+        end
+        return M
+    """)
+
+    SCALA_CODE = textwrap.dedent("""\
+        object App {
+          def main(args: Array[String]): Unit = ()
+          case class Config(path: String)
+        }
+    """)
+
+    def test_find_symbol_lua(self, tmp_path):
+        searcher = SymbolSearcher(str(tmp_path))
+        (tmp_path / "m.lua").write_text(self.LUA_CODE, encoding="utf-8")
+        res = searcher.find_symbol("configure")
+        assert res and res[0].file == "m.lua", (
+            ".lua symbol not found — LUA provider not registered (half-wired regression)"
+        )
+
+    def test_find_symbol_scala(self, tmp_path):
+        searcher = SymbolSearcher(str(tmp_path))
+        (tmp_path / "App.scala").write_text(self.SCALA_CODE, encoding="utf-8")
+        res = searcher.find_symbol("main")
+        assert res and res[0].file == "App.scala", (
+            ".scala symbol not found — SCALA provider not registered (half-wired regression)"
+        )
+
+    def test_outline_lua_not_empty(self, tmp_path):
+        searcher = SymbolSearcher(str(tmp_path))
+        (tmp_path / "m.lua").write_text(self.LUA_CODE, encoding="utf-8")
+        outline = searcher.get_file_outline("m.lua")
+        names = [s.name for s in outline]
+        assert "configure" in names
+        assert len(outline) >= 2
+
+    def test_outline_scala_not_empty(self, tmp_path):
+        searcher = SymbolSearcher(str(tmp_path))
+        (tmp_path / "App.scala").write_text(self.SCALA_CODE, encoding="utf-8")
+        outline = searcher.get_file_outline("App.scala")
+        names = [s.name for s in outline]
+        assert "main" in names
+        assert "App" in names
+
+
+class TestExtensionWalkerRegression:
+    """Regression: .mts/.cts/.mjs/.cjs/.pyi were first-class in the 5-way SSOT
+    (_EXT_MAP + family groups + grammar key + provider globs + provider) but
+    find_symbol silently returned nothing for symbols defined in them — the
+    repo walkers (_walk_ts_js_files / _walk_py_files) and single-file dispatches
+    used hardcoded extension literals that drifted from the SSOT. These pin the
+    fix end-to-end via find_symbol + get_file_outline."""
+
+    @pytest.mark.parametrize("ext,code,name", [
+        (".mts", "export function mtsFn(x: number): string { return String(x); }\n", "mtsFn"),
+        (".cts", "export function ctsFn(): number { return 1; }\n", "ctsFn"),
+        (".mjs", "export function mjsFn() { return 2; }\n", "mjsFn"),
+        (".cjs", "function cjsFn() { return 3; }\nmodule.exports = { cjsFn };\n", "cjsFn"),
+    ])
+    def test_find_symbol_modern_js_ts_extensions(self, tmp_path, ext, code, name):
+        searcher = SymbolSearcher(str(tmp_path))
+        (tmp_path / f"mod{ext}").write_text(code, encoding="utf-8")
+        hits = searcher.find_symbol(name, search_path=str(tmp_path))
+        assert any(h.name == name for h in hits), f"{name} in {ext} must be findable"
+
+    def test_find_symbol_pyi_type_stub(self, tmp_path):
+        searcher = SymbolSearcher(str(tmp_path))
+        (tmp_path / "stub.pyi").write_text(
+            "class StubClass:\n    def method(self) -> int: ...\n", encoding="utf-8"
+        )
+        # directory search
+        hits = searcher.find_symbol("StubClass", search_path=str(tmp_path))
+        assert any(h.name == "StubClass" for h in hits)
+        # single-file dispatch (search_path points at the .pyi file itself)
+        single = searcher.find_symbol("StubClass", search_path=str(tmp_path / "stub.pyi"))
+        assert any(h.name == "StubClass" for h in single)
+
+    def test_outline_pyi_type_stub(self, tmp_path):
+        searcher = SymbolSearcher(str(tmp_path))
+        (tmp_path / "stub.pyi").write_text(
+            "class StubClass:\n    def method(self) -> int: ...\n", encoding="utf-8"
+        )
+        outline = searcher.get_file_outline("stub.pyi")
+        names = [s.name for s in outline]
+        assert "StubClass" in names
+
+
+# ── Provider fallback-pattern accuracy (Lua/Scala) ──────────────────────────
+# These providers exist to close "silent-empty result" gaps when the tree-sitter
+# grammar is absent. Their fallback regex + name_capture must cover idiomatic
+# forms or the gap reopens. These regex-level checks are grammar-agnostic (they
+# test the substitution that _outline_ripgrep / _nonpy_index_for perform), so
+# they guard the fix regardless of whether the lua/scala grammar is installed.
+
+class TestProviderFallbackPatterns:
+    def test_lua_dotted_function_uses_name_capture(self):
+        """Outline substitution must use sp.name_capture, not a hardcoded \\w+.
+
+        Lua's ``function M.foo()`` requires name_capture=[\\w.:]+. With the old
+        hardcoded \\w+ the whole regex aborted at the '.' (\\w+ matched 'M', then
+        \\s*\\( saw '.'), dropping the symbol entirely from the outline.
+        """
+        import re
+        from external_llm.languages.lua_provider import LuaSyntaxProvider
+        sp = LuaSyntaxProvider().get_symbol_patterns(kind="any")[0]
+        pat = sp.regex.replace("{name}", f"({sp.name_capture})")
+        m = re.search(pat, "function M.foo()")
+        assert m is not None, "dotted Lua function must match via name_capture"
+        assert m.group(1) == "M.foo"
+
+    def test_lua_colon_method_captured(self):
+        """Lua OOP colon form ``function Obj:method()`` must index under its full
+        qualified name — name_capture includes ':'."""
+        import re
+        from external_llm.languages.lua_provider import LuaSyntaxProvider
+        sp = LuaSyntaxProvider().get_symbol_patterns(kind="any")[0]
+        pat = sp.regex.replace("{name}", f"({sp.name_capture})")
+        m = re.search(pat, "function Account:withdraw(v)")
+        assert m is not None
+        assert m.group(1) == "Account:withdraw"
+
+    def test_scala_parameterless_def_matched(self):
+        """Scala parameterless defs are idiomatic; the fallback regex must not
+        require ``(`` or ``[`` after the name (the previous ``[\\[(]``-requiring
+        form silently dropped them)."""
+        import re
+        from external_llm.languages.scala_provider import ScalaSyntaxProvider
+        sp = ScalaSyntaxProvider().get_symbol_patterns(kind="any")[0]
+        cases = [
+            ("size", "def size = xs.length"),        # parameterless, no type
+            ("greet", "def greet(): Unit = ()"),     # empty param list
+            ("name", "def name: Int = 1"),           # parameterless with type
+            ("apply", "def apply[T](xs: T): T = xs"),  # generic
+        ]
+        for name, src in cases:
+            pat = sp.regex.replace("{name}", re.escape(name))
+            assert re.search(pat, src), f"Scala def {name!r} must match: {src!r}"

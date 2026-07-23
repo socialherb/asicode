@@ -173,6 +173,17 @@ class ScoreThresholds:
     RENAME_SIMILARITY_RATIO: float = 0.50   # executor_signal_utils.py rename char-ratio gate
     RENAME_BEST_SCORE_THRESHOLD: float = 1.0  # executor_signal_utils.py rename score gate
 
+    # ── Tool health (failure_rate consumer) ─────────────────────────────────
+    # A tool whose failure_rate ≥ this trips a ``warn_failing_tools`` health
+    # warning and appears in the dashboard "Top Failing Tools" card. 0.5 = a tool
+    # that fails at least half its calls is clearly degraded.
+    TOOL_FAILURE_RATE_WARN: float = 0.50
+    # Minimum total_calls before a tool is eligible for the warn/card. Without a
+    # floor, a single transient failure on a tool called once (1/1 = 100%) would
+    # permanently flag it. 3 calls is the smallest sample where a ≥50% rate means
+    # ≥2 failures — a real signal, not one-shot noise.
+    TOOL_FAILURE_WARN_MIN_CALLS: int = 3
+
     # ── Distillation / Learning ────────────────────────────────────────────
     DISTILL_THRESHOLD_SPARSE: float = 0.90   # context_utils.py: sample_count < 10
     DISTILL_THRESHOLD_MODERATE: float = 0.82 # context_utils.py: sample_count < 30

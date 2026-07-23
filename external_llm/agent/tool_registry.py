@@ -254,6 +254,22 @@ class AgentConfig:
     # Design Chat refines implementation_spec with user help → re-runs planner.
     design_chat_reroute_enabled: bool = True
 
+    # ── Cross-repo read boundary (trust-scoped) ───────────────────────────
+    # When False (default), read tools (read_file / get_file_outline /
+    # read_image) are confined to repo_root by _secure_path. When True they may
+    # read any resolvable path on the host.
+    #
+    # This is a TRUST toggle, NOT a folder allowlist: the CLI already exposes an
+    # unrestricted `bash` tool (cat/rg any absolute path), so in a trusted local
+    # CLI the repo-only read boundary is pure friction, not a security control —
+    # the agent trivially bypasses it via bash. The webapp, where repo_root is
+    # attacker-controlled, MUST leave this False so _secure_path keeps closing the
+    # arbitrary-file-read surface that path_security.py guards. Only trusted local
+    # entry points (asi.py CLI, collaborate REPL) opt in; sub-agent configs
+    # inherit it via dataclasses.replace. Write tools ignore this flag entirely —
+    # they stay confined to repo_root regardless.
+    unrestricted_read: bool = False
+
     def __post_init__(self) -> None:
         """Validate and clamp default value ranges. Applies the same constraints on both server and CLI."""
         self.max_turns = max(1, self.max_turns)
@@ -1588,6 +1604,27 @@ class ToolRegistry(
         return fixed if fixed != original_content else None
 
     def dispatch(self, tool_name: str, args: dict[str, Any]) -> ToolResult:
+        """Public entry: dispatch a tool call and record metrics.
+
+        Wraps :meth:`_dispatch_impl` so EVERY return path — cache hit, normal
+        completion, write-safety rollback, gate/arg validation, unknown tool,
+        exception — is recorded exactly once on the **global** collector
+        (webapp dashboard aggregate).  The per-loop per-turn summary is served
+        by a separate collector (``agent_turn_pipeline`` records tool calls
+        there).  These are distinct sinks — no double-counting.
+
+        Serial, parallel (dispatch_parallel calls self.dispatch) and async
+        (shared_pool.submit(self.dispatch)) execution all pass through this
+        single wrapper.
+        """
+        result = self._dispatch_impl(tool_name, args)
+        cache_hit = result.metadata.get("cache_hit", False) if result.metadata else False
+        get_global_collector().record_tool_call(
+            tool_name, result.execution_time, cache_hit, failed=not result.ok
+        )
+        return result
+
+    def _dispatch_impl(self, tool_name: str, args: dict[str, Any]) -> ToolResult:
         """Dispatch a tool call and return the result."""
         # Robust args handling for small models (7B/3B)
         if not isinstance(args, dict):
@@ -1664,8 +1701,6 @@ class ToolRegistry(
                 )
                 result.metadata["cache_hit"] = True
                 logger.debug("Tool result cache HIT: %s (cached) (args: %s)", tool_name, args)
-                # Record performance with zero execution time
-                get_global_collector().record_tool_call(tool_name, 0.0, True)
                 return result
 
         # File lock manager + locked-paths holder. Acquisition is deferred to
@@ -1871,9 +1906,9 @@ class ToolRegistry(
                         execution_time=result.execution_time,
                     )
 
-            # Record performance metrics
-            cache_hit = result.metadata.get("cache_hit", False) if result.metadata else False
-            get_global_collector().record_tool_call(tool_name, result.execution_time, cache_hit)
+            # Performance metrics are recorded at the single dispatch() exit
+            # (the wrapper), not here — that covers this path AND every early
+            # return (write-safety rollback, gate/arg validation, unknown tool).
 
             # ── Phase 2: deterministic semantic auto-repair (F401/F821) ──
             # Runs after syntax verify passes (or after soft-fail preserves changes).
@@ -2234,34 +2269,42 @@ class ToolRegistry(
         """Return the effective repo root, preferring staging override."""
         return self._repo_root_override or self.repo_root
 
-    def _secure_path(self, path: str) -> Optional[Path]:
+    def _secure_path(self, path: str, *, confine: bool = False) -> Optional[Path]:
         """
-        Resolve path within repo_root.
-        Returns None if path is outside repo_root or doesn't exist.
+        Resolve a path against repo_root.
+
+        Returns None if the path escapes repo_root (unless unrestricted_read is
+        set) or cannot be resolved. Absolute paths resolve as-is; relative paths
+        anchor at repo_root.
+
+        When ``config.unrestricted_read`` is True (trusted local CLI — see
+        ``AgentConfig.unrestricted_read``) the repo-boundary check is skipped and
+        any resolvable path is allowed. That flag is never set on the webapp path,
+        where repo_root is attacker-controlled.
+
+        ``confine=True`` forces the repo-boundary check to run REGARDLESS of
+        ``unrestricted_read``. Write tools that mutate a file via
+        ``symbol_modify_tool.modify_symbol`` (modify_symbol / edit_ast, and the
+        apply_patch→modify_symbol auto-fallback) pass ``confine=True`` so writes
+        can never escape repo_root even on a trusted CLI — the unrestricted flag
+        is a READ capability only, never a write capability. (Read-only analysis
+        helpers such as ``_analyze_patch_symbol_change`` keep the default,
+        flag-respecting mode.)
         """
         path = self._correct_bias_path(path)
+        unrestricted = getattr(getattr(self, "config", None), "unrestricted_read", False)
         try:
             repo = Path(self._effective_repo_root).resolve()
             p = Path(path)
-
-            # If path is absolute, check if it's within repo
-            if p.is_absolute():
-                resolved = p.resolve()
+            # Absolute paths resolve as-is; relative paths anchor at repo_root.
+            resolved = p.resolve() if p.is_absolute() else (repo / path).resolve()
+            if confine or not unrestricted:
                 try:
                     resolved.relative_to(repo)
                 except ValueError:
                     logger.warning("Path traversal attempt blocked: %r -> %s", path, resolved)
                     return None
-                return resolved
-            else:
-                # Relative path - resolve relative to repo
-                resolved = (repo / path).resolve()
-                try:
-                    resolved.relative_to(repo)
-                except ValueError:
-                    logger.warning("Path traversal attempt blocked: %r -> %s", path, resolved)
-                    return None
-                return resolved
+            return resolved
         except Exception:
             return None  # non-critical — never block execution
 

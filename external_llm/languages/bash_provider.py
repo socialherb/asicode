@@ -75,7 +75,11 @@ class BashSyntaxProvider(SyntaxProvider):
     # ── File globs ────────────────────────────────────────────────────────
 
     def get_file_globs(self) -> list[str]:
-        return ["*.sh", "*.bash"]
+        # Must stay in sync with _EXT_MAP / _LANGUAGE_EXTENSION_GROUPS /
+        # _EXT_TO_GRAMMAR_KEY (all four list .sh/.bash/.zsh/.ksh → bash).  A
+        # glob dropped here silently drops those files from the symbol index —
+        # see TestGrammarMapConsistency.test_provider_globs_cover_ext_map.
+        return ["*.sh", "*.bash", "*.zsh", "*.ksh"]
 
     def get_lint_command(self, file_path: str) -> Optional[list[str]]:
         return None

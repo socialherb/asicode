@@ -85,6 +85,9 @@ _prompt_session: Optional[PromptSession] = None
 # Toggled per _collect_input call; referenced by ConditionalContainer/menu filters in the layout.
 _input_underline: bool = False
 _prompt_history_path: str = ""  # run_repl sets to <repo>/.asicode/cli_history
+# CLI history rotation: FileHistory loads the whole file at startup, so cap it.
+_CLI_HISTORY_ROTATE_AT = 20000  # lines — trigger rotation above this
+_CLI_HISTORY_KEEP = 10000       # lines — how many recent lines to keep after rotation
 _ctrlc_armed: bool = False  # True after 1st Ctrl+C on empty prompt — reset by typing/sending etc.
 # ── Ghost suggestion for next action (filled by background LLM after turn end) ──
 _next_prompt_suggestion: str = ""  # Suggestion text shown dimmed on empty prompt
@@ -119,6 +122,44 @@ _C: dict[str, str] = {
     "muted":  "#6c7086",   # secondary / dim info
     "border": "#313244",   # separator (very fine)
 }
+
+
+def _rotate_cli_history_if_needed(path: str) -> None:
+    """Cap unbounded CLI history growth.
+
+    prompt_toolkit's ``FileHistory`` loads the ENTIRE file into memory at
+    startup, so a long-lived session's ``.asicode/cli_history`` grows without
+    bound (observed 40k+ lines / 2.6MB).  When the line count exceeds
+    ``_CLI_HISTORY_ROTATE_AT``, rewrite the file keeping only the most recent
+    ``_CLI_HISTORY_KEEP`` lines, snapped forward to the next ``# <ts>`` entry
+    boundary so no multi-line ``+...`` entry is split (FileHistory treats any
+    non-``+`` line as an entry separator; starting mid-entry would orphan lines
+    into a spurious first entry).  Non-critical: any failure is swallowed and
+    the full history is used as-is.
+    """
+    import os as _os
+    try:
+        if not path or not _os.path.exists(path):
+            return
+        with open(path, "rb") as f:
+            lines = f.readlines()
+        if len(lines) <= _CLI_HISTORY_ROTATE_AT:
+            return
+        tail = lines[-_CLI_HISTORY_KEEP:]
+        # Snap to the first entry boundary ('# <ts>' header) so we never start
+        # inside a multi-line entry.
+        start = 0
+        for i, ln in enumerate(tail):
+            if ln.startswith(b"# "):
+                start = i
+                break
+        kept = tail[start:]
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.writelines(kept)
+        _os.replace(tmp, path)
+    except Exception:
+        pass
 
 
 def _lerp_color(c1: str, c2: str, t: float) -> str:
@@ -2392,7 +2433,11 @@ def _print_dep_status(repo_root: str, *, no_deps_check: bool = False) -> None:
     # Merge tree-sitter + tools + vector into a single line
     if _RICH and _out_console:
         from rich.text import Text
-        line = Text("tree-sitter: ", style="dim")
+        # Leading space aligns this status line with the "/insights" nudge
+        # continuation line printed above it in run_repl (col 6 = _CONSOLE_MARGIN
+        # 4 + 1 literal space; the nudge is split at " /insights" and printed with
+        # one literal leading space). The non-Rich branch below mirrors this.
+        line = Text(" tree-sitter: ", style="dim")
         line.append(ts_summary)
         if tool_parts:
             line.append("  ", style="dim")
@@ -2405,7 +2450,7 @@ def _print_dep_status(repo_root: str, *, no_deps_check: bool = False) -> None:
         if tool_parts:
             parts.append("  ".join(tool_parts))
         parts.append(f"vector: {tool_status.get('vector', 'OFF')}")
-        _print("  " + "  ".join(parts))
+        _print(" " + "  ".join(parts))
 
     # ── (a) Tree-sitter grammar missing warning (repo-filtered lazy check) ──
     repo_files = _git_ls_files(repo_root)
@@ -2473,7 +2518,17 @@ def _restart_cli() -> None:
     except Exception:
         pass
     argv = [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]]
-    os.execv(sys.executable, argv)
+    try:
+        os.execv(sys.executable, argv)
+    except OSError as _e:
+        # execv failed (broken/missing interpreter, exec-permission). Don't crash —
+        # the newly installed deps simply won't be live this session; the CLI can
+        # continue degraded and the user can restart manually when convenient.
+        _print(
+            f"  ! auto-restart failed ({_e.strerror or _e}); please restart asi "
+            f"manually to load the new dependencies.",
+            _C["yellow"],
+        )
 
 
 def _pip_install(pkgs: list[str], *, timeout: int = 600, _force_break: bool = False, label: "Optional[str]" = None) -> bool:
@@ -5046,6 +5101,7 @@ def _build_engine(
         run_lint=False,
         run_tests=False,
         cancel_event=cancel_event,
+        unrestricted_read=True,   # trusted local CLI: read tools may cross the repo boundary (bash already can)
         user_checkpoint_callback=_cli_checkpoint_cb,
         scoped_verification=scoped_verification,
     )
@@ -5914,6 +5970,8 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
             try:
                 from prompt_toolkit.history import FileHistory
                 Path(_prompt_history_path).parent.mkdir(parents=True, exist_ok=True)
+                # Cap history growth BEFORE FileHistory reads it all into memory.
+                _rotate_cli_history_if_needed(_prompt_history_path)
                 _history = FileHistory(_prompt_history_path)
             except Exception:
                 pass  # History persistence failure is non-critical — fall back to in-memory
@@ -6339,12 +6397,27 @@ def _save_key_to_dotenv(repo_root: str, key: str, value: str) -> None:
             lines[-1] += "\n"
         lines.append(f'{key}="{value}"\n')
 
+    # Best-effort persistence: the API key already lives in os.environ for this
+    # session, so a write failure (read-only mount, full disk, permission denied)
+    # must NOT crash the caller — it still has to return the live service object.
     tmp = dotenv_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-    os.replace(tmp, dotenv_path)
-    os.chmod(dotenv_path, 0o600)  # API keys — owner-only
-    _print(f"  ✓ saved to {dotenv_path}", _C["muted"])
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        os.replace(tmp, dotenv_path)
+        os.chmod(dotenv_path, 0o600)  # API keys — owner-only
+        _print(f"  ✓ saved to {dotenv_path}", _C["muted"])
+    except OSError as _e:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        _print(
+            f"  ! could not persist {dotenv_path} ({_e.strerror or _e}); "
+            f"the key is active for this session only.",
+            _C["yellow"],
+        )
 
 
 def _list_provider_model_choices() -> list[tuple[str, str]]:
@@ -6717,6 +6790,7 @@ def run_repl(args: argparse.Namespace) -> None:
     design_config = AgentConfig(
         model_name=svc.model or "",
         user_checkpoint_callback=_cli_checkpoint_cb,
+        unrestricted_read=True,   # trusted local CLI (also inherited by _orch_cfg via dataclasses.replace)
     )
     design_config.thinking_mode = None  # overridden by saved config below
     design_registry = ToolRegistry(repo_root, design_config)
@@ -7125,19 +7199,30 @@ def run_repl(args: argparse.Namespace) -> None:
             except Exception:
                 pass  # non-critical — never block the turn
         if _ci_n_demoted:
-            _print(
-                f"  ✓ design_insights compacted ({_ci_b_n}→{_ci_a_n} entries) + "
+            _ci_msg = (
+                f"✓ design_insights compacted ({_ci_b_n}→{_ci_a_n} entries) + "
                 f"{_ci_n_demoted} oldest entr{'y' if _ci_n_demoted == 1 else 'ies'} "
                 f"demoted to design_insights_archive.md (not deleted; "
                 f"/insights archive list|restore). Active now {_ci_a_b:,} bytes ≤ "
-                f"{COMPACT_BUDGET_BYTES:,} budget.", "dim")
+                f"{COMPACT_BUDGET_BYTES:,} budget."
+            )
+            # Pre-wrap so every wrapped line carries the same 2-space literal indent as
+            # `before:`/`after:` above. Rich's auto-wrap preserves the leading whitespace
+            # of the first line only — wrapped continuation lines would start at col 4
+            # (_MarginIO left margin alone) instead of col 6 (margin + literal indent),
+            # leaving `deleted`/`Active now` misaligned with `before`/`after`.
+            _print(textwrap.fill(_ci_msg, width=max(40, _console_width),
+                                 initial_indent="  ", subsequent_indent="  "), "dim")
         elif _ci_a_b > COMPACT_BUDGET_BYTES:
             # Backstop could not reach budget: every remaining entry is a protected
             # timestamp-less principle (never demoted). Report honestly.
-            _print(
-                f"  ⚠ over budget ({_ci_a_b:,} > {COMPACT_BUDGET_BYTES:,} bytes); "
+            _ci_warn = (
+                f"⚠ over budget ({_ci_a_b:,} > {COMPACT_BUDGET_BYTES:,} bytes); "
                 f"all remaining entries are protected principles — no demotion "
-                f"possible. Manual /insights drop <n> to remove.", _C["yellow"])
+                f"possible. Manual /insights drop <n> to remove."
+            )
+            _print(textwrap.fill(_ci_warn, width=max(40, _console_width),
+                                 initial_indent="  ", subsequent_indent="  "), _C["yellow"])
         else:
             _print(f"  ✓ design_insights compacted ({_ci_b_n}→{_ci_a_n} entries).", "dim")
         # ── Token accounting (interactive compact) ───────────────────────────
@@ -8160,7 +8245,7 @@ def run_repl(args: argparse.Namespace) -> None:
                 repo_root=repo_root,
                 model=_claude_model,
             )
-            _claude_registry = ToolRegistry(repo_root, AgentConfig())
+            _claude_registry = ToolRegistry(repo_root, AgentConfig(unrestricted_read=True))  # trusted local CLI
 
             # Suppress INFO logs during session to prevent breaking in-place ○→✓ lines
             # (WARNING+ passes, file handlers unaffected)
@@ -9119,6 +9204,7 @@ def _run_orchestrate_single_shot(
         stream_callback=_stream_cb,
         consume_content_events=False,
         cancel_event=cancel_event,
+        unrestricted_read=True,   # trusted local CLI
     )
     if getattr(args, "thinking_mode", None) is not None:
         _cfg.thinking_mode = args.thinking_mode
@@ -9593,6 +9679,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
                 run_lint=True,
                 run_tests=True,
                 cancel_event=cancel_event,
+                unrestricted_read=True,   # trusted local CLI
             )
 
             registry = ToolRegistry(repo_root, config)
@@ -10016,11 +10103,14 @@ def main() -> None:
 
     # ── Load model from config.json (CLI args > config.json > env vars) ──
     # Common to all modes (subagent included): CLI --model/provider takes precedence.
-    _shared_cfg_path = os.path.join(args.repo or os.getcwd(), ".asicode", "config.json")
+    # Read from git toplevel (_repo_root), NOT cwd — this MUST match run_repl()'s
+    # write path so /model (and /think, /helper, /dev, /code) persistence survives
+    # launches from a subdirectory under the repo. See _resolve_repo_root.
+    _shared_cfg_path = os.path.join(_repo_root, ".asicode", "config.json")
     _saved_cfg_path = _shared_cfg_path
     # Per-terminal isolation: a TTY-attached terminal reads/writes its own
     # config file (seeded from the shared one) so /model switches stay local.
-    _term_cfg = _terminal_config_path(args.repo or os.getcwd())
+    _term_cfg = _terminal_config_path(_repo_root)
     if _term_cfg:
         _seed_terminal_config(_term_cfg, _shared_cfg_path)
         _saved_cfg_path = _term_cfg

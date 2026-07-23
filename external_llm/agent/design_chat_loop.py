@@ -15,6 +15,7 @@ import os
 import random
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -34,6 +35,7 @@ from external_llm.client import (
 from ._shared_utils import context_message_cap, estimate_tokens_from_msgs, preemptive_trim
 from .agent_loop_types import AgentCancelled
 from .agent_turn_pipeline import _cache_hit_ratio, _evict_for_loop
+from .performance_metrics import get_global_collector
 from .config.thresholds import config as _cfg
 from .context_budget import (
     _is_context_length_error,
@@ -258,12 +260,14 @@ def _fallback_plain_chat(
     plain_msgs = _strip_tool_messages(messages)
     plain_msgs = _apply_context_hard_cap(plain_msgs, model)
     try:
+        _fb_t0 = time.monotonic()
         response = llm_client.chat(
             messages=plain_msgs, model=model,
             temperature=_PROCESS_TEMPERATURE,
             max_tokens=max_tokens,
             token_callback=token_callback,
         )
+        _fb_elapsed = time.monotonic() - _fb_t0
         _content = response.content or ""
         _reasoning = ""
         try:
@@ -282,6 +286,7 @@ def _fallback_plain_chat(
             "cache_read_tokens": getattr(response, "cache_read_input_tokens", 0) or 0,
             "cache_creation_tokens": getattr(response, "cache_creation_input_tokens", 0) or 0,
             "provider": getattr(response, "provider", "") or "",
+            "execution_time_ms": round(_fb_elapsed * 1000),
         }
     except Exception as e:
         # Re-raise ALL service-side LLM errors (auth/quota/rate-limit/server/
@@ -831,13 +836,37 @@ class _SessionSearcher:
         else:
             self._vector_cache = None
             if _HAS_VECTOR_CACHE:
+                # Use the process-wide memoised VCM so standalone callers
+                # (those that construct _SessionSearcher without a shared cache)
+                # also avoid the ~77ms on-disk reload per call, and so all paths
+                # share the same in-memory index + dirty tail.
                 try:
-                    self._vector_cache = VectorCacheManager(".asicode/session_vector_cache")
+                    self._vector_cache = _get_session_vcm()
                 except Exception:
                     pass
 
-    def index_docs(self, docs: list[tuple[Any, str]]) -> None:
-        """Index a list of (id, text) documents for BM25 retrieval."""
+    def index_docs(
+        self,
+        docs: list[tuple[Any, str]],
+        pre_tokenized: Optional[list[tuple[Any, dict, int, str]]] = None,
+        archive_sig: Optional[tuple] = None,
+    ) -> None:
+        """Index a list of (id, text) documents for BM25 retrieval.
+
+        ``pre_tokenized`` (optional): already-tokenised docs as
+        ``(id, token_count_dict, length, text)`` tuples — e.g. from the archive
+        BM25 cache — merged in WITHOUT re-tokenising.  The df/avgdl aggregation
+        is always recomputed over the full set (cheap O(n_docs)), so passing a
+        cached prefix keeps results identical to a fresh build while skipping the
+        expensive ``_TOKENIZER.tokenize()`` pass (measured ~3.9s for a 14k-turn
+        archive; the dominant cost of search_design_history on long sessions).
+
+        ``archive_sig`` (optional): when set, pre-tokenized entries came from an
+        archive BM25 cache hit.  The vector-cache insertion for those entries is
+        skipped on repeat searches of the same (unchanged) archive via the
+        module-level ``_VECTOR_CACHE_INDEXED_ARCHIVES`` set, avoiding redundant
+        ``add_document`` calls (14k SHA-256 hashes + 14k model loads per repeat).
+        """
         self._doc_ids.clear()
         self._doc_token_counts.clear()
         self._doc_lengths.clear()
@@ -845,6 +874,10 @@ class _SessionSearcher:
         self._df.clear()
         total_len = 0
 
+        entries: list[tuple[Any, dict, int, str]] = []
+        n_pre_tokenized = len(pre_tokenized) if pre_tokenized else 0
+        if pre_tokenized:
+            entries.extend(pre_tokenized)
         for _id, text in docs:
             tokens = _TOKENIZER.tokenize(text)
             if not tokens:
@@ -852,21 +885,55 @@ class _SessionSearcher:
             tc: dict[str, int] = {}
             for t in tokens:
                 tc[t] = tc.get(t, 0) + 1
+            entries.append((_id, tc, len(tokens), text))
+
+        # Determine whether to skip vector-cache insertion for pre-tokenised entries
+        skip_vector_archive = False
+        if archive_sig is not None and n_pre_tokenized > 0:
+            with _VECTOR_CACHE_LOCK:
+                if archive_sig in _VECTOR_CACHE_INDEXED_ARCHIVES:
+                    skip_vector_archive = True
+
+        for i, (_id, tc, length, text) in enumerate(entries):
             self._doc_ids.append(_id)
             self._doc_token_counts.append(tc)
-            self._doc_lengths.append(len(tokens))
+            self._doc_lengths.append(length)
             self._doc_texts.append(text)
-            total_len += len(tokens)
-            for t in set(tc):
+            total_len += length
+            for t in tc:
                 self._df[t] = self._df.get(t, 0) + 1
 
             # Also index into vector cache if available
             if self._vector_cache is not None:
+                # Skip pre-tokenised (archive) entries when already indexed
+                if skip_vector_archive and i < n_pre_tokenized:
+                    continue
                 try:
                     doc_key = f"{self._session_prefix}{_id}"
-                    self._vector_cache.add_document(doc_key, text)
+                    # Serialize FAISS mutation: the shared VCM's index is touched
+                    # from multiple threads (search_design_history runs in the
+                    # shared pool — see the parallel dispatch branch). Per-doc
+                    # scope keeps contention minimal while preventing an
+                    # interleaved add/search on the same IndexFlatIP.
+                    with _SESSION_VCM_IO_LOCK:
+                        self._vector_cache.add_document(doc_key, text)
                 except Exception:
                     pass
+
+        # Mark archive sig as vector-indexed for future skips (always record
+        # after a full pass — the sig is now always passed so that the second
+        # search benefits from the skip; the first search always does full work).
+        if archive_sig is not None and n_pre_tokenized > 0 and self._vector_cache is not None:
+            with _VECTOR_CACHE_LOCK:
+                _VECTOR_CACHE_INDEXED_ARCHIVES[archive_sig] = None
+                # Safety cap: prevent unbounded growth across process lifetime.
+                # FIFO eviction (oldest-inserted first) is deterministic — unlike
+                # the previous set.pop() which dropped an arbitrary sig, possibly
+                # a still-active one, forcing a redundant re-index on the next
+                # search. (LRU would need a move_to_end on every hit; insertion
+                # order is a sufficient approximation here.)
+                while len(_VECTOR_CACHE_INDEXED_ARCHIVES) > _VECTOR_CACHE_INDEXED_ARCHIVES_MAX:
+                    _VECTOR_CACHE_INDEXED_ARCHIVES.popitem(last=False)
 
         self._n_docs = len(self._doc_ids)
         self._avgdl = total_len / self._n_docs if self._n_docs > 0 else 0.0
@@ -905,9 +972,13 @@ class _SessionSearcher:
         vector_rank: dict[int, int] = {}
         if self._vector_cache is not None:
             try:
-                vec_results = self._vector_cache.search(
-                    query, top_k=min(max(top_k * 2, 10), self._n_docs)
-                )
+                # Serialize FAISS read: concurrent search_design_history calls
+                # share this index (see _SESSION_VCM_IO_LOCK). Only the FAISS
+                # call is held; the subsequent key_to_idx/ranking is unlocked.
+                with _SESSION_VCM_IO_LOCK:
+                    vec_results = self._vector_cache.search(
+                        query, top_k=min(max(top_k * 2, 10), self._n_docs)
+                    )
                 key_to_idx = {
                     f"{self._session_prefix}{self._doc_ids[i]}": i
                     for i in range(self._n_docs)
@@ -958,6 +1029,216 @@ class _SessionSearcher:
 
 
 
+
+
+# ── Archive BM25 cache ──────────────────────────────────────────────────────
+# search_design_history() re-tokenised the ENTIRE archived-turn set on every
+# call (a long session's .archive.jsonl is ~14k turns / ~26MB → ~3.9s of
+# `_TOKENIZER.tokenize()` per search, plus the 0.17s JSONL reparse).  The
+# archive is append-only and changes only when the compressor flushes old turns,
+# so a (session_id, size, mtime_ns) signature keys an LRU cache of the
+# pre-tokenised per-doc term-frequency vectors.  On a hit the searcher is fed
+# the cached vectors via ``index_docs(pre_tokenized=...)`` and only the small
+# compressed-but-not-yet-archived active prefix is tokenised fresh.
+#
+# MEMORY TRADE-OFF: the cached value holds one tc-dict per non-empty archived
+# turn.  For a 14k-turn archive this is a few hundred MB resident while the
+# session is cached.  The cap bounds the worst case; tune
+# ``_ARCHIVED_BM25_CACHE_MAX`` (default 2: the current + most-recent other
+# session) if memory matters more than cross-session search latency.
+_ARCHIVED_BM25_CACHE: "OrderedDict[tuple, list[tuple[Any, dict, int, str]]]" = OrderedDict()
+_ARCHIVED_BM25_CACHE_LOCK = threading.Lock()
+"""Serialises all access to ``_ARCHIVED_BM25_CACHE`` (read + write).
+
+``search_design_history`` is a read-tool: it can run concurrently in the
+shared pool.  Without a lock, concurrent ``.get()`` / ``.move_to_end()`` /
+``.__setitem__()`` / ``.popitem()`` calls can corrupt the internal
+``OrderedDict`` doubly-linked list.  The lock is held only for the brief
+cache-lookup / cache-write sections — the expensive tokenisation happens
+outside it.
+"""
+_ARCHIVE_SMALL_SKIP = 2000
+"""Small archives (≤ this many turns) skip BM25 caching — tokenisation is fast enough."""
+
+
+def _parse_cache_max(raw: str | None = None) -> int | float:
+    """Parse *ASICODE_ARCHIVED_BM25_CACHE_MAX* into a cache-cap value.
+
+    Returns ``>= 1`` |int| or ``float("inf")`` for unlimited (negative /
+    ``"inf"`` / ``"unlimited"``).  Empty, missing, or non-numeric input
+    degrades to the safe default ``2`` so that an invalid env var never
+    crashes import.
+    """
+    if raw is None:
+        raw = os.environ.get("ASICODE_ARCHIVED_BM25_CACHE_MAX")
+    if raw is None:
+        return 2
+    raw = raw.strip()
+    if not raw:
+        return 2
+    raw_lower = raw.lower()
+    if raw_lower in ("inf", "unlimited", "-1"):
+        return float("inf")
+    try:
+        n = int(raw)
+    except ValueError:
+        logger.warning("invalid ASICODE_ARCHIVED_BM25_CACHE_MAX=%r, using default 2", raw)
+        return 2
+    return float("inf") if n < 0 else max(1, n)
+
+
+_ARCHIVED_BM25_CACHE_MAX = _parse_cache_max()
+
+_VECTOR_CACHE_INDEXED_ARCHIVES: "OrderedDict[tuple, None]" = OrderedDict()
+"""Archive signatures whose documents have already been indexed into the vector cache.
+
+The BM25 cache avoids re-tokenising the archive, but ``index_docs`` was still calling
+``vector_cache.add_document`` for every archived turn on every search_design_history()
+call — 14k SHA-256 hashes + 14k ``_ensure_model_loaded`` on every repeat search.
+
+This set gates that: once a particular archive sig has been vector-indexed once in
+this process lifetime, repeat searches of the same (unchanged) archive skip the
+vector-insertion loop for the archived portion entirely.  Resets on process restart
+(ephemeral); archive change (different sig) triggers a fresh index.
+"""
+_VECTOR_CACHE_LOCK = threading.Lock()
+_VECTOR_CACHE_INDEXED_ARCHIVES_MAX = 100
+"""Safety cap on ``_VECTOR_CACHE_INDEXED_ARCHIVES`` growth (process-lifetime set)."""
+
+
+_SHARED_SESSION_VCM: Optional[Any] = None
+"""Process-wide memoised ``VectorCacheManager`` for ``.asicode/session_vector_cache``.
+
+Previously each ``search_design_history()`` call constructed a fresh
+``VectorCacheManager`` (loading ``faiss_index.bin`` + the ~23MB
+``metadata.json`` from disk, ~77ms each) and relied on ``__del__`` to flush the
+dirty (<100-doc) tail back to disk before the NEXT call reloaded it.  That flush
+is unreliable: an exception traceback can pin the frame local (preventing
+prompt refcount destruction) or a GC cycle can delay ``__del__``, so the next
+call's reload would miss the tail — and the archive-sig skip gate
+(``_VECTOR_CACHE_INDEXED_ARCHIVES``) would then never re-insert it, silently
+dropping the most-recent archived turn from vector re-ranking for the rest of
+the process.
+
+A single shared instance sidesteps the whole disk round-trip: the dirty tail
+stays in the SAME in-memory index for the process lifetime, so the skip gate
+reads against live state and inter-call persistence is no longer a correctness
+dependency (disk is still checkpointed every 100 docs + at process exit).
+"""
+
+_SHARED_SESSION_VCM_LOCK = threading.Lock()
+"""Guards creation of ``_SHARED_SESSION_VCM`` (double-checked init)."""
+
+_SESSION_VCM_IO_LOCK = threading.Lock()
+"""Serialises FAISS index mutation/read on the shared session VCM.
+
+``search_design_history`` is a read-tool and dispatches concurrently in the
+shared pool (a multi-tool batch runs read-tools in parallel threads — see the
+parallel dispatch branch in ``_process_tool_call``).  The shared VCM's
+``IndexFlatIP`` is therefore mutated (``add_document``) and read (``search``)
+from multiple threads; FAISS add/search are not safe to interleave on one
+index, so both operations take this lock.  Held only around the FAISS call —
+BM25 ranking (the primary signal) and the per-doc dedup map are untouched, so
+contention stays minimal (and the archive-sig gate means each archive is
+indexed once per process, so ``add_document`` is rare after warmup).
+"""
+
+
+def _get_session_vcm() -> Optional[Any]:
+    """Return the process-wide shared session vector cache (created once).
+
+    Returns ``None`` when the vector stack is unavailable
+    (``_HAS_VECTOR_CACHE`` is False) or the first construction raises — callers
+    treat ``None`` as "no vector re-ranking" and BM25 alone drives results.
+    """
+    global _SHARED_SESSION_VCM
+    if not _HAS_VECTOR_CACHE:
+        return None
+    with _SHARED_SESSION_VCM_LOCK:
+        if _SHARED_SESSION_VCM is None:
+            try:
+                _SHARED_SESSION_VCM = VectorCacheManager(".asicode/session_vector_cache")
+            except Exception:
+                return None
+        return _SHARED_SESSION_VCM
+
+
+def _reset_session_vcm_for_test() -> None:
+    """Drop the memoised session VCM (test-only: isolation between tests)."""
+    global _SHARED_SESSION_VCM
+    with _SHARED_SESSION_VCM_LOCK:
+        _SHARED_SESSION_VCM = None
+
+
+def _archive_sig(session_mgr: Any, sid: str):
+    """Return (sid, size, mtime_ns) for a session's archive, or None if absent."""
+    try:
+        p = session_mgr.archive_path(sid)
+        if not p.exists():
+            return None
+        st = p.stat()
+        return (sid, st.st_size, st.st_mtime_ns)
+    except Exception:
+        return None
+
+
+def _archived_bm25_entries(
+    session_mgr: Any, sid: str, archived_turns: list,
+) -> tuple[list[tuple[Any, dict, int, str]], tuple | None, bool]:
+    """Return pre-tokenised BM25 entries for a session's archived turns (cached).
+
+    On a cache miss the archived turns are tokenised once and stored under their
+    ``(sid, size, mtime_ns)`` signature; repeat searches reuse them.  The doc id
+    is the 0-based index into ``archived_turns`` (matches ``_turns`` ordering,
+    which is always ``archived + active``).  Any error degrades to returning a
+    freshly-built list without caching (search still works, just slower).
+
+    Returns:
+        ``(entries, sig, from_cache)`` where ``entries`` is the pre-tokenised list,
+        ``sig`` is the archive signature (``(sid, size, mtime_ns)`` or ``None``),
+        and ``from_cache`` is ``True`` if the result came from the BM25 cache.
+    """
+    sig = _archive_sig(session_mgr, sid)
+    _small = len(archived_turns) <= _ARCHIVE_SMALL_SKIP if archived_turns else True
+
+    # Cache hit (only for non-small archives)
+    if sig is not None and not _small:
+        with _ARCHIVED_BM25_CACHE_LOCK:
+            cached = _ARCHIVED_BM25_CACHE.get(sig)
+            if cached is not None:
+                _ARCHIVED_BM25_CACHE.move_to_end(sig)
+                return cached, sig, True  # from_cache=True
+
+    entries: list[tuple[Any, dict, int, str]] = []
+    for idx, turn in enumerate(archived_turns):
+        content = turn.get("content", "") if isinstance(turn, dict) else ""
+        if not content:
+            continue
+        tokens = _TOKENIZER.tokenize(content)
+        if not tokens:
+            continue
+        tc: dict[str, int] = {}
+        for t in tokens:
+            tc[t] = tc.get(t, 0) + 1
+        entries.append((idx, tc, len(tokens), content))
+
+    # Store in cache (skip for small archives — tokenisation is fast enough)
+    if sig is not None and not _small:
+        with _ARCHIVED_BM25_CACHE_LOCK:
+            _ARCHIVED_BM25_CACHE[sig] = entries
+            _ARCHIVED_BM25_CACHE.move_to_end(sig)
+            while len(_ARCHIVED_BM25_CACHE) > _ARCHIVED_BM25_CACHE_MAX:
+                _evicted_sig, _evicted_val = _ARCHIVED_BM25_CACHE.popitem(last=False)
+                # Keep the two caches' lifetimes coupled: the evicted BM25 sig
+                # is also dropped from the vector-indexed set. Guard under the
+                # VECTOR lock so this structure uses a single lock (the previous
+                # code mutated it under the BM25 lock → latent two-lock race on
+                # the same set). Lock order is always BM25 → VECTOR here (no
+                # reverse acquisition exists anywhere), so no deadlock risk.
+                with _VECTOR_CACHE_LOCK:
+                    _VECTOR_CACHE_INDEXED_ARCHIVES.pop(_evicted_sig, None)
+
+    return entries, sig, False
 
 
 class DesignChatLoop:
@@ -1307,8 +1588,32 @@ class DesignChatLoop:
                     iteration, _call_elapsed, response.tokens_used or 0,
                     len(response.tool_calls or []) if response.tool_calls else 0,
                 )
+                # Record LLM call to global collector for dashboard visibility.
+                # Design-chat's own _call_llm_with_retry has no recording hook
+                # (only agent_loop does it automatically). Without this, design-
+                # chat LLM usage is invisible on the dashboard while tool calls
+                # (dispatched via tool_registry.dispatch → global collector) are
+                # visible — creating a counterintuitive gap.
+                _dc_pt = getattr(response, "prompt_tokens", None)
+                if _dc_pt is None:
+                    _dc_pt = response.tokens_used or 0
+                get_global_collector().record_llm_call(
+                    prompt_tokens=_dc_pt,
+                    completion_tokens=getattr(response, "completion_tokens", None) or 0,
+                    execution_time_ms=_call_elapsed * 1000,
+                    failed=False,
+                )
             except Exception as e:
                 from external_llm.client import LLMClientError
+                # Record the failed main LLM call (this exception path means
+                # _call_llm_with_retry failed after all retries). The fallback
+                # below will be recorded as a separate successful LLM call.
+                get_global_collector().record_llm_call(
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    execution_time_ms=round((time.monotonic() - _call_start) * 1000),
+                    failed=True,
+                )
                 # ALL service-side LLM errors (rate-limit / auth / quota / 5xx
                 # server-overload / 4xx request-rejection / connection) propagate
                 # to respond()'s LLMClientError handler for a clean, actionable
@@ -1349,6 +1654,15 @@ class DesignChatLoop:
                 result.last_call_completion_tokens = _fb.get("completion_tokens", 0) or 0
                 result.last_call_cache_read_tokens = _fb.get("cache_read_tokens", 0) or 0
                 result.last_call_cache_creation_tokens = _fb.get("cache_creation_tokens", 0) or 0
+                # Record the fallback LLM call to the global collector too, so
+                # design-chat fallback-path token consumption is not invisible
+                # on the dashboard (parallel with L1598-1606).
+                get_global_collector().record_llm_call(
+                    prompt_tokens=_fb.get("prompt_tokens", 0) or 0,
+                    completion_tokens=_fb.get("completion_tokens", 0) or 0,
+                    execution_time_ms=_fb.get("execution_time_ms", 0),
+                    failed=False,
+                )
                 if not result.provider:
                     result.provider = _fb.get("provider", "") or ""
                 return result
@@ -1746,12 +2060,21 @@ class DesignChatLoop:
             plain_msgs = _strip_tool_messages(msgs)
             plain_msgs = _apply_context_hard_cap(plain_msgs, self.model)
             result.total_llm_calls += 1
+            _final_t0 = time.monotonic()
             final_response = self.llm_client.chat(
                 messages=plain_msgs, model=self.model,
                 temperature=_PROCESS_TEMPERATURE, max_tokens=_max_tokens,
                 token_callback=token_callback,
             )
             _final_content = final_response.content or ""
+            # Record the final-response LLM call to global collector for
+            # dashboard visibility (parallel with tool-loop L1598-1606).
+            get_global_collector().record_llm_call(
+                prompt_tokens=getattr(final_response, "prompt_tokens", None) or (final_response.tokens_used or 0),
+                completion_tokens=getattr(final_response, "completion_tokens", None) or 0,
+                execution_time_ms=round((time.monotonic() - _final_t0) * 1000),
+                failed=False,
+            )
             # DeepSeek Reasoner may put analysis in reasoning_content with empty content
             if not _final_content.strip():
                 raw = final_response.raw_response or {}
@@ -1785,6 +2108,7 @@ class DesignChatLoop:
                     ),
                 )
                 try:
+                    _retry_t0 = time.monotonic()
                     retry_response = self.llm_client.chat(
                         messages=_retry_msgs, model=self.model,
                         temperature=_PROCESS_TEMPERATURE, max_tokens=_max_tokens,
@@ -1821,7 +2145,24 @@ class DesignChatLoop:
                     result.last_call_cache_read_tokens = getattr(retry_response, "cache_read_input_tokens", None) or 0
                     result.last_call_cache_creation_tokens = getattr(retry_response, "cache_creation_input_tokens", None) or 0
                     _retry_superseded = True
+                    # Record the retry-response LLM call to global collector
+                    # (parallel with final_response recording at L2059-2066).
+                    get_global_collector().record_llm_call(
+                        prompt_tokens=getattr(retry_response, "prompt_tokens", None) or (retry_response.tokens_used or 0),
+                        completion_tokens=getattr(retry_response, "completion_tokens", None) or 0,
+                        execution_time_ms=round((time.monotonic() - _retry_t0) * 1000),
+                        failed=False,
+                    )
                 except Exception as retry_e:
+                    # Record the failed retry — the original final_response was
+                    # already recorded above, and the retry is an additional
+                    # failed LLM call.
+                    get_global_collector().record_llm_call(
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                        execution_time_ms=round((time.monotonic() - _retry_t0) * 1000),
+                        failed=True,
+                    )
                     logger.warning("Design chat: retry also failed: %s", retry_e)
 
             result.content = _final_content
@@ -1845,6 +2186,15 @@ class DesignChatLoop:
             if not result.provider:
                 result.provider = getattr(final_response, "provider", "") or ""
         except Exception as e:
+            # Record the failed final-response LLM call — no successful
+            # recording was made (the success-path record_llm_call was
+            # never reached).
+            get_global_collector().record_llm_call(
+                prompt_tokens=0,
+                completion_tokens=0,
+                execution_time_ms=round((time.monotonic() - _final_t0) * 1000),
+                failed=True,
+            )
             # hit_max_iterations is already True (set just before the try), but a
             # final-response GENERATION failure is a real error, not "budget
             # exhausted with partial progress". Mark is_error so downstream
@@ -1941,12 +2291,15 @@ class DesignChatLoop:
                     return []
             return []
 
+        # Session whose archive is searched (for the BM25 cache signature).
+        _search_sid = target_session_id or self.session_id
         if target_session_id and target_session_id != self.session_id:
             # Cross-session search: load the target session from disk
             session = self._session_mgr.get_or_create(target_session_id)
-            _turns = _load_archived(target_session_id) + session.turns
+            _archived = _load_archived(target_session_id)
+            _active = session.turns
             label = f"session '{target_session_id}'"
-            if not _turns and _field in ("content", "all"):
+            if not (_archived or _active) and _field in ("content", "all"):
                 return f"Session '{target_session_id}' has no conversation history."
         else:
             # Current session: search only the compressed (old) portion —
@@ -1957,12 +2310,12 @@ class DesignChatLoop:
             _local_cut = max(
                 0, session.compressed_up_to - getattr(session, "archived_count", 0)
             )
-            _turns = _load_archived(self.session_id) + (
-                session.turns[:_local_cut] if _local_cut > 0 else []
-            )
+            _archived = _load_archived(self.session_id)
+            _active = session.turns[:_local_cut] if _local_cut > 0 else []
             label = "current session"
-            if not _turns and _field in ("content", "all"):
+            if not (_archived or _active) and _field in ("content", "all"):
                 return "No old conversation history to search (all turns are still in the recent window)."
+        _turns = _archived + _active
 
         # Derive session key for vector cache isolation
         _session_key = target_session_id or self.session_id or "local"
@@ -1983,13 +2336,18 @@ class DesignChatLoop:
             nonlocal _shared_vcm, _shared_vcm_loaded
             if not _shared_vcm_loaded:
                 _shared_vcm_loaded = True
+                # Use the process-wide memoised VCM: the OLD per-call
+                # construction reloaded faiss_index.bin + metadata.json (~77ms,
+                # ~23MB) on EVERY search_design_history() invocation, and relied
+                # on __del__ flushing the dirty (<100-doc) tail to disk between
+                # calls — a flush that an exception traceback (holding the frame
+                # local) or a GC cycle could skip, after which the archive-sig
+                # gate would silently drop the recently-archived turn from vector
+                # re-ranking. A single shared instance keeps the tail in memory
+                # for the whole process lifetime, so correctness no longer
+                # depends on inter-call disk persistence.
                 if _HAS_VECTOR_CACHE:
-                    try:
-                        _shared_vcm = VectorCacheManager(
-                            ".asicode/session_vector_cache"
-                        )
-                    except Exception:
-                        _shared_vcm = None
+                    _shared_vcm = _get_session_vcm()
             return _shared_vcm
 
         # ── P2: Field-specific search (decisions / summary) ──────────────────
@@ -2035,12 +2393,23 @@ class DesignChatLoop:
         searcher = _SessionSearcher(
             session_prefix=_session_key, vector_cache=_get_shared_vcm()
         )
-        doc_pairs = []
-        for idx, turn in enumerate(_turns):
-            content = turn.get("content", "")
+        # Cached archived-turn BM25 vectors (skips ~3.9s re-tokenisation on
+        # repeat searches of a long archive).  The small active prefix is
+        # always tokenised fresh — it grows as the conversation progresses, and
+        # df/avgdl are recomputed over the combined set so scores stay correct.
+        _archived_tok, _archive_sig_val, _archive_from_cache = (
+            _archived_bm25_entries(self._session_mgr, _search_sid, _archived)
+        )
+        _base = len(_archived)
+        _active_docs: list[tuple[int, str]] = []
+        for j, turn in enumerate(_active):
+            content = turn.get("content", "") if isinstance(turn, dict) else ""
             if content:
-                doc_pairs.append((idx, content))
-        searcher.index_docs(doc_pairs)
+                _active_docs.append((_base + j, content))
+        searcher.index_docs(
+            _active_docs, pre_tokenized=_archived_tok,
+            archive_sig=_archive_sig_val,
+        )
         results = searcher.search(query, top_k=max_results)
 
         # Build combined result lines

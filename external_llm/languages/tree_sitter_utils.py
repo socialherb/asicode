@@ -126,6 +126,8 @@ _EXT_TO_GRAMMAR_KEY: dict[str, str] = {
     ".lua": "lua",
     ".sh": "bash",
     ".bash": "bash",
+    ".zsh": "bash",
+    ".ksh": "bash",
 }
 
 
