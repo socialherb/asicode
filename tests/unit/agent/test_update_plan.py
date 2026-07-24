@@ -196,6 +196,10 @@ class _FakeClient:
         self.scripted = list(scripted)
         self.calls = []  # recorded message lists
 
+    @staticmethod
+    def get_provider_name() -> str:
+        return "fake"
+
     def chat_with_tools(self, messages, tools, model, **kwargs):
         self.calls.append(list(messages))
         return self.scripted.pop(0)()

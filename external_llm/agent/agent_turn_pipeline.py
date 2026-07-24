@@ -1487,10 +1487,22 @@ class TurnPipelineMixin:
             # per-turn summary isolation. The global collector (dashboard) is
             # fed by the dispatch wrapper in tool_registry.py — separate sinks
             # so concurrent sessions do not contaminate each other's summary.
-            _cache_hit = result.metadata.get("cache_hit", False) if result.metadata else False
+            #
+            # 3-state cache outcome (mirrors tool_registry.dispatch): only
+            # cacheable (read-only) tools are probed, so a write/serial tool
+            # emits ``None`` and contributes NEITHER a hit nor a miss — otherwise
+            # its per-tool cache_hit_rate would be structurally faked to 0%.
+            # Cacheability is the registry's SSOT (is_result_cacheable), not
+            # ``write_tools`` (which omits serial-only tools like ask_user/job).
+            if result.metadata and result.metadata.get("cache_hit"):
+                _cache_outcome: Optional[bool] = True
+            elif self.registry and self.registry.is_result_cacheable(tool_name):
+                _cache_outcome = False
+            else:
+                _cache_outcome = None
             self.performance_collector.record_tool_call(
                 tool_name, result.execution_time,
-                cache_hit=_cache_hit,
+                cache_hit=_cache_outcome,
                 failed=not result.ok,
             )
 

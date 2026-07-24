@@ -51,7 +51,7 @@ def _map_git_apply_output_to_taxonomy(output: str) -> str:
     if "no valid patches in input" in o:
         return "EMPTY_PATCH"
 
-    if "corrupt patch" in o or "corrupt" in o:
+    if "corrupt" in o:
         return "CORRUPT_PATCH"
 
     if "patch format" in o or "malformed patch" in o:

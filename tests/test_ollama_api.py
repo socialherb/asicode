@@ -32,14 +32,16 @@ def _ok_resp(payload: dict) -> MagicMock:
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
-    """Isolate each test from prior cache state (manual dict is module-global)."""
+    """Isolate each test from prior cache state (manual dicts are module-global)."""
     ollama_api._num_ctx_cache.clear()
+    ollama_api._num_ctx_negative_cache.clear()
     yield
     ollama_api._num_ctx_cache.clear()
+    ollama_api._num_ctx_negative_cache.clear()
 
 
 def _age_past_ttl() -> None:
-    """Rewind the cached entry's timestamp so the next read treats it as expired.
+    """Rewind the positive-cache entry's timestamp so the next read treats it as expired.
 
     Deterministic (no sleep): subtracts (TTL + 1) seconds from the stored
     monotonic timestamp, guaranteeing the freshness check fails.
@@ -47,6 +49,13 @@ def _age_past_ttl() -> None:
     key = (_MODEL, _TEST_URL)
     val, ts = ollama_api._num_ctx_cache[key]
     ollama_api._num_ctx_cache[key] = (val, ts - ollama_api._NUM_CTX_CACHE_TTL_SECONDS - 1)
+
+
+def _age_negative_past_ttl() -> None:
+    """Rewind the negative-cache timestamp so the next read treats it as expired."""
+    key = (_MODEL, _TEST_URL)
+    ts = ollama_api._num_ctx_negative_cache[key]
+    ollama_api._num_ctx_negative_cache[key] = ts - ollama_api._NUM_CTX_NEGATIVE_CACHE_TTL_SECONDS - 1
 
 
 # ── TTL-bounded cache (the fix) ────────────────────────────────────────────
@@ -112,39 +121,138 @@ class TestTTLCache:
         assert ollama_api._NUM_CTX_CACHE_TTL_SECONDS == 300
 
 
-# ── Failure paths never poison the cache ───────────────────────────────────
+# ── Failure paths: short negative cache (storm-collapse + expiry) ───────────
 
-class TestNoCachePoisoning:
+class TestNegativeCache:
+    """Failures populate a short-TTL negative cache that collapses per-request
+    retry storms while still expiring so a server restart is detected promptly."""
+
     @patch("external_llm.ollama_api.requests.post")
-    def test_connection_error_not_cached(self, mock_post):
-        """ConnectionError returns None but is NOT cached → next call re-queries."""
+    def test_connection_error_negative_cached_within_ttl(self, mock_post):
+        """A ConnectionError is cached for the short negative TTL — the second
+        call within the window skips the HTTP request entirely (storm collapse)."""
         mock_post.side_effect = requests.ConnectionError("refused")
         assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
         assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
-        assert mock_post.call_count == 2
+        assert mock_post.call_count == 1  # second call served from negative cache
 
     @patch("external_llm.ollama_api.requests.post")
-    def test_timeout_not_cached(self, mock_post):
+    def test_timeout_negative_cached_within_ttl(self, mock_post):
         mock_post.side_effect = requests.Timeout("slow")
         assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
         assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
-        assert mock_post.call_count == 2
+        assert mock_post.call_count == 1
 
     @patch("external_llm.ollama_api.requests.post")
-    def test_http_404_not_cached(self, mock_post):
+    def test_http_404_positive_cached_within_ttl(self, mock_post):
+        """404 'model not present' is a STABLE, definitive answer — the same kind of
+        'num_ctx definitively unavailable' as the no-num_ctx success path — so it goes
+        to the POSITIVE cache (5-min TTL), NOT the short negative cache. Within the TTL
+        the second call skips HTTP entirely (storm collapse), exactly like a cache hit."""
         err = requests.HTTPError(response=MagicMock(status_code=404))
         mock_post.side_effect = err
         assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
         assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
-        assert mock_post.call_count == 2
+        assert mock_post.call_count == 1  # served from positive cache
+        # Distinguishing assertion: 404 landed in the POSITIVE cache, NOT negative.
+        key = (_MODEL, _TEST_URL)
+        assert key in ollama_api._num_ctx_cache
+        assert key not in ollama_api._num_ctx_negative_cache
 
     @patch("external_llm.ollama_api.requests.post")
-    def test_generic_exception_not_cached(self, mock_post):
-        """The broad `except Exception` still returns None without poisoning cache."""
+    def test_http_404_outlasts_negative_ttl(self, mock_post):
+        """Because 404 is positive-cached, it is re-queried only when the POSITIVE
+        (5-min) TTL elapses — NOT at the 15s negative mark. A misnamed model therefore
+        does not POST every 15s for the whole 12h run (~2880 wasted calls), which is
+        the storm commit 631966bd's negative cache was added to prevent and this fix
+        closes. Contrast test_negative_cache_expires_and_requeries (a transient
+        ConnectionError re-queries at the 15s mark)."""
+        err = requests.HTTPError(response=MagicMock(status_code=404))
+        mock_post.side_effect = err
+        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
+        assert mock_post.call_count == 1
+        _age_past_ttl()  # expire the POSITIVE entry (a negative-only age would KeyError,
+        # confirming 404 never entered the negative cache)
+        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
+        assert mock_post.call_count == 2  # re-queried only after the POSITIVE TTL
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_http_5xx_negative_cached_within_ttl(self, mock_post):
+        """Non-404 HTTP errors (5xx/429) ARE genuinely transient — they stay in the
+        short negative cache so a recovered/overloaded server is re-queried promptly,
+        distinct from the stable 404 answer."""
+        err = requests.HTTPError(response=MagicMock(status_code=503))
+        mock_post.side_effect = err
+        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
+        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
+        assert mock_post.call_count == 1
+        # Distinguishing: a transient HTTP error lands in NEGATIVE, NOT positive.
+        key = (_MODEL, _TEST_URL)
+        assert key in ollama_api._num_ctx_negative_cache
+        assert key not in ollama_api._num_ctx_cache
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_generic_exception_negative_cached_within_ttl(self, mock_post):
+        """The broad `except Exception` also feeds the negative cache."""
         mock_post.side_effect = ValueError("boom")
         assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
         assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
+        assert mock_post.call_count == 1
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_negative_cache_expires_and_requeries(self, mock_post):
+        """Past the negative TTL, the server is re-queried (restart detected)."""
+        mock_post.side_effect = requests.ConnectionError("refused")
+        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
+        _age_negative_past_ttl()
+        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
         assert mock_post.call_count == 2
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_negative_cache_then_recovery(self, mock_post):
+        """A failure populates the negative cache; once it expires and the server
+        recovers, the positive result is cached normally (then served from cache)."""
+        mock_post.side_effect = requests.ConnectionError("refused")
+        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
+        _age_negative_past_ttl()
+        # Server recovers
+        mock_post.side_effect = None
+        mock_post.return_value = _ok_resp({"parameters": {"num_ctx": 8192}})
+        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) == 8192
+        assert mock_post.call_count == 2
+        # Subsequent call hits the positive cache (no HTTP)
+        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) == 8192
+        assert mock_post.call_count == 2
+
+    def test_default_negative_ttl_is_short(self):
+        """Negative TTL must be short so a server restart is detected promptly."""
+        assert 0 < ollama_api._NUM_CTX_NEGATIVE_CACHE_TTL_SECONDS <= 60
+
+
+# ── FIFO entry cap (parity with _shared_utils._capped_put) ──────────────────
+
+class TestCacheCap:
+    """Both num_ctx caches are FIFO-bounded so a pathological spread of distinct
+    (model, base_url) keys cannot grow either dict without bound."""
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_positive_cache_fifo_bounded(self, mock_post):
+        mock_post.return_value = _ok_resp({"parameters": {"num_ctx": 8192}})
+        cap = ollama_api._NUM_CTX_CACHE_MAX_ENTRIES
+        for i in range(cap + 5):
+            query_ollama_num_ctx(f"model-{i}:latest", base_url_hint=_TEST_URL)
+        # Exactly ``cap`` entries retained; the 5 oldest evicted (FIFO).
+        assert len(ollama_api._num_ctx_cache) == cap
+        assert ("model-0:latest", _TEST_URL) not in ollama_api._num_ctx_cache
+        assert (f"model-{cap + 4}:latest", _TEST_URL) in ollama_api._num_ctx_cache
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_negative_cache_fifo_bounded(self, mock_post):
+        mock_post.side_effect = requests.ConnectionError("server down")
+        cap = ollama_api._NUM_CTX_CACHE_MAX_ENTRIES
+        for i in range(cap + 5):
+            query_ollama_num_ctx(f"model-{i}:latest", base_url_hint=_TEST_URL)
+        assert len(ollama_api._num_ctx_negative_cache) == cap
 
 
 # ── Ollama-format model-name guard ─────────────────────────────────────────

@@ -2,8 +2,11 @@
 # Install:  pipx install pre-commit && pre-commit install
 #
 # This gate mirrors .github/workflows/lint.yml EXACTLY: three ruff
-# baseline-diff checks (F821/F401/F811) plus one zero-tolerance check (F823).
-# It catches lint-baseline drift (e.g. the F811 line-scoped key shifting when a
+# baseline-diff checks (F821/F401/F811) plus one zero-tolerance check (F823),
+# AND one AST-based baseline-diff check (no-new-silent-except) that freezes the
+# ~1.4k pre-existing silent-except handlers and blocks only NET-NEW ones — the
+# documented fail-open incident class (0.2.6 version_check). It catches lint- and
+# observability-baseline drift (e.g. the F811 line-scoped key shifting when a
 # baselined file is edited above a redefinition) BEFORE the public CI does.
 #
 # F823 has no baseline: the repo was at zero when the check was added, and the
@@ -41,5 +44,11 @@ repos:
         name: F823 (referenced before assignment) zero-tolerance
         language: system
         entry: python3 scripts/check_f823_none.py
+        pass_filenames: false
+        always_run: true
+      - id: no-new-silent-except
+        name: silent-except (no log/raise) baseline-diff
+        language: system
+        entry: python3 scripts/check_no_new_silent_except.py
         pass_filenames: false
         always_run: true

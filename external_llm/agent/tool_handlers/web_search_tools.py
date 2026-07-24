@@ -1176,10 +1176,17 @@ class WebSearchToolsMixin:
         collected: list[tuple[str, list[dict[str, str]]]] = []
         errors: list[str] = []
         connect_failed: set[str] = set()
-        runnable = [(n, fn) for n, fn in backends if not self._backend_in_cooldown(n)]
-        for name, _ in backends:
+        # Single pass: probe each backend's circuit breaker ONCE. The old code called
+        # _backend_in_cooldown twice per backend (once in the runnable listcomp, once
+        # in the logging loop) — each call acquires the cooldown lock AND re-runs its
+        # lazy eviction side-effect, so a just-expired entry was deleted then looked up
+        # again pointlessly. Computing the partition once is both cheaper and cleaner.
+        runnable = []
+        for name, fn in backends:
             if self._backend_in_cooldown(name):
                 logger.debug("web_search: skipping %s (in cooldown)", name)
+            else:
+                runnable.append((name, fn))
         if not runnable:
             return collected, errors, connect_failed
 

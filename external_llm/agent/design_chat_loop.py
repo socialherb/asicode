@@ -1598,6 +1598,7 @@ class DesignChatLoop:
                 if _dc_pt is None:
                     _dc_pt = response.tokens_used or 0
                 get_global_collector().record_llm_call(
+                    provider=self.llm_client.get_provider_name(),
                     prompt_tokens=_dc_pt,
                     completion_tokens=getattr(response, "completion_tokens", None) or 0,
                     execution_time_ms=_call_elapsed * 1000,
@@ -1609,6 +1610,7 @@ class DesignChatLoop:
                 # _call_llm_with_retry failed after all retries). The fallback
                 # below will be recorded as a separate successful LLM call.
                 get_global_collector().record_llm_call(
+                    provider=self.llm_client.get_provider_name(),
                     prompt_tokens=0,
                     completion_tokens=0,
                     execution_time_ms=round((time.monotonic() - _call_start) * 1000),
@@ -1658,6 +1660,7 @@ class DesignChatLoop:
                 # design-chat fallback-path token consumption is not invisible
                 # on the dashboard (parallel with L1598-1606).
                 get_global_collector().record_llm_call(
+                    provider=self.llm_client.get_provider_name(),
                     prompt_tokens=_fb.get("prompt_tokens", 0) or 0,
                     completion_tokens=_fb.get("completion_tokens", 0) or 0,
                     execution_time_ms=_fb.get("execution_time_ms", 0),
@@ -2056,11 +2059,12 @@ class DesignChatLoop:
             content=self._build_final_instruction(),
         ))
 
+        _final_t0 = time.monotonic()
+        _final_recorded = False
         try:
             plain_msgs = _strip_tool_messages(msgs)
             plain_msgs = _apply_context_hard_cap(plain_msgs, self.model)
             result.total_llm_calls += 1
-            _final_t0 = time.monotonic()
             final_response = self.llm_client.chat(
                 messages=plain_msgs, model=self.model,
                 temperature=_PROCESS_TEMPERATURE, max_tokens=_max_tokens,
@@ -2070,11 +2074,13 @@ class DesignChatLoop:
             # Record the final-response LLM call to global collector for
             # dashboard visibility (parallel with tool-loop L1598-1606).
             get_global_collector().record_llm_call(
+                provider=self.llm_client.get_provider_name(),
                 prompt_tokens=getattr(final_response, "prompt_tokens", None) or (final_response.tokens_used or 0),
                 completion_tokens=getattr(final_response, "completion_tokens", None) or 0,
                 execution_time_ms=round((time.monotonic() - _final_t0) * 1000),
                 failed=False,
             )
+            _final_recorded = True
             # DeepSeek Reasoner may put analysis in reasoning_content with empty content
             if not _final_content.strip():
                 raw = final_response.raw_response or {}
@@ -2109,6 +2115,7 @@ class DesignChatLoop:
                 )
                 try:
                     _retry_t0 = time.monotonic()
+                    result.total_llm_calls += 1
                     retry_response = self.llm_client.chat(
                         messages=_retry_msgs, model=self.model,
                         temperature=_PROCESS_TEMPERATURE, max_tokens=_max_tokens,
@@ -2148,21 +2155,29 @@ class DesignChatLoop:
                     # Record the retry-response LLM call to global collector
                     # (parallel with final_response recording at L2059-2066).
                     get_global_collector().record_llm_call(
+                        provider=self.llm_client.get_provider_name(),
                         prompt_tokens=getattr(retry_response, "prompt_tokens", None) or (retry_response.tokens_used or 0),
                         completion_tokens=getattr(retry_response, "completion_tokens", None) or 0,
                         execution_time_ms=round((time.monotonic() - _retry_t0) * 1000),
                         failed=False,
                     )
                 except Exception as retry_e:
-                    # Record the failed retry — the original final_response was
-                    # already recorded above, and the retry is an additional
-                    # failed LLM call.
+                    # Record the failed retry first — before propagating
+                    # service-side errors (parallel with tool-loop L1612-1626).
+                    # The original final_response was already recorded above,
+                    # and the retry is an additional failed LLM call.
                     get_global_collector().record_llm_call(
+                        provider=self.llm_client.get_provider_name(),
                         prompt_tokens=0,
                         completion_tokens=0,
                         execution_time_ms=round((time.monotonic() - _retry_t0) * 1000),
                         failed=True,
                     )
+                    # Propagate service-side LLM errors and user cancellation —
+                    # never catch-and-swallow them (parallel with tool-loop L1626).
+                    from external_llm.client import LLMClientError
+                    if isinstance(retry_e, (LLMClientError, AgentCancelled)):
+                        raise
                     logger.warning("Design chat: retry also failed: %s", retry_e)
 
             result.content = _final_content
@@ -2186,15 +2201,24 @@ class DesignChatLoop:
             if not result.provider:
                 result.provider = getattr(final_response, "provider", "") or ""
         except Exception as e:
-            # Record the failed final-response LLM call — no successful
-            # recording was made (the success-path record_llm_call was
-            # never reached).
-            get_global_collector().record_llm_call(
-                prompt_tokens=0,
-                completion_tokens=0,
-                execution_time_ms=round((time.monotonic() - _final_t0) * 1000),
-                failed=True,
-            )
+            # Record the failed final-response LLM call first — before
+            # propagating service-side errors (parallel with tool-loop L1612-1626).
+            # Only when no successful recording was already made (the
+            # success-path record_llm_call may have fired before a subsequent
+            # statement in the try block raised).
+            if not _final_recorded:
+                get_global_collector().record_llm_call(
+                    provider=self.llm_client.get_provider_name(),
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    execution_time_ms=round((time.monotonic() - _final_t0) * 1000),
+                    failed=True,
+                )
+            # Propagate service-side LLM errors and user cancellation —
+            # never catch-and-swallow them (parallel with tool-loop L1626).
+            from external_llm.client import LLMClientError
+            if isinstance(e, (LLMClientError, AgentCancelled)):
+                raise
             # hit_max_iterations is already True (set just before the try), but a
             # final-response GENERATION failure is a real error, not "budget
             # exhausted with partial progress". Mark is_error so downstream

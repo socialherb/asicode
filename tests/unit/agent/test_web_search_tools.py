@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+import time
 
 import external_llm.agent.tool_handlers.web_search_tools as wst
 from external_llm.agent.tool_handlers.web_search_tools import (
@@ -772,6 +773,35 @@ def test_backend_cooldown_expires(monkeypatch):
     wst.WebSearchToolsMixin._backend_cooldown["DuckDuckGo"] = 0.0  # deadline in the past
     assert not host._backend_in_cooldown("DuckDuckGo")            # expired → False
     assert "DuckDuckGo" not in wst.WebSearchToolsMixin._backend_cooldown  # and evicted
+def test_parallel_merge_probes_breaker_once_per_backend(monkeypatch):
+    """Regression: the parallel-merge path (_run_tier_parallel) used to call
+    _backend_in_cooldown TWICE per backend — once in the runnable listcomp and once
+    in the logging loop. Each call acquires the cooldown lock AND re-runs its lazy
+    eviction side-effect, so a just-expired entry was deleted then looked up again.
+    The single-pass rewrite probes each backend exactly once."""
+    host = _Host()
+    # Sideline one of three backends so both the skip-log branch and the runnable
+    # partition are exercised in the same call.
+    wst.WebSearchToolsMixin._backend_cooldown["B"] = time.monotonic() + 3600
+
+    probes = {"n": 0}
+    orig = host._backend_in_cooldown
+
+    def _counting(name):
+        probes["n"] += 1
+        return orig(name)
+
+    monkeypatch.setattr(host, "_backend_in_cooldown", _counting)
+
+    backends = [
+        ("A", lambda: [{"t": "1"}]),
+        ("B", lambda: [{"t": "2"}]),   # in cooldown → skipped, never submitted
+        ("C", lambda: [{"t": "3"}]),
+    ]
+    collected, _errors, _connect_failed = host._run_tier_parallel(backends, deadline=2.0)
+
+    assert probes["n"] == 3                       # exactly once per backend (was 6)
+    assert {name for name, _ in collected} == {"A", "C"}   # B was skipped
 
 
 # ── DuckDuckGo anomaly detection + close() flush ────────────────────────

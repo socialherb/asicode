@@ -621,7 +621,11 @@ class ToolRegistry(
         ``performance_metrics.get_summary()`` — see
         ``PerformanceCollector.register_tool_result_cache``.
         """
-        if not getattr(config, "tool_result_cache_enabled", False):
+        # getattr default matches the dataclass field default (True, L168), NOT
+        # False: a duck-typed config that omits the attribute must get the
+        # DOCUMENTED behavior (cache enabled), not silently fail-closed to
+        # disabled. Real AgentConfig instances always carry the field.
+        if not getattr(config, "tool_result_cache_enabled", True):
             return None
         try:
             from .tool_result_cache import ToolResultCache
@@ -851,6 +855,28 @@ class ToolRegistry(
         # them conservatively, but repeated identical queries within a turn still hit.
         "search_web", "web_fetch",
     }
+
+    def is_result_cacheable(self, tool_name: str) -> bool:
+        """Whether ``tool_name`` will actually be probed against the result cache.
+
+        Mirrors the cache-lookup guard in :meth:`_dispatch_impl` EXACTLY:
+        ``self._tool_result_cache is not None AND tool_name in _READ_ONLY_TOOLS``.
+        Membership in ``_READ_ONLY_TOOLS`` alone is NOT sufficient — when the cache
+        is disabled (``tool_result_cache_enabled=False`` → ``_tool_result_cache`` is
+        None), read-only tools are never probed, so a recorder that sees only the
+        set membership would classify them as "missed" and pin their per-tool
+        ``cache_hit_rate`` at a fake 0% (the very contamination the 3-state
+        ``cache_hit`` recording was built to prevent). Checking the live cache
+        reference makes this the true "was it probed?" SSOT shared by
+        :meth:`_dispatch_impl` and both recording sites (``dispatch`` here and
+        ``agent_turn_pipeline``), so they can never disagree.
+
+        Exposed as a method (not a private peek) so the recorders classify a
+        tool's cache outcome as hit / miss / **non-probed** (3-state) without
+        duplicating the guard: a non-probed tool emits ``None`` (neither hit nor
+        miss), keeping its per-tool rate honest.
+        """
+        return self._tool_result_cache is not None and tool_name in self._READ_ONLY_TOOLS
 
     # ── bash cache-invalidation heuristic ──────────────────────────────
     # Read-only bash commands (ls, cat, git log, grep, find, ...) never mutate
@@ -1618,9 +1644,23 @@ class ToolRegistry(
         single wrapper.
         """
         result = self._dispatch_impl(tool_name, args)
-        cache_hit = result.metadata.get("cache_hit", False) if result.metadata else False
+        # 3-state cache outcome (mirrors agent_turn_pipeline's per-loop recording).
+        # ``is_result_cacheable`` is the "was it probed?" SSOT — it matches
+        # _dispatch_impl's guard (cache exists AND read-only), so a write/serial
+        # tool OR any tool when the cache is disabled emits ``None`` (N/A).
+        # Counting a non-probed tool as a miss would pin its per-tool
+        # cache_hit_rate at a fake 0%. _dispatch_impl stamps
+        # ``metadata["cache_hit"]=True`` ONLY on a real hit (cacheable tools), so
+        # absence of that key on a cacheable tool means "miss"; absence on a
+        # non-cacheable tool means "N/A".
+        if result.metadata and result.metadata.get("cache_hit"):
+            _cache_outcome: Optional[bool] = True
+        elif self.is_result_cacheable(tool_name):
+            _cache_outcome = False
+        else:
+            _cache_outcome = None
         get_global_collector().record_tool_call(
-            tool_name, result.execution_time, cache_hit, failed=not result.ok
+            tool_name, result.execution_time, _cache_outcome, failed=not result.ok
         )
         return result
 

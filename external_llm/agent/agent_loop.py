@@ -2911,14 +2911,23 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         Dual-sink design: per-loop (session-isolated, per-turn summary) +
         global (dashboard aggregation). The two are independent collectors
         — no double-counting.
+
+        ``provider`` is resolved from the MAIN agent client (``self._get_provider_name``)
+        and threaded into both record_llm_call() calls so LLM metrics are bucketed
+        PER-PROVIDER — a failing fallback provider is then not diluted by a healthy
+        primary's traffic within one shared deque. This site records the main agent's
+        tool-calling LLM calls; planner/developer sub-agents record their own streams.
         """
+        _provider = self._get_provider_name()
         self.performance_collector.record_llm_call(
+            provider=_provider,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             execution_time_ms=execution_time_ms,
             failed=failed,
         )
         get_global_collector().record_llm_call(
+            provider=_provider,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             execution_time_ms=execution_time_ms,

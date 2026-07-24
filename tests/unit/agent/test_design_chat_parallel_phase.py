@@ -71,6 +71,10 @@ class _RegStub:
 
 
 class _LLMStub:
+    @staticmethod
+    def get_provider_name() -> str:
+        return "stub"
+
     def chat(self, *a, **k):
         return _make_response(content="final")
 

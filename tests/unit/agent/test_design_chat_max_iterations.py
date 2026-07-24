@@ -22,6 +22,10 @@ class _StubClient:
     def __init__(self, always_tool_call: bool):
         self.always = always_tool_call
 
+    @staticmethod
+    def get_provider_name() -> str:
+        return "stub"
+
     def chat_with_tools(self, messages, tools, model, **kw):
         if self.always:
             return ToolCallResponse(
@@ -68,6 +72,35 @@ def test_exhaustion_sets_hit_max_iterations(_repo):
     status = ("max_turns" if r.hit_max_iterations
               else "error" if r.is_error else "success")
     assert status == "max_turns"
+
+
+def test_final_response_generation_failure_sets_error(_repo, monkeypatch):
+    """Regression: if _strip_tool_messages raises inside the final-response
+    block, the result must carry is_error=True with NO UnboundLocalError
+    (the _final_t0 timer is assigned BEFORE the try block)."""
+    import external_llm.agent.design_chat_loop as dcl
+
+    _calls = []
+
+    def _raising_strip(msgs):
+        _calls.append(1)
+        raise RuntimeError("simulated strip failure")
+
+    monkeypatch.setattr(dcl, "_strip_tool_messages", _raising_strip)
+
+    reg = ToolRegistry(_repo, AgentConfig())
+    loop = DesignChatLoop(_StubClient(True), reg, "stub-model")
+    r = loop.respond(
+        [LLMMessage(role="user", content="do stuff")], max_tool_iterations=1,
+    )
+    # Must NOT raise UnboundLocalError — _final_t0 is bound before try
+    assert r.is_error is True
+    assert r.content.startswith("Final response generation failed")
+    assert r.hit_max_iterations is True
+    # _strip_tool_messages must have been called at least once (the
+    # final-response block call); tool-loop's _fallback_plain_chat may not
+    # be reached, but we know the final-response block was exercised.
+    assert len(_calls) >= 1, "_strip_tool_messages was never called"
 
 
 def test_normal_completion_leaves_flag_false(_repo):

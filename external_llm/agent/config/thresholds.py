@@ -183,6 +183,53 @@ class ScoreThresholds:
     # permanently flag it. 3 calls is the smallest sample where a ≥50% rate means
     # ≥2 failures — a real signal, not one-shot noise.
     TOOL_FAILURE_WARN_MIN_CALLS: int = 3
+    # Sliding window (call count) for ``recent_failure_rate`` — the LIVE-health
+    # signal that gates ``warn_failing_tools`` and the "Top Failing Tools" card
+    # (the cumulative failure_rate is kept for display but no longer gates). A
+    # 12h+ run dilutes the cumulative rate so badly that a tool failing its last
+    # 20 calls after 1000 successes reads ~2% and never trips the warn gate; the
+    # recent window tracks CURRENT health instead. With window=30 and threshold
+    # 0.50, a previously-healthy tool trips after ~15 consecutive failures, while
+    # a ≤10-failure transient burst stays under 50% (10/30) and is ignored. The
+    # window is a bounded per-tool deque (maxlen), so memory is constant
+    # regardless of run length. min_calls(TOOL_FAILURE_WARN_MIN_CALLS) on the
+    # CUMULATIVE total still applies as a floor: since recent = min(total, N),
+    # total≥min_calls ⇒ recent≥min_calls samples, so the floor also guarantees a
+    # minimum recent sample count (no separate knob needed).
+    TOOL_FAILURE_RATE_WINDOW: int = 30
+
+    # ── Latency distribution (p50 / p95) ───────────────────────────────────
+    # Bounded RECENT-latency window (call count) kept per tool / per LLM
+    # provider so get_summary() can ship p50_ms / p95_ms alongside the existing
+    # O(1) avg. On a 12h+ run the avg is diluted flat by a mass of fast cache
+    # hits while a degrading tool/provider shows up FIRST in the tail (p95) —
+    # the same "history dilution" blind spot that motivated recent_failure_rate.
+    # A bounded sliding window (NOT a uniform reservoir) is chosen precisely so
+    # a uniform lifetime sample does not dilute the tail back toward early fast
+    # calls; recent p95 tracks CURRENT degradation. Constant memory per tool /
+    # provider (deque maxlen) regardless of run length; percentile() is
+    # O(K log K) with K ≤ this cap, called at most once per tool/provider per
+    # get_summary() (every ~2s). 128 ≈ a stable tail estimate that still fits a
+    # tight memory budget across ~50 tools + N providers.
+    LATENCY_SAMPLE_WINDOW: int = 128
+    # p95 latency warn threshold (milliseconds). A tool whose recent p95 exceeds this
+    # trips a ``warn_slow_tools`` health warning and appears in the dashboard "Slow
+    # Tools" card. 5000ms = 5 seconds: any tool whose tail latency surpasses 5s is
+    # clearly degraded (tool execution times are typically sub-second for code-serving
+    # tools like read_file/grep; multi-second tools like web_search/bash have a higher
+    # natural baseline, but a p95 above 5s on ANY tool warrants operator attention).
+    TOOL_LATENCY_P95_WARN_MS: float = 5000.0
+    # Same semantics for LLM providers. LLM calls are inherently slower (network I/O),
+    # so the threshold is higher. 30000ms = 30 seconds: a provider whose p95 tail
+    # exceeds 30s is degrading (typical LLM calls span 2-15s depending on model size
+    # and output length; 30s p95 means a significant fraction of calls are stalling).
+    LLM_LATENCY_P95_WARN_MS: float = 30000.0
+    # Minimum number of latency samples needed before a tool/provider's p95 is
+    # considered meaningful for slow-health gates (top_slow_tools / top_slow_llm).
+    # Prevents a single slow call (cold start, first-of-run network hit) from
+    # tripping a false "degraded" warning. Matches the design intent of
+    # TOOL_FAILURE_WARN_MIN_CALLS (the failure gate's equivalent floor).
+    LATENCY_P95_MIN_SAMPLES: int = 5
 
     # ── Distillation / Learning ────────────────────────────────────────────
     DISTILL_THRESHOLD_SPARSE: float = 0.90   # context_utils.py: sample_count < 10
