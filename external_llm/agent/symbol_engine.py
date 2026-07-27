@@ -296,6 +296,7 @@ def resolve_fixspec_insert_anchor(
     if anchor_line and file_path:
         resolved = resolve_anchor_text_based(
             file_path, anchor_line, module_level_only=module_level_only,
+            repo_root=executor._repo_root,
         )
         if resolved:
             return resolved
@@ -406,6 +407,7 @@ def resolve_anchor_text_based(
     file_path: str,
     anchor_line: int,
     module_level_only: bool = False,
+    repo_root: Optional[str] = None,
 ) -> Optional[str]:
     """Find the nearest existing definition above *anchor_line* via text scan.
 
@@ -414,7 +416,10 @@ def resolve_anchor_text_based(
     returns the bare definition name.
     """
     try:
-        _abs = file_path if os.path.isabs(file_path) else file_path
+        if os.path.isabs(file_path) or repo_root is None:
+            _abs = file_path
+        else:
+            _abs = os.path.join(repo_root, file_path)
         if not os.path.isfile(_abs):
             return None
         with open(_abs, encoding="utf-8", errors="replace") as _fh:

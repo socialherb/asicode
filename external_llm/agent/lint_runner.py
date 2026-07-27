@@ -369,11 +369,22 @@ class LintRunner:
         return LintResult(ok=ok, issues=all_issues, summary=summary)
 
     def _resolve_path(self, path: str) -> Optional[Path]:
-        """Resolve path within repo_root, return None if invalid."""
+        """Resolve *path* within repo_root, return None if it escapes or is absent.
+
+        Containment uses ``relative_to``, not ``str.startswith``: the latter
+        accepted any sibling sharing the root's textual prefix, so
+        ``run_lint("../repo-evil/secret.py")`` from ``/a/repo`` resolved to
+        ``/a/repo-evil/secret.py`` and was linted. Same boundary bug (and same
+        fix) as ``path_security._repo_within_allowlist`` documents.
+
+        ``path_security.resolve_inside_repo`` is the SSOT for repo-relative
+        paths but is not a drop-in here: ``run_ruff`` accepts ``""``/``"."`` to
+        mean "the whole repository", which that function rejects as invalid.
+        """
         try:
-            repo = Path(self.repo_root)
+            repo = Path(self.repo_root).resolve()
             p = (repo / path).resolve()
-            if not str(p).startswith(str(repo)):
+            if p != repo and not p.is_relative_to(repo):
                 return None
             if not p.exists():
                 return None

@@ -270,6 +270,8 @@ class IntelligentLLMService:
         """
         from .agent.agent_loop import AgentLoop
         from .agent.tool_registry import AgentConfig, ToolRegistry
+        from .agent.task_router import Lane, RouteDecision, TaskKind
+        from .agent.enums import Complexity, Scope
 
         def _stream_cb(event: str, data: dict) -> None:
             if not progress_callback:
@@ -297,6 +299,17 @@ class IntelligentLLMService:
             run_lint=True,
             context_variant=context_variant,
             stream_callback=_stream_cb,
+        )
+        # Agent mode always uses the MAIN_AGENT lane. Without a route_decision,
+        # AgentLoop.run() hits the unhandled-lane guard and returns
+        # partial_success with 0 LLM calls — a silent no-op.
+        config.route_decision = RouteDecision(
+            task_kind=TaskKind.SINGLE_FILE_EDIT,
+            complexity=Complexity.MEDIUM,
+            scope=Scope.SINGLE_FILE,
+            lane=Lane.MAIN_AGENT,
+            confidence=0.9,
+            reasoning="Agent mode requested by caller",
         )
 
         registry = ToolRegistry(str(repo_path), config)

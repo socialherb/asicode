@@ -30,6 +30,15 @@ logger = logging.getLogger(__name__)
 # what a "what is this job doing" query needs.
 _OUTPUT_BUF_CAP = 2 * 1024 * 1024  # 2 MiB
 _TRUNCATION_MARKER = "…[oldest output truncated]…\n"
+# Max completed-job results preserved in the ring-buffer after reaping/eviction.
+# Once the ring is full, the oldest entry is evicted (FIFO).  This gives the
+# agent a window to retrieve job output after a job is cleaned up.
+_REAPED_RESULTS_MAX = 20
+# Per-stream output kept per reaped job. Generous because the whole point of
+# the ring is that this is the ONLY surviving copy of a finished job's result:
+# 20 jobs × 2 streams × 32 KiB ≈ 1.3 MiB worst case, which is nothing next to
+# the 2 MiB a single *live* job's buffer is already allowed.
+_REAPED_OUTPUT_CAP = 32 * 1024
 
 
 def _cap_tail(buf: str) -> str:
@@ -270,10 +279,57 @@ class BackgroundJobManager:
         self.max_jobs = max_jobs
         self._reap_interval = reap_interval
         self._jobs: dict[str, BackgroundJob] = OrderedDict()
+        # Ring buffer for completed/killed job results: preserves output after
+        # the job is removed from _jobs by cleanup() or _evict_over_capacity.
+        # Maps job_id -> BackgroundJobInfo.  Bounded at _REAPED_RESULTS_MAX
+        # (oldest entries evicted first via popitem(last=False)).
+        self._reaped_results: "OrderedDict[str, BackgroundJobInfo]" = OrderedDict()
         self._lock = threading.Lock()
         self._last_reap: float = 0.0
         self._reaper_timer: Optional[threading.Timer] = None
         self._reaper_active: bool = False
+
+    @staticmethod
+    def _reaped_tail(buf: Optional[str]) -> str:
+        """Keep the LAST ``_REAPED_OUTPUT_CAP`` chars of *buf*, marking elision.
+
+        Tail, never head: a job is backgrounded precisely because it is long,
+        and a long command's answer — the test summary, the build verdict, the
+        final line of a script — is at the END. A leading slice preserves the
+        boilerplate and drops the result, which is worse than useless because
+        it looks like a successful retrieval. (Same reasoning, and the same
+        direction, as :func:`_cap_tail` for live buffers.)
+        """
+        buf = buf or ""
+        if len(buf) <= _REAPED_OUTPUT_CAP:
+            return buf
+        return _TRUNCATION_MARKER + buf[-_REAPED_OUTPUT_CAP:]
+
+    def _snapshot_job_locked(self, job_id: str, job: BackgroundJob) -> BackgroundJobInfo:
+        """Build a BackgroundJobInfo from a job without I/O (caller must hold _lock).
+
+        Uses the already-accumulated output buffers; does NOT call poll_status()
+        or read_output() to avoid I/O under the lock.
+        """
+        return BackgroundJobInfo(
+            job_id=job_id,
+            command=job.command,
+            pid=job.proc.pid,
+            status=job.status,
+            elapsed=job.elapsed,
+            stdout=self._reaped_tail(job._stdout_buf),
+            stderr=self._reaped_tail(strip_malloc_noise(job._stderr_buf)),
+        )
+
+    def _store_reaped_locked(self, job_id: str, info: BackgroundJobInfo) -> None:
+        """Insert a reaped job into the ring buffer, evicting oldest if over cap.
+
+        Caller MUST hold ``self._lock``.
+        """
+        self._reaped_results[job_id] = info
+        self._reaped_results.move_to_end(job_id)
+        while len(self._reaped_results) > _REAPED_RESULTS_MAX:
+            self._reaped_results.popitem(last=False)
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -313,6 +369,23 @@ class BackgroundJobManager:
         # Kill outside the lock — may block up to ~6 s.
         for victim_id, victim_job, victim_cmd in kill_victims:
             victim_job.kill()
+            # Drain any remaining output (final pipe flush after kill).
+            try:
+                victim_job.read_output()
+            except Exception:
+                # Best-effort: the snapshot below still stores whatever was
+                # already buffered. Logged because a failure here is the
+                # difference between a retrievable result and a silently
+                # empty one.
+                logger.debug(
+                    "Final drain failed for evicted job %s", victim_id, exc_info=True
+                )
+            # Snapshot the victim's final state into the ring buffer so
+            # get_info() can still retrieve output after eviction.
+            with self._lock:
+                if victim_id not in self._reaped_results:
+                    info = self._snapshot_job_locked(victim_id, victim_job)
+                    self._store_reaped_locked(victim_id, info)
             logger.warning(
                 "Killed oldest job to enforce max_jobs=%d: id=%s cmd=%.200s",
                 self.max_jobs, victim_id, victim_cmd,
@@ -323,6 +396,11 @@ class BackgroundJobManager:
     def get_info(self, job_id: str) -> Optional[BackgroundJobInfo]:
         """Get a snapshot of job state, or None if not found.
 
+        Fallback: if the job has been reaped (removed from ``_jobs`` by
+        cleanup or capacity eviction), searches the ring buffer of recent
+        results (``_reaped_results``), which preserves the final state
+        including stdout/stderr tail.
+
         I/O (``poll_status``, ``read_output``) is performed *outside*
         ``self._lock`` so that long-running pipe reads do not block
         other callers (``kill``, ``list_jobs``, etc.).
@@ -330,6 +408,10 @@ class BackgroundJobManager:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
+                # Not in active registry — check the reaped-results ring.
+                reaped = self._reaped_results.get(job_id)
+                if reaped is not None:
+                    return reaped
                 return None
             # Snapshot mutable fields under the lock, then release
             command = job.command
@@ -436,10 +518,48 @@ class BackgroundJobManager:
             logger.info("Background job killed: id=%s cmd=%.200s", job_id, job.command)
             return self._jobs[job_id].poll_status() if job_id in self._jobs else "killed"
 
+    def _drain_finished(self) -> None:
+        """Read any still-buffered pipe output for finished jobs. Lock-free.
+
+        MUST run before :meth:`cleanup` snapshots a job, because
+        ``_snapshot_job_locked`` deliberately performs no I/O — it copies
+        ``_stdout_buf``, and that buffer is only filled by ``read_output()``.
+        A job nobody polled between its exit and the reaper tick therefore had
+        its entire output still sitting unread in the OS pipe, and the ring
+        preserved an empty string: a "successful" retrieval of nothing, for
+        precisely the walk-away workflow the ring exists to serve.
+
+        The job list is snapshotted under the lock and the reads happen
+        outside it, matching ``get_info``/``list_jobs``.
+        """
+        with self._lock:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            try:
+                if job.poll_status() != "running":
+                    job.read_output()  # final drain — process is dead, pipe flushing
+            except Exception:
+                # Never let one unreadable pipe abort the sweep for the rest,
+                # but do say so: an undrained job is reaped with empty output,
+                # which reads as a successful retrieval of nothing.
+                logger.debug("Final drain failed before reap", exc_info=True)
+
     def cleanup(self) -> int:
-        """Remove completed/failed/killed jobs from the registry. Returns count removed."""
+        """Remove completed/failed/killed jobs from the registry. Returns count removed.
+
+        Before removal, each job's final state is snapshotted into a bounded
+        ring buffer (``_reaped_results``) so callers can still retrieve recent
+        job output via ``get_info()`` after cleanup.
+        """
+        self._drain_finished()
         with self._lock:
             before = len(self._jobs)
+            # Snapshot completed/failed/killed jobs BEFORE removal so their
+            # final output is preserved in the ring buffer.
+            for jid, j in list(self._jobs.items()):
+                if j.poll_status() != "running":
+                    info = self._snapshot_job_locked(jid, j)
+                    self._store_reaped_locked(jid, info)
             self._jobs = OrderedDict(
                 (jid, j) for jid, j in self._jobs.items()
                 if j.poll_status() == "running"
@@ -478,6 +598,9 @@ class BackgroundJobManager:
                 if jid == keep_job_id:
                     continue
                 if job.poll_status() != "running":
+                    # Snapshot before removal so output is preserved.
+                    info = self._snapshot_job_locked(jid, job)
+                    self._store_reaped_locked(jid, info)
                     del self._jobs[jid]
                     logger.debug("Evicted completed job: id=%s", jid)
                     evicted_finished = True
@@ -488,6 +611,10 @@ class BackgroundJobManager:
             killed_one = False
             for jid, job in list(self._jobs.items()):
                 if jid != keep_job_id:
+                    # Victim will be killed outside the lock.  Don't snapshot
+                    # yet — the status is still "running" here.  The caller
+                    # (start()) snapshots after the kill so the ring buffer
+                    # gets the correct "killed" status.
                     del self._jobs[jid]
                     victims.append((jid, job, job.command))
                     killed_one = True

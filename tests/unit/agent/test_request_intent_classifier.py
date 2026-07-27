@@ -1,5 +1,8 @@
 """Unit tests for request_intent_classifier.py — 100% branch coverage."""
+import pytest
+
 from external_llm.agent.request_intent_classifier import (
+    intent_is_undetermined,
     is_non_edit_intent,
     normalize_routing_label,
     routing_intent_from_intent_result,
@@ -70,6 +73,17 @@ class TestNormalizeRoutingLabel:
         caplog.set_level(logging.WARNING)
         result = normalize_routing_label("question")
         assert result == "question"
+        assert "LABEL_DRIFT" not in caplog.text
+
+    def test_unknown_sentinel_is_recognized_no_drift(self, caplog):
+        """'unknown' is the IntentResult default / classification-failure sentinel
+        (intent_models.py:41; emitted by every IntentResolver failure path). It is
+        an internal first-class sentinel, NOT LLM-output drift, and must NOT trigger
+        LABEL_DRIFT. Maps to explore_and_edit (fail-open: never block a legit edit)."""
+        import logging
+        caplog.set_level(logging.WARNING)
+        result = normalize_routing_label("unknown")
+        assert result == "explore_and_edit"
         assert "LABEL_DRIFT" not in caplog.text
 
     def test_unrecognized_label_passthrough(self, caplog):
@@ -145,3 +159,69 @@ class TestRoutingIntentFromIntentResult:
         """intent_type='question' (lowercase) is recognized as read_only."""
         result = FakeIntentResult(intent_type="question")
         assert routing_intent_from_intent_result(result) == "read_only"
+
+    def test_classification_failure_routes_to_explore_and_edit(self, caplog):
+        """End-to-end contract: a real IntentResolver failure path produces
+        IntentResult(intent_type='unknown', lane_hint='planner') — see
+        intent_resolver.py:796/811/825 and intent_models.py:41. This must route to
+        explore_and_edit (fail-open: never block a legitimate edit) and must NOT
+        emit LABEL_DRIFT, since 'unknown' is a first-class internal sentinel."""
+        import logging
+        caplog.set_level(logging.WARNING)
+        result = FakeIntentResult(lane_hint="planner", intent_type="unknown")
+        assert routing_intent_from_intent_result(result) == "explore_and_edit"
+        assert "LABEL_DRIFT" not in caplog.text
+
+
+# ── intent_is_undetermined ───────────────────────────────────────────────────
+
+class TestIntentIsUndetermined:
+    """The permission default (explore_and_edit) must stay separable from the
+    question 'did classification actually happen?'."""
+
+    def test_none_is_undetermined(self):
+        """No IntentResult attached at all — nothing was classified."""
+        assert intent_is_undetermined(None) is True
+
+    @pytest.mark.parametrize("source", [
+        "minimal_fallback",   # LLM call raised / no client
+        "llm_parse_failed",   # response was not parseable JSON
+        "empty_request",      # nothing to classify
+    ])
+    def test_resolver_failure_sources_are_undetermined(self, source):
+        result = FakeIntentResult(lane_hint="planner", intent_type="unknown")
+        result.metadata = {"source": source}
+        assert intent_is_undetermined(result) is True
+        # …while routing still fails OPEN so a legitimate edit is never blocked.
+        assert routing_intent_from_intent_result(result) == "explore_and_edit"
+
+    def test_real_classification_is_determined(self):
+        result = FakeIntentResult(lane_hint="planner", intent_type="bugfix")
+        result.metadata = {"source": "llm"}
+        assert intent_is_undetermined(result) is False
+
+    def test_real_unknown_classification_is_determined(self):
+        """intent_type='unknown' from a SUCCESSFUL resolve is not a failure —
+        the sentinel alone cannot distinguish the two, the source can."""
+        result = FakeIntentResult(lane_hint="planner", intent_type="unknown")
+        result.metadata = {"source": "llm"}
+        assert intent_is_undetermined(result) is False
+
+    def test_missing_metadata_is_determined(self):
+        """No metadata attribute → no evidence of failure, treat as classified."""
+        assert intent_is_undetermined(FakeIntentResult(intent_type="feature")) is False
+
+    def test_matches_real_resolver_failure_shape(self):
+        """Contract test against the real IntentResolver, not a fake: whatever
+        it emits when its LLM call raises must be recognised as undetermined."""
+        from external_llm.agent.intent_resolver import (
+            IntentResolver, IntentResolutionConfig,
+        )
+
+        class _Boom:
+            def chat(self, **kw):
+                raise RuntimeError("intent LLM unreachable")
+
+        resolver = IntentResolver(IntentResolutionConfig(llm_client=_Boom(), model="x"))
+        result = resolver.resolve("이 함수 뭐 하는 건지 설명해줘")
+        assert intent_is_undetermined(result) is True

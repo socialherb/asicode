@@ -24,10 +24,13 @@ from external_llm.repl.collaborate.asi_mcp_adapter import (
     _ANALYSIS_SAFE_TOOLS,
     _DESTRUCTIVE_TOOLS,
     _EXCLUDED_TOOLS,
+    _INNER_TIMEOUT_TOOLS,
     _OPEN_WORLD_TOOLS,
     _READ_ONLY_TOOLS,
+    _TOOL_SPECIFIC_TIMEOUTS,
     _convert_schema_to_input_type,
     _get_tool_annotations,
+    _resolve_mcp_timeout,
     build_asr_mcp_server,
     build_collaborate_install_command,
     build_collaborate_install_spec,
@@ -374,3 +377,87 @@ class TestMcpServerBuilding:
         tools = list_mcp_tools()
         for t in tools:
             assert t.get("description"), f"Tool {t['name']} missing description"
+
+
+class TestTimeoutOrdering:
+    """The MCP ceiling must outlive the inner budget of self-policing tools.
+
+    `bash` enforces its own timeout and, on expiry, salvages partial output and
+    hands the process to BackgroundJobManager, returning a Job ID the agent can
+    poll. Both layers previously defaulted to 120s, so the outer asyncio.wait_for
+    won the race: the agent got TOOL_TIMEOUT, the Job ID was discarded, the
+    background job was never reaped, and the worker thread kept running
+    (observed: outer gave up at 120.0s, that same call completed at 122.9s).
+    """
+
+    def test_bash_ceiling_exceeds_inner_budget_across_the_allowed_range(self):
+        from external_llm.agent.tool_handlers.shell_policy import SHELL_TIMEOUT_MAX
+
+        for inner in range(1, SHELL_TIMEOUT_MAX + 1):
+            outer = _resolve_mcp_timeout("bash", {"timeout": inner})
+            assert outer > inner, f"inner={inner} outer={outer} — inner wins the race"
+
+    def test_every_inner_timeout_tool_gets_headroom_over_its_own_max(self):
+        """Contract for the whole table, so a newly added tool cannot regress."""
+        for tool, (key, default, maximum) in _INNER_TIMEOUT_TOOLS.items():
+            for inner in (1, default, maximum):
+                outer = _resolve_mcp_timeout(tool, {key: inner})
+                assert outer > inner, f"{tool}: inner={inner} outer={outer}"
+
+    def test_bash_default_ceiling_leaves_room_for_the_background_transition(self):
+        """No argument → the inner run uses its default, so the ceiling must clear it."""
+        from external_llm.agent.tool_handlers.shell_policy import SHELL_TIMEOUT_DEFAULT
+
+        assert _resolve_mcp_timeout("bash", {}) > SHELL_TIMEOUT_DEFAULT
+
+    def test_bash_honours_the_schema_max_not_the_requested_absurdity(self):
+        """timeout=99999 is clamped, so it cannot pin an executor thread for hours."""
+        from external_llm.agent.tool_handlers.shell_policy import SHELL_TIMEOUT_MAX
+
+        assert _resolve_mcp_timeout("bash", {"timeout": 99999}) == _resolve_mcp_timeout(
+            "bash", {"timeout": SHELL_TIMEOUT_MAX}
+        )
+
+    @pytest.mark.parametrize("bad", [None, 0, "", "abc", -5, 3.7, [], {"nested": 1}])
+    def test_malformed_timeout_arg_never_raises(self, bad):
+        """A model-supplied garbage value must not break tool dispatch."""
+        assert _resolve_mcp_timeout("bash", {"timeout": bad}) > 0
+
+    @pytest.mark.parametrize("args", [None, "notadict", 42])
+    def test_non_dict_args_fall_back_to_the_default(self, args):
+        assert _resolve_mcp_timeout("bash", args) > 0
+
+    def test_non_self_policing_tools_keep_their_static_budget(self):
+        """Only _INNER_TIMEOUT_TOOLS get a derived ceiling; the rest are untouched."""
+        for tool, expected in _TOOL_SPECIFIC_TIMEOUTS.items():
+            if tool in _INNER_TIMEOUT_TOOLS:
+                continue
+            assert _resolve_mcp_timeout(tool, {}) == expected
+        # A tool with no override falls through to the global default.
+        from external_llm.repl.collaborate import asi_mcp_adapter as mod
+        assert _resolve_mcp_timeout("apply_patch", {}) == mod.CLAUDE_MCP_TOOL_TIMEOUT
+
+    def test_a_timeout_arg_is_ignored_for_tools_that_do_not_police_their_own(self):
+        """An unrelated tool carrying a `timeout` key must not inflate its ceiling."""
+        assert _resolve_mcp_timeout("read_file", {"timeout": 9999}) == (
+            _TOOL_SPECIFIC_TIMEOUTS["read_file"]
+        )
+
+    def test_zero_env_disables_the_ceiling_and_is_not_resurrected(self, monkeypatch):
+        """CLAUDE_MCP_TOOL_TIMEOUT=0 means "no ceiling" (config allows zero).
+
+        The per-call derivation must not turn that opt-out back into a limit.
+        """
+        from external_llm.repl.collaborate import asi_mcp_adapter as mod
+
+        monkeypatch.setattr(mod, "CLAUDE_MCP_TOOL_TIMEOUT", 0)
+        assert _resolve_mcp_timeout("bash", {}) == 0
+        assert _resolve_mcp_timeout("bash", {"timeout": 300}) == 0
+        assert _resolve_mcp_timeout("apply_patch", {}) == 0
+
+    def test_explicitly_raised_env_ceiling_still_wins(self, monkeypatch):
+        """Raising the env ceiling above the derived one must not be downgraded."""
+        from external_llm.repl.collaborate import asi_mcp_adapter as mod
+
+        monkeypatch.setattr(mod, "CLAUDE_MCP_TOOL_TIMEOUT", 5000)
+        assert _resolve_mcp_timeout("bash", {"timeout": 120}) == 5000

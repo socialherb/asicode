@@ -157,7 +157,7 @@ def _iter_repo_py() -> list[Path]:
 def _scan_path(path: Path) -> list[str]:
     rel = str(path.relative_to(REPO))
     try:
-        src = path.read_text()
+        src = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
     return _scan_source(src, rel)
@@ -174,7 +174,7 @@ def _load_baseline() -> set[str]:
     if not BASELINE.exists():
         return set()
     out: set[str] = set()
-    for line in BASELINE.read_text().splitlines():
+    for line in BASELINE.read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if s and not s.startswith("#"):
             out.add(s)
@@ -194,7 +194,7 @@ def _write_baseline(keys: set[str]) -> None:
         "#\n"
     )
     lines = sorted(keys)
-    BASELINE.write_text(header + "\n".join(lines) + ("\n" if lines else ""))
+    BASELINE.write_text(header + "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def main() -> int:

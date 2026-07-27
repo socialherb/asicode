@@ -49,12 +49,14 @@ def test_reuses_cache_when_model_matches(tmp_path):
     mgr0 = _manager(tmp_path)
     _seed_cache(tmp_path, mgr0.model_name)
     mgr = _manager(tmp_path)
+    mgr._ensure_index_loaded()
     assert mgr.index.ntotal == 3  # vectors reused
 
 
 def test_rebuilds_when_model_differs(tmp_path):
     _seed_cache(tmp_path, "some-old-model")
     mgr = _manager(tmp_path)
+    mgr._ensure_index_loaded()
     assert mgr.index.ntotal == 0  # stale vectors discarded
     assert mgr.id_to_doc == {}
 
@@ -63,11 +65,13 @@ def test_rebuilds_when_marker_missing(tmp_path):
     _seed_cache(tmp_path, "x")
     (tmp_path / "embedding_model.txt").unlink()  # legacy pre-marker cache
     mgr = _manager(tmp_path)
+    mgr._ensure_index_loaded()
     assert mgr.index.ntotal == 0
 
 
 def test_save_writes_marker(tmp_path):
     mgr = _manager(tmp_path)
+    mgr._ensure_index_loaded()  # load empty index first so _save_index has something to write
     mgr._save_index()
     marker = tmp_path / "embedding_model.txt"
     assert marker.exists()

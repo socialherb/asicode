@@ -327,3 +327,89 @@ class TestRedirectFdDupVsFile:
             ToolRegistry, "_has_file_redirect_via_ts", classmethod(lambda cls, c: None)
         )
         assert _mutates("git log 2>&1 | head") is True
+
+
+class TestArbitraryCodeIsNotReadOnly:
+    """`python -c` / `python3 -c` / `node -e` run ARBITRARY code.
+
+    They were on the read-only prefix whitelist, justified in a comment as
+    "introspection only when via -c (no pip/install)" — which considers what the
+    flag prevents (installing) but not what it permits (writing files). A
+    `python3 -c "open('f','w').write(...)"` therefore classified as read-only,
+    and this classifier feeds three consumers that must agree on it:
+
+      * read-tool cache invalidation — the agent then re-reads its own
+        pre-mutation content for the rest of the 120 s TTL (reproduced
+        end-to-end: disk said MUTATED, read_file returned ORIGINAL with
+        cache_hit=True);
+      * dispatch_parallel's gate — a file-writing command batched in parallel
+        with reads of that same file, the exact race the gate exists to stop;
+      * DesignChatLoop's read/write phase partition.
+
+    The classifier's own stated policy is that ambiguous commands default to
+    mutating "since a stale cache is worse than a miss". Arbitrary code is the
+    most ambiguous shape there is, so it now falls to that default — including
+    for harmless-looking bodies, since deciding otherwise would mean parsing a
+    second language to guess intent.
+    """
+
+    def test_python_c_write_is_mutating(self):
+        assert _mutates("python -c \"open('a.py','w').write('x')\"") is True
+
+    def test_python3_c_write_is_mutating(self):
+        assert _mutates("python3 -c \"import pathlib;pathlib.Path('a').write_text('x')\"") is True
+
+    def test_node_e_write_is_mutating(self):
+        assert _mutates("node -e \"require('fs').writeFileSync('a','x')\"") is True
+
+    def test_python_c_rmtree_is_mutating(self):
+        assert _mutates("python -c \"import shutil;shutil.rmtree('d')\"") is True
+
+    def test_harmless_looking_body_is_still_mutating(self):
+        """No body inspection: we do not parse Python/JS to guess intent."""
+        assert _mutates("python -c 'print(1)'") is True
+        assert _mutates("node -e 'console.log(1)'") is True
+
+    def test_node_check_stays_readonly(self):
+        """`node --check` only parses — it must keep its cache benefit."""
+        assert _mutates("node --check a.js") is False
+
+
+class TestEnvPrefix:
+    """`env` printed the environment, but `env <cmd>` RUNS <cmd>.
+
+    The whitelist entry was the bare string "env" (no trailing space, unlike
+    every other entry), so a plain prefix match whitelisted any command it
+    wrapped — the same hole as `python -c`, reachable as `env python -c ...`.
+    """
+
+    def test_bare_env_is_readonly(self):
+        assert _mutates("env") is False
+
+    def test_env_with_assignment_only_is_readonly(self):
+        assert _mutates("env FOO=1") is False
+        assert _mutates("env FOO=1 BAR=2") is False
+
+    def test_env_running_a_command_is_mutating(self):
+        assert _mutates("env python -c \"open('a','w').write('x')\"") is True
+        assert _mutates("env rm -rf d") is True
+
+    def test_env_prefixed_other_binary_is_mutating(self):
+        """'env' without a trailing space also matched envsubst, envdir, ..."""
+        assert _mutates("envsubst < template") is True
+
+
+class TestConservativeDefaultStillHolds:
+    """Spot-check that the fix did not weaken or over-broaden the classifier."""
+
+    def test_known_mutators(self):
+        for cmd in ("sed -i 's/a/b/' f", "find . -delete", "sort -o out in",
+                    "dd if=/dev/zero of=f", "truncate -s 0 f", "install -m 644 a b",
+                    "git stash pop", "echo hi > f", "echo hi | tee f"):
+            assert _mutates(cmd) is True, cmd
+
+    def test_known_readonly_still_cacheable(self):
+        for cmd in ("cat a.py", "ls -la", "git status", "grep -rn x .",
+                    "git log --oneline", "pwd", "whoami", "printenv",
+                    "head -20 f", "wc -l f"):
+            assert _mutates(cmd) is False, cmd

@@ -413,6 +413,7 @@ class ToolRegistry(
         "job": "_tool_job",
         "find_symbol": "_tool_find_symbol",
         "grep": "_tool_grep",
+        "glob": "_tool_glob",
         "read_file": "_tool_read_file",
         "read_symbol": "_tool_read_symbol",
         "find_references": "_tool_find_references",
@@ -782,6 +783,19 @@ class ToolRegistry(
         except Exception:
             pass  # non-critical — never block execution
 
+        # Same reason, for the non-Python symbol caches. Without this the
+        # "cannot find a symbol in code it just wrote" symptom above persisted
+        # for every non-Python language (measured: a new Go func stayed invisible
+        # to find_symbol for the full 30 s TTL while an equivalent Python edit was
+        # visible immediately). Scoped to non-Python touches because those caches
+        # only ever index non-Python files, so a .py write cannot affect them —
+        # and clearing them would cost a needless re-walk on the common path.
+        try:
+            if any(not p.endswith((".py", ".pyi")) for p in touched_paths):
+                self._symbol_searcher.invalidate_nonpy_caches()
+        except Exception as e:
+            logger.debug("post-write invalidation: non-Python caches failed: %s", e)
+
         # Invalidate run-scoped graph cache for touched files
         try:
             from external_llm.graph.run_scoped_graph_cache import get_global_graph_cache
@@ -789,6 +803,49 @@ class ToolRegistry(
             graph_cache.invalidate_for_files(touched_paths)
         except Exception:
             pass  # non-critical — never block execution
+
+    def _invalidate_caches_unknown_scope(self) -> None:
+        """Post-write invalidation for a mutating call whose targets are unknown.
+
+        ``_invalidate_cache_after_write`` needs the touched paths, so it is only
+        reachable from the write TOOLS. ``bash`` mutates just as often — the
+        agent's own no-tool nudge literally instructs it to create files with
+        ``bash('cat > path << EOF ...')`` — but carried none of it: a successful
+        mutating bash cleared the tool-result cache and nothing else. Measured:
+        a .py AND a .go file created by bash were both invisible to find_symbol
+        afterwards, which is the same "cannot find a symbol in code it just
+        wrote" symptom the write-tool path was fixed for.
+
+        Scope is unknown here (parsing arbitrary shell for target paths is the
+        classifier trap all over again), so this clears wholesale — the same
+        choice the tool-result cache already makes for bash one level up
+        ("falls back to a full clear — safer than guessing scope").
+
+        RAG and the run-scoped graph cache are path-keyed with no clear-all and
+        are deliberately left alone: they rank relevance rather than answer
+        "does this symbol exist", so staleness there degrades ordering, not
+        correctness.
+        """
+        try:
+            self._file_cache.clear()
+        except Exception as e:
+            logger.debug("unknown-scope invalidation: file cache clear failed: %s", e)
+        try:
+            cgi = getattr(getattr(self, "_call_graph", None), "call_graph_indexer", None)
+            if cgi is not None:
+                cgi.invalidate()
+        except Exception as e:
+            logger.debug("unknown-scope invalidation: call-graph invalidate failed: %s", e)
+        try:
+            from external_llm.agent._shared_utils import _PY_WALK_CACHE, _TS_WALK_CACHE
+            for _walk_cache in (_PY_WALK_CACHE, _TS_WALK_CACHE):
+                _walk_cache.pop(self.repo_root, None)
+        except Exception as e:
+            logger.debug("unknown-scope invalidation: walk cache pop failed: %s", e)
+        try:
+            self._symbol_searcher.invalidate_nonpy_caches()
+        except Exception as e:
+            logger.debug("unknown-scope invalidation: non-Python caches failed: %s", e)
 
     def _ensure_asicode_gitignored(self) -> None:
         """Add .asicode/ to .gitignore if not already present.
@@ -849,6 +906,7 @@ class ToolRegistry(
         "read_symbol",
         "read_file",
         "grep",
+        "glob",
         "read_image",
         # Web search/fetch — read-only network lookups; cached under the same TTL/LRU
         # as the others. Scope is None (network result), so a write-tool success drops
@@ -894,9 +952,14 @@ class ToolRegistry(
         "git rev-parse", "git remote -v", "git config --get",
         "git blame", "git ls-files", "git ls-tree", "git count-objects",
         "pwd", "whoami", "hostname", "uname", "echo ", "printf ",
-        "which ", "command -v", "type ", "env", "printenv",
-        "python3 -c ", "python -c ",  # introspection only when via -c (no pip/install)
-        "node -e ", "node --check ",
+        "which ", "command -v", "type ", "printenv",
+        # NOT here, deliberately: "python -c", "python3 -c", "node -e". They were
+        # whitelisted as "introspection only when via -c (no pip/install)", but -c
+        # and -e run ARBITRARY code — `python3 -c "open('f','w').write(...)"`
+        # rewrites a file while classifying as read-only. That is the single most
+        # ambiguous command shape there is, and this classifier's stated policy is
+        # that ambiguous defaults to mutating. `node --check` stays: it only parses.
+        "node --check ",
         "pytest --collect-only", "pytest -q --co",
         "ruff check", "ruff --version",
         "test ", "[ ",
@@ -1078,6 +1141,14 @@ class ToolRegistry(
         if segment == "git branch" or segment.startswith("git branch "):
             rest = segment[len("git branch"):].strip()
             return rest == "" or any(rest.startswith(a) for a in cls._GIT_BRANCH_READONLY_ARGS)
+        if segment == "env" or segment.startswith("env "):
+            # Bare `env` (optionally with VAR=VAL assignments) prints the
+            # environment and is read-only. `env <cmd> ...` RUNS <cmd>, so a plain
+            # prefix match would whitelist an arbitrary command — the same hole
+            # `python -c` had. Options (-i, -u FOO) fall to mutating: conservative,
+            # and only costs a cache miss.
+            rest = segment[len("env"):].strip()
+            return all("=" in tok for tok in rest.split()) if rest else True
         for prefix in cls._BASH_READONLY_PREFIXES:
             if segment.startswith(prefix) or segment == prefix.rstrip():
                 return True
@@ -1273,7 +1344,11 @@ class ToolRegistry(
                 full = p if os.path.isabs(p) else os.path.join(self.repo_root, p)
                 return frozenset({os.path.normpath(full)})
             return None
-        if tool_name == "grep":
+        # glob shares grep's shape: an optional `path` narrows the scope, its
+        # absence means repo-wide. Both must report "unknown scope" when
+        # unscoped so a write anywhere invalidates the cached listing — a glob
+        # result goes stale the moment a matching file is created or deleted.
+        if tool_name in ("grep", "glob"):
             p = args.get("path")
             p = p.strip() if isinstance(p, str) else ""
             if p and p not in (".", self.repo_root):
@@ -1986,16 +2061,48 @@ class ToolRegistry(
                             "Semantic auto-repair error: %s", _sem_exc, exc_info=True
                         )
 
+                # ── Post-write cache invalidation (PARITY across write tools) ──
+                # _invalidate_cache_after_write was reachable from exactly TWO
+                # handler-internal call sites (write_plan, and one apply_patch
+                # branch guarded by `if touched:`), while _WRITE_TOOLS has seven
+                # members. Measured: a successful apply_patch — new file AND
+                # existing file — invoked it ZERO times, so the file cache, call
+                # graph, RAG index and per-root walk caches all kept serving
+                # pre-write state until their TTLs expired. The agent then could
+                # not find a symbol in code it had just written (find_symbol
+                # answered "No definitions found" for a function on disk).
+                #
+                # Invalidating HERE, at the same central post-success point the
+                # semantic auto-repair above already uses for the same
+                # parity reason, makes it structurally impossible for a write
+                # tool to skip it — including the three self-validating tools
+                # (edit_text/edit_ast/anchor_edit) that never had a call at all.
+                # The two handler-internal calls remain and are harmless: every
+                # step of _invalidate_cache_after_write is idempotent.
+                try:
+                    self._invalidate_cache_after_write(sorted(_sem_snapshots))
+                except Exception as _inv_exc:
+                    logger.debug(
+                        "Post-write cache invalidation failed for %s: %s",
+                        tool_name, _inv_exc, exc_info=True,
+                    )
+
             # Cache result for read-only tools (if not already a cache hit)
             if (self._tool_result_cache is not None and
                 tool_name in self._READ_ONLY_TOOLS and
                 result.ok and not cache_hit):
-                # Convert ToolResult to serializable dict
+                # Convert ToolResult to serializable dict.
+                # ``metadata`` defaults to {} via default_factory, but a handler
+                # that passes metadata=None explicitly overrides that default —
+                # and `dict(None)` here would raise, killing the whole tool call
+                # for a merely cosmetic slip.  Worse, it only fires when the
+                # cache is on and the tool is read-only, so the same handler
+                # looks fine in tests that disable the cache.
                 cached = {
                     "ok": result.ok,
                     "content": result.content,
                     "error": result.error,
-                    "metadata": dict(result.metadata),
+                    "metadata": dict(result.metadata or {}),
                 }
                 _cache_paths = self._extract_read_scope_paths(tool_name, args)
                 self._tool_result_cache.set(tool_name, args, cached, paths=_cache_paths)
@@ -2024,11 +2131,23 @@ class ToolRegistry(
                     else:
                         self._tool_result_cache.clear()
                         logger.debug("Tool result cache cleared due to successful write tool: %s", tool_name)
+                # Write tools already ran _invalidate_cache_after_write with their
+                # known target paths at the central post-success point above. A
+                # mutating NON-write tool (bash) never reaches that, so its file /
+                # walk / symbol caches kept serving pre-write state — see
+                # _invalidate_caches_unknown_scope.
+                if tool_name not in self._WRITE_TOOLS:
+                    self._invalidate_caches_unknown_scope()
                 for cb in self._write_success_callbacks:
                     try:
                         cb()
                     except Exception:
-                        pass  # non-critical — never block execution
+                        # Non-critical — one bad observer must never block the
+                        # write path. Logged rather than swallowed: a callback
+                        # that raises every time is otherwise invisible forever.
+                        logger.debug(
+                            "write-success callback %r failed", cb, exc_info=True
+                        )
 
             return result
         except Exception as e:
@@ -2160,7 +2279,7 @@ class ToolRegistry(
             filtering is needed (no per-call copy). Callers must NOT mutate the
             returned list or its dicts. When ``lang_filter`` filters out tools,
             the filtered list is memoized per registry instance — stable object
-            identity restores the ``id()``-keyed token cache in
+            identity enables the content-fingerprint-keyed token cache in
             ``estimate_tokens_from_tool_schemas``. Callers must NOT mutate the
             returned list or its dicts.
         """

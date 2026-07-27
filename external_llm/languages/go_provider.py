@@ -116,10 +116,10 @@ class GoSyntaxProvider(SyntaxProvider):
                 return tree_sitter_syntax_fallback(content, LanguageId.GO, file_path)
             except subprocess.TimeoutExpired:
                 logger.debug("go build timed out for %s", file_path)
-                return SyntaxValidationResult(ok=True, language=LanguageId.GO)
+                return tree_sitter_syntax_fallback(content, LanguageId.GO, file_path)
             except Exception as e:
                 logger.debug("go build error: %s", e)
-                return SyntaxValidationResult(ok=True, language=LanguageId.GO)
+                return tree_sitter_syntax_fallback(content, LanguageId.GO, file_path)
 
             if proc.returncode == 0:
                 return SyntaxValidationResult(ok=True, language=LanguageId.GO)

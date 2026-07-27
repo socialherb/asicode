@@ -110,6 +110,92 @@ _WALK_SKIP_DIRS: frozenset = frozenset({
     ".eggs", "worktrees",
 })
 
+# Directories whose contents are least useful for code-navigation tools
+# (find_symbol / find_relevant_files / analyze_change_impact). The walker
+# visits these LAST, so when a file cap is reached, real source code fills it
+# before tests / fixtures / generated output do. This is a typed NAME set (a
+# policy), not a regex — ``os.walk`` already prunes vendor dirs via
+# :data:`_WALK_SKIP_DIRS`; this set only reorders the survivors by relevance.
+# Case-insensitive match against the directory basename.
+_WALK_DEPRIORITIZED_DIRS: frozenset = frozenset({
+    "tests", "test", "__tests__", "tst", "spec", "specs", "__specs__",
+    "fixtures", "testdata", "test_data", "test-data", "mocks", "stubs",
+    "snapshots", "__snapshots__", "fakes", "examples", "samples",
+    "out", "target", "generated", "gen", "autogen",
+})
+
+
+def _walk_dir_sort_key(d: str) -> tuple[int, str]:
+    """Sort key for ``os.walk`` directory descent order.
+
+    Lower tuple = visited first. Deprioritized dirs (tests/fixtures/generated)
+    get tier 1 so source subtrees (tier 0) are enumerated — and thus fill the
+    file cap — before them. Within a tier, plain alphabetical order keeps the
+    walk deterministic across machines/clones (``os.walk`` otherwise returns
+    filesystem-enumeration order, which is non-reproducible).
+    """
+    return (1 if d.lower() in _WALK_DEPRIORITIZED_DIRS else 0, d)
+
+
+# Module-level guard so the truncation warning fires at most once per
+# (root, cap) per process — a long-lived REPL re-walks every TTL window and
+# would otherwise spam. Reset implicitly when the entry is re-cached.
+_WALK_TRUNCATION_WARNED: set[tuple[str, int]] = set()
+
+
+def _warn_walk_truncated(root_key: str, cap: int, collected: int) -> None:
+    """Log (once) that a repo walk hit the file cap and is therefore incomplete.
+
+    A truncated walk silently hides files from find_symbol / call_graph /
+    find_relevant_files — the agent then concludes "symbol does not exist"
+    (fail-silent). Surfacing the cap as an explicit, deduped warning makes the
+    incompleteness visible without changing any return type.
+    """
+    marker = (root_key, cap)
+    if marker in _WALK_TRUNCATION_WARNED:
+        return
+    _WALK_TRUNCATION_WARNED.add(marker)
+    logger.warning(
+        "File walk for %s truncated at cap %d (collected %d); files beyond the "
+        "cap are INVISIBLE to find_symbol / find_relevant_files / "
+        "analyze_change_impact. Raise the cap if the repo is larger.",
+        root_key, cap, collected,
+    )
+
+
+def _walk_truncated_for(root, cache: dict, max_files: Optional[int] = None) -> bool:
+    """True if the walk *this caller* would receive for *root* is incomplete.
+
+    Callers (e.g. find_symbol on a miss) consult this to distinguish "symbol
+    genuinely absent" from "symbol may exist in un-indexed files". Returns
+    False when no cached walk exists (treat as: not known-truncated).
+
+    Truncation is a property of ``(walk, max_files)``, NOT of the cache entry
+    alone, so *max_files* must be the cap the caller itself passes to
+    :func:`_walk_repo_files`. A cache entry produced by a HIGHER-cap caller can
+    be complete (``was_truncated=False``) yet still be sliced down for a
+    lower-cap one — ``_walk_repo_files`` returns ``files[:max_files]`` on the
+    hit path. Reading only the stored flag then reports "complete" for a result
+    that is missing files, resurrecting the exact fail-silent behaviour this
+    helper exists to prevent.
+
+    Live example of the mismatch: ``vulture_scanner`` walks with
+    ``max_files=4000`` while ``symbol_search``/``call_graph`` use 3000, so on a
+    3000-4000 file repo a structural scan inside the cache TTL would hand
+    find_symbol a silently shortened list. Passing *max_files* closes that.
+    Omitting it preserves the old flag-only reading for callers that genuinely
+    do not have a cap in hand.
+    """
+    cached = cache.get(str(root))
+    if cached is None:
+        return False
+    # cached = (timestamp, files, was_truncated)
+    _ts, _files, _was_truncated = cached
+    if _was_truncated:
+        return True
+    return max_files is not None and len(_files) > max_files
+
+
 # Per-root file-list cache. rglob over a large repo costs ~250ms; repeated
 # find_symbol / call-graph builds would pay it every time. Short TTL so newly
 # created files become visible quickly. Best-effort: callers tolerate a
@@ -131,15 +217,24 @@ _TS_WALK_CACHE: dict[str, tuple[float, list, bool]] = {}
 def _capped_put(cache: dict, key, value, cap: int = _WALK_CACHE_MAX_ENTRIES) -> None:
     """Set ``cache[key] = value`` then FIFO-evict the oldest entry if over *cap*.
 
-    Pure-dict, GIL-atomic — no lock needed (consistent with the lock-free cache
-    family). ``dict`` insertion order (3.7+) yields the oldest via
-    ``next(iter(cache))``; the most-recently-inserted path is the current repo,
-    so stale repos are the correct eviction candidates.
+    Note: ``iter(cache)`` / ``next(iter(cache))`` is *not* atomic under
+    free-threaded CPython (PEP 703 or concurrent threads that insert/delete).
+    ``next()`` can fail with ``RuntimeError`` (dict resized during iteration)
+    or ``StopIteration`` (concurrent drain) — the eviction loop catches both
+    and bails out, leaving the cache temporarily over cap (harmless).
+
+    ``dict`` insertion order (3.7+) yields the oldest via ``next(iter(cache))``;
+    the most-recently-inserted path is the current repo, so stale repos are the
+    correct eviction candidates.
     """
     cache[key] = value
     while len(cache) > cap:
-        _oldest = next(iter(cache))
-        cache.pop(_oldest, None)
+        try:
+            _oldest = next(iter(cache))
+            cache.pop(_oldest, None)
+        except (RuntimeError, StopIteration):
+            logger.debug("_capped_put: concurrent dict resize, stopping eviction (cap=%s, size=%s)", cap, len(cache))
+            break  # concurrent dict resize or empty — give up eviction
 
 
 def _walk_should_skip_dir(d: str) -> bool:
@@ -198,19 +293,31 @@ def _walk_repo_files(root, max_files: int, cache: dict, keep) -> list:
     results: list = []
     _was_truncated = False
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not _walk_should_skip_dir(d)]
+        # Prune vendor/noise dirs, then SORT the survivors so the descent is
+        # (a) deterministic across machines/clones — os.walk otherwise yields
+        # filesystem-enumeration order — and (b) source-prioritized: real code
+        # subtrees (tier 0) are visited before tests/fixtures/generated (tier
+        # 1), so the file cap is filled with source, not tests. Sorting both
+        # dirnames and filenames keeps file order reproducible too.
+        dirnames[:] = sorted(
+            (d for d in dirnames if not _walk_should_skip_dir(d)),
+            key=_walk_dir_sort_key,
+        )
+        filenames.sort()
         for name in filenames:
             if keep(name):
                 results.append(Path(dirpath) / name)
                 if len(results) >= max_files:
+                    _was_truncated = True
                     _capped_put(cache, key, (_walk_time.monotonic(), results, True))
+                    _warn_walk_truncated(key, max_files, len(results))
                     # Slice + shallow-copy, mirroring the cache-HIT path above. Without
                     # the copy we'd hand back the very list object stored in *cache*, so
                     # a caller that .append()/.sort()s the result would pollute the cache
                     # for every subsequent caller — the invariant documented at the HIT
                     # path must hold on both paths.
                     return list(results[:max_files])
-    _capped_put(cache, key, (_walk_time.monotonic(), results, False))
+    _capped_put(cache, key, (_walk_time.monotonic(), results, _was_truncated))
     # See note above: return a copy, not the cached object.
     return list(results[:max_files])
 
@@ -1842,6 +1949,22 @@ def reset_unknown_block_type_counts() -> dict[str, int]:
         return snapshot
 
 
+def _images_ocr_len(images: object) -> int:
+    """Total length of any pre-computed ``ocr_text`` across *images*.
+
+    Non-list ``images`` and non-dict elements yield 0 rather than raising: this
+    runs on every cache probe and on every estimate, and the token estimator
+    must degrade rather than crash on a malformed message.
+    """
+    if not isinstance(images, list):
+        return 0
+    return sum(
+        len(img.get("ocr_text") or "")
+        for img in images
+        if isinstance(img, dict)
+    )
+
+
 def _msg_token_fingerprint(m: object) -> tuple:
     """Length-based signature of every field that feeds the token estimate.
 
@@ -1852,6 +1975,13 @@ def _msg_token_fingerprint(m: object) -> tuple:
     change a container length.  Nested in-place edits that preserve every length
     are not detected — but no current mutator produces those, and the
     copy-on-write discipline remains the primary safety mechanism.
+
+    ``images`` is the one known in-place mutator: ``_images_to_text`` writes an
+    ``ocr_text`` key into each image dict without changing the list length, and
+    that text feeds the estimate (see ``_estimate_single_message_tokens``).  So
+    the OCR length is fingerprinted alongside the list length — otherwise the
+    pre-OCR flat estimate stays cached and the message is under-counted, which
+    is the context-overflow failure this subsystem exists to prevent.
     """
     rc = getattr(m, 'raw_content', None)
     tc = getattr(m, 'tool_calls', None)
@@ -1862,6 +1992,7 @@ def _msg_token_fingerprint(m: object) -> tuple:
         len(rc) if isinstance(rc, (list, str)) else 0,
         len(tc) if isinstance(tc, list) else 0,
         len(images) if isinstance(images, list) else 0,
+        _images_ocr_len(images),
         len(reasoning) if isinstance(reasoning, str) else (1 if reasoning else 0),
     )
 
@@ -1999,10 +2130,16 @@ def _estimate_single_message_tokens(m: object) -> int:
                 # surfaced via a one-time-per-type warning.
                 mt += _count_block_wholesale(block)
                 _warn_unknown_block_type(btype)
-    # Images (provider-cap flat estimate — see _IMAGE_BLOCK_TOKEN_ESTIMATE docstring)
+    # Images (provider-cap flat estimate — see _IMAGE_BLOCK_TOKEN_ESTIMATE docstring).
+    # When an image dict carries a pre-computed ``ocr_text`` (set by
+    # _images_to_text on first call), use its token-equivalent length
+    # as a floor so that text-only model paths never under-count
+    # Korean-heavy OCR output (which can be ~2× the flat cap).
     images = _msg_field(m, 'images', None)
     if images:
-        mt += len(images) * _IMAGE_BLOCK_TOKEN_ESTIMATE
+        for img in images:
+            ocr_len = len(img.get("ocr_text") or "") if isinstance(img, dict) else 0
+            mt += max(_IMAGE_BLOCK_TOKEN_ESTIMATE, ocr_len // 2)
 
     # Cache on the message object for the turn lifetime (only for cacheable
     # objects).  Store a length fingerprint alongside so a later in-place
@@ -2024,19 +2161,39 @@ def estimate_tokens_from_msgs(messages: list) -> int:
     return sum(_estimate_single_message_tokens(m) for m in messages)
 
 
-_tool_schema_token_cache: dict[int, int] = {}
-"""Bounded ``id(tool_schemas)`` → token-count cache.
+_tool_schema_token_cache: dict[tuple[int, tuple[str, ...]], int] = {}
+"""Bounded ``content-fingerprint -> token-count`` cache.
 
-The no-filter path (``tool_registry.AGENT_TOOL_SCHEMAS``) always returns the
-*same* list object — 100% permanent cache hit.  The lang_filter path returns a
-*fresh* list each call, but within a single turn all call sites pass the same
-object.  A small bounded cache eliminates repeated ``json.dumps`` of the
-(identical or same-reference) schemas.
-
-The id()-reuse risk (GC → same address → different content) is negligible:
-tool schemas are loaded once and never mutated, so any reuse produces the same
-token count.  Worst-case mismatch is one turn with a slightly stale count.
+Keyed on ``(len(tool_schemas), tuple(tool_names))`` instead of ``id()``: the
+old id()-keyed cache was silently poisoned by address reuse (a freed small
+schema list's id was handed to a freshly-allocated large schema list, yielding
+a 10x+ under-count that survived because the freed id stayed in the cache).
+The fingerprint is content-based, so it is immune to GC address reuse, while
+staying cheaper than the ``json.dumps`` it exists to avoid.  Tool schemas are
+loaded once per process and never mutated, so the name-set uniquely identifies
+the (immutable) schema content -- the cache is both safe and collision-free
+for the in-repo usage.
 """
+
+
+def _tool_schema_fingerprint(tool_schemas: list) -> tuple[int, tuple[str, ...]]:
+    """Cheap content key for :data:`_tool_schema_token_cache`.
+
+    Reads only each schema's ``name`` (or ``function.name`` for OpenAI-style
+    wrappers) -- O(n) string extraction, far cheaper than the full
+    ``json.dumps`` the cache exists to avoid.  Mutation guard: revert the key
+    to ``id(tool_schemas)`` -> test_tool_schema_token_cache tests FAIL.
+    """
+    names: list[str] = []
+    for s in tool_schemas:
+        nm = ""
+        if isinstance(s, dict):
+            nm = s.get("name") or ""
+            if not nm:
+                fn = s.get("function")
+                nm = fn.get("name", "") if isinstance(fn, dict) else ""
+        names.append(str(nm))
+    return len(tool_schemas), tuple(names)
 
 
 def estimate_tokens_from_tool_schemas(tool_schemas: Optional[list]) -> int:
@@ -2051,9 +2208,10 @@ def estimate_tokens_from_tool_schemas(tool_schemas: Optional[list]) -> int:
     """
     if not tool_schemas:
         return 0
-    # Bounded id()-keyed cache: same list object → skip json.dumps.
-    _cache_id = id(tool_schemas)
-    _cached = _tool_schema_token_cache.get(_cache_id)
+    # Content-fingerprint cache: identical name-set -> skip json.dumps. The key
+    # is content-based (not id()) so GC address reuse can never poison it.
+    _fp = _tool_schema_fingerprint(tool_schemas)
+    _cached = _tool_schema_token_cache.get(_fp)
     if _cached is not None:
         return _cached
     try:
@@ -2064,7 +2222,7 @@ def estimate_tokens_from_tool_schemas(tool_schemas: Optional[list]) -> int:
     # FIFO-bounded via the shared SSOT helper (same family as the file-index and
     # walk caches) — evicts only the oldest entry instead of nuking the whole
     # cache on the 9th distinct schema, so recently-used schemas stay warm.
-    _capped_put(_tool_schema_token_cache, _cache_id, result, cap=8)
+    _capped_put(_tool_schema_token_cache, _fp, result, cap=8)
     return result
 
 

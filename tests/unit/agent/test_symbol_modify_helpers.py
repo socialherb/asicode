@@ -21,15 +21,19 @@ Run: pytest tests/unit/agent/test_symbol_modify_helpers.py -v
 """
 from __future__ import annotations
 
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
+
+import pytest
 
 # Ensure repo root on path for any sys-level imports the module does.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import external_llm.agent.symbol_modify_tool as smt  # noqa: E402
 from external_llm.agent.symbol_modify_tool import (  # noqa: E402
     _apply_diff_to_source,
     _block_parses_after_dedent,
@@ -325,3 +329,86 @@ class TestReindentRelativeEdgeCases:
         assert out[1] == "        y = 2"
         # No tabs leak into the output.
         assert all("\t" not in _item_ for _item_ in out)
+
+
+class TestPostEditSyntaxFallbackTiers:
+    """`_post_edit_syntax_ok` runs node/gofmt when present, then toolchain-free
+    tiers. Two properties are pinned here: an infra FAILURE must be no more
+    permissive than the tool being ABSENT, and the toolchain-free path must see
+    errors that keep the braces balanced."""
+
+    SRC = "function alpha() {\n  return 1;\n}\n"
+    ORPHAN = "function alpha() {\n  return 1;\n}\n}\n"     # brace-imbalanced
+    BAL_BAD = "function alpha( {\n  return 1;\n}\n"        # balanced, invalid
+    GOOD = "function alpha() {\n  return 2;\n}\n"
+
+    @staticmethod
+    def _no_node(monkeypatch):
+        import shutil as _sh
+        real = _sh.which
+        monkeypatch.setattr(
+            smt.shutil, "which", lambda n: None if n == "node" else real(n)
+        )
+
+    @staticmethod
+    def _node_explodes(monkeypatch, exc):
+        def boom(*a, **k):
+            raise exc
+        monkeypatch.setattr(smt.subprocess, "run", boom)
+
+    @pytest.mark.parametrize("exc", [
+        subprocess.TimeoutExpired("node", 10),
+        OSError("boom"),
+    ])
+    def test_infra_failure_is_not_weaker_than_absence(self, monkeypatch, exc):
+        """Regression: the except branch used to `return True`, waving through
+        an orphan brace that node-absent correctly rejected."""
+        self._node_explodes(monkeypatch, exc)
+        assert smt._post_edit_syntax_ok(self.ORPHAN, "a.js", self.SRC) is False
+
+    def test_absence_and_failure_agree(self, monkeypatch):
+        with monkeypatch.context() as m:
+            self._no_node(m)
+            absent = [smt._post_edit_syntax_ok(c, "a.js", self.SRC)
+                      for c in (self.ORPHAN, self.BAL_BAD, self.GOOD)]
+        with monkeypatch.context() as m:
+            self._node_explodes(m, OSError("boom"))
+            failed = [smt._post_edit_syntax_ok(c, "a.js", self.SRC)
+                      for c in (self.ORPHAN, self.BAL_BAD, self.GOOD)]
+        assert absent == failed, "infra failure diverged from tool absence"
+
+    def test_balanced_syntax_error_rejected_without_node(self, monkeypatch):
+        """Brace counting alone cannot see this; the tree-sitter tier can."""
+        self._no_node(monkeypatch)
+        assert smt._post_edit_syntax_ok(self.BAL_BAD, "a.js", self.SRC) is False
+
+    def test_valid_edit_still_allowed_without_node(self, monkeypatch):
+        self._no_node(monkeypatch)
+        assert smt._post_edit_syntax_ok(self.GOOD, "a.js", self.SRC) is True
+
+    def test_editing_an_already_broken_file_is_not_rejected(self, monkeypatch):
+        """The tree-sitter tier must not fire on the file's PRE-EXISTING errors.
+
+        This is the case the relative brace delta was introduced for: a user
+        mid-fix. Rejecting requires the pre-edit source to have parsed clean.
+        """
+        self._no_node(monkeypatch)
+        broken_src = "function alpha( {\n  return 1;\n}\n"
+        assert smt._post_edit_syntax_ok(self.GOOD, "a.js", broken_src) is True
+
+    def test_no_source_does_not_engage_the_relative_tier(self, monkeypatch):
+        """Without pre-edit content there is nothing to attribute the error to."""
+        self._no_node(monkeypatch)
+        assert smt._post_edit_syntax_ok(self.GOOD, "a.js", "") is True
+
+    def test_unavailable_grammar_is_no_opinion_not_a_syntax_error(self, monkeypatch):
+        """None from the tier must never read as False."""
+        monkeypatch.setattr(smt, "_ts_syntax_valid", lambda *_a: None)
+        self._no_node(monkeypatch)
+        assert smt._post_edit_syntax_ok(self.GOOD, "a.js", self.SRC) is True
+        # brace-imbalance is still caught by the tier below it
+        assert smt._post_edit_syntax_ok(self.ORPHAN, "a.js", self.SRC) is False
+
+    def test_python_path_unaffected(self):
+        assert smt._post_edit_syntax_ok("def a():\n    return 1\n", "m.py", "") is True
+        assert smt._post_edit_syntax_ok("def a(:\n    return 1\n", "m.py", "") is False

@@ -42,10 +42,17 @@ class _Harness(WriteToolsMixin):
         return {"ok": True, "skipped": True, "reason": "test"}
 
     def _secure_path(self, path, *, confine=False):
+        # Mirrors ToolRegistry._secure_path: a repo-BOUNDARY check, not an
+        # existence check (and absolute paths INSIDE the repo are allowed).
         from pathlib import Path as _Path
-
-        resolved = _Path(self.repo_root) / path
-        return resolved if resolved.exists() else None
+        repo = _Path(self.repo_root).resolve()
+        p = _Path(path)
+        resolved = p.resolve() if p.is_absolute() else (repo / path).resolve()
+        try:
+            resolved.relative_to(repo)
+        except ValueError:
+            return None
+        return resolved
 
     def _invalidate_cache_after_write(self, files):
         pass

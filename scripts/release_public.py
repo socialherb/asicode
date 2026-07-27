@@ -57,9 +57,89 @@ def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
         sys.exit(1)
 
 
+FIRST_PARTY_PREFIXES = ("external_llm.", "webapp.")
+
+
 def _version() -> str:
-    m = re.search(r'^version\s*=\s*"([^"]+)"', (REPO / "pyproject.toml").read_text(), re.M)
+    m = re.search(r'^version\s*=\s*"([^"]+)"', (REPO / "pyproject.toml").read_text(encoding="utf-8"), re.M)
     return m.group(1) if m else "0.0.0"
+
+
+def _check_untracked_imports() -> bool:
+    """Fail-fast gate: every first-party module imported by a *shipping* file
+    must itself be tracked by git.  Prevents the 'untracked module silently
+    missing from wheel' class of release bug (0.2.6 version_check, 0.2.14
+    rich_markdown).
+
+    Two properties this gate lives or dies by:
+
+    * **``ast.walk``, not ``ast.iter_child_nodes``.**  Only walking top-level
+      statements would miss function-level imports — and this codebase imports
+      lazily by convention (``asi._rich_markdown_cls`` and
+      ``streaming_display._markdown_lines`` are both function-level).  A
+      top-level-only scan passes clean on the exact bug this gate cites as its
+      reason to exist, which is worse than no gate: it certifies the release.
+      Mutation guard: revert to ``iter_child_nodes`` → the
+      ``rich_markdown``-untracked case in test_release_untracked_import_gate
+      FAILS.
+    * **Scoped to what ships.**  ``is_excluded`` drops lane/, webapp/, tools/
+      etc., whose imports are irrelevant to the wheel and which legitimately
+      reference private-only modules.  Scanning them produced 4 pre-existing
+      false positives that would have made the gate un-turn-on-able.
+
+    Returns True if all imports resolve to tracked files, False otherwise.
+    """
+    import ast as _ast
+
+    tracked = set(export_public.tracked_files())
+    shipped = [
+        rel for rel in tracked
+        if rel.endswith(".py") and export_public.is_excluded(rel) is None
+    ]
+
+    errors: list[str] = []
+    for pyfile in sorted(shipped):
+        abs_path = REPO / pyfile
+        if not abs_path.is_file():
+            continue
+        try:
+            tree = _ast.parse(abs_path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue  # malformed file (unlikely in tracked files)
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                for alias in node.names:
+                    _check_import(alias.name, pyfile, tracked, errors)
+            elif isinstance(node, _ast.ImportFrom):
+                if node.level and node.level > 0:
+                    continue  # relative import — skip
+                if node.module:
+                    _check_import(node.module, pyfile, tracked, errors)
+    if errors:
+        print("error: release blocked — untracked first-party imports detected:", file=sys.stderr)
+        for line in sorted(set(errors)):
+            print(f"  {line}", file=sys.stderr)
+        print("  → git add the module(s), or the wheel ships an ImportError.", file=sys.stderr)
+        return False
+    return True
+
+
+def _check_import(module: str, importer: str, tracked: set[str], errors: list[str]) -> None:
+    """Check if a single imported module resolves to a tracked file."""
+    # Only check first-party modules (those under our packages).
+    if not any(module.startswith(p) for p in FIRST_PARTY_PREFIXES):
+        # Not a first-party module — skip (stdlib, third-party, or top-level
+        # module like "asi" which lives in the repo root and is always tracked).
+        return
+    # Convert module name to file path: external_llm.foo.bar → external_llm/foo/bar.py
+    parts = module.split(".")
+    # The module file could be a directory with __init__.py or a .py file
+    # Try module.py first, then module/__init__.py
+    candidate_py = "/".join(parts) + ".py"
+    candidate_init = "/".join(parts) + "/__init__.py"
+    if candidate_py in tracked or candidate_init in tracked:
+        return
+    errors.append(f"{module} (imported by {importer}) → not tracked by git")
 
 
 def _changelog_has_version(version: str) -> bool:
@@ -73,7 +153,7 @@ def _changelog_has_version(version: str) -> bool:
     cl = REPO / "CHANGELOG.md"
     if not cl.exists():
         return False
-    return f"## [{version}]" in cl.read_text(errors="replace")
+    return f"## [{version}]" in cl.read_text(encoding="utf-8", errors="replace")
 
 
 def main() -> int:
@@ -124,7 +204,14 @@ def main() -> int:
         )
         return 1
 
-    # ── 1) Export snapshot to a temp dir ───────────────────────────────────
+    # ── 1) Check: no untracked first-party imports ──────────────────────────
+    # A tracked file importing an untracked module means the module is
+    # silently absent from the wheel (export copies tracked files only).
+    # This gate catches the 0.2.6 (version_check) class of release bug.
+    if not _check_untracked_imports():
+        return 1
+
+    # ── 2) Export snapshot to a temp dir ───────────────────────────────────
     shipped: list[str] = []
     for rel in export_public.tracked_files():
         if export_public.is_excluded(rel) is None:
@@ -144,7 +231,7 @@ def main() -> int:
         # copied verbatim still reference modules that don't ship.
         export_public.prune_baseline_files(tmp, shipped)
 
-        # ── 2) Sync into public working tree (delete + overwrite) ──────────
+        # ── 3) Sync into public working tree (delete + overwrite) ──────────
         removed = 0
         for p in sorted(public.rglob("*"), reverse=True):
             rel = p.relative_to(public).as_posix()
@@ -160,7 +247,7 @@ def main() -> int:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(tmp / rel, dst)
 
-    # ── 3) Commit (+ tag/push) in the public repo ──────────────────────────
+    # ── 4) Commit (+ tag/push) in the public repo ──────────────────────────
     _run(["git", "add", "-A"], public)
     if not _run(["git", "status", "--porcelain"], public).stdout.strip():
         print("nothing to release: public repo already matches the snapshot")

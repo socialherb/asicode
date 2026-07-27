@@ -13,6 +13,9 @@ Excluded from the public snapshot:
   - .github/workflows/p11-ci.yml  (runs a tools/ script)
   - tests that import lane/webapp/tools (recomputed on every export, so
     newly added coupled tests are excluded automatically)
+  - tests that REQUEST a fixture defined by an excluded conftest.py — a test
+    need not import an excluded package itself to depend on one (see
+    _fixture_coupled_tests)
 
 Lint-baseline files (scripts/*_baseline.txt) are copied then pruned: any
 entry keyed by ``<path>::...`` whose path is itself excluded from the
@@ -25,6 +28,7 @@ Usage:
 """
 from __future__ import annotations
 
+import ast
 import re
 import shutil
 import subprocess
@@ -61,15 +65,30 @@ EXCLUDE_FILES = {
     "tests/unit/agent/test_scanner_registry_coverage.py",
     "tests/unit/agent/test_skip_reason_classification.py",
     "tests/unit/test_config_flag_reachable.py",
+    # Same category: this one asserts things about the PRIVATE tree that are
+    # false by construction after export — that lane/ modules lazily imported by
+    # shipped code are git-tracked (they are not, in the snapshot lane/ is gone)
+    # and that webapp/ exists as an excluded package (it does not ship at all).
+    # It guards the pre-export release gate, so it belongs upstream of the
+    # export, never inside it.
+    "tests/unit/test_release_untracked_import_gate.py",
 }
 
 # A test file is excluded when it imports (or patches into) an excluded area.
+#
+# The ``^\s*`` anchors matter: this repo imports lazily by convention, so an
+# excluded package is routinely reached from *inside* a test function, indented.
+# The anchors were previously ``^from``/``^import`` (column 0 only), which let
+# `tests/unit/agent/test_rollback_shared_tree.py` ship — it does
+# ``import webapp.routes.agent_stream`` inside `test_webapp_injects_file_lock_manager`,
+# and webapp/ does not exist in the public snapshot, so the test failed on a
+# fresh clone of the released repo.
 _COUPLED_TEST_PAT = re.compile(
     r"(_editor_core\.lane|_editor_core/lane"
     r"|editor\.operation_handlers|editor/operation_handlers"
     r"|editor\.refactor|editor\.safety|editor\.semantic_lineage"
-    r"|^from webapp|^import webapp\b|from webapp import|from webapp\."
-    r"|^from tools|^import tools\b|from tools import|from tools\."
+    r"|^\s*from webapp|^\s*import webapp\b|from webapp import|from webapp\."
+    r"|^\s*from tools|^\s*import tools\b|from tools import|from tools\."
     # path-string loading of excluded dirs (importlib.spec_from_file_location,
     # subprocess script invocations): REPO / "tools" / "x.py", "webapp/..." etc.
     r"|[\"']tools[\"'] */|[\"']webapp[\"'] */|tools/[A-Za-z_]+\.py|webapp/[A-Za-z_]+\.py)",
@@ -86,8 +105,12 @@ def tracked_files() -> list[str]:
     return [p.decode("utf-8") for p in out.split(b"\0") if p]
 
 
-def is_excluded(rel: str) -> str | None:
-    """Return the exclusion reason, or None if the file ships."""
+def _base_exclusion(rel: str) -> str | None:
+    """Exclusion by path rule or by the test's own imports (no fixture analysis).
+
+    Split out from :func:`is_excluded` so the fixture pass below can ask "is this
+    conftest excluded?" without recursing back into itself.
+    """
     if rel in EXCLUDE_FILES:
         return "internal"
     for pref in EXCLUDE_PREFIXES:
@@ -100,6 +123,104 @@ def is_excluded(rel: str) -> str | None:
             return None
         if _COUPLED_TEST_PAT.search(src):
             return "coupled-test"
+    return None
+
+
+def _fixture_names(src: str) -> set[str]:
+    """Names of ``@pytest.fixture``-decorated functions in *src* (AST, not regex)."""
+    names: set[str] = set()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return names
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            # @pytest.fixture, @pytest.fixture(...), @fixture, @fixture(...)
+            target = dec.func if isinstance(dec, ast.Call) else dec
+            attr = getattr(target, "attr", None) or getattr(target, "id", None)
+            if attr == "fixture":
+                names.add(node.name)
+                break
+    return names
+
+
+def _requested_params(src: str) -> set[str]:
+    """Every parameter name a test/fixture function in *src* asks pytest to inject.
+
+    Parameters are how a test declares a fixture dependency, so this is exact
+    where a substring search is not: a docstring or a string literal that merely
+    mentions ``test_client`` does not make the file coupled.
+    """
+    params: set[str] = set()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return params
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        args = node.args
+        for a in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+            if a.arg not in ("self", "cls"):
+                params.add(a.arg)
+    return params
+
+
+_FIXTURE_COUPLED_CACHE: dict[str, frozenset[str]] | None = None
+
+
+def _excluded_conftest_fixtures() -> dict[str, frozenset[str]]:
+    """Map ``<dir>/`` -> fixture names defined by an EXCLUDED conftest.py there.
+
+    ``tests/integration/conftest.py`` is excluded (it builds a FastAPI
+    ``TestClient`` over ``webapp.main``), but its consumers —
+    ``integration/sse/test_sse_streaming.py``, ``e2e/test_end_to_end_scenarios.py``,
+    ``memory/test_memory_persistence.py`` — import no webapp symbol themselves, so
+    the import-based rule shipped them. In the public snapshot they collected and
+    then errored with ``fixture 'test_client' not found`` (12 errors, measured on
+    a real export + clean venv). Fixture inheritance is a real coupling edge and
+    has to be walked like one.
+    """
+    global _FIXTURE_COUPLED_CACHE
+    if _FIXTURE_COUPLED_CACHE is not None:
+        return _FIXTURE_COUPLED_CACHE
+    out: dict[str, frozenset[str]] = {}
+    for rel in tracked_files():
+        if not (rel.startswith("tests/") and rel.endswith("/conftest.py")):
+            continue
+        if not _base_exclusion(rel):
+            continue
+        try:
+            src = (REPO / rel).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        names = _fixture_names(src)
+        if names:
+            out[rel[: -len("conftest.py")]] = frozenset(names)
+    _FIXTURE_COUPLED_CACHE = out
+    return out
+
+
+def is_excluded(rel: str) -> str | None:
+    """Return the exclusion reason, or None if the file ships."""
+    reason = _base_exclusion(rel)
+    if reason:
+        return reason
+    # A test that requests a fixture from an excluded conftest.py cannot run in
+    # the snapshot even though it imports nothing excluded itself.
+    if rel.startswith("tests/") and Path(rel).name.startswith("test_") and rel.endswith(".py"):
+        coupled = _excluded_conftest_fixtures()
+        if coupled:
+            try:
+                src = (REPO / rel).read_text(encoding="utf-8")
+            except OSError:
+                return None
+            requested = _requested_params(src)
+            for dirpath, names in coupled.items():
+                if rel.startswith(dirpath) and (requested & names):
+                    return "coupled-test"
     return None
 
 

@@ -1,6 +1,7 @@
 """Tests for ExperienceStore."""
 import pytest
 
+from external_llm.agent.vector_cache import HAS_FAISS, HAS_NUMPY
 from external_llm.editor.learning.experience_store import ExperienceRecord, ExperienceStore
 from external_llm.editor.learning.problem_signature import ProblemSignature
 
@@ -133,8 +134,19 @@ class _FakeEmbeddingModel:
         return mat / norms
 
 
+@pytest.mark.skipif(
+    not (HAS_FAISS and HAS_NUMPY), reason="faiss/numpy not installed",
+)
 class TestFindSimilarSemantic:
-    """Tests for the embedding-augmented semantic recall path."""
+    """Tests for the embedding-augmented semantic recall path.
+
+    Skipped without faiss/numpy (the ``rag`` extra): the semantic half of the
+    recall silently returns nothing when the vector cache is disabled, so every
+    assertion here would fail on an ``asserted 0 == 1`` rather than on a real
+    defect. Mirrors the guards on ``tests/unit/agent/test_vector_cache_*.py``.
+    Caught on a clean ``[dev,config]`` install of the public export, where these
+    three were the only unguarded extras-dependent tests left.
+    """
 
     def test_no_op_when_store_empty(self, store):
         # No experiences recorded → semantic search returns nothing, never raises.

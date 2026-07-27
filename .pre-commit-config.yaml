@@ -9,6 +9,17 @@
 # observability-baseline drift (e.g. the F811 line-scoped key shifting when a
 # baselined file is edited above a redefinition) BEFORE the public CI does.
 #
+# "EXACTLY" was aspirational until 2026-07-27: no-new-silent-except lived HERE
+# ONLY and had no lint.yml step, so it gated nothing for anyone who had not run
+# `pre-commit install` — and lint.yml is the only workflow that actually runs
+# (p11-ci.yml is excluded from the public export). Keep the two lists in sync;
+# a hook without a matching CI step is indistinguishable from no gate at all.
+#
+# no-new-unguarded-subprocess freezes the 2 intentional unguarded subprocess
+# calls and blocks NET-NEW ones — the symbol_search rg P0, where a subprocess
+# call to an optional binary sat in a try that didn't catch OSError and crashed
+# on plain `pip install`. Mirrors lint.yml.
+#
 # F823 has no baseline: the repo was at zero when the check was added, and the
 # rule has no legitimate use (it is always a missing `global`/`nonlocal`). See
 # scripts/check_f823_none.py for the production bug that motivated it.
@@ -50,5 +61,17 @@ repos:
         name: silent-except (no log/raise) baseline-diff
         language: system
         entry: python3 scripts/check_no_new_silent_except.py
+        pass_filenames: false
+        always_run: true
+      - id: open-encoding
+        name: open() without encoding= zero-tolerance
+        language: system
+        entry: python3 scripts/check_open_encoding.py
+        pass_filenames: false
+        always_run: true
+      - id: no-new-unguarded-subprocess
+        name: unguarded subprocess (no OSError catch) baseline-diff
+        language: system
+        entry: python3 scripts/check_no_new_unguarded_subprocess.py
         pass_filenames: false
         always_run: true

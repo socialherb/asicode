@@ -40,19 +40,56 @@ _LANG_CACHE_LOCK = threading.RLock()
 # cost once and then reuses its own instance with no locking on the parse path.
 _PARSER_TLS = threading.local()
 
+# Generation counter for invalidating the PER-THREAD parser caches.
+#
+# invalidate_caches() can only reach the thread-local dict of the thread that
+# calls it, so clearing directly would leave every OTHER thread holding a Parser
+# still bound to the previous Language — defeating the documented purpose of
+# invalidate_caches() ("newly installed grammars take effect without a process
+# restart"). Instead the counter is bumped there and each thread compares it
+# lazily on its next get_parser() call, rebuilding when it has fallen behind.
+_PARSER_GENERATION = 0
+
 # Sentinel distinguishing "no entry yet" from a cached None (negative cache
 # from a failed language-binding load). A module-level object is identity-safe
 # across threads. Used by the parser TLS cache AND the compiled-query cache
 # (_compile_query) — the single sentinel serves both.
 _MISS = object()
 
+# Both memo caches below key on the FULL source text, so an entry cap alone
+# bounds the entry COUNT, not the bytes held — the two caches are filled by
+# whatever the agent last looked at, and the biggest sources are both the most
+# expensive to retain and the least likely to repeat.
+#
+# Measured on this repo (scan the 200 largest .py files, hold no references,
+# then diff RSS across cache_clear): the old 64/128-entry settings retained
+# 89 MB, these retain 17 MB. A parsed Tree costs ~19.5x its source, which is
+# where the bulk goes. Meanwhile a realistic find_symbol workload (10 lookups)
+# got hits=0/misses=36 — find_symbol has its own per-file mtime cache, so
+# nothing repeats at this layer. The documented win is intra-pipeline reuse
+# (one source parsed by several helpers in a row), which needs a handful of
+# slots, not 64.
+#
+# So: skip the cache above _MAX_CACHED_SOURCE_CHARS and keep few slots. The
+# size distribution here is median 6.5 KB / p90 42 KB, so a 64 KB gate still
+# caches ~95% of files while capping one parse entry near 1.3 MB. Larger
+# sources are re-parsed on repeat — correct, just not memoised.
+_MAX_CACHED_SOURCE_CHARS = 64 * 1024
+
+
 # Memoised UTF-8 encoding: the same content is encoded by query_captures,
 # query_matches, extract_import_names, and find_anchor_node.  Caching avoids
-# re-encoding a 300 KB file 4 times per scan pipeline.
-@lru_cache(maxsize=128)
-def _encode_content(content: str) -> bytes:
-    """Memoised UTF-8 encoding of *content*."""
+# re-encoding the same file 4 times per scan pipeline.
+@lru_cache(maxsize=32)
+def _encode_content_cached(content: str) -> bytes:
     return content.encode("utf-8")
+
+
+def _encode_content(content: str) -> bytes:
+    """UTF-8 encode *content*, memoised for sources small enough to be worth it."""
+    if len(content) > _MAX_CACHED_SOURCE_CHARS:
+        return content.encode("utf-8")
+    return _encode_content_cached(content)
 
 
 # Leading import-keyword prefix stripped from an @source capture that spans
@@ -283,10 +320,19 @@ _CONTAINER_NODE_TYPES = frozenset({
 #   @name — the name identifier (for the symbol name string)
 #   @kind — optional: a node whose type encodes the symbol kind
 _SYMBOL_QUERIES: dict[str, str] = {
+    # The two module-child alternatives are the same statement under two
+    # grammars: standalone tree-sitter-python wraps a statement-position
+    # assignment in `expression_statement`, the language-pack bundle emits
+    # `assignment` directly under `module`. Only the pack is a declared
+    # dependency, so the wrapper-only pattern found no module-level symbols at
+    # all on a real install.
     "python": """
 (function_definition name: (identifier) @name) @def
 (class_definition name: (identifier) @name) @def
-(module (expression_statement (assignment left: (identifier) @name)) @def)
+(module [
+  (expression_statement (assignment left: (identifier) @name))
+  (assignment left: (identifier) @name)
+ ] @def)
 """,
     "typescript": """
 (function_declaration name: (identifier) @name) @def
@@ -571,12 +617,40 @@ _REFERENCE_QUERIES: dict[str, str] = {
 
 _REFERENCE_QUERIES["tsx"] = _REFERENCE_QUERIES["typescript"]
 def get_available_languages() -> set[str]:
-    """Return set of language names whose tree-sitter bindings are installed."""
+    """Return set of language names whose tree-sitter bindings are installed.
+
+    Resolving the whole set imports EVERY mapped grammar module (~50 ms here,
+    where 18 of the 19 standalone packages happen to be installed). Callers that
+    only need to know about one language should use :func:`is_language_available`
+    instead — it is exactly equivalent per-language and resolves just that one.
+    """
     available = set()
     for lang in _LANG_MODULE_MAP:
         if _get_language(lang) is not None:
             available.add(lang)
     return available
+
+
+def is_language_available(language: str) -> bool:
+    """True iff *language* would appear in :func:`get_available_languages`.
+
+    Exactly equivalent to ``language in get_available_languages()`` — the set
+    is built by filtering ``_LANG_MODULE_MAP`` through ``_get_language``, so
+    membership is ``mapped AND resolvable`` and this reproduces both halves.
+    It just resolves the ONE language asked about instead of all 19.
+
+    The ``_LANG_MODULE_MAP`` check must come first, and not only for speed:
+    ``_get_language`` falls back to ``tree_sitter_language_pack`` for anything
+    it cannot import, and that pack resolves ~306 languages by DOWNLOADING the
+    grammar on first use (measured: a cold ``_get_language("json")`` took
+    644 ms, and json is not in the map). Probing an unmapped language would
+    therefore turn a symbol lookup into a network fetch AND report available
+    for a language the set-based callers treat as missing — a behaviour change,
+    not just a slow one. Gating on the map keeps this a pure optimisation.
+    """
+    if language not in _LANG_MODULE_MAP:
+        return False
+    return _get_language(language) is not None
 
 
 def is_available() -> bool:
@@ -664,9 +738,14 @@ def get_parser(language: str):
         return None
 
     cache = getattr(_PARSER_TLS, "cache", None)
+    # Drop this thread's parsers when a cache invalidation happened since they
+    # were built — they still reference the previous Language object.
+    if cache is not None and getattr(_PARSER_TLS, "generation", None) != _PARSER_GENERATION:
+        cache = None
     if cache is None:
         cache = {}
         _PARSER_TLS.cache = cache
+        _PARSER_TLS.generation = _PARSER_GENERATION
 
     cached = cache.get(language, _MISS)
     if cached is not _MISS:
@@ -701,19 +780,27 @@ _QUERY_CACHE_LOCK = threading.RLock()
 # the query cache's absence-check pattern.
 
 def invalidate_caches() -> None:
-    """Atomically clear all tree-sitter caches (language, parse, query).
+    """Atomically clear all tree-sitter caches (language, parse, query, parsers).
 
     Called by the dependency checker after a late pip-install so that newly
     installed grammars take effect without a process restart.
-    All three caches are cleared under the ``_LANG_CACHE_LOCK`` (an RLock) to
+    The caches are cleared under the ``_LANG_CACHE_LOCK`` (an RLock) to
     prevent interleaved reads from seeing a partially-invalidated state.
     ``_QUERY_CACHE_LOCK`` is also acquired in the correct lock order
     (``_LANG_CACHE_LOCK`` → ``_QUERY_CACHE_LOCK``, matching ``_get_language``)
     to avoid deadlock.
+
+    The per-thread parser caches are invalidated via ``_PARSER_GENERATION``
+    rather than cleared: this function only sees its OWN thread's
+    ``_PARSER_TLS``, so a direct clear left every other thread holding a Parser
+    bound to the discarded Language — the newly installed grammar then never took
+    effect on those threads, which is exactly what this function exists to fix.
     """
+    global _PARSER_GENERATION
     with _LANG_CACHE_LOCK:
         _LANG_CACHE.clear()
         parse_to_tree.cache_clear()
+        _PARSER_GENERATION += 1
         with _QUERY_CACHE_LOCK:
             _QUERY_CACHE.clear()
 
@@ -1594,7 +1681,21 @@ def find_anchor_node(
     }
 
 
-@lru_cache(maxsize=64)
+def _parse_to_tree_uncached(content: str, language: str):
+    parser = get_parser(language)
+    if parser is None:
+        return None
+    try:
+        return parser.parse(_encode_content(content))
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=16)
+def _parse_to_tree_cached(content: str, language: str):
+    return _parse_to_tree_uncached(content, language)
+
+
 def parse_to_tree(content: str, language: str):
     """Parse *content* and return the tree-sitter Tree object.
 
@@ -1606,14 +1707,24 @@ def parse_to_tree(content: str, language: str):
     (``__all__`` extraction, def collection, reference collection — and again
     per scanner in a pipeline).  Trees are read-only in this codebase, so
     sharing the object is safe.
+
+    Sources larger than ``_MAX_CACHED_SOURCE_CHARS`` bypass the memo and are
+    re-parsed on every call (see that constant for the measurements). Callers
+    must therefore not assume object identity across calls — only that every
+    call returns a valid tree for the content they passed.
     """
-    parser = get_parser(language)
-    if parser is None:
-        return None
-    try:
-        return parser.parse(_encode_content(content))
-    except Exception:
-        return None
+    if len(content) > _MAX_CACHED_SOURCE_CHARS:
+        return _parse_to_tree_uncached(content, language)
+    return _parse_to_tree_cached(content, language)
+
+
+# Keep the lru_cache surface on the public name: invalidate_caches() calls
+# parse_to_tree.cache_clear() to make a late-installed grammar take effect, and
+# losing it would silently break grammar hot-reload.
+parse_to_tree.cache_clear = _parse_to_tree_cached.cache_clear  # type: ignore[attr-defined]
+parse_to_tree.cache_info = _parse_to_tree_cached.cache_info  # type: ignore[attr-defined]
+_encode_content.cache_clear = _encode_content_cached.cache_clear  # type: ignore[attr-defined]
+_encode_content.cache_info = _encode_content_cached.cache_info  # type: ignore[attr-defined]
 
 
 def structural_hash(node) -> str:

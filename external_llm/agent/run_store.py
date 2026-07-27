@@ -118,6 +118,13 @@ class FailurePatternSummary:
     last_seen_run_id: Optional[str]
 
 
+# Adaptive-hub persistence debounce (see batch_adaptive_signals). Bounds how
+# much learning data a crash can lose while still collapsing the per-tool-call
+# write storm: at most this many signals, or this many seconds, between writes.
+_HUB_FLUSH_INTERVAL_S = 5.0
+_HUB_FLUSH_MAX_PENDING = 25
+
+
 class InMemoryRunStore:
     """In-memory FIFO store for run records and repair memories."""
 
@@ -127,6 +134,10 @@ class InMemoryRunStore:
         self._runs: dict[str, RunRecord] = {}
         self._run_order: list[str] = []
         self._next_run_id = 1  # deterministic monotonic counter
+        # Adaptive-hub write batching (see batch_adaptive_signals). Thread-local:
+        # this store is shared across concurrent subagent loops, so batching
+        # depth/pending state must never be a plain instance field.
+        self._hub_batch_state = threading.local()
         # Guard: only write to unified_runs.db in production contexts.
         # Unit tests create InMemoryRunStore() with default write_unified=False,
         # preventing test data from polluting cross-session learning DB.
@@ -163,7 +174,12 @@ class InMemoryRunStore:
         self._model_name = self._normalize_model_name(model_name)
         self._developer_model_name = ""
         # Adaptive learner hub (tool/patch/context/routing/prompt)
-        self._adaptive_hub: Any = None
+        # Adaptive hubs keyed by persistence namespace (see
+        # _adaptive_hub_namespace). One entry per model context this process
+        # touches — bounded by the number of distinct models in a session, so a
+        # handful; sub-agents reuse the parent's entry when they share its model.
+        self._adaptive_hubs: dict[str, Any] = {}
+        self._adaptive_hub_lock = threading.Lock()
         # Concurrency: parallel sub-agents share this single run_store instance and
         # each fires the run-completion telemetry hook (_record_p8_strategy_learning,
         # ~12 RMW calls per run) from inside the sub-agent's worker thread. The
@@ -2236,22 +2252,60 @@ class InMemoryRunStore:
     # ── Adaptive learner hub (tool/patch/context/routing/prompt) ──────────────
 
     def _get_adaptive_hub(self) -> Any:
-        """Return (lazy-initialised) AdaptiveLearnerHub."""
-        if self._adaptive_hub is None:
+        """Return the lazy-initialised AdaptiveLearnerHub for this thread's model.
+
+        Keyed by :meth:`_adaptive_hub_namespace`, NOT a single instance field.
+        The namespace is thread-local (per-model) while the hub used to be shared
+        instance state, so the two disagreed: the hub was loaded once under
+        whichever namespace the first caller's thread had — in practice the
+        parent session's generic ``adaptive_hub``, since agent_loop constructs
+        the store with no model_name — and then a sub-agent thread inside
+        ``model_context_scope`` saved that same shared object to
+        ``adaptive_hub/<model>``. That per-model namespace was therefore
+        WRITE-ONLY (the load had already happened elsewhere), and every
+        sub-agent flush copied the parent's whole blob into it, after which the
+        two drifted. Keying the cache the same way the load and save are keyed
+        removes the split at the source.
+
+        The lock is required for the same reason the telemetry RMW paths have
+        one: parallel sub-agents share this singleton. Two threads racing the
+        lazy init would each build a hub, one would overwrite the other in the
+        map, and any signals already recorded into the loser were silently
+        dropped — the loser is never saved, since saving reads the map.
+        Double-checked so the common (already-built) path stays lock-free.
+        """
+        ns = self._adaptive_hub_namespace()
+        hub = self._adaptive_hubs.get(ns)
+        if hub is not None:
+            return hub
+        with self._adaptive_hub_lock:
+            hub = self._adaptive_hubs.get(ns)
+            if hub is not None:
+                return hub
             try:
                 from .weight_learning import AdaptiveLearnerHub
-                hub = AdaptiveLearnerHub()
-                self._load_adaptive_hub_state(hub)
-                self._adaptive_hub = hub
             except ImportError:
                 logger.debug("run_store: AdaptiveLearnerHub not available")
-        return self._adaptive_hub
+                return None
+            hub = AdaptiveLearnerHub()
+            self._load_adaptive_hub_state(hub, ns)
+            self._adaptive_hubs[ns] = hub
+            return hub
 
 
-    def _load_adaptive_hub_state(self, hub: Any) -> None:
+    def _adaptive_hub_namespace(self) -> str:
+        """Persistence namespace for the CURRENT thread's model context.
+
+        Single source of truth for the key, so the cache, the load and the save
+        can no longer disagree about which hub they are talking about — they
+        previously derived it independently, which is exactly how the split
+        below arose.
+        """
+        return f"adaptive_hub/{self._model_name}" if self._model_name else "adaptive_hub"
+
+    def _load_adaptive_hub_state(self, hub: Any, ns: str) -> None:
         try:
             from external_llm.editor.learning.strategy_state import read_namespace
-            ns = f"adaptive_hub/{self._model_name}" if self._model_name else "adaptive_hub"
             state = read_namespace(ns)
             if isinstance(state, dict):
                 hub.load_state(state)
@@ -2259,32 +2313,73 @@ class InMemoryRunStore:
             logger.debug("run_store: could not restore adaptive hub (%s)", exc)
 
     def _save_adaptive_hub_state(self) -> None:
-        hub = self._adaptive_hub
+        ns = self._adaptive_hub_namespace()
+        hub = self._adaptive_hubs.get(ns)
         if hub is None:
             return
         try:
             from external_llm.editor.learning.strategy_state import write_namespace
-            state = hub.get_summary()
-            ns = f"adaptive_hub/{self._model_name}" if self._model_name else "adaptive_hub"
-            write_namespace(ns, state)
+            write_namespace(ns, hub.get_summary())
         except Exception as exc:
             logger.debug("run_store: _save_adaptive_hub_state failed: %s", exc)
 
     @contextmanager
     def batch_adaptive_signals(self):
-        """Batch multiple record_* calls into one persistence write.
+        """Batch multiple record_* calls into fewer persistence writes.
 
-        During the block, in-memory hub updates proceed normally but disk
-        persistence is deferred to block exit — turning N consecutive
-        record_* calls (which all write the same ``adaptive_hub`` namespace)
-        into a single read-merge-write cycle instead of N.
+        Each record_* call otherwise re-serialises the WHOLE adaptive-hub
+        namespace (~94 KB) and fsyncs it. In a MAIN_AGENT run that is one full
+        write per tool call — measured at 11 writes / 1.3 MB / 41 ms for a
+        12-turn run, i.e. most of the loop's own (non-LLM) wall clock.
+
+        Inside the block, writes are debounced rather than fully suspended:
+        state is still flushed every ``_HUB_FLUSH_INTERVAL_S`` or every
+        ``_HUB_FLUSH_MAX_PENDING`` signals, so a crash mid-run loses at most a
+        bounded slice of learning data instead of the entire session. A final
+        flush happens on exit if anything is still pending.
+
+        Thread-local and re-entrant. The store is a process-lifetime singleton
+        that the orchestrator hands to CONCURRENT subagent loops, so batching
+        state must not live in an instance field — one thread entering the
+        block would otherwise suspend writes for every other thread, and its
+        exit would re-enable them mid-batch. Nesting is depth-counted so an
+        inner block cannot end the outer one's batch.
         """
-        self._hub_save_suspended = True
+        tls = self._hub_batch_state
+        depth = getattr(tls, "depth", 0)
+        if depth == 0:
+            tls.pending = 0
+            tls.last_flush = time.monotonic()
+        tls.depth = depth + 1
         try:
             yield
         finally:
-            self._hub_save_suspended = False
+            tls.depth = getattr(tls, "depth", 1) - 1
+            if tls.depth <= 0:
+                tls.depth = 0
+                if getattr(tls, "pending", 0):
+                    tls.pending = 0
+                    self._save_adaptive_hub_state()
+
+    def _persist_hub_signal(self) -> None:
+        """Write hub state now, or defer it when inside batch_adaptive_signals.
+
+        Single choke point for the record_* family so the batching policy lives
+        in one place instead of being re-implemented at each call site.
+        """
+        tls = self._hub_batch_state
+        if getattr(tls, "depth", 0) <= 0:
             self._save_adaptive_hub_state()
+            return
+        pending = getattr(tls, "pending", 0) + 1
+        now = time.monotonic()
+        if (pending >= _HUB_FLUSH_MAX_PENDING
+                or now - getattr(tls, "last_flush", now) >= _HUB_FLUSH_INTERVAL_S):
+            tls.pending = 0
+            tls.last_flush = now
+            self._save_adaptive_hub_state()
+        else:
+            tls.pending = pending
 
     # Convenience methods for signal recording
     def record_tool_usage(self, phase: str, tool_name: str, success: bool,
@@ -2292,40 +2387,35 @@ class InMemoryRunStore:
         hub = self._get_adaptive_hub()
         if hub:
             hub.record_tool_usage(phase, tool_name, success, context_bucket)
-            if not getattr(self, "_hub_save_suspended", False):
-                self._save_adaptive_hub_state()
+            self._persist_hub_signal()
 
     def record_patch_result(self, failure_class: str, file_ext: str,
                             method: str, success: bool, repair_rounds: int = 0) -> None:
         hub = self._get_adaptive_hub()
         if hub:
             hub.record_patch_result(failure_class, file_ext, method, success, repair_rounds)
-            if not getattr(self, "_hub_save_suspended", False):
-                self._save_adaptive_hub_state()
+            self._persist_hub_signal()
 
     def record_context_result(self, task_type: str, context_config: str,
                               success: bool, plan_quality: float = 0.0) -> None:
         hub = self._get_adaptive_hub()
         if hub:
             hub.record_context_result(task_type, context_config, success, plan_quality)
-            if not getattr(self, "_hub_save_suspended", False):
-                self._save_adaptive_hub_state()
+            self._persist_hub_signal()
 
     def record_routing_result(self, request_features: str, lane: str,
                               success: bool, was_fallback: bool = False) -> None:
         hub = self._get_adaptive_hub()
         if hub:
             hub.record_routing_result(request_features, lane, success, was_fallback)
-            if not getattr(self, "_hub_save_suspended", False):
-                self._save_adaptive_hub_state()
+            self._persist_hub_signal()
 
     def record_prompt_result(self, strategy: str, variant: str,
                              success: bool, plan_quality: float = 0.0) -> None:
         hub = self._get_adaptive_hub()
         if hub:
             hub.record_prompt_result(strategy, variant, success, plan_quality)
-            if not getattr(self, "_hub_save_suspended", False):
-                self._save_adaptive_hub_state()
+            self._persist_hub_signal()
 
     # ── Execution learner persistence ──────────────────────────────────────────
 

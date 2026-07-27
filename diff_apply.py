@@ -708,8 +708,20 @@ def _delete_path_best_effort(p: Path) -> None:
 def _parse_porcelain_z_paths(raw: str) -> list[str]:
     """Parse ``git status --porcelain -z`` output into a list of dirty file paths.
 
-    Handles non-ASCII filenames (no C-quoting with -z) and rename entries
-    (``R  old\\0new\\0`` where the extra path must be skipped).
+    Handles non-ASCII filenames (``-z`` does not C-quote them) and rename
+    entries, which occupy TWO NUL-separated fields.
+
+    Order matters and is easy to get backwards: git emits ``R  <new>\\0<old>\\0``
+    — the CURRENT path first, the original second. So ``rec[3:]`` is the new
+    path (the one on disk, which is what a dirty-state check wants) and the
+    following field is the original, which is skipped. Verified against real
+    ``git status --porcelain -z`` output, not inferred.
+
+    Known, accepted limitation: the original path of a rename is therefore not
+    returned. The only caller uses this to decide whether a rollback left the
+    worktree dirty, and the new path is always present, so ``verified`` is
+    never wrongly True — a rename is still reported as dirty. Only the file
+    COUNT in the warning under-reports (1 instead of 2).
     """
     items = [x for x in (raw or "").split("\x00") if x]
     paths: list[str] = []

@@ -462,7 +462,13 @@ def _jvm_symbol_defined(
     if syms is not None:
         result = _ts_member_is_defined(syms, symbol)
         if result is not None:
-            return result
+            # Kotlin tree-sitter grammar can mis-parse and miss symbols
+            # (e.g. single-line ``object`` declarations).  Only trust
+            # positive identification; False → fall through to regex.
+            if result is False and lid is _LanguageId.KOTLIN:
+                pass  # fall through to regex below
+            else:
+                return result
 
     # ── Regex fallback (tree-sitter unavailable / parse failed) ──────────
     # Member regex factory covering Kotlin (fun/val/var) and Java
@@ -789,7 +795,14 @@ def _walk_definitions(node: ast.AST, out: list[DefinitionInfo], parent_class: Op
 
 
 def _collect_assign_targets(node, out_set: set, code_bytes: bytes) -> None:
-    """Extract assignment target names from a tree-sitter expression_statement.
+    """Extract assignment target names from a tree-sitter statement node.
+
+    Accepts EITHER an ``expression_statement`` wrapper or a bare
+    ``assignment``/``augmented_assignment``. The two Python grammars disagree on
+    whether the wrapper exists (standalone ``tree-sitter-python`` emits it, the
+    ``tree-sitter-language-pack`` bundle does not), and only the pack is a
+    declared dependency — so wrapper-only handling collected nothing on a real
+    install.
 
     Handles:
     - ``X = 42``              (assignment → identifier)
@@ -797,8 +810,14 @@ def _collect_assign_targets(node, out_set: set, code_bytes: bytes) -> None:
     - ``X = Y = 42``          (chained assignment → nested assignment)
     - ``X: int``              (type-only assignment)
     - ``X += 1``              (augmented assignment)
+
+    Accepting the bare form also fixes chained assignment, which the docstring
+    always claimed but the code never did: the recursive call passes the INNER
+    ``assignment`` node, and the old wrapper-only loop then searched that node's
+    children for another ``assignment`` and found none, dropping ``Y``.
     """
-    for child in node.children:
+    children = (node,) if node.type in ("assignment", "augmented_assignment") else node.children
+    for child in children:
         if child.type == "assignment":
             # Direct target identifier
             for sub in child.children:
@@ -1327,7 +1346,20 @@ def collect_defined_names(source: str, file_path: Optional[str] = None) -> set:
                             if node.type not in ("class_definition", "decorated_definition"):
                                 return
                     # Module-level assignments: X = 42, X: int = 42
-                    elif node.type == "expression_statement":
+                    #
+                    # Two node shapes, one meaning: the standalone
+                    # tree-sitter-python grammar wraps a statement-position
+                    # assignment in `expression_statement`, the grammar bundled in
+                    # tree-sitter-language-pack does not. Only the pack is a
+                    # declared dependency, so matching the wrapper alone dropped
+                    # every module-level name on a real install.
+                    # `augmented_assignment` is listed for the same reason as
+                    # `assignment`: under the wrapper grammar it is reached THROUGH
+                    # `expression_statement`, but the pack grammar hangs it straight
+                    # off `module`, where it would otherwise be walked past.
+                    elif node.type in (
+                        "expression_statement", "assignment", "augmented_assignment",
+                    ):
                         _collect_assign_targets(node, names, code_bytes)
                         return
                     for child in node.children:

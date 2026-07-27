@@ -55,19 +55,56 @@ def get_current_version() -> str:
     """Return the installed package version, or ``"0.0.0"`` if unresolvable.
 
     Uses ``importlib.metadata`` (stdlib). On a source checkout that is not
-    installed, the metadata lookup fails — we return the ``"0.0.0"`` sentinel,
-    which :func:`start_update_check` treats as "not pip-installed" and skips
+    installed, the metadata lookup fails — we first fall back to
+    ``pyproject.toml`` (for editable/development installs that shadow the
+    metadata), then return the ``"0.0.0"`` sentinel, which
+    :func:`start_update_check` treats as "not pip-installed" and skips
     the check entirely (a pip-upgrade hint would be wrong there).
+
+    For **editable** installs (``pip install -e .``) the metadata version
+    reflects the state at install time, not HEAD — we prefer ``pyproject.toml``
+    to avoid stale version reporting during development.
     """
+    # Editable install: egg-info/dist-info version is stale (install-time);
+    # prefer pyproject.toml at HEAD when available.
+    if _has_editable_distribution():
+        _v = _read_version_from_pyproject()
+        if _v != "0.0.0":
+            return _v
     try:
         from importlib.metadata import PackageNotFoundError, version
 
         try:
             return str(version(PACKAGE_NAME))
         except PackageNotFoundError:
-            return "0.0.0"
+            pass
+        return _read_version_from_pyproject()
     except Exception:
         return "0.0.0"
+
+
+def _read_version_from_pyproject() -> str:
+    """Read ``version`` from ``project`` table in ``pyproject.toml``.
+
+    Searches the script's directory first, then CWD.  Returns ``"0.0.0"`` if
+    neither is found or the TOML is unreadable.
+    """
+    try:
+        import tomllib as _toml
+    except ImportError:
+        try:
+            import tomli as _toml  # type: ignore[no-redef]
+        except ImportError:
+            return "0.0.0"
+    for _root_candidate in (os.path.dirname(__file__), os.getcwd()):
+        _pp = os.path.join(_root_candidate, "pyproject.toml")
+        if os.path.isfile(_pp):
+            try:
+                with open(_pp, "rb") as _f:
+                    return str(_toml.load(_f).get("project", {}).get("version", "0.0.0"))
+            except Exception:
+                pass
+    return "0.0.0"
 
 
 def _has_editable_distribution(package_name: str = PACKAGE_NAME) -> bool:

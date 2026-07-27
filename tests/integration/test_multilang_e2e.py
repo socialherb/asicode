@@ -10,6 +10,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -20,6 +21,29 @@ from external_llm.agent.task_router import Lane, TaskRouter
 from external_llm.graph.graph_facade import RepositoryGraphFacade
 from external_llm.graph.repository_graph import RepositoryGraph
 from external_llm.languages import LanguageId, LanguageRegistry
+
+
+def _make_router(repo_root: str | None = None) -> TaskRouter:
+    """TaskRouter wired to a stub LLM client.
+
+    TaskRouter builds an IntentResolver, which rejects an empty model name, so
+    a bare ``TaskRouter()`` raises. The stub returns a fixed intent payload —
+    routing itself is deterministic, so the LLM only has to be present.
+    """
+    client = Mock()
+    client.get_provider_name.return_value = "openai"
+    response = Mock()
+    response.content = (
+        '{"intent_type": "edit", "normalized_query": "edit request",'
+        ' "lane_hint": "main_agent", "confidence": 0.9,'
+        ' "search_terms": [], "target_files": []}'
+    )
+    response.tool_calls = []
+    response.prompt_tokens = 0
+    response.completion_tokens = 0
+    client.chat.return_value = response
+    client.chat_with_tools.return_value = response
+    return TaskRouter(llm_client=client, model="test-model", repo_root=repo_root)
 
 # ── Fixture: multi-language project ──────────────────────────────────────────
 
@@ -496,58 +520,59 @@ class TestRepositoryGraph:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestTaskRouter:
-    """Verify that the router sends TS/JS edits to PLANNER, non-AST to MAIN_AGENT."""
+    """Verify that edit requests route to MAIN_AGENT for every language.
+
+    PLANNER is permanently disabled — ``DeterministicClassifier.decide_flow()``
+    always returns MAIN_AGENT — so these assert the lane that actually ships.
+    They still exercise the full route() path (intent resolution + stage-1
+    classification), which is what catches a router that raises or reclassifies.
+    """
 
     @pytest.fixture(autouse=True)
     def _setup_router(self):
-        try:
-            self.router = TaskRouter()
-        except Exception:
-            pytest.skip("TaskRouter requires llm_client and model params")
+        self.router = _make_router()
 
-    def test_python_edit_to_planner(self):
+    def test_python_edit_to_main_agent(self):
         decision = self.router.route(
             "add a docstring to the get_user function in user_service.py"
         )
-        assert decision.lane == Lane.PLANNER
+        assert decision.lane == Lane.MAIN_AGENT
 
-    def test_typescript_edit_to_planner(self):
+    def test_typescript_edit_to_main_agent(self):
         decision = self.router.route(
             "add a findAll method to the UserRepository class in api/user.ts"
         )
-        assert decision.lane == Lane.PLANNER
+        assert decision.lane == Lane.MAIN_AGENT
 
-    def test_javascript_edit_to_planner(self):
+    def test_javascript_edit_to_main_agent(self):
         decision = self.router.route(
             "modify the formatDate function in utils/helpers.js to accept a locale parameter"
         )
-        assert decision.lane == Lane.PLANNER
+        assert decision.lane == Lane.MAIN_AGENT
 
-    def test_tsx_edit_to_planner(self):
+    def test_tsx_edit_to_main_agent(self):
         decision = self.router.route(
             "add a size prop to the Button component in ui/Button.tsx"
         )
-        assert decision.lane == Lane.PLANNER
+        assert decision.lane == Lane.MAIN_AGENT
 
-    def test_css_edit_to_planner(self):
+    def test_css_edit_to_main_agent(self):
         decision = self.router.route(
             "change the background-color of body in styles.css"
         )
-        # All requests go through PLANNER (universal lane)
-        assert decision.lane == Lane.PLANNER
+        assert decision.lane == Lane.MAIN_AGENT
 
-    def test_json_edit_to_planner(self):
+    def test_json_edit_to_main_agent(self):
         decision = self.router.route(
             "change the version value to 2.0 in config.json"
         )
-        # All requests go through PLANNER (universal lane)
-        assert decision.lane == Lane.PLANNER
+        assert decision.lane == Lane.MAIN_AGENT
 
-    def test_mixed_ts_js_to_planner(self):
+    def test_mixed_ts_js_to_main_agent(self):
         decision = self.router.route(
             "modify the functions related to the User type in api/user.ts and utils/helpers.js"
         )
-        assert decision.lane == Lane.PLANNER
+        assert decision.lane == Lane.MAIN_AGENT
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1018,11 +1043,11 @@ class TestGoProvider:
         names = {s.name for s in go_symbols}
         assert "UserService" in names or "NewUserService" in names or "FormatUser" in names
 
-    @pytest.mark.xfail(reason="TaskRouter now requires llm_client and model params", strict=False)
-    def test_go_router_planner(self):
-        router = TaskRouter()
-        decision = router.route("modify the GetUser function in server/main.go")
-        assert decision.lane == Lane.PLANNER
+    def test_go_router_routes_main_agent(self):
+        decision = _make_router().route(
+            "modify the GetUser function in server/main.go"
+        )
+        assert decision.lane == Lane.MAIN_AGENT
 
     def test_go_lint_dispatch(self, multilang_project):
         lr = LintRunner(multilang_project)
@@ -1099,11 +1124,11 @@ class TestJavaProvider:
         names = {s.name for s in java_symbols}
         assert "UserRepository" in names or "findById" in names
 
-    @pytest.mark.xfail(reason="TaskRouter now requires llm_client and model params", strict=False)
-    def test_java_router_planner(self):
-        router = TaskRouter()
-        decision = router.route("modify the delete method in src/UserRepository.java")
-        assert decision.lane == Lane.PLANNER
+    def test_java_router_routes_main_agent(self):
+        decision = _make_router().route(
+            "modify the delete method in src/UserRepository.java"
+        )
+        assert decision.lane == Lane.MAIN_AGENT
 
     def test_java_lint_dispatch(self, multilang_project):
         lr = LintRunner(multilang_project)

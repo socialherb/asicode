@@ -131,10 +131,10 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 return tree_sitter_syntax_fallback(content, LanguageId.TYPESCRIPT, file_path)
             except subprocess.TimeoutExpired:
                 logger.debug("tsc timed out for %s", file_path)
-                return SyntaxValidationResult(ok=True, language=LanguageId.TYPESCRIPT)
+                return tree_sitter_syntax_fallback(content, LanguageId.TYPESCRIPT, file_path)
             except Exception as e:
                 logger.debug("tsc error: %s", e)
-                return SyntaxValidationResult(ok=True, language=LanguageId.TYPESCRIPT)
+                return tree_sitter_syntax_fallback(content, LanguageId.TYPESCRIPT, file_path)
 
             if proc.returncode == 0:
                 return SyntaxValidationResult(ok=True, language=LanguageId.TYPESCRIPT)
@@ -498,7 +498,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         runner = "jest"  # default
         if os.path.isfile(pkg_path):
             try:
-                with open(pkg_path) as f:
+                with open(pkg_path, encoding="utf-8") as f:
                     pkg = json.load(f)
                 deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
                 if "vitest" in deps:

@@ -332,7 +332,7 @@ class SmartRequestAnalyzer:
                         fpath = self.repo_root / fname
                         if fpath.exists():
                             try:
-                                content = fpath.read_text(errors="replace")
+                                content = fpath.read_text(encoding="utf-8", errors="replace")
                                 if pattern in content.lower():
                                     detected.append(detector.tech)
                                     found = True

@@ -117,7 +117,7 @@ def _source_line_has_noqa(abs_path: str, lineno: int, codes: set[str] | None = N
     cached = _source_lines_cache.get(abs_path)
     if cached is None or cached[0] != mtime:
         try:
-            with open(abs_path) as fh:
+            with open(abs_path, encoding="utf-8", errors="replace") as fh:
                 cached = (mtime, fh.read().splitlines())
         except OSError:
             cached = (mtime, [])

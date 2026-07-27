@@ -27,16 +27,56 @@ from .client import (
     is_balance_quota_signal,
     parse_retry_after,
 )
+from .model_registry import text_only_model
 from .output_parser import parse_tool_args
 
 logger = logging.getLogger(__name__)
 
+# (base_url, model) pairs observed rejecting image_url parts (HTTP 400) at
+# runtime this process. Complements the static registry
+# (model_registry.text_only_model) for models not yet listed there — populated
+# by _request_with_retry's strip-and-retry net. Keyed per route, not per model:
+# the same model name can accept images on one gateway and reject them on
+# another (verified 2026-07-26: grok-4.5 is vision-capable in general but
+# opencode Go 400s it, while the same route carries images fine for kimi-k3).
+_IMAGE_REJECTING_MODELS: set[tuple[str, str]] = set()
 
-def _openai_content(msg: LLMMessage):
-    """Build OpenAI-compatible content: str if no images, list of parts if images attached."""
+
+def _bare_model_name(model: str) -> str:
+    """Strip route prefixes: 'openrouter/deepseek/deepseek-v4-flash' → 'deepseek-v4-flash'."""
+    return (model or "").strip().lower().split("/")[-1]
+
+
+def _norm_base(base: str) -> str:
+    return (base or "").strip().rstrip("/").lower()
+
+
+def _model_rejects_images(model: str, base: str = "") -> bool:
+    return bool(model) and (
+        text_only_model(model)
+        or (_norm_base(base), _bare_model_name(model)) in _IMAGE_REJECTING_MODELS
+    )
+
+
+def _openai_content(msg: LLMMessage, model: str = "", base: str = ""):
+    """Build OpenAI-compatible content: str if no images, list of parts if images attached.
+
+    Models known to reject image input (static registry + runtime-learned per
+    route) get the images converted to OCR/placeholder text instead — sending
+    them an image_url part is a guaranteed HTTP 400, even for a 1x1 PNG.
+    """
     images = getattr(msg, "images", None)
     if not images:
         return msg.content
+    if _model_rejects_images(model, base):
+        from .providers import _images_to_text  # lazy: providers is a heavy module
+        logger.warning(
+            "Model %s does not accept image input — sending OCR/placeholder text "
+            "for %d attached image(s) instead",
+            model, len(images),
+        )
+        text = _images_to_text(images)
+        return text + ("\n" + msg.content if msg.content else "")
     parts: list[dict[str, Any]] = []
     for img in images:
         parts.append({
@@ -45,6 +85,52 @@ def _openai_content(msg: LLMMessage):
         })
     parts.append({"type": "text", "text": msg.content})
     return parts
+
+
+def _strip_image_parts(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Copy of ``payload`` with image_url parts replaced by OCR/placeholder text.
+
+    Returns None when the payload contains no image parts (nothing to strip).
+    Used by the 400 strip-and-retry net for models whose lack of vision support
+    is discovered at request time rather than known from the registry.
+    """
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list):
+        return None
+    stripped_any = False
+    new_msgs: list[Any] = []
+    for m in msgs:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            new_msgs.append(m)
+            continue
+        images: list[dict[str, str]] = []
+        texts: list[str] = []
+        for part in content:
+            ptype = part.get("type") if isinstance(part, dict) else None
+            if ptype == "image_url":
+                url = (part.get("image_url") or {}).get("url", "")
+                if url.startswith("data:") and ";base64," in url:
+                    head, b64 = url.split(";base64,", 1)
+                    images.append({"media_type": head[5:] or "image", "data": b64})
+                else:
+                    images.append({"media_type": "image", "data": ""})
+            elif ptype == "text":
+                texts.append(part.get("text") or "")
+        if not images:
+            new_msgs.append(m)
+            continue
+        stripped_any = True
+        from .providers import _images_to_text  # lazy: providers is a heavy module
+        text = "\n".join(t for t in texts if t)
+        nm = dict(m)
+        nm["content"] = _images_to_text(images) + ("\n" + text if text else "")
+        new_msgs.append(nm)
+    if not stripped_any:
+        return None
+    new_payload = dict(payload)
+    new_payload["messages"] = new_msgs
+    return new_payload
 
 
 def _is_reasoning_model(model: str) -> bool:
@@ -389,6 +475,33 @@ class OpenAIClient(LLMClient):
                     continue
                 raise LLMServerUnavailableError(f"API returned HTTP {response.status_code}: {error_body}")
             break  # Success (non-retryable) — exit retry loop
+        if response.status_code == 400:
+            # Some models reject image_url parts outright (e.g. DeepSeek family:
+            # HTTP 400 even for a 1x1 PNG). When the 400 request carried images,
+            # strip the image parts and retry once.  Only remember the model as
+            # image-rejecting when the retry *succeeds* — a 400 caused by context
+            # overflow, bad tool schema, etc. must NOT poison the model's vision
+            # capability for the process lifetime.
+            stripped = _strip_image_parts(payload)
+            if stripped is not None:
+                model = str(payload.get("model", ""))
+                stripped_base = _norm_base(self.base_url or self.DEFAULT_BASE_URL)
+                stripped_model = _bare_model_name(model)
+                # Close the original 400 response before recursing — a streaming
+                # response whose body has never been consumed would leak the
+                # underlying connection back to the pool (see #840-843 invariant).
+                response.close()
+                retry_resp = self._request_with_retry(
+                    url, headers, stripped, tag=f"{tag}+noimg", stream=stream,
+                )
+                if retry_resp.status_code < 400:
+                    _IMAGE_REJECTING_MODELS.add((stripped_base, stripped_model))
+                    logger.warning(
+                        "HTTP 400 with image attachment(s) — model %s rejects "
+                        "image input on this route; remembering for future calls (%s)",
+                        model, tag,
+                    )
+                return retry_resp
         return response
 
     def chat(
@@ -413,8 +526,9 @@ class OpenAIClient(LLMClient):
         headers = self._build_headers()
 
         # Convert to OpenAI format (with optional image support)
+        _base = self.base_url or self.DEFAULT_BASE_URL
         api_messages = [
-            {"role": msg.role, "content": _openai_content(msg)}
+            {"role": msg.role, "content": _openai_content(msg, model, _base)}
             for msg in messages
         ]
 
@@ -570,8 +684,9 @@ class OpenAIClient(LLMClient):
         headers = self._build_headers()
 
         api_messages = []
+        _content_base = self.base_url or self.DEFAULT_BASE_URL
         for m in messages:
-            d: dict[str, Any] = {"role": m.role, "content": _openai_content(m)}
+            d: dict[str, Any] = {"role": m.role, "content": _openai_content(m, model, _content_base)}
             if m.role == "assistant" and getattr(m, "tool_calls", None):
                 d["tool_calls"] = m.tool_calls
                 if d.get("content") is None:

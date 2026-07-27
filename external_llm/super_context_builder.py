@@ -154,7 +154,7 @@ class SuperContextBuilder:
             lines.append(f"**README**: `{readme.name}` (exists)")
             # Extract first paragraph
             try:
-                content = readme.read_text()
+                content = readme.read_text(encoding="utf-8", errors="replace")
                 first_para = content.split('\n\n')[0]
                 if len(first_para) < 500:
                     lines.append(f"> {first_para}")
@@ -165,7 +165,7 @@ class SuperContextBuilder:
         req_file = self._find_requirements()
         if req_file:
             try:
-                reqs = req_file.read_text().split('\n')
+                reqs = req_file.read_text(encoding="utf-8", errors="replace").split('\n')
                 main_reqs = [r.split('==')[0] for r in reqs if r and not r.startswith('#')][:10]
                 if main_reqs:
                     lines.append(f"\n**Dependencies**: {', '.join(main_reqs)}")
@@ -397,7 +397,7 @@ class SuperContextBuilder:
         lines.append("")
 
         try:
-            content = file_path.read_text()
+            content = file_path.read_text(encoding="utf-8", errors="replace")
             content_lines = content.split('\n')
 
             if len(content_lines) <= max_lines:

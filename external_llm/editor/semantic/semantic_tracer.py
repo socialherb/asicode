@@ -15,7 +15,6 @@ import ast
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Optional
 
 from external_llm.languages import LanguageId
 
@@ -282,125 +281,6 @@ def extract_trace_from_files(
         len(trace.all_instantiations), len(trace.all_persist_calls),
     )
     return trace
-
-
-def extract_trace_cross_file(
-    file_paths: list,
-    repo_root: str = ".",
-    resolver: Any = None,
-    max_depth: int = 2,
-) -> "SemanticTrace":
-    """Build SemanticTrace with cross-file trace merging.
-
-    When a function calls another function in a different file,
-    the callee's trace (persist_calls, instantiations, entity_bindings)
-    is merged into the caller's trace. This allows contract evaluation
-    to see through delegation patterns like:
-        route.create_user() -> service.create_user() -> db.add()
-
-    Args:
-        file_paths: Files to analyze.
-        repo_root: Repository root.
-        resolver: CrossFileFlowResolver instance (builds import graph).
-        max_depth: Maximum call chain depth for merging (default 2).
-    """
-    # Step 1: Build base trace (single-file analysis)
-    trace = extract_trace_from_files(file_paths, repo_root)
-
-    if not resolver or max_depth <= 0:
-        return trace
-
-    # Step 2: Build resolver graph if not already built
-    try:
-        if not getattr(resolver, '_built', False):
-            resolver.build(file_paths)
-    except Exception:
-        return trace
-
-    # Step 3: For each function, merge callee traces
-    for _func_name, ft in list(trace.function_traces.items()):
-        _merge_callee_traces(ft, trace, resolver, max_depth, set())
-
-    # Update aggregate sets
-    for ft in trace.function_traces.values():
-        trace.all_calls.update(ft.calls)
-        trace.all_instantiations.update(ft.instantiations)
-        trace.all_persist_calls.update(ft.persist_calls)
-
-    logger.info(
-        "[TRACER_CROSS] merged cross-file traces for %d functions",
-        len(trace.function_traces),
-    )
-    return trace
-
-
-def _merge_callee_traces(
-    caller_ft: "FunctionTrace",
-    trace: "SemanticTrace",
-    resolver: Any,
-    remaining_depth: int,
-    visited: set,
-) -> None:
-    """Recursively merge callee FunctionTraces into caller.
-
-    For each call in the caller, if the callee has a FunctionTrace,
-    merge its persist_calls, instantiations, and entity_bindings into
-    the caller. This propagates deep behaviors upward.
-    """
-    if remaining_depth <= 0:
-        return
-
-    visit_key = (caller_ft.name, caller_ft.file_path)
-    if visit_key in visited:
-        return
-    visited.add(visit_key)
-
-    for call_name in list(caller_ft.calls):
-        # Extract bare function name from attribute calls (e.g., "service.create_user" -> "create_user")
-        bare_name = call_name.split(".")[-1] if "." in call_name else call_name
-
-        # Find callee trace
-        callee_ft = trace.function_traces.get(bare_name)
-        if not callee_ft:
-            # Try via resolver
-            callee_ft = _find_callee_trace_via_resolver(
-                bare_name, caller_ft, trace, resolver,
-            )
-
-        if callee_ft and callee_ft.name != caller_ft.name:
-            # Recursively merge the callee first (depth-1)
-            _merge_callee_traces(callee_ft, trace, resolver, remaining_depth - 1, visited)
-
-            # Merge callee's behavioral data into caller
-            caller_ft.persist_calls.update(callee_ft.persist_calls)
-            caller_ft.instantiations.update(callee_ft.instantiations)
-            caller_ft.entity_bindings.extend(callee_ft.entity_bindings)
-            # If callee has return entity ref, propagate
-            if callee_ft.return_has_entity_ref:
-                caller_ft.return_has_entity_ref = True
-            # Propagate error branch info
-            if callee_ft.has_error_branch:
-                caller_ft.has_error_branch = True
-
-
-def _find_callee_trace_via_resolver(
-    func_name: str,
-    caller_ft: "FunctionTrace",
-    trace: "SemanticTrace",
-    resolver: Any,
-) -> Optional["FunctionTrace"]:
-    """Try to find a callee's FunctionTrace using the cross-file resolver."""
-    try:
-        graph = resolver.graph
-        # Look up the function in the resolver's function_files mapping
-        for key, _file_path in graph.function_files.items():
-            if ":" in key and key.endswith(f":{func_name}"):
-                # Found it — check if we have its trace
-                if func_name in trace.function_traces:
-                    return trace.function_traces[func_name]
-    except Exception:
-        pass
-    return None
 
 
 def _process_function(

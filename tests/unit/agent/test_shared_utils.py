@@ -775,3 +775,203 @@ def test_walk_repo_files_miss_path_returns_copy_not_cached_object(tmp_path):
     )
     complete.append(Path("/polluted2.py"))
     assert Path("/polluted2.py") not in cache2[str(sub)][1]
+
+
+# ── Walk determinism + source prioritization + truncation visibility ────────
+# Regression guard for the "exploration layer blindness" fix: os.walk yields
+# filesystem-enumeration order (non-reproducible) and early-returns at the cap,
+# which on this repo meant tests/ filled the 600-file cap entirely and
+# external_llm/ (the product source) got ZERO coverage — silently, with ok=True
+# empty find_symbol results. The walker now (1) sorts dirnames+filenames for a
+# deterministic, source-prioritized descent and (2) flags truncation so callers
+# can tell "absent" from "not indexed".
+
+def test_walk_dir_sort_key_source_before_tests_fixtures_generated():
+    """_walk_dir_sort_key must tier source dirs (0) before tests/fixtures (1),
+    with alphabetical order within a tier for determinism."""
+    from external_llm.agent._shared_utils import _walk_dir_sort_key
+
+    src = _walk_dir_sort_key("external_llm")
+    tests = _walk_dir_sort_key("tests")
+    fixtures = _walk_dir_sort_key("fixtures")
+    generated = _walk_dir_sort_key("generated")
+    assert src < tests, "source must sort before tests"
+    assert src < fixtures, "source must sort before fixtures"
+    assert src < generated, "source must sort before generated output"
+    # Case-insensitive tier: Tests/TESTS are deprioritized (tier 1) just like
+    # "tests". The name component keeps original case (tier is the policy).
+    assert _walk_dir_sort_key("TESTS")[0] == 1 == tests[0]
+    # Plain source dir is tier 0, alpha-ordered.
+    assert _walk_dir_sort_key("src") == (0, "src")
+
+
+def test_walk_repo_files_is_source_prioritized_under_cap(tmp_path):
+    """Under a tight cap, source files must fill the budget BEFORE test files.
+    This is the direct regression for the blindness bug: with the old unsorted
+    walk, whichever subtree os.walk hit first (often tests/) consumed the cap
+    and starved external_llm/ entirely."""
+    from external_llm.agent import _shared_utils as su
+
+    # Build: src/ (source) + tests/ (deprioritized), each with several .py files.
+    src = tmp_path / "src"
+    tests = tmp_path / "tests"
+    src.mkdir()
+    tests.mkdir()
+    for i in range(4):
+        (src / f"s{i}.py").write_text(f"x = {i}\n")
+        (tests / f"t{i}.py").write_text(f"y = {i}\n")
+    su._PY_WALK_CACHE.clear()
+
+    # Cap=4: with source-prioritization, ALL 4 src files fill the budget and
+    # NO test file is admitted. (Old behavior: arbitrary, often all-tests.)
+    got = su._walk_py_files(tmp_path, max_files=4)
+    names = {p.name for p in got}
+    assert names == {f"s{i}.py" for i in range(4)}, (
+        f"source-prioritized walk must admit src/ before tests/; got {names}"
+    )
+
+
+def test_walk_repo_files_is_deterministic_across_calls(tmp_path):
+    """The walk order must be reproducible (sorted), not filesystem-enumeration
+    order. Two independent walks over the same tree return files in the SAME
+    sequence — the property that was violated by bare os.walk."""
+    from external_llm.agent import _shared_utils as su
+
+    for sub in ("zeta", "alpha", "mid"):
+        d = tmp_path / sub
+        d.mkdir()
+        (d / "b.py").write_text("x")
+        (d / "a.py").write_text("x")
+    su._PY_WALK_CACHE.clear()
+    first = [str(p.relative_to(tmp_path)) for p in su._walk_py_files(tmp_path, 100)]
+    su._PY_WALK_CACHE.clear()
+    second = [str(p.relative_to(tmp_path)) for p in su._walk_py_files(tmp_path, 100)]
+    assert first == second, "walk order must be deterministic across calls"
+    # And it must be the SORTED order (alpha/ before zeta/, a.py before b.py).
+    assert first == sorted(first), f"walk must yield sorted order; got {first}"
+
+
+def test_walk_truncated_for_reflects_cap_hit(tmp_path):
+    """_walk_truncated_for reads the cached was_truncated flag so callers
+    (find_symbol on a miss) can distinguish 'absent' from 'not indexed'."""
+    from external_llm.agent._shared_utils import _walk_repo_files, _walk_truncated_for
+
+    for i in range(5):
+        (tmp_path / f"f{i}.py").write_text("x\n")
+
+    # Truncated walk FIRST on a fresh cache → cap hit → was_truncated=True cached.
+    # (A complete walk cached first would shadow a later smaller-cap call via the
+    # cache-hit guard, so the order matters here.)
+    cache: dict = {}
+    _walk_repo_files(tmp_path, 2, cache, lambda n: n.endswith(".py"))
+    assert _walk_truncated_for(tmp_path, cache) is True
+
+    # A fresh complete walk (cap >> files) on a clean cache → not truncated.
+    cache2: dict = {}
+    _walk_repo_files(tmp_path, 100, cache2, lambda n: n.endswith(".py"))
+    assert _walk_truncated_for(tmp_path, cache2) is False
+
+    # Unknown root → False (not known-truncated).
+    assert _walk_truncated_for("/nonexistent/path/xyz", cache) is False
+
+
+def test_walk_repo_files_truncation_flag_cached_on_truncated_entry(tmp_path):
+    """The cache tuple's third element (was_truncated) must be True when the
+    walk early-exits at the cap. The cache-hit guard relies on this to decide
+    whether a larger-cap caller needs a re-walk."""
+    from external_llm.agent._shared_utils import _walk_repo_files
+
+    for i in range(4):
+        (tmp_path / f"f{i}.py").write_text("x\n")
+    cache: dict = {}
+    _walk_repo_files(tmp_path, 2, cache, lambda n: n.endswith(".py"))
+    _ts, _files, was_truncated = cache[str(tmp_path)]
+    assert was_truncated is True, "truncated walk must cache was_truncated=True"
+
+
+# ── _walk_truncated_for must be cap-aware ─────────────────────────────────
+#
+# Truncation is a property of (walk, max_files), not of the cache entry alone.
+# _walk_repo_files serves a lower-cap caller from a higher-cap cache entry by
+# returning files[:max_files] — a shortened list whose stored flag still says
+# "complete". Reading the flag alone therefore reports a truncated result as
+# complete, resurrecting the fail-silent behaviour the helper exists to prevent.
+# Live cap mismatch in-tree: vulture_scanner walks at 4000, symbol_search and
+# call_graph at 3000.
+
+
+def _seed_walk(tmp_path, n: int):
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(n):
+        (src / f"m{i:02d}.py").write_text("x = 1\n", encoding="utf-8")
+    return tmp_path
+
+
+def test_walk_truncated_for_reports_slice_from_a_complete_cache_entry(tmp_path):
+    from external_llm.agent._shared_utils import (
+        _PY_WALK_CACHE, _walk_py_files, _walk_truncated_for,
+    )
+
+    root = _seed_walk(tmp_path, 50)
+    complete = _walk_py_files(root, 100)          # high-cap caller finishes
+    assert len(complete) == 50
+    assert _PY_WALK_CACHE[str(root)][2] is False, "cache entry should be complete"
+
+    shortened = _walk_py_files(root, 20)          # low-cap caller reuses it
+    assert len(shortened) == 20, "expected the cache-hit slice path"
+    assert _walk_truncated_for(root, _PY_WALK_CACHE, 20) is True, (
+        "a 20-of-50 result is truncated for this caller even though the cached "
+        "walk itself was complete"
+    )
+
+
+def test_walk_truncated_for_is_false_when_the_cap_covers_the_corpus(tmp_path):
+    from external_llm.agent._shared_utils import (
+        _PY_WALK_CACHE, _walk_py_files, _walk_truncated_for,
+    )
+
+    root = _seed_walk(tmp_path, 50)
+    _walk_py_files(root, 100)
+    assert _walk_truncated_for(root, _PY_WALK_CACHE, 100) is False
+    assert _walk_truncated_for(root, _PY_WALK_CACHE, 50) is False, (
+        "cap exactly equal to the corpus size loses nothing"
+    )
+
+
+def test_walk_truncated_for_still_honours_the_stored_flag(tmp_path):
+    """A genuinely truncated walk stays truncated for any cap."""
+    from external_llm.agent._shared_utils import (
+        _PY_WALK_CACHE, _walk_py_files, _walk_truncated_for,
+    )
+
+    root = _seed_walk(tmp_path, 50)
+    _walk_py_files(root, 10)
+    assert _PY_WALK_CACHE[str(root)][2] is True
+    assert _walk_truncated_for(root, _PY_WALK_CACHE, 10) is True
+    assert _walk_truncated_for(root, _PY_WALK_CACHE) is True, "flag-only read"
+
+
+def test_walk_truncated_for_returns_false_without_a_cached_walk(tmp_path):
+    from external_llm.agent._shared_utils import _PY_WALK_CACHE, _walk_truncated_for
+
+    assert _walk_truncated_for(tmp_path / "never-walked", _PY_WALK_CACHE, 10) is False
+
+
+def test_symbol_searcher_passes_its_own_cap(tmp_path):
+    """find_symbol's truncation note must be driven by symbol_search's cap, not
+    by whichever cap happened to populate the shared cache."""
+    import external_llm.agent.symbol_search as ss
+    from external_llm.agent._shared_utils import _walk_py_files
+
+    root = _seed_walk(tmp_path, 50)
+    _walk_py_files(root, 100)                      # complete entry, cap 100
+    searcher = ss.SymbolSearcher(str(root))
+    original = ss._MAX_PY_FILES
+    try:
+        ss._MAX_PY_FILES = 20                      # our cap is lower
+        assert searcher.index_was_truncated() is True
+        ss._MAX_PY_FILES = 100
+        assert searcher.index_was_truncated() is False
+    finally:
+        ss._MAX_PY_FILES = original

@@ -266,10 +266,29 @@ def _images_to_text(images: list[dict[str, str]]) -> str:
 
     Tries OCR first; falls back to a placeholder marker so the LLM at least
     knows an image was attached.
+
+    If an image dict already carries a pre-computed ``ocr_text`` key
+    (set by a prior call or by an upstream attachment point to avoid
+    redundant OCR), it is reused without re-running OCR.  Otherwise
+    ``_try_ocr_base64`` is called and the result is stored back into
+    the dict as ``ocr_text`` for the process lifetime.
     """
     parts = []
     for i, img in enumerate(images, 1):
+        ocr_text = img.get("ocr_text")
+        if ocr_text is not None:
+            if ocr_text:
+                parts.append(f"[Image {i} — OCR Extracted Text:\n{ocr_text}\n]")
+            else:
+                media_type = img.get("media_type", "image")
+                parts.append(
+                    f"[Image {i} Attached ({media_type}). "
+                    "Text extraction requires pytesseract+Pillow "
+                    "— OCR applied automatically when installed]"
+                )
+            continue
         ocr_text = _try_ocr_base64(img.get("data", ""))
+        img["ocr_text"] = ocr_text  # cache for reuse across calls
         if ocr_text:
             parts.append(f"[Image {i} — OCR Extracted Text:\n{ocr_text}\n]")
         else:

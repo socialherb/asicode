@@ -72,7 +72,11 @@ from .performance_metrics import PerformanceCollector, get_global_collector
 # does not break this import. See planner_lane_facade docstring for rationale.
 from .planner_lane_facade import OperationExecutor, PlannerAgent
 from .reasoning_utils import reasoning_ab_kwargs
-from .request_intent_classifier import is_non_edit_intent, routing_intent_from_intent_result
+from .request_intent_classifier import (
+    intent_is_undetermined,
+    is_non_edit_intent,
+    routing_intent_from_intent_result,
+)
 from .run_store import InMemoryRunStore
 from .symbol_search import SymbolSearcher
 from .task_router import Lane
@@ -2127,6 +2131,12 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
             is_local_model=is_local_model,
             has_native_tools=has_native_tools,
             read_only_request=read_only_request,
+            # Derived from the same route the intent hint came from, so the
+            # "was this actually classified?" answer cannot drift from the
+            # read_only_request it qualifies.
+            intent_undetermined=intent_is_undetermined(
+                getattr(route, "intent_result", None) if route else None
+            ),
             known_target_file=known_target_file,
             target_keywords=target_keywords,
             tier=tier,
@@ -2364,14 +2374,22 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 read_only_request, known_target_file, _target_keywords,
                 tier, None, [], turns,
             )
-            return self._run_llm_loop(ctx)
+            # Batch adaptive-hub persistence for the whole loop. Without this
+            # every tool call re-serialises and fsyncs the full ~94 KB hub
+            # namespace (_record_tool_success/_failure -> record_tool_usage):
+            # 11 writes / 1.3 MB / 41 ms on a 12-turn run, most of the loop's
+            # own non-LLM wall clock. The batch still flushes on an interval so
+            # a crash cannot discard the whole session's learning signals.
+            with self._shared_run_store.batch_adaptive_signals():
+                return self._run_llm_loop(ctx)
 
         logger.warning(
-            "run() reached end without handling route.lane=%s — returning partial_success",
+            "run() reached end without handling route.lane=%s — returning error (fail-closed)",
             str(getattr(getattr(route, 'lane', None), 'value', getattr(route, 'lane', None))),
         )
         return AgentResult(
-            status="partial_success",
+            status="error",
+            error="No active lane handled this request. Ensure AgentConfig.route_decision is set.",
             turns=turns or [],
             final_message="No active lane handled this request.",
             applied_patches=self.registry.applied_patches,

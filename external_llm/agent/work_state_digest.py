@@ -27,7 +27,7 @@ _WRITE_TOOLS = {
 }
 _COMMAND_TOOLS = {"bash", "run_tests", "run_lint"}
 _SEARCH_TOOLS = {
-    "grep", "find_symbol", "find_references", "find_relevant_files",
+    "grep", "glob", "find_symbol", "find_references", "find_relevant_files",
     "query_dependency_graph", "analyze_change_impact",
     "estimate_change_scope", "run_structural_scan",
     "find_tests_for_symbol",

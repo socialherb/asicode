@@ -1,4 +1,4 @@
-name: Lint (F401/F811/F821 baseline-diff + F823 zero-tolerance)
+name: Lint (F401/F811/F821 baseline-diff + F823/open-encoding/unguarded-subprocess gates)
 
 on:
   push:
@@ -48,3 +48,30 @@ jobs:
         # Motivating incident: a 500 on /stats/rg-fallback that ruff had been
         # reporting all along, invisible because only F821/F401/F811 were gated.
         run: python scripts/check_f823_none.py
+
+      - name: Check no NEW silent except handlers vs baseline
+        # Was pre-commit-ONLY until now, so it gated nothing for anyone who had
+        # not run `pre-commit install` — and lint.yml is the only workflow that
+        # actually runs (p11-ci.yml is excluded from the public export). A gate
+        # that exists but never executes is indistinguishable from no gate.
+        # Baseline-diff: 1351 pre-existing handlers are frozen, net-new ones fail.
+        run: python scripts/check_no_new_silent_except.py
+
+      - name: Check ZERO text-mode open() without encoding=
+        # Also no baseline: the 44 pre-existing sites were fixed when this was
+        # added. Pure AST, no ruff — ruff's equivalent (PLW1514) is preview-only
+        # and enabling --preview would activate every other unstable rule.
+        # Scoped to non-test code; tests/ open fixtures they just wrote.
+        run: python scripts/check_open_encoding.py
+
+      - name: Check no NEW unguarded subprocess calls vs baseline
+        # Baseline-diff like F401/F811/F821/silent-except. Motivating incident:
+        # symbol_search.py invoked ripgrep inside a try that caught only
+        # subprocess.SubprocessError / (AttributeError, TypeError) — none catch
+        # FileNotFoundError (an OSError), so on a plain `pip install asicode`
+        # (rg is an optional [search] extra) every default find_symbol/read_symbol
+        # crashed. 3 sites fixed (now OSError-guarded); the 2 baselined survivors
+        # are intentional (run_bounded_subprocess defers to its caller;
+        # TestRunner._run_cmd spawns pytest/npm). Pure AST, no ruff.
+        # Key <rel>::<scope>::<ordinal> is line-drift-stable. Production only.
+        run: python scripts/check_no_new_unguarded_subprocess.py

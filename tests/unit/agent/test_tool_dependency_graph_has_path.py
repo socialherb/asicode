@@ -32,7 +32,7 @@ from external_llm.agent.tool_dependency_graph import ToolDependencyGraph
 
 
 class TestHasPath:
-    """Public ``has_path`` works for both networkx and dict backends."""
+    """Public ``has_path`` works with dict backend."""
 
     @pytest.fixture
     def graph(self):

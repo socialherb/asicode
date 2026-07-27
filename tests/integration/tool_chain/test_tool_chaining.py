@@ -15,13 +15,7 @@ class TestToolDependencyGraph:
         graph = ToolDependencyGraph()
 
         # Should have nodes
-        if hasattr(graph, 'graph'):
-            # Check internal structure
-            if isinstance(graph.graph, dict) and "nodes" in graph.graph:
-                assert len(graph.graph["nodes"]) > 0
-            # Or if using networkx
-            elif hasattr(graph.graph, 'nodes'):
-                assert len(list(graph.graph.nodes())) > 0
+        assert len(graph.graph["nodes"]) > 0
 
     def test_add_dependency(self):
         """Test adding custom dependencies to graph."""
@@ -88,11 +82,9 @@ class TestToolDependencyGraph:
         graph.add_dependency("start", "middle2", weight=0.5)
         graph.add_dependency("middle2", "end", weight=0.5)  # Total weight 1.0
 
-        # Optimal path should prefer lower weight path
+        # Both paths have 2 edges; BFS returns the first added
         chain = graph.get_optimal_chain("start", "end")
 
-        # With networkx, should use Dijkstra and prefer middle2 path
-        # Without networkx, BFS might return first found path
         assert isinstance(chain, list)
 
     def test_circular_dependency_prevention(self):

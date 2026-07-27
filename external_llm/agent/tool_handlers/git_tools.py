@@ -22,8 +22,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+from .shell_policy import ARG_COMMAND_INTRODUCERS as _ARG_COMMAND_INTRODUCERS
+from .shell_policy import COMMAND_INTRODUCING_KEYWORDS as _COMMAND_INTRODUCING_KEYWORDS
+from .shell_policy import COMMAND_WRAPPERS as _COMMAND_WRAPPERS
+from .shell_policy import DANGEROUS_FLAG_COMBOS as _DANGEROUS_FLAG_COMBOS
 from .shell_policy import DANGEROUS_SHELL_COMMANDS as _DANGEROUS_SHELL_COMMANDS
 from .shell_policy import FORBIDDEN_FLAGS as _FORBIDDEN_FLAGS
+from .shell_policy import SHELL_TIMEOUT_DEFAULT as _SHELL_TIMEOUT_DEFAULT
+from .shell_policy import SHELL_TIMEOUT_MAX as _SHELL_TIMEOUT_MAX
+
+# `FOO=bar cmd` — an assignment prefix, not the command itself.
+_ENV_ASSIGN_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# `timeout 5 cmd` / `timeout 5s cmd` / `nice 10 cmd` — a wrapper's numeric arg.
+_WRAPPER_NUM_ARG_RE = _re.compile(r"^[0-9]+(?:\.[0-9]+)?[smhd]?$")
 
 # LLM-generated shell commands are always executed under bash. LLMs are trained
 # on bash, so bash is the dialect whose semantics match model expectations.
@@ -326,6 +337,191 @@ def _truncate_bash_output(content: str, max_chars: int) -> str:
     )
 
 
+_SHELL_SEPARATOR_SPLIT_RE = _re.compile(r"([;&|]+)")
+# Any run of separator punctuation starts a new command segment. Matching the
+# whole class, rather than the enumerated {"|", "&&", "||", ";"} this replaced,
+# also covers a bare `&` (`sleep 30 & rm -rf x`) and `;;`, which the fixed set
+# let slip past as if they were ordinary words.
+_SEPARATOR_ONLY_RE = _re.compile(r"[;&|]+")
+
+
+def _matches_forbidden_flag(token: str, forbidden: set) -> bool:
+    """True if *token* is one of *forbidden*, including its value-carrying forms.
+
+    An exact comparison misses the spellings that actually appear: ``-i.bak``
+    (BSD/GNU sed's in-place suffix form) and ``--in-place=.bak`` are the same
+    restricted flag as ``-i``. Bundled short flags (``sed -ni``) are NOT matched —
+    catching those needs per-flag arity knowledge, and this is an advisory guard
+    steering the model toward apply_patch, not a sandbox.
+    """
+    if token in forbidden:
+        return True
+    head = token.split("=", 1)[0]
+    if head in forbidden:
+        return True
+    # Short form with an attached value: `-i.bak` for `-i`.
+    return any(
+        len(flag) == 2 and not flag.startswith("--") and token.startswith(flag)
+        for flag in forbidden
+    )
+
+
+def _split_shell_separators(tokens, original_command: Optional[str] = None) -> list:
+    """Break unquoted ``;`` / ``&`` / ``|`` runs out of *tokens* into their own items.
+
+    ``shlex.split`` does not treat those as separators, so a segment boundary can
+    arrive glued to a word: ``ls;rm -rf x`` tokenises as ``['ls;rm', '-rf', 'x']``
+    and ``for f in a b; do rm`` yields ``'b;'``. The scan then never sees the
+    boundary, keeps treating the next word as an argument, and the command after
+    the separator escapes the danger check.
+
+    When *original_command* is provided (the raw shell command string), the
+    function detects separators that appear inside single- or double-quoted
+    regions and skips splitting them — preventing false positives on grep/rg
+    patterns like ``grep -rn "foo|rm" .`` where ``|`` is literal, not a pipe.
+    """
+    # ── Build set of separator byte positions inside quoted regions ─────
+    # A simple state machine: track whether each byte is inside a quote.
+    # This lets us skip split-position bytes that are literal.
+    _quoted_seps: set[int] = set()
+    if original_command:
+        in_single = False
+        in_double = False
+        for i, ch in enumerate(original_command):
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif ch in ";&|" and (in_single or in_double):
+                _quoted_seps.add(i)
+
+    out = []
+    # Cursor into *original_command* so each token is located at or after the
+    # previous one. Without it, a token that repeats (``rm a; rm b`` → two
+    # ``rm``) always resolves to the FIRST occurrence and the quoted-region
+    # lookup is answered about the wrong byte range.
+    _cursor = 0
+    for token in tokens:
+        if any(ch in token for ch in ";&|"):
+            idx = -1
+            if original_command:
+                idx = original_command.find(token, _cursor)
+                if idx < 0:  # shlex un-escaped it (``'a'"b"``) — not locatable
+                    idx = original_command.find(token)
+            if idx >= 0:
+                _cursor = idx + len(token)
+                # Split only separators that are NOT inside a quoted region.
+                pieces: list[str] = []
+                _buf: list[str] = []
+                for j, ch in enumerate(token):
+                    if ch in ";&|" and (idx + j) not in _quoted_seps:
+                        if _buf:
+                            pieces.append("".join(_buf))
+                            _buf = []
+                        pieces.append(ch)
+                    else:
+                        _buf.append(ch)
+                if _buf:
+                    pieces.append("".join(_buf))
+                # Trust this result even when it did NOT split — "every
+                # separator in this token was quoted" is the answer, not a
+                # failure. The previous `if len(pieces) > 1` guard fell through
+                # to the naive regex split in exactly that case, re-splitting
+                # the token the quote scan had just cleared and making the whole
+                # quote-awareness dead code for its own target
+                # (``grep -rn "foo|rm" .`` kept raising an rm prompt).
+                out.extend(p for p in pieces if p)
+                continue
+            # Not locatable in the raw command — fall back to the naive split,
+            # which over-approximates toward asking (the safe direction).
+            out.extend(piece for piece in _SHELL_SEPARATOR_SPLIT_RE.split(token) if piece)
+        else:
+            out.append(token)
+    return out
+
+
+# `-fdx` → {-f, -d, -x}: a bundle of single-letter flags, the spelling
+# DANGEROUS_FLAG_COMBOS is written against. `--force` is excluded by the
+# leading-single-dash anchor; so is a negative number (`-5`).
+_SHORT_FLAG_BUNDLE_RE = _re.compile(r"^-[A-Za-z]{2,}$")
+
+# `>`, `>>`, `2>`, `&>`, `<`, and their glued-target forms (`>out.txt`).
+_REDIRECT_RE = _re.compile(r"^(?:\d+|&)?(>>|>|<)(.*)$")
+
+
+def _segment_flag_combo_hit(exe: Optional[str], tokens: list) -> bool:
+    """True if *tokens* (one command segment) satisfy a combo for *exe*.
+
+    Whole-token membership only — see the matching contract in
+    ``shell_policy.DANGEROUS_FLAG_COMBOS``. Bundled short flags are expanded so
+    ``-fdx``, ``-fd -x`` and ``-f -d -x`` are one rule rather than three.
+    """
+    combos = _DANGEROUS_FLAG_COMBOS.get(exe or "")
+    if not combos:
+        return False
+    vocab = set(tokens)
+    for tok in tokens:
+        if _SHORT_FLAG_BUNDLE_RE.fullmatch(tok):
+            vocab.update("-" + ch for ch in tok[1:])
+    return any(combo <= vocab for combo in combos)
+
+
+def _truncating_redirect_targets(targets: list, repo_root: str) -> list:
+    """Existing in-repo files that a ``>`` redirect would truncate to zero.
+
+    ``echo '' > src/main.py`` destroys a source file as thoroughly as ``rm``
+    does, but no *executable* in it is dangerous, so neither the name gate nor
+    the flag gate can see it. Scoped deliberately narrowly to keep the prompt
+    rare and meaningful:
+
+    * ``>>`` (append) and ``<`` (read) are not truncation and never listed.
+    * A target that does not exist yet, or is empty, loses nothing.
+    * A target outside the repo is not listed — writing to ``/tmp/out.txt`` or
+      ``/dev/null`` is ordinary agent behaviour, and prompting on it would
+      train reflexive approval.
+    * Unexpanded shell syntax (``$VAR``, globs, ``&1``) is skipped rather than
+      guessed at.
+    """
+    root = Path(repo_root).resolve()
+    hits = []
+    for target in targets:
+        if not target or target[0] in "&$" or any(c in target for c in "*?"):
+            continue
+        p = Path(target)
+        if not p.is_absolute():
+            p = root / target
+        try:
+            if not (p.is_file() and p.stat().st_size > 0):
+                continue
+            resolved = p.resolve()
+            if resolved.is_relative_to(root):
+                hits.append(str(resolved.relative_to(root)))
+        except OSError:
+            # Unstattable target (broken symlink, permission, ELOOP). Treated
+            # as "nothing to truncate" so the gate stays quiet, but logged:
+            # every swallowed target here is one the user is NOT asked about.
+            logger.debug("Redirect target not stattable: %r", target, exc_info=True)
+            continue
+    return hits
+
+
+def _format_command_for_approval(command: str, limit: int = 1200) -> str:
+    """Render *command* for a human approval prompt, never hiding text silently.
+
+    The prompt used to cut the command at 200 chars with no marker, so a chained
+    command's dangerous part could sit past the cutoff and the user would approve
+    text they never saw. A cap is still needed (a here-doc payload can be tens of
+    KB), but any elision has to announce itself.
+    """
+    if len(command) <= limit:
+        return command
+    return (
+        command[:limit]
+        + f"\n      … [{len(command) - limit} more chars hidden — approve only if "
+        f"the visible part is what you intend]"
+    )
+
+
 class ShellToolsMixin:
     """Mixin providing shell tool implementations for ToolRegistry."""
 
@@ -344,7 +540,7 @@ class ShellToolsMixin:
             if _sys.stdin.isatty():
                 print()
                 print(f"  ⚠️  Command execution requested: {dangerous_names}")
-                print(f"      Command: {command[:200]}")
+                print(f"      Command: {_format_command_for_approval(command)}")
                 try:
                     _answer = input("      Approve execution? (y/N): ").strip().lower()
                     return _answer in ("y", "yes")
@@ -355,7 +551,7 @@ class ShellToolsMixin:
         _question_data = {
             "question": (
                 f"The shell command contains dangerous operations ({dangerous_names}):\n"
-                f"```\n{command[:500]}\n```\n"
+                f"```\n{_format_command_for_approval(command)}\n```\n"
                 f"Allow execution?"
             ),
             "type": "yes_no",
@@ -534,7 +730,15 @@ class ShellToolsMixin:
         import shlex
 
         command = (args.get("command") or "").strip()
-        timeout = int(args.get("timeout") or 120)
+        # Clamp to the range the tool schema advertises ("default: 120, max: 300").
+        # Unclamped, a model-supplied timeout=99999 pins a worker thread for
+        # hours; the MCP layer derives its own ceiling from this same bound
+        # (asi_mcp_adapter._resolve_mcp_timeout), so the two must agree.
+        try:
+            timeout = int(args.get("timeout") or _SHELL_TIMEOUT_DEFAULT)
+        except (TypeError, ValueError):
+            timeout = _SHELL_TIMEOUT_DEFAULT
+        timeout = max(1, min(timeout, _SHELL_TIMEOUT_MAX))
 
         if not command:
             return self._make_result(ok=False, content="", error="command is required")
@@ -672,7 +876,6 @@ class ShellToolsMixin:
                 command = fixed_cmd
 
         _SHELL_SYNTAX = {"for", "in", "do", "done", "if", "then", "else", "fi", "while", "until", "echo"}
-        _SEGMENT_SEPARATORS = {"|", "&&", "||", ";"}
 
         # heredoc syntax (<<) cannot be parsed by shlex.split → extract only the header portion for permission check
         # NOTE: _re is the module-level `import re as _re` (see top of file).
@@ -697,37 +900,118 @@ class ShellToolsMixin:
         if not parts:
             return self._make_result(ok=False, content="", error="Empty command")
 
-        executables = set()
         dangerous_executables = set()
         expect_executable = True
-        for token in parts:
-            if token in _SEGMENT_SEPARATORS:
+        segment_exe: Optional[str] = None  # executable of the segment being scanned
+        # Per-segment token accumulator. The flag-combo check consults THIS,
+        # not the raw command string: a combo is only meaningful once the
+        # segment's own executable is known, and a raw-string regex cannot tell
+        # `git reset --hard` from `echo "--hard"` or from a commit message that
+        # merely says "--hard". See _segment_flag_combo_hit.
+        segment_tokens: list = []
+        flag_combo_exes: set = set()
+        redirect_targets: list = []
+        expect_redirect_target = False
+
+        def _close_segment() -> None:
+            """Evaluate the finished segment's flag combos (call before reset)."""
+            if _segment_flag_combo_hit(segment_exe, segment_tokens):
+                flag_combo_exes.add(segment_exe)
+
+        for token in _split_shell_separators(parts, command):
+            if _SEPARATOR_ONLY_RE.fullmatch(token):
+                _close_segment()
+                expect_executable = True
+                segment_exe = None
+                segment_tokens = []
+                expect_redirect_target = False
+                continue
+            if expect_redirect_target:
+                # Detached target of the `>` seen on the previous token.
+                redirect_targets.append(token)
+                expect_redirect_target = False
+                continue
+            _redir = _REDIRECT_RE.match(token)
+            if _redir is not None:
+                _op, _glued = _redir.group(1), _redir.group(2)
+                if _op == ">":  # `>>` appends and `<` reads — neither truncates
+                    if _glued:
+                        redirect_targets.append(_glued)
+                    else:
+                        expect_redirect_target = True
+                continue
+            segment_tokens.append(token)
+            # ── Tokens that PRECEDE a command without being one ──────────────
+            # Each of these used to consume the executable slot, so the real
+            # command behind them was classified as a mere argument and never
+            # reached the danger check: `sudo rm -rf /`, `xargs rm -rf`,
+            # `FOO=1 rm -rf x`, `find . -exec rm {} +`, `timeout 5 pkill -f x`
+            # and `for f in *; do rm -rf $f; done` all ran unprompted.
+            if token in _ARG_COMMAND_INTRODUCERS:
+                # `find . -name x -exec rm {} +` — the command follows the flag,
+                # from a position where nothing was expected.
                 expect_executable = True
                 continue
-            if token.startswith(">") or token.startswith("<") or token.startswith("2>"):
+            if Path(token).name in _COMMAND_INTRODUCING_KEYWORDS:
+                # `do` / `then` / `else` are followed by a command. Checked
+                # regardless of expectation state: the `;` that precedes them is
+                # glued to the previous token by shlex, so arriving here with
+                # expect_executable already False is the normal case.
+                # Exception: `!` is a shell keyword that negates exit codes
+                # (`! rm file`), but also a `find` negation flag (`find . ! -name
+                # rm`).  Only treat standalone `!` as a command introducer when
+                # we're at a segment boundary — `find . ! -name` arrives with
+                # expect_executable=False (find consumed it), so we skip it.
+                if token == "!" and not expect_executable:
+                    continue
+                expect_executable = True
                 continue
-            if token.startswith("-") or "/" in token or token.startswith("$") or "=" in token:
+            if token.startswith("-"):
+                # ── Forbidden-flag check ─────────────────────────────────────
+                # This has to happen HERE. It used to live in the "not an
+                # executable" branch below, unreachable because the generic skip
+                # `continue`d on every token starting with "-": `sed -i` was
+                # advertised as blocked (FORBIDDEN_FLAGS, and "sed (no -i)" in
+                # the tool schema) while running unimpeded.
+                # Scoped to the current segment's executable rather than every
+                # executable seen so far, so `sed x; cat -i` no longer charges
+                # cat with sed's restriction.
+                _forbidden = _FORBIDDEN_FLAGS.get(segment_exe or "")
+                if _forbidden and _matches_forbidden_flag(token, _forbidden):
+                    return self._make_result(
+                        ok=False, content="",
+                        error=f"Flag '{token}' is not allowed for '{segment_exe}'. "
+                              f"Use apply_patch for file edits.",
+                    )
+                # A flag is never the executable, so it must not consume the
+                # expectation — `xargs -n1 rm` still has to reach `rm`.
+                continue
+            if expect_executable and (
+                token in _COMMAND_WRAPPERS
+                or _WRAPPER_NUM_ARG_RE.match(token)   # wrapper arg: `timeout 5s rm`
+                or _ENV_ASSIGN_RE.match(token)        # `FOO=bar rm ...`
+            ):
+                continue
+            if token.startswith("$") or "=" in token:
                 if expect_executable:
                     expect_executable = False
                 continue
 
             if expect_executable:
-                expect_executable = False
+                # Reduce a path form to its basename BEFORE the policy lookup:
+                # `/bin/rm` and `./rm` are the same command as `rm`. The old
+                # scan skipped every token containing "/" outright, which made
+                # this Path(...).name reduction dead code for the one case it
+                # exists for — an absolute path bypassed the gate entirely.
                 name = Path(token).name
+                expect_executable = False
                 if name in _SHELL_SYNTAX:
                     continue
+                segment_exe = name
                 if name in _DANGEROUS_SHELL_COMMANDS:
                     dangerous_executables.add(name)
-                executables.add(name)
-            else:
-                # Check forbidden flags for already-registered executables
-                for exe in executables:
-                    if exe in _FORBIDDEN_FLAGS and token in _FORBIDDEN_FLAGS[exe]:
-                        return self._make_result(
-                            ok=False, content="",
-                            error=f"Flag '{token}' is not allowed for '{exe}'. "
-                                  f"Use apply_patch for file edits.",
-                        )
+
+        _close_segment()  # the last segment ends without a trailing separator
 
         # User approval required for dangerous commands
         if dangerous_executables:
@@ -741,6 +1025,35 @@ class ShellToolsMixin:
                         f"Operation cancelled."
                     ),
                 )
+            logger.info("User approved dangerous command(s): %s", _danger_str)
+
+        # ── Destructive-effect check (flag combos + truncating redirects) ──
+        # Both are cases where no *executable name* is dangerous, so the gate
+        # above cannot see them: `git reset --hard` and `echo '' > src/main.py`
+        # destroy work as thoroughly as `rm` does. Collected during the token
+        # scan, per segment, so the reason names the segment's real executable.
+        _effect_reasons: list = []
+        if flag_combo_exes:
+            _effect_reasons.append(
+                ", ".join(sorted(e for e in flag_combo_exes if e)) + " (dangerous flags)"
+            )
+        _truncated = _truncating_redirect_targets(redirect_targets, self.repo_root)
+        if _truncated:
+            _effect_reasons.append(
+                "output redirection truncates " + ", ".join(sorted(set(_truncated)))
+            )
+        if _effect_reasons:
+            _danger_str = "; ".join(_effect_reasons)
+            _approval = self._request_shell_danger_approval(_danger_str, command)
+            if not _approval:
+                return self._make_result(
+                    ok=False, content="",
+                    error=(
+                        f"User denied execution of destructive operation: {_danger_str}. "
+                        f"Operation cancelled."
+                    ),
+                )
+            logger.info("User approved destructive operation(s): %s", _danger_str)
 
         # Background job manager for timeout→background transition
         _bg_mgr = self._get_bg_manager()

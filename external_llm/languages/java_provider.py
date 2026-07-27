@@ -148,10 +148,10 @@ class JavaSyntaxProvider(SyntaxProvider):
                 return tree_sitter_syntax_fallback(content, LanguageId.JAVA, file_path)
             except subprocess.TimeoutExpired:
                 logger.warning("javac timed out for %s", file_path)
-                return SyntaxValidationResult(ok=True, language=LanguageId.JAVA)
+                return tree_sitter_syntax_fallback(content, LanguageId.JAVA, file_path)
             except Exception as e:
                 logger.debug("javac error: %s", e)
-                return SyntaxValidationResult(ok=True, language=LanguageId.JAVA)
+                return tree_sitter_syntax_fallback(content, LanguageId.JAVA, file_path)
 
             if proc.returncode == 0:
                 return SyntaxValidationResult(ok=True, language=LanguageId.JAVA)

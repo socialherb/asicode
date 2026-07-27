@@ -107,7 +107,9 @@ def temp_repo_root_with_memory(temp_repo_root: str) -> Generator[str, None, None
 def agent_config() -> AgentConfig:
     """Return a basic AgentConfig for testing."""
     from external_llm.agent.tool_registry import AgentConfig
-    return AgentConfig(
+    from external_llm.agent.task_router import Lane, RouteDecision, TaskKind
+    from external_llm.agent.enums import Complexity, Scope
+    config = AgentConfig(
         max_turns=5,
         run_tests=False,
         run_lint=False,
@@ -117,6 +119,17 @@ def agent_config() -> AgentConfig:
         rag_enabled=False,
         parallel_tool_execution_enabled=False,
     )
+    # Without a route_decision, AgentLoop.run() hits the unhandled-lane
+    # guard and returns error — every AgentLoop-based test would fail.
+    config.route_decision = RouteDecision(
+        task_kind=TaskKind.SINGLE_FILE_EDIT,
+        complexity=Complexity.LOW,
+        scope=Scope.SINGLE_FILE,
+        lane=Lane.MAIN_AGENT,
+        confidence=0.9,
+        reasoning="Test fixture default",
+    )
+    return config
 
 
 @pytest.fixture

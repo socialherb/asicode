@@ -326,7 +326,7 @@ def _is_dotted_name_class_field(file_path: str, class_name: str, dotted_name: st
         if len(parts) != 2:
             return False
         _child_name = parts[1]
-        with open(file_path) as _f:
+        with open(file_path, encoding="utf-8", errors="replace") as _f:
             _tree = ast.parse(_f.read())
         for _node in ast.iter_child_nodes(_tree):
             if isinstance(_node, ast.ClassDef) and _node.name == class_name:

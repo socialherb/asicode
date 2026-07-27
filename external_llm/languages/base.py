@@ -454,7 +454,69 @@ def _consume_char_or_lifetime(content: str, i: int, length: int) -> int:
     return i + 1  # no closing tick within one element → lifetime
 
 
-def _iter_brace_tokens(content: str, offset: int = 0):
+_REGEX_PRECEDERS = frozenset("(,=:[!&|?{};+-*%^~<>")
+_REGEX_PRECEDING_KEYWORDS = frozenset({
+    "return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
+    "throw", "case", "do", "else", "yield", "await",
+})
+
+
+def _regex_can_start_at(content: str, i: int) -> bool:
+    """Whether the ``/`` at *i* begins a JS/TS regex literal (vs division).
+
+    Standard heuristic: a regex may start only where an *operand* may start.
+    Walks back over whitespace to the previous significant character — if it
+    closes a value (identifier char, digit, ``)``, ``]``, quote, backtick)
+    the slash is division; otherwise it opens a regex. ``}`` is treated as
+    regex-permitting (block end), which is the common convention.
+    """
+    j = i - 1
+    while j >= 0 and content[j] in " \t\r\n":
+        j -= 1
+    if j < 0:
+        return True
+    c = content[j]
+    if c in _REGEX_PRECEDERS:
+        return True
+    if c.isalnum() or c in "_$)]\"'`":
+        # could still be a keyword like `return /re/`
+        k = j
+        while k >= 0 and (content[k].isalnum() or content[k] in "_$"):
+            k -= 1
+        return content[k + 1:j + 1] in _REGEX_PRECEDING_KEYWORDS
+    return True
+
+
+def _skip_regex_literal(content: str, start: int, length: int) -> int:
+    """Index of the closing ``/`` of the regex opening at *start*, or -1.
+
+    ``/`` inside a ``[...]`` character class is literal, and a regex cannot
+    span a newline — hitting one means this was division after all, so the
+    caller must fall back rather than swallow the rest of the file (which is
+    exactly how a backtick inside ``/```/g`` used to flip literal parity for
+    every following line).
+    """
+    j = start + 1
+    in_class = False
+    while j < length:
+        c = content[j]
+        if c == "\\":
+            j += 2
+            continue
+        if c == "\n":
+            return -1
+        if in_class:
+            if c == "]":
+                in_class = False
+        elif c == "[":
+            in_class = True
+        elif c == "/":
+            return j
+        j += 1
+    return -1
+
+
+def _iter_brace_tokens(content: str, offset: int = 0, *, js_lexing: bool = False):
     """Yield ``(ch, idx)`` for every ``{``/``}`` OUTSIDE literals and comments.
 
     SSOT literal/comment/char-vs-lifetime scanner shared by both
@@ -506,8 +568,21 @@ def _iter_brace_tokens(content: str, offset: int = 0):
             i = _consume_char_or_lifetime(content, i, length)
             continue
         if ch == "`":
-            i = _skip_quoted_literal(content, i, length, "`", escapes=False) + 1
+            # JS/TS template literals honour \` escapes; Go raw strings do not.
+            i = _skip_quoted_literal(
+                content, i, length, "`", escapes=js_lexing,
+            ) + 1
             continue
+        # ── JS/TS regex literal ───────────────────────────────────────
+        # Opt-in: in C-family languages a bare `/` is division, and treating
+        # it as a regex would swallow real code. Under js_lexing a regex body
+        # may contain quotes/backticks (`/```/g`), which would otherwise be
+        # read as opening a string and flip literal parity for the whole file.
+        if js_lexing and ch == "/" and _regex_can_start_at(content, i):
+            end = _skip_regex_literal(content, i, length)
+            if end != -1:
+                i = end + 1
+                continue
         # ── brace token ───────────────────────────────────────────────
         if ch == "{" or ch == "}":
             yield (ch, i)
@@ -541,13 +616,19 @@ def _find_closing_brace(content: str, offset: int) -> int:
     return -1
 
 
-def net_brace_count(content: str) -> int:
+def net_brace_count(content: str, *, js_lexing: bool = False) -> int:
     """Literal/comment-aware net brace count (``{`` minus ``}``).
 
     Thin consumer of :func:`_iter_brace_tokens` — shares the EXACT same
     string/char/template-literal and ``//`` / ``/* */`` comment skipping as
     :func:`_find_closing_brace`, so the two can never desync. Returns 0 for a
     balanced region.
+
+    Set *js_lexing* for JavaScript/TypeScript: it enables regex-literal
+    skipping and ``\\```-escape handling in template literals. Without it a
+    backtick or quote inside a regex (e.g. ``.replace(/```/g, "")``) is read
+    as opening a string literal, which flips literal parity for every line
+    that follows and silently voids the tally.
 
     This is the SSOT brace tally for the pre-write safety gate in
     ``symbol_modify_tool._post_edit_syntax_ok``: brace-delimited languages that
@@ -558,7 +639,7 @@ def net_brace_count(content: str) -> int:
     the known corruption class where braces are added/removed in net terms.
     """
     depth = 0
-    for ch, _idx in _iter_brace_tokens(content):
+    for ch, _idx in _iter_brace_tokens(content, js_lexing=js_lexing):
         depth += 1 if ch == "{" else -1
     return depth
 

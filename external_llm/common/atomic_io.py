@@ -29,9 +29,75 @@ motivated this module.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
+import time
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# ── Crash-leftover sweep ──────────────────────────────────────────────────
+# The ``except BaseException: os.unlink(tmp_path)`` in each writer covers the
+# EXCEPTION path only. A SIGKILL, an OOM kill or a power loss runs no Python
+# handler at all, so the half-written ``.atomic_*.tmp`` survives forever —
+# observed in the wild as a 96 MB orphan in .asicode/vector_cache/ left by an
+# interrupted 124 MB metadata dump, still present a day later because nothing
+# in the codebase ever looked for one.
+#
+# Sweep once per directory per process: orphans are created by a process that
+# already died, so re-scanning on every write would be pure overhead.
+_ATOMIC_TMP_PREFIX = ".atomic_"
+# Generous enough that a legitimate in-flight write is never a candidate (the
+# largest dump in this repo takes ~2 s), small enough to reclaim promptly.
+_STALE_TMP_AGE_S = 3600.0
+_swept_dirs: set[str] = set()
+
+
+def sweep_stale_temp_files(base_dir: str, max_age_s: float = _STALE_TMP_AGE_S) -> int:
+    """Delete ``.atomic_*`` leftovers in *base_dir* older than *max_age_s*.
+
+    Returns the number of files removed. Never raises: a sweep failure must not
+    prevent the write it was called from.
+
+    Age-gated rather than unconditional because a *concurrent* writer in
+    another process has its own live temp file in this directory, and deleting
+    that would corrupt its rename. Nothing legitimate holds one for an hour.
+    """
+    removed = 0
+    now = time.time()
+    try:
+        with os.scandir(base_dir) as entries:
+            for entry in entries:
+                if not entry.name.startswith(_ATOMIC_TMP_PREFIX):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if (now - st.st_mtime) < max_age_s:
+                        continue
+                    os.unlink(entry.path)
+                    removed += 1
+                    logger.info(
+                        "Reclaimed stale atomic-write leftover: %s (%.1f MB, age %.1f h)",
+                        entry.path, st.st_size / 1e6, (now - st.st_mtime) / 3600.0,
+                    )
+                except OSError as exc:
+                    # Raced with another sweeper, or not ours to remove.
+                    logger.debug("Could not reclaim %s: %s", entry.path, exc)
+    except OSError as exc:
+        logger.debug("Stale-temp sweep skipped for %s: %s", base_dir, exc)
+    return removed
+
+
+def _sweep_once(base_dir: str) -> None:
+    """Run :func:`sweep_stale_temp_files` at most once per directory per process."""
+    key = os.path.abspath(base_dir)
+    if key in _swept_dirs:
+        return
+    _swept_dirs.add(key)
+    sweep_stale_temp_files(base_dir)
 
 
 def atomic_write_json(
@@ -63,6 +129,7 @@ def atomic_write_json(
     file_path = os.fspath(path)
     base_dir = os.path.dirname(file_path) or "."
     os.makedirs(base_dir, exist_ok=True)
+    _sweep_once(base_dir)  # reclaim leftovers from a previously killed process
     fd, tmp_path = tempfile.mkstemp(dir=base_dir, prefix=".atomic_", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -110,6 +177,7 @@ def atomic_write_jsonl(
     file_path = os.fspath(path)
     base_dir = os.path.dirname(file_path) or "."
     os.makedirs(base_dir, exist_ok=True)
+    _sweep_once(base_dir)  # reclaim leftovers from a previously killed process
     fd, tmp_path = tempfile.mkstemp(dir=base_dir, prefix=".atomic_", suffix=".jsonl")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -170,6 +238,7 @@ def atomic_write_text(path: Any, content: str, *, mode: Any = None) -> None:
     file_path = os.fspath(path)
     base_dir = os.path.dirname(file_path) or "."
     os.makedirs(base_dir, exist_ok=True)
+    _sweep_once(base_dir)  # reclaim leftovers from a previously killed process
     fd, tmp_path = tempfile.mkstemp(dir=base_dir, prefix=".atomic_", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

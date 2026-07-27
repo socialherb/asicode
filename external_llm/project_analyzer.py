@@ -527,7 +527,7 @@ class ProjectAnalyzer:
                     # a quoted mention in another, would self-trigger.
                     for py_file in self._sample_files('.py', 50):
                         try:
-                            content = py_file.read_text()
+                            content = py_file.read_text(encoding="utf-8", errors="replace")
                             if any(line.lstrip().startswith(marker_value)
                                    for line in content.splitlines()):
                                 scores[framework] += weight
@@ -540,7 +540,7 @@ class ProjectAnalyzer:
                     if pkg_path.exists():
                         try:
                             import json
-                            pkg = json.loads(pkg_path.read_text())
+                            pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
                             all_deps = {**pkg.get('dependencies', {}), **pkg.get('devDependencies', {})}
                             if marker_value in all_deps:
                                 scores[framework] += weight
@@ -582,7 +582,7 @@ class ProjectAnalyzer:
                     # parallel to the 'import' marker (Python) but on .kt/.java.
                     for src_file in self._sample_files(('.kt', '.java'), 50):
                         try:
-                            content = src_file.read_text()
+                            content = src_file.read_text(encoding="utf-8", errors="replace")
                             if any(line.lstrip().startswith(marker_value)
                                    for line in content.splitlines()):
                                 scores[framework] += weight
@@ -617,7 +617,7 @@ class ProjectAnalyzer:
         if not go_mod.exists():
             return False
         try:
-            for line in go_mod.read_text().splitlines():
+            for line in go_mod.read_text(encoding="utf-8").splitlines():
                 stripped = line.strip()
                 if not stripped or stripped.startswith('//'):
                     continue
@@ -656,12 +656,12 @@ class ProjectAnalyzer:
                 if not (name.endswith(".gradle.kts") or name.endswith(".gradle")):
                     continue
                 try:
-                    chunks.append(path.read_text())
+                    chunks.append(path.read_text(encoding="utf-8", errors="replace"))
                 except Exception:
                     continue
             for path in self.repo_root.glob("gradle/*.toml"):
                 try:
-                    chunks.append(path.read_text())
+                    chunks.append(path.read_text(encoding="utf-8"))
                 except Exception:
                     continue
         except Exception as e:
@@ -690,7 +690,7 @@ class ProjectAnalyzer:
         pyproject = self.repo_root / 'pyproject.toml'
         if pyproject.exists():
             try:
-                data = self._parse_toml(pyproject.read_text())
+                data = self._parse_toml(pyproject.read_text(encoding="utf-8"))
             except Exception:
                 data = None
             if isinstance(data, dict):
@@ -714,7 +714,7 @@ class ProjectAnalyzer:
         if setup_py.exists():
             try:
                 import ast as _ast
-                content = setup_py.read_text()
+                content = setup_py.read_text(encoding="utf-8", errors="replace")
                 tree = _ast.parse(content)
                 for node in _ast.walk(tree):
                     if isinstance(node, _ast.keyword) and node.arg == 'install_requires':
@@ -854,7 +854,7 @@ class ProjectAnalyzer:
             # framework list but still signals a CLI).
             for py_file in self._sample_files('.py', 30):
                 try:
-                    content = py_file.read_text()
+                    content = py_file.read_text(encoding="utf-8", errors="replace")
                     stdlib_hit = any(
                         f'import {mod}' in content or f'from {mod}' in content
                         for mod in stdlib_cli
@@ -900,7 +900,7 @@ class ProjectAnalyzer:
             return True
         for go_file in self._sample_files('.go', 50):
             try:
-                for line in go_file.read_text().splitlines():
+                for line in go_file.read_text(encoding="utf-8", errors="replace").splitlines():
                     stripped = line.strip()
                     if stripped.startswith('package '):
                         if stripped == 'package main':
@@ -1072,7 +1072,7 @@ class ProjectAnalyzer:
             # Python imports
             for py_file in self._sample_files('.py', 50):
                 try:
-                    content = py_file.read_text()
+                    content = py_file.read_text(encoding="utf-8", errors="replace")
                     # import can appear anywhere in a file (lazy import, long module docstring/
                     # license header). Same full-line scan as _detect_frameworks.
                     for line in content.split('\n'):
@@ -1095,7 +1095,7 @@ class ProjectAnalyzer:
             for ts_ext in ['.ts', '.tsx', '.js', '.jsx']:
                 for ts_file in self._sample_files(ts_ext, 50):
                     try:
-                        content = ts_file.read_text()
+                        content = ts_file.read_text(encoding="utf-8", errors="replace")
                         # ESM/CJS imports can appear anywhere too — full line scan.
                         for line in content.split('\n'):
                             line = line.strip()
@@ -1172,7 +1172,7 @@ class ProjectAnalyzer:
         if setup_py_path.exists() and not entry_points:
             try:
                 import ast as _ast
-                with open(setup_py_path) as f:
+                with open(setup_py_path, encoding="utf-8", errors="replace") as f:
                     tree = _ast.parse(f.read())
                 for node in _ast.walk(tree):
                     if isinstance(node, _ast.Call) and hasattr(node.func, 'id') and node.func.id == 'setup':
@@ -1206,7 +1206,7 @@ class ProjectAnalyzer:
         if pkg_json.exists():
             try:
                 import json
-                with open(pkg_json) as f:
+                with open(pkg_json, encoding="utf-8") as f:
                     pkg = json.load(f)
                 bin_ = pkg.get('bin')
                 if isinstance(bin_, str):
@@ -1257,7 +1257,7 @@ class ProjectAnalyzer:
     def _has_entry_pattern(path: Path) -> bool:
         """Check if a Python file contains a real entry point pattern"""
         try:
-            content = path.read_text()
+            content = path.read_text(encoding="utf-8", errors="replace")
             return ("if __name__ == '__main__'" in content
                     or 'if __name__ == "__main__"' in content
                     or 'def main():' in content)

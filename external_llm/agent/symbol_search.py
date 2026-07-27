@@ -18,9 +18,11 @@ import difflib
 import logging
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from fnmatch import fnmatch
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from ..languages import (
@@ -36,6 +38,12 @@ from ._shared_utils import (
 from ._shared_utils import (
     _walk_ts_js_files as _shared_walk_ts_js_files,
 )
+# Walk-cache introspection — lets find_symbol distinguish a genuine miss
+# ("symbol absent") from a truncated index ("symbol may live in un-indexed
+# files"). Both caches are module-global in ._shared_utils.
+from ._shared_utils import _PY_WALK_CACHE as _SHARED_PY_WALK_CACHE
+from ._shared_utils import _TS_WALK_CACHE as _SHARED_TS_WALK_CACHE
+from ._shared_utils import _walk_truncated_for as _shared_walk_truncated_for
 from .config.thresholds import config as _cfg
 from .rag_configs import CodeTokenizer
 from .rag_searcher import _bm25_score as _bm25
@@ -54,6 +62,9 @@ try:
     )
     from ..languages.tree_sitter_utils import (
         get_available_languages as _ts_available_languages,
+    )
+    from ..languages.tree_sitter_utils import (  # type: ignore
+        is_language_available as _ts_language_available,
     )
     from ..languages.tree_sitter_utils import (  # type: ignore
         get_node_text as _ts_get_node_text,
@@ -246,6 +257,301 @@ def _walk_py_files(root: Path) -> list[Path]:
     return _shared_walk_py_files(root, _MAX_PY_FILES)
 
 
+def _nonpy_index_globs() -> list[str]:
+    """File globs the non-Python index actually covers.
+
+    Read from the same provider registry and with the same python/ts/js
+    exclusion that ``_index_via_treesitter_batch`` uses, so the probe and the
+    index can never disagree about what is in scope.
+
+    Owning a glob is NOT enough — the provider must have a path that can emit a
+    symbol. ``_nonpy_index_for`` has exactly two: the tree-sitter batch (needs
+    the grammar installed) and the regex loop (needs non-empty
+    ``get_symbol_patterns``). A provider with neither owns globs whose files the
+    index walks past in silence, so counting them makes the probe answer a
+    question the build cannot: it returns True and the caller pays a whole-repo
+    build that provably cannot contain the token.
+
+    Measured on this repo, where ``json`` is exactly such a provider (no
+    grammar in ``_LANG_MODULE_MAP``, no regex patterns): its ``*.json`` glob
+    contributed 158 of the 163 files in the probe's scope while only 5 were
+    indexable at all, and 19 of 40 sampled real symbol names probed True purely
+    on a .json mention — a 75 ms index build each, for a set that could never
+    match. Filtering here is the whole fix; the build itself was already right.
+
+    Grammar availability is a property of the INSTALL, not of the repo, so this
+    is recomputed rather than frozen: installing ``tree-sitter-json`` makes json
+    indexable and its glob correctly re-enters scope.
+    """
+    globs: list[str] = []
+    registry = LanguageRegistry.instance()
+    for provider in sorted(
+        set(registry._providers.values()), key=lambda p: p.language_id().value
+    ):
+        lang_id = provider.language_id().value
+        if lang_id in ("python", "typescript", "javascript"):
+            continue
+        # Patterns first, grammar second — deliberately, not stylistically. A
+        # provider with regex patterns is indexable no matter what is installed,
+        # so asking about its grammar is a question we do not need the answer
+        # to, and answering it imports that grammar module. Ordering this way
+        # leaves only the pattern-less providers (css/html/json here) to
+        # resolve, on what is now find_symbol's hot path — the whole-set form
+        # imported all 19 mapped grammars (~50 ms) to decide 28 globs.
+        if provider.get_symbol_patterns(kind="any"):
+            globs.extend(provider.get_file_globs())
+        elif _HAS_TS and _ts_language_available(lang_id):
+            globs.extend(provider.get_file_globs())
+    return globs
+
+
+# In-process probing is only a win while the indexable set stays small: it
+# trades one rg spawn (~9 ms, flat) for reading N files (~0.04 ms each here).
+# Above these caps the spawn is cheaper and bounded, so we defer to rg.
+_NONPY_INPROC_MAX_FILES = 200
+_NONPY_INPROC_MAX_BYTES = 8 * 1024 * 1024
+# {root: (timestamp, files, total_bytes)} — files is None when unanswerable.
+_NONPY_FILES_CACHE: dict[str, tuple] = {}
+
+
+def _nonpy_indexable_files(root: Path) -> Optional[tuple[list[str], int]]:
+    """TTL-cached ``(paths, total_bytes)`` of files the non-Python index reads.
+
+    One ``rg --files`` walk shared across every token, where the probe's own
+    query is per-token. That is the whole point: the walk is the expensive half
+    and it does not depend on the token, so hoisting it turns each subsequent
+    probe into an in-process scan.
+
+    Returns None when the answer cannot be trusted (rg missing/error), so the
+    caller keeps its existing fallback rather than treating "unknown" as empty.
+    """
+    key = str(root)
+    hit = _NONPY_FILES_CACHE.get(key)
+    if hit is not None and (_time.monotonic() - hit[0]) < _WALK_CACHE_TTL:
+        return None if hit[1] is None else (hit[1], hit[2])
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+    glob_args: list[str] = []
+    for g in _nonpy_index_globs():
+        glob_args += ["--glob", g]
+    if not glob_args:
+        return None
+    try:
+        proc = subprocess.run(
+            [rg, "--files", "--no-ignore-vcs", *glob_args, "."],
+            cwd=str(root), capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug("nonpy file list: rg failed (%s)", e)
+        _NONPY_FILES_CACHE[key] = (_time.monotonic(), None, 0)
+        return None
+    if proc.returncode not in (0, 1):
+        _NONPY_FILES_CACHE[key] = (_time.monotonic(), None, 0)
+        return None
+    files: list[str] = []
+    total = 0
+    for line in proc.stdout.splitlines():
+        if not line:
+            continue
+        p = str(root / line)
+        files.append(p)
+        try:
+            total += os.path.getsize(p)
+        except OSError as e:
+            # Vanished between walk and stat — the scan skips it too, so the
+            # only consequence is a slightly low byte total for the cap.
+            logger.debug("nonpy file list: cannot size %s (%s)", p, e)
+    _NONPY_FILES_CACHE[key] = (_time.monotonic(), files, total)
+    return files, total
+
+
+def _word_in_files(files: list[str], token: str) -> bool:
+    """True if *token* occurs as a whole word in any of *files*.
+
+    Mirrors rg's ``--word-regexp --fixed-strings``: the match must not be
+    flanked by word characters. ``(?<!\\w)…(?!\\w)`` is used rather than
+    ``\\b…\\b`` because ``\\b`` is defined relative to the adjacent pattern
+    character, so a token starting or ending in a non-word character (CSS's
+    ``--var``) would anchor the wrong way; the lookarounds mean the same thing
+    for plain identifiers and stay correct for those.
+
+    Unreadable files are skipped, matching ``_index_via_treesitter_batch`` —
+    a file the build cannot read holds no indexable symbol either.
+    """
+    pat = re.compile(r"(?<!\w)" + re.escape(token) + r"(?!\w)")
+    for f in files:
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                if pat.search(fh.read()):
+                    return True
+        except OSError as e:
+            logger.debug("nonpy probe: unreadable %s (%s) — skipped", f, e)
+            continue
+    return False
+
+
+def _rg_token_in_nonpy_files(root: Path, token: str) -> Optional[bool]:
+    """Whether *token* appears as a bare word in any indexed non-Python file.
+
+    Companion to :func:`_rg_py_files_containing` for the non-Python index: a
+    file that DEFINES ``token`` must mention it, so a False here means the
+    whole-repo non-Python index cannot possibly contain the symbol and building
+    it is pure waste.
+
+    Returns None when the answer cannot be trusted (rg missing, error, timeout)
+    so the caller builds the index exactly as before.
+
+    Scope is the provider globs, NOT ``--type-not py``. The looser form both
+    cost more (1335 files scanned instead of 163 here, 26-97ms instead of
+    8-12ms) and answered the wrong question — it reported True for tokens that
+    appear only in .txt baselines, which the index never indexes, so the build
+    it triggered could not have matched. ``--no-ignore-vcs`` matches
+    _rg_py_files_containing; see its docstring.
+    """
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+    # Fast path: the indexable set is walked ONCE per root (TTL-cached, token
+    # independent) and scanned in-process, so repeat lookups cost a read rather
+    # than a spawn. Falls through to rg when the set is unknown or too big.
+    _listed = _nonpy_indexable_files(root)
+    if _listed is not None:
+        _files, _bytes = _listed
+        if len(_files) <= _NONPY_INPROC_MAX_FILES and _bytes <= _NONPY_INPROC_MAX_BYTES:
+            return _word_in_files(_files, token)
+    glob_args: list[str] = []
+    for g in _nonpy_index_globs():
+        glob_args += ["--glob", g]
+    if not glob_args:
+        return None  # no non-Python providers -> nothing to assert; build as before
+    try:
+        proc = subprocess.run(
+            [rg, "--quiet", "--no-ignore-vcs", "--word-regexp", "--fixed-strings"]
+            + glob_args + ["--", token, "."],
+            cwd=str(root), capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug("nonpy index probe: rg failed (%s) — building index", e)
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    logger.debug("nonpy index probe: rg exit %s — building index", proc.returncode)
+    return None
+
+
+def _rg_py_files_containing(root: Path, token: str) -> Optional[set[str]]:
+    """Absolute paths of .py files under *root* containing *token* as a word.
+
+    A prefilter for the Python symbol scan: a file that DEFINES ``token`` must
+    contain ``token`` as a bare word, so any file rg does not list cannot hold
+    the definition. Narrowing to these files avoids tree-sitter-parsing the
+    whole repo to answer one lookup (measured: 1102 parses / 2.2s cold on this
+    repo, versus 2-61 candidate files for real symbols).
+
+    Returns None when the filter cannot be trusted — rg missing, rg error, or
+    timeout — so the caller falls back to scanning every file. An empty set is
+    a real answer (no file contains the token) and is NOT None.
+
+    ``--no-ignore-vcs`` is deliberate: .gitignore in this repo has hidden real
+    source before (bare filename patterns un-tracking exploration/ modules), and
+    a prefilter that inherits that blindness would silently drop definitions.
+    Vendor/hidden-dir policy is not rg's job here — the caller intersects this
+    set with ``_walk_py_files``, which remains the single source of truth for
+    which files are in scope.
+    """
+    return _rg_list_py_files(root, ["--word-regexp", "--fixed-strings", "--", token])
+
+
+def _rg_list_py_files(root: Path, matcher_args: list[str]) -> Optional[set[str]]:
+    """Core rg runner for the find_symbol prefilters.
+
+    Returns absolute paths of .py files under *root* that rg matches with
+    *matcher_args*, or None when the answer cannot be trusted (rg missing,
+    error, timeout). Shared by the word-match and definition-pattern
+    prefilters so the trust contract (None vs empty set) stays identical.
+    """
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+    try:
+        proc = subprocess.run(
+            [rg, "--files-with-matches", "--type", "py",
+             "--no-ignore-vcs", *matcher_args, "."],
+            cwd=str(root), capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug("find_symbol prefilter: rg failed (%s) — scanning all files", e)
+        return None
+    # 0 = matches, 1 = no matches (a real, trustworthy empty answer), 2+ = error.
+    if proc.returncode not in (0, 1):
+        logger.debug(
+            "find_symbol prefilter: rg exit %s — scanning all files", proc.returncode
+        )
+        return None
+    out: set[str] = set()
+    for line in proc.stdout.splitlines():
+        if line:
+            # No .resolve(): the intersection at the call site compares
+            # against _walk_py_files paths, which are built from the same
+            # already-resolved *root* (repo_root/_resolve_search_root resolve
+            # at the boundary). Both sides being plain joins of one resolved
+            # root makes them string-identical; per-path realpath() here cost
+            # ~1,150 lstat-walking calls per find_symbol on this repo.
+            out.add(str(root / line))
+    return out
+
+
+# A definition line must literally contain one of these shapes — the complete
+# definition surface of _extract_all_python_symbols/_ts_collect_all (class,
+# def/async def, simple or chained assignment, annotated assignment). The
+# assignment piece deliberately over-matches (kwargs `f(X=1)`, slices `a[X:]`,
+# lambda params): a false positive only keeps a file the word-match set would
+# have kept anyway; it can never drop one.
+_DEF_PATTERNS: dict[str, str] = {
+    "class": r"^\s*class\s+{t}\b",
+    "function": r"^\s*(async\s+def|def)\s+{t}\b",
+    "variable": r"\b{t}\s*=([^=]|$)|\b{t}\s*:",
+}
+_DEF_PATTERNS["method"] = _DEF_PATTERNS["function"]
+_DEF_PATTERNS["constant"] = _DEF_PATTERNS["variable"]
+
+_PLAIN_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _rg_py_files_defining(root: Path, token: str, kind: str) -> Optional[set[str]]:
+    """Files that can DEFINE *token* (per kind), or None when not answerable.
+
+    A strict subset of :func:`_rg_py_files_containing`: a definition line
+    contains the token, but for widely-imported names the mention set is
+    dominated by importers that provably hold no definition (measured on this
+    repo: ToolRegistry — 82 mentioning files, 1 defining; dispatch 120 → 12).
+    Parsing only the defining set is the entire win of this prefilter.
+
+    Trust contract mirrors the word-match prefilter, with one addition: the
+    caller must treat an EMPTY set as "fall back to the word-match set", not
+    as a real answer. The regex cannot see definitions split across physical
+    lines (`X \\` + `= 1`), so empty means "the regex saw nothing", while the
+    extractor might still find something in a mentioning file. Non-empty is
+    safe to use directly: a file whose only definition is regex-invisible
+    while ANOTHER file defines the name visibly is the one shape this filter
+    can drop, and no such construct survives review in practice.
+
+    Non-identifier tokens (regex metacharacters, unicode names) return None —
+    the fixed-string word-match path handles those.
+    """
+    if not _PLAIN_IDENTIFIER_RE.fullmatch(token):
+        return None
+    pattern = _DEF_PATTERNS.get(kind)
+    if pattern is None:  # "any" or an unrecognized kind → union of all shapes
+        pattern = "|".join(
+            _DEF_PATTERNS[k] for k in ("class", "function", "variable")
+        )
+    return _rg_list_py_files(root, ["--", pattern.replace("{t}", token)])
+
+
 def _walk_ts_js_files(root: Path) -> list[Path]:
     """Return TS/JS files under *root*, skipping hidden/vendor/node_modules.
 
@@ -311,14 +617,28 @@ def _ts_extract_decorators(node, code_bytes: bytes) -> list[str]:
 
 
 def _ts_extract_docstring(node, code_bytes: bytes) -> Optional[str]:
-    """Extract docstring from a function/class tree-sitter node."""
+    """Extract docstring from a function/class tree-sitter node.
+
+    Two independent shape problems are handled here:
+
+    1. ``expression_statement`` has NO ``expression`` named field in the Python
+       grammar, so ``child_by_field_name("expression")`` returned None and this
+       function never extracted anything under EITHER grammar (verified against
+       both). The docstring is ``children[0]``. The same trap is already noted at
+       the ``_walk_outline`` site below.
+    2. The wrapper may not be there at all: standalone ``tree-sitter-python``
+       gives ``block → expression_statement → string``, while the
+       ``tree-sitter-language-pack`` bundle gives ``block → string``.
+    """
     try:
         body = node.child_by_field_name("body")
         if body and body.children:
             first = body.children[0]
-            if first.type == "expression_statement":
-                expr = first.child_by_field_name("expression")
-                if expr and expr.type == "string":
+            if first.type in ("expression_statement", "string"):
+                expr = first if first.type == "string" else (
+                    first.children[0] if first.children else None
+                )
+                if expr is not None and expr.type == "string":
                     text = _ts_get_node_text(code_bytes, expr)
                     # Strip quotes
                     if text.startswith(('"""', "'''")):
@@ -512,6 +832,28 @@ class SymbolSearcher:
 
         # ── Python AST scan ──────────────────────────────────────────────────
         py_files = [root] if root.is_file() and LanguageId.from_path(str(root)) == LanguageId.PYTHON else _walk_py_files(root)
+        # Narrow to files that actually contain the name before parsing any of
+        # them. Intersecting (rather than using rg's list directly) keeps
+        # _walk_py_files as the sole authority on which files are in scope, so
+        # this can only ever remove files that provably cannot hold the
+        # definition. A None result means the prefilter is untrustworthy —
+        # scan everything, exactly as before.
+        if len(py_files) > 1:
+            # Definition-pattern pass first: for widely-imported names the
+            # word-match set is dominated by importers (82 files for
+            # ToolRegistry on this repo, 1 of which defines it), and every
+            # candidate is tree-sitter parsed. Empty-or-None falls back to
+            # the word-match set, so this can only skip files whose text
+            # provably contains no definition shape the extractor records.
+            _candidates = _rg_py_files_defining(root, search_name, kind)
+            if not _candidates:
+                _candidates = _rg_py_files_containing(root, search_name)
+            if _candidates is not None:
+                # str(p), not str(p.resolve()): both sides are plain joins of
+                # the same resolved root (see _rg_list_py_files), and
+                # resolving every walked file cost ~1,150 realpath calls per
+                # lookup — most of find_symbol's non-parse overhead.
+                py_files = [p for p in py_files if str(p) in _candidates]
         for pf in py_files:
             results.extend(self._find_in_python_cached(pf, search_name, kind))
             if len(results) >= _cfg.counts.SEARCH_RESULTS_CAP:
@@ -536,11 +878,15 @@ class SymbolSearcher:
         # ── Provider-aware search for registered languages (persistent index)
         if (not results or kind == "any") and kind != "variable":
             registry = LanguageRegistry.instance()
+            # NOTE: this is a property of the STATIC provider registry, not of
+            # the repo — the built-in providers always include non-Python ones,
+            # so it is always True and filters nothing. Repo-level "is there
+            # anything to find here" is what _nonpy_index_worth_building answers.
             has_nonpy_provider = any(
                 p.language_id().value not in ("python", "typescript", "javascript")
                 for p in set(registry._providers.values())
             )
-            if has_nonpy_provider:
+            if has_nonpy_provider and self._nonpy_index_worth_building(root, search_name):
                 # The persistent index already aggregates all non-Python
                 # providers in one rg pass; filter to this name/kind.
                 _idx = self._nonpy_index_for(root)
@@ -891,13 +1237,18 @@ class SymbolSearcher:
                                     _walk_outline(child, parent_class)
                             return
 
-                        elif node.type == "expression_statement":
+                        elif node.type in ("expression_statement", "assignment"):
                             # Top-level assignment (constant)
                             if not parent_class:
                                 # Python tree-sitter grammar: expression_statement has
                                 # no "expression" named field — child_by_field_name
                                 # always returns None. Use children[0] instead.
-                                expr = node.children[0] if node.children else None
+                                # And the wrapper is grammar-dependent: the
+                                # language-pack bundle puts `assignment` straight
+                                # under `module`, so accept the bare node too.
+                                expr = node if node.type == "assignment" else (
+                                    node.children[0] if node.children else None
+                                )
                                 if expr and expr.type == "assignment":
                                     left = expr.child_by_field_name("left")
                                     right = expr.child_by_field_name("right")
@@ -1002,7 +1353,7 @@ class SymbolSearcher:
             or lang_id in ("python", "typescript", "javascript")
         ):
             return []
-        if lang_id not in _ts_available_languages():
+        if not _ts_language_available(lang_id):
             return []  # grammar mapped but not installed → caller falls back
         try:
             content = file_path.read_text(encoding="utf-8", errors="replace")
@@ -1095,7 +1446,10 @@ class SymbolSearcher:
                         file=rel, line=lineno, kind=kind, name=name,
                         signature=ctx,
                     ))
-            except (AttributeError, TypeError):
+            except (AttributeError, TypeError, OSError):
+                # OSError covers rg-absent FileNotFoundError (rg is an OPTIONAL dep,
+                # see pyproject [search]); graceful degradation — skip this pattern
+                # and return whatever the other patterns found (possibly empty).
                 continue
 
         results.sort(key=lambda s: s.line)
@@ -1111,6 +1465,28 @@ class SymbolSearcher:
         except Exception:
             pass  # non-critical — never block execution
         return None
+
+    def index_was_truncated(self, search_path: Optional[str] = None) -> bool:
+        """True if the most recent file walk for *search_path* hit the cap.
+
+        find_symbol walks the candidate file set lazily; on a MISS the result
+        is only authoritative if the walk was complete. A truncated walk means
+        the symbol may simply live in an un-indexed file. The caller (see
+        read_tools._tool_find_symbol) uses this to annotate the empty result so
+        the agent does not wrongly conclude "symbol does not exist".
+
+        Each cache is queried with the cap THIS module walks at, not with the
+        flag alone: a higher-cap caller (vulture_scanner uses 4000) can leave a
+        complete cache entry that is nonetheless sliced down for our 3000, and
+        a flag-only reading would call that shortened list complete.
+        """
+        root = self._resolve_search_root(search_path)
+        if root is None:
+            return False
+        return (
+            _shared_walk_truncated_for(root, _SHARED_PY_WALK_CACHE, _MAX_PY_FILES)
+            or _shared_walk_truncated_for(root, _SHARED_TS_WALK_CACHE, _MAX_TS_FILES)
+        )
 
     # ── Python per-file symbol extraction + mtime cache ────────────────────
     # The cache stores, per file, a {name -> [SymbolDef]} map of ALL symbols
@@ -1308,8 +1684,12 @@ class SymbolSearcher:
                     self._ts_collect_all(child, code_bytes, rel, parent_class, out)
             return
 
-        elif node.type == "expression_statement":
-            expr = node.children[0] if node.children else None
+        elif node.type in ("expression_statement", "assignment"):
+            # Bare `assignment` is the language-pack grammar's shape for the same
+            # statement the standalone grammar wraps in `expression_statement`.
+            expr = node if node.type == "assignment" else (
+                node.children[0] if node.children else None
+            )
             if expr and expr.type == "assignment":
                 left = expr.child_by_field_name("left")
                 right = expr.child_by_field_name("right")
@@ -1685,11 +2065,11 @@ class SymbolSearcher:
             s = s[2:]
         return s
 
-    def _index_via_treesitter(
-        self, provider, search_root: Path,
+    def _index_via_treesitter_batch(
+        self, providers: list, search_root: Path,
         index: dict[str, list[SymbolDef]], seen: set,
     ) -> None:
-        """Index a provider's files by parsing each with tree-sitter.
+        """Index every provider's files from a SINGLE ``rg --files`` walk.
 
         Replaces the rg+regex path for languages whose tree-sitter binding is
         installed. For CSS this is the authoritative source: class selectors,
@@ -1697,64 +2077,161 @@ class SymbolSearcher:
         AST, so no regex pattern ever becomes an rg positional/flag arg (the
         ``--name`` leading-dash trap is structurally impossible here).
 
+        rg accepts repeated ``--glob``, so every provider's globs go into one
+        invocation and the repo tree is walked once instead of once per
+        provider. Each returned path is dispatched back to its language by
+        matching the file NAME against the globs (``fnmatch``, first match in
+        provider order wins) — this handles non-``*.ext`` globs too, which a
+        plain suffix map would not.
+
         Failures (unreadable file, parse error) are skipped per-file — the
         index simply lacks those symbols, matching the rg path's tolerance.
         """
-        lang_id = provider.language_id().value
-        for glob in provider.get_file_globs():
-            try:
-                proc = subprocess.run(
-                    ["rg", "--files", "--glob", glob,
-                     "--glob", "!node_modules*", str(search_root)],
-                    cwd=str(self.repo_root),
-                    capture_output=True, text=True, timeout=8,
-                )
-            except subprocess.SubprocessError:
+        # (glob, lang_id) in stable provider order — first match wins, so a
+        # path matching two providers' globs resolves deterministically.
+        glob_lang: list[tuple[str, str]] = []
+        for provider in providers:
+            lang_id = provider.language_id().value
+            for g in provider.get_file_globs():
+                glob_lang.append((g, lang_id))
+        if not glob_lang:
+            return
+
+        try:
+            cmd = ["rg", "--files"]
+            for g, _ in glob_lang:
+                cmd += ["--glob", g]
+            cmd += ["--glob", "!node_modules*", str(search_root)]
+            proc = subprocess.run(
+                cmd, cwd=str(self.repo_root),
+                capture_output=True, text=True, timeout=8,
+            )
+        except (OSError, subprocess.SubprocessError) as _err:
+            # OSError covers rg-absent FileNotFoundError (rg is OPTIONAL — pyproject
+            # [search]). Without it, a base `pip install asicode` has no rg and the
+            # default find_symbol(kind="any") crashes here every time. Graceful:
+            # empty tree-sitter index this pass.
+            logger.debug(
+                "[symbol-search] batched rg --files failed for %d glob(s) "
+                "under %s: %s — tree-sitter index will be empty this pass",
+                len(glob_lang), search_root, _err,
+            )
+            return
+        if proc.returncode not in (0, 1):
+            # rg exit 2+ (regex/flag error) yields empty stdout and would otherwise
+            # silently produce an empty index with no signal.
+            logger.debug(
+                "[symbol-search] batched rg --files exit %s under %s — "
+                "tree-sitter index will be empty this pass",
+                proc.returncode, search_root,
+            )
+            return
+
+        for fpath in (proc.stdout or "").splitlines():
+            if not fpath:
                 continue
-            for fpath in (proc.stdout or "").splitlines():
-                if not fpath:
+            _base = PurePosixPath(fpath).name
+            lang_id = ""
+            for g, lid in glob_lang:
+                if fnmatch(_base, g):
+                    lang_id = lid
+                    break
+            if not lang_id:
+                continue
+            try:
+                abs_path = self.repo_root / fpath
+                content = abs_path.read_text(encoding="utf-8", errors="replace")
+            except (OSError, UnicodeDecodeError) as _err:
+                logger.debug(
+                    "[symbol-search] unreadable %s (%s) — skipped", fpath, _err,
+                )
+                continue
+            try:
+                syms = _ts_find_all_symbols(content, lang_id)
+            except Exception as _err:
+                logger.debug(
+                    "[symbol-search] tree-sitter parse failed for %s (%s): %s "
+                    "— skipped", fpath, lang_id, _err,
+                )
+                continue
+            rel = self._rg_path_to_rel(fpath)
+            for name, kind, start_line, _end_line in syms:
+                # Dedup by (file, name, line): multiple distinct symbols can
+                # share a line (e.g. ``.x { color: red; --real-var: 1; }``
+                # has both a class selector and a custom property on line 1),
+                # so name must be part of the key to avoid dropping them.
+                key = (rel, name, start_line)
+                if key in seen:
                     continue
-                try:
-                    abs_path = self.repo_root / fpath
-                    content = abs_path.read_text(encoding="utf-8", errors="replace")
-                except (OSError, UnicodeDecodeError):
-                    continue
-                try:
-                    syms = _ts_find_all_symbols(content, lang_id)
-                except Exception:
-                    continue
-                rel = self._rg_path_to_rel(fpath)
-                for name, kind, start_line, _end_line in syms:
-                    # Dedup by (file, name, line): multiple distinct symbols can
-                    # share a line (e.g. ``.x { color: red; --real-var: 1; }``
-                    # has both a class selector and a custom property on line 1),
-                    # so name must be part of the key to avoid dropping them.
-                    key = (rel, name, start_line)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    # CSS custom properties are stored in the AST with their
-                    # leading "--" (e.g. "--primary-color"), but callers search
-                    # by the bare identifier ("primary-color"). Normalize both
-                    # the index key and the stored name so lookup matches
-                    # regardless of whether the caller includes the dashes.
-                    if kind == "css_variable" and name.startswith("--"):
-                        norm_name = name[2:]
-                        index.setdefault(norm_name, []).append(SymbolDef(
-                            file=rel, line=start_line, kind=kind, name=norm_name,
-                            signature="",
-                        ))
-                        # Also index under the dashed form so "--primary-color"
-                        # lookups resolve too.
-                        index.setdefault(name, []).append(SymbolDef(
-                            file=rel, line=start_line, kind=kind, name=name,
-                            signature="",
-                        ))
-                    else:
-                        index.setdefault(name, []).append(SymbolDef(
-                            file=rel, line=start_line, kind=kind, name=name,
-                            signature="",
-                        ))
+                seen.add(key)
+                # CSS custom properties are stored in the AST with their
+                # leading "--" (e.g. "--primary-color"), but callers search
+                # by the bare identifier ("primary-color"). Normalize both
+                # the index key and the stored name so lookup matches
+                # regardless of whether the caller includes the dashes.
+                if kind == "css_variable" and name.startswith("--"):
+                    norm_name = name[2:]
+                    index.setdefault(norm_name, []).append(SymbolDef(
+                        file=rel, line=start_line, kind=kind, name=norm_name,
+                        signature="",
+                    ))
+                    # Also index under the dashed form so "--primary-color"
+                    # lookups resolve too.
+                    index.setdefault(name, []).append(SymbolDef(
+                        file=rel, line=start_line, kind=kind, name=name,
+                        signature="",
+                    ))
+                else:
+                    index.setdefault(name, []).append(SymbolDef(
+                        file=rel, line=start_line, kind=kind, name=name,
+                        signature="",
+                    ))
+
+    def _nonpy_index_worth_building(self, search_root: Path, token: str) -> bool:
+        """Whether consulting the non-Python index for *token* is worth its cost.
+
+        The index is whole-repo and TTL-cached, so a COLD lookup pays a full
+        build (123ms here) even when the caller already found the symbol in
+        Python — ``find_symbol``'s default ``kind="any"`` reaches this branch
+        unconditionally. When no non-Python file even mentions the token, that
+        build cannot produce a match, so skip it.
+
+        Only the cold path is probed. On a warm cache the index lookup is a
+        dict hit, which is cheaper than the rg probe would be — probing there
+        would make the fast path slower.
+        """
+        cached = self._nonpy_index_cache.get(str(search_root))
+        if cached is not None and (_time.monotonic() - cached[0]) < _WALK_CACHE_TTL:
+            return True
+        found = _rg_token_in_nonpy_files(search_root, token)
+        # None = probe untrustworthy -> build, exactly as before the probe existed.
+        return found is not False
+
+    def invalidate_nonpy_caches(self) -> None:
+        """Drop the non-Python symbol caches so a just-written file is visible.
+
+        Both are TTL-based (30 s) because an mtime fingerprint would need the
+        very directory walk they exist to avoid. That TTL is fine for drift, but
+        NOT for the agent's own writes: it edits a file and immediately looks up
+        the symbol it just added. ``_invalidate_cache_after_write`` already
+        clears six caches for exactly that reason — its comment records
+        find_symbol answering "No definitions found" for a function on disk —
+        but these two were not among them, so the symptom survived for every
+        non-Python language while Python edits were visible at once.
+
+        Two layers, and both must go:
+
+        * ``_nonpy_index_cache`` — the built {name: [SymbolDef]} index. Stale for
+          an EDITED file.
+        * ``_NONPY_FILES_CACHE`` — the shared file-list walk behind the probe.
+          Stale for a NEWLY CREATED file: the probe scans that cached list, so a
+          new .go file is invisible even once the index above is rebuilt.
+
+        Kept here rather than reaching into the module from tool_registry so the
+        caller does not have to know how many caches there are.
+        """
+        self._nonpy_index_cache.clear()
+        _NONPY_FILES_CACHE.clear()
 
     def _nonpy_index_for(self, search_root: Path) -> dict[str, list[SymbolDef]]:
         """Build (once, TTL-cached) a {name -> [SymbolDef]} index of ALL
@@ -1777,7 +2254,15 @@ class SymbolSearcher:
         seen: set = set()
         ts_langs = _ts_available_languages() if _HAS_TS else set()
         registry = LanguageRegistry.instance()
-        for provider in set(registry._providers.values()):
+        # Providers whose grammar is installed are indexed by ONE batched
+        # rg --files walk after this loop (see _index_via_treesitter_batch);
+        # collecting them here keeps the tree walk count at 1 instead of one
+        # per provider. Sorted for a deterministic glob-dispatch order.
+        _ts_providers: list = []
+        for provider in sorted(
+            set(registry._providers.values()),
+            key=lambda p: p.language_id().value,
+        ):
             lang_id = provider.language_id().value
             if lang_id in ("python", "typescript", "javascript"):
                 continue  # handled by AST/TS tracer paths
@@ -1810,7 +2295,7 @@ class SymbolSearcher:
             # of truth for CSS (class/id/custom-property), where the regex
             # approach previously hit the leading "-"/"#" shell-arg trap.
             if lang_id in ts_langs:
-                self._index_via_treesitter(provider, search_root, index, seen)
+                _ts_providers.append(provider)
                 continue  # skip the provider-regex rg spawn below
 
             for glob in provider.get_file_globs():
@@ -1862,8 +2347,20 @@ class SymbolSearcher:
                                 ))
                             except (ValueError, AttributeError, TypeError):
                                 pass
-                    except (AttributeError, TypeError, subprocess.SubprocessError):
+                    except (AttributeError, TypeError, OSError, subprocess.SubprocessError):
+                        # OSError covers rg-absent FileNotFoundError (rg is OPTIONAL —
+                        # pyproject [search]). Graceful: skip this glob/pattern.
                         pass
+
+        # One rg --files walk for every tree-sitter-capable provider at once.
+        # Runs after the regex loop rather than inside it; the two paths key
+        # ``seen`` with different tuple arities ((rel, lineno) vs
+        # (rel, name, line)), so they can never collide and ordering between
+        # them does not affect the result.
+        if _ts_providers:
+            self._index_via_treesitter_batch(
+                _ts_providers, search_root, index, seen,
+            )
 
         self._nonpy_index_cache[cache_key] = (_time.monotonic(), index)
         return index

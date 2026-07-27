@@ -668,7 +668,19 @@ class TurnPipelineMixin:
 
         logger.info("Agent finished after %d turns", ctx.turn_num - 1)
 
-        if (not ctx.read_only_request) and (not self.registry.applied_patches):
+        # The block below asserts "the user asked for an edit and none happened".
+        # ``read_only_request`` alone does not establish that premise: every
+        # IntentResolver failure path also yields read_only_request=False (the
+        # deliberate never-block-an-edit default). Running the gate on an
+        # unresolved intent turned answered QUESTIONS into status="error" and
+        # injected `bash('cat > path << EOF')` instructions into read-only
+        # conversations. Write PERMISSION is untouched — only the expectation.
+        if ctx.intent_undetermined and not self.registry.applied_patches:
+            logger.info(
+                "Skipping write-intent false-success gate — intent resolution "
+                "never classified this request (no evidence an edit was asked for)"
+            )
+        elif (not ctx.read_only_request) and (not self.registry.applied_patches):
             if ctx.noop_confirmed and final_msg:
                 logger.info("No-op task confirmed — returning success with no patches")
                 self.performance_collector.end_session()
@@ -741,27 +753,20 @@ class TurnPipelineMixin:
 
             if ctx.no_tool_nudge_count < _NO_TOOL_NUDGE_MAX and ctx.turn_num < self.config.max_turns:
                 ctx.no_tool_nudge_count += 1
-                if ctx.read_only_request:
-                    nudge_content = (
-                        "[ACTION REQUIRED] You explained the task but did NOT call any tool.\n"
-                        f"Original task: {ctx.request}\n\n"
-                        "You MUST output a JSON tool call. Do NOT write text — output the call directly.\n\n"
-                        "This is a READ-ONLY request.\n"
-                        "Use only read/search tools.\n"
-                        "Do NOT call apply_patch.\n"
-                        "Once the answer is confirmed, finish with the final summary in the user's language."
-                    )
-                else:
-                    nudge_content = (
-                        "[ACTION REQUIRED] You explained the task but did NOT call any tool.\n"
-                        "You MUST output a tool call. Do NOT write code as plain text.\n\n"
-                        "To CREATE a new file:\n"
-                        "  bash('cat > path << EOF\\n...content...\\nEOF') or bash('tee path << EOF\\n...\\nEOF')\n\n"
-                        "To MODIFY an existing file:\n"
-                        "  1. bash cat/pygmentize to see current content\n"
-                        "  2. apply_patch with unified diff\n\n"
-                        f"Task: {ctx.request[:2000]}"
-                    )
+                # Only the write wording is reachable here: the enclosing branch
+                # already requires ``not ctx.read_only_request``. A read-only
+                # variant used to sit behind `if ctx.read_only_request:` inside
+                # this same block — dead since it contradicted its own guard.
+                nudge_content = (
+                    "[ACTION REQUIRED] You described the change but applied NO patch.\n"
+                    "You MUST output a tool call. Do NOT write code as plain text.\n\n"
+                    "To CREATE a new file:\n"
+                    "  bash('cat > path << EOF\\n...content...\\nEOF') or bash('tee path << EOF\\n...\\nEOF')\n\n"
+                    "To MODIFY an existing file:\n"
+                    "  1. bash cat/pygmentize to see current content\n"
+                    "  2. apply_patch with unified diff\n\n"
+                    f"Task: {ctx.request[:2000]}"
+                )
                 nudge_msg = LLMMessage(role="user", content=nudge_content)
                 self._cb("tool_nudge", {"turn": ctx.turn_num, "nudge_count": ctx.no_tool_nudge_count,
                                         "agent_id": self.config.agent_id})
@@ -1529,13 +1534,10 @@ class TurnPipelineMixin:
                             })
                         except Exception:
                             pass
-                    current_turn = AgentTurn(
-                        turn_num=turn_num,
-                        tool_name=tool_name,
-                        tool_args=tool_args,
-                        tool_result=result,
-                    )
-                    early_result.turns = [*turns, current_turn]
+                    # `turns` is ctx.turns, which the caller already appended
+                    # this tool call to before invoking _process_tool_results.
+                    # Building another AgentTurn here would double-count it.
+                    early_result.turns = list(turns)
                     early_result.metadata.update({
                         "turns_used": turn_num,
                         "readonly_early_finish": True,
@@ -1713,7 +1715,7 @@ class TurnPipelineMixin:
             _EXPLORATION_TOOLS = {
                 "bash", "find_symbol", "find_references",
                 "find_relevant_files", "read_file", "read_symbol",
-                "get_file_outline", "get_project_info", "grep",
+                "get_file_outline", "get_project_info", "grep", "glob",
             }
             if result.ok:
                 if tool_name in _EXPLORATION_TOOLS:
@@ -1935,6 +1937,26 @@ class TurnPipelineMixin:
                                     )
                                     result.metadata["edit_blocks_fallback_error"] = eb_result.error
                 results.append(result)
+
+        # Record one AgentTurn per executed tool call. Both the parallel and
+        # serial branches above converge here with `results` aligned to
+        # `prepared_calls`, and `result` is final (post auto-repair / retry /
+        # edit_blocks fallback) — so this is the single point that sees every
+        # tool call exactly once.
+        #
+        # Until now AgentTurn was built ONLY in the read-only early-finish
+        # branch below, so AgentResult.turns came back empty from every normal
+        # MAIN_AGENT run however many tools ran (11 dispatched -> turns == []),
+        # while metadata["turns_used"] reported the real count. Consumers that
+        # read .turns — intelligent_service's turn_summary and its
+        # "turns_used": len(turns) — therefore always saw nothing.
+        for _pc, _res in zip(prepared_calls, results, strict=False):
+            ctx.turns.append(AgentTurn(
+                turn_num=ctx.turn_num,
+                tool_name=_pc["tool"],
+                tool_args=_pc["args"],
+                tool_result=_res,
+            ))
 
         _rpr = self._process_tool_results(
             results=results,

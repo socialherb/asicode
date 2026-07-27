@@ -39,13 +39,17 @@ try:
         find_all_symbols as _ts_find_all_symbols,
     )
     from ...languages.tree_sitter_utils import (
-        get_available_languages as _ts_available_languages,
+        is_language_available as _ts_language_available,
     )
     _HAS_TS = True
 except Exception:  # pragma: no cover - tree-sitter is optional
     _HAS_TS = False
     _ts_find_all_symbols = None  # type: ignore
-    _ts_available_languages = lambda: set()  # noqa: E731
+    # Must mirror the name the guarded call site uses. The `_HAS_TS and ...`
+    # short-circuit means a stale stub name would not raise today, but it would
+    # NameError for the first caller that checks availability without that
+    # guard — so the stub tracks the import, not the other way round.
+    _ts_language_available = lambda _lang: False  # noqa: E731
     _TS_LANG_MODULE_MAP = {}  # type: ignore
 
 
@@ -103,7 +107,7 @@ def _find_block_end_line(
     if (
         _HAS_TS
         and lang_str in _TS_LANG_MODULE_MAP
-        and lang_str in _ts_available_languages()
+        and _ts_language_available(lang_str)
     ):
         try:
             syms = _ts_find_all_symbols(content, lang_str)
@@ -2214,6 +2218,39 @@ class WriteToolsMixin:
             )
 
     def _tool_apply_patch(self, args: dict[str, Any]) -> "ToolResult":
+        """Thin wrapper adding the unverifiable-placement notice to EVERY success.
+
+        The implementation has several ok=True returns. Annotating each is how
+        this repo has twice shipped a guard reachable from only some of its call
+        sites (``_invalidate_cache_after_write`` from 2 of 7 write tools), so the
+        notice is attached once, here, after the fact.
+        """
+        result = self._tool_apply_patch_impl(args)
+        if not result.ok:
+            return result
+        try:
+            from external_llm.patch_engine import PatchEngine as _PE
+            unverifiable = _PE.context_free_hunks(args.get("patch", "") or "")
+        except Exception as _e:
+            logger.debug("context-free hunk scan failed: %s", _e)
+            return result
+        if not unverifiable:
+            return result
+        # Report, don't refuse — see PatchEngine.context_free_hunks. The agent
+        # is the only thing left that can notice a misplaced insert here, so it
+        # has to be told which hunks were placed on trust.
+        if result.metadata is None:
+            result.metadata = {}
+        result.metadata["unverifiable_hunks"] = list(unverifiable)
+        result.content = (result.content or "") + (
+            "\n\nNOTE: {n} hunk(s) carried no context lines, so they were placed "
+            "by line number alone and their location could NOT be verified: {h}. "
+            "If the line numbers were stale the change landed somewhere else and "
+            "may still parse — re-read the affected region to confirm."
+        ).format(n=len(unverifiable), h=", ".join(unverifiable))
+        return result
+
+    def _tool_apply_patch_impl(self, args: dict[str, Any]) -> "ToolResult":
         import time as _time
         start_time = _time.monotonic()
         args = self._recover_args_from_raw(args, ("patch", "path"))
@@ -2228,8 +2265,16 @@ class WriteToolsMixin:
         path = args.get("path")
 
         if isinstance(path, str):
-            repo_root_str = str(self._effective_repo_root)
-            if path.startswith(repo_root_str):
+            # Strip a leading repo_root so an absolute path from the model
+            # becomes repo-relative. The prefix must end at a path separator:
+            # a bare startswith also matched siblings that merely share the
+            # text, mangling "/dev/repository/a.py" into "sitory/a.py" and
+            # "/dev/repo-backup/x.py" into "-backup/x.py" — paths that then
+            # fail with a "File not found" naming a file nobody asked for.
+            repo_root_str = str(self._effective_repo_root).rstrip("/")
+            if path == repo_root_str:
+                path = ""
+            elif path.startswith(repo_root_str + "/"):
                 path = path[len(repo_root_str):].lstrip("/")
             if path.startswith("/"):
                 path = path.lstrip("/")
@@ -2603,6 +2648,17 @@ class WriteToolsMixin:
             )
         if not ops:
             return self._make_result(ok=False, error=f"operations list cannot be empty for {file_path}", execution_time=0)
+
+        # Repo-boundary check — see _tool_edit_text. Placed at the resolution
+        # point rather than next to the arg read, so it covers the path whichever
+        # key supplied it (`path`, or `file_path` recovered from raw arguments).
+        # `Path(repo_root) / file_path` below happily walks out of the repo on a
+        # leading `../`, and .exists() then confirms the victim file.
+        if self._secure_path(file_path, confine=True) is None:
+            return self._make_result(
+                ok=False, error=f"Path blocked (outside repo): {file_path}",
+                execution_time=0,
+            )
 
         _norm = Path(self.repo_root) / file_path
         if not _norm.exists():
@@ -3794,6 +3850,19 @@ class WriteToolsMixin:
 
         if not file_path:
             return self._make_result(ok=False, error="file_path is required", execution_time=0)
+
+        # Repo-boundary check. `confine=True` because _secure_path's contract is
+        # that unrestricted_read is a READ capability and "writes can never
+        # escape repo_root even on a trusted CLI" — but edit_text had no check at
+        # all, so `../outside/f` and absolute paths both wrote through, at the
+        # DEFAULT config (unrestricted_read=False), which is the webapp's, where
+        # that same docstring notes repo_root is attacker-controlled. Mirrors
+        # _tool_modify_symbol / _tool_edit_ast, which were already guarded.
+        if self._secure_path(file_path, confine=True) is None:
+            return self._make_result(
+                ok=False, error=f"Path blocked (outside repo): {file_path}",
+                execution_time=0,
+            )
 
         # ── Determine mode: batch (edits) vs single ──
         raw_edits = args.get("edits")
@@ -5553,6 +5622,14 @@ class WriteToolsMixin:
         if not file_path:
             return self._make_result(
                 ok=False, content="", error="'file_path' is required", execution_time=0,
+            )
+        # Repo-boundary check — see _tool_edit_text. anchor_edit is exposed to the
+        # LLM in tool_schemas, so a bare `../` in a model-emitted file_path wrote
+        # outside the repo with nothing logged.
+        if self._secure_path(file_path, confine=True) is None:
+            return self._make_result(
+                ok=False, content="",
+                error=f"Path blocked (outside repo): {file_path}", execution_time=0,
             )
         # anchor_pattern OR anchor_ast_lineno — exactly one locating strategy required.
         if not anchor_pattern and anchor_ast_lineno is None:

@@ -356,10 +356,6 @@ class LLMMetrics:
         return len(self._latency_samples)
 
     @property
-    def avg_time_ms(self) -> float:
-        return self.total_time_ms / self.calls if self.calls > 0 else 0
-
-    @property
     def failure_rate(self) -> float:
         # Cumulative (failures / calls) — display/context only, mirrors ToolMetrics.
         return self.failures / self.calls if self.calls > 0 else 0.0

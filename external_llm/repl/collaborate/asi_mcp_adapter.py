@@ -17,6 +17,10 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from config import CLAUDE_MCP_TOOL_TIMEOUT, CLAUDE_SDK_MAX_TURNS
+from external_llm.agent.tool_handlers.shell_policy import (
+    SHELL_TIMEOUT_DEFAULT as _SHELL_TIMEOUT_DEFAULT,
+    SHELL_TIMEOUT_MAX as _SHELL_TIMEOUT_MAX,
+)
 from external_llm.agent.tool_registry import ToolRegistry
 
 from .verdict import CollaborationVerdict
@@ -138,12 +142,34 @@ _TOOL_SPECIFIC_TIMEOUTS: dict[str, int] = {
     "get_project_info": 60,
 }
 
+# ─── Outer(MCP) vs inner(tool) timeout ordering ───────────────────────────
+# Some tools police their OWN timeout and have a graceful expiry path whose
+# result only reaches the agent if the MCP ceiling outlives the inner budget.
+# `bash` is the case in point: on expiry it salvages the partial output and
+# hands the process to BackgroundJobManager, returning a Job ID the agent can
+# poll. With both layers on the same 120s default, the outer asyncio.wait_for
+# won the race every time — the agent got TOOL_TIMEOUT, the Job ID was
+# discarded, the background job was never reaped, and the executor thread kept
+# running (observed: outer gave up at 120.0s, that same call completed at
+# 122.9s). It also capped bash below the 300s the tool schema advertises.
+# Worst-case inner wall time is two full budgets, because the pytest
+# missing-plugin recovery (_maybe_recover_pytest_missing_plugin) re-runs the
+# command with the same timeout after installing, so the ceiling is derived
+# from the request's own timeout rather than a flat constant.
+_INNER_TIMEOUT_TOOLS: dict[str, tuple[str, int, int]] = {
+    # tool: (args key holding the inner timeout, default, schema max)
+    "bash": ("timeout", _SHELL_TIMEOUT_DEFAULT, _SHELL_TIMEOUT_MAX),
+}
+_INNER_TIMEOUT_RERUNS: int = 2  # first run + missing-plugin recovery re-run
+_MCP_TIMEOUT_GRACE: int = 30    # bg transition + result formatting headroom
+
 _EXCLUDED_TOOLS: set[str] = {
     "delegate_to_helper",       # internal sub-agent delegation
     "update_memory",            # asicode internal memory
     "query_experience",         # asicode learning system internal
     "read_image",               # LLM sees OCR text via system; schema overhead not worth it
     "grep",                     # overlaps native Grep; low MCP added value (but Bash is now MCP-exposed since native Bash is disallowed)
+    "glob",                     # overlaps native Glob; same reasoning as grep
     "search_web",              # Claude Code has native web search
     "web_fetch",               # Claude Code has native web fetch
     "browser_action",          # Claude Code has native browser automation
@@ -376,6 +402,31 @@ def build_asr_mcp_server(
     )
 
 
+def _resolve_mcp_timeout(tool_name: str, args: Any) -> int:
+    """Resolve this call's MCP ceiling in seconds; ``0`` means no ceiling.
+
+    For tools listed in :data:`_INNER_TIMEOUT_TOOLS` the ceiling is derived
+    per-call from the request's own timeout argument so that it always sits
+    strictly ABOVE the tool's inner budget, letting the inner graceful-expiry
+    path (bash → background job) win the race instead of being discarded.
+
+    ``CLAUDE_MCP_TOOL_TIMEOUT=0`` disables the ceiling entirely; that opt-out is
+    never resurrected from a per-call argument. An explicitly raised env ceiling
+    still wins when it is higher than the derived one.
+    """
+    static = _TOOL_SPECIFIC_TIMEOUTS.get(tool_name, CLAUDE_MCP_TOOL_TIMEOUT)
+    spec = _INNER_TIMEOUT_TOOLS.get(tool_name)
+    if spec is None or static <= 0:
+        return static
+    key, default, maximum = spec
+    try:
+        inner = int((args or {}).get(key) or default)
+    except (AttributeError, TypeError, ValueError):
+        inner = default
+    inner = max(1, min(inner, maximum))
+    return max(static, inner * _INNER_TIMEOUT_RERUNS + _MCP_TIMEOUT_GRACE)
+
+
 def _make_async_handler(registry: ToolRegistry, tool_name: str):
     """Factory: create an async handler for a specific tool.
 
@@ -385,7 +436,7 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
 
     async def handler(args: dict) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
-        timeout = _TOOL_SPECIFIC_TIMEOUTS.get(tool_name, CLAUDE_MCP_TOOL_TIMEOUT)
+        timeout = _resolve_mcp_timeout(tool_name, args)
         # Dedicated pool for always-fast read tools so they are not queued
         # behind heavy tools saturating the default executor.
         executor = _FAST_READ_EXECUTOR if tool_name in _FAST_READ_TOOLS else None
@@ -433,6 +484,9 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
             # exhausted and subsequent fast-reads immediately cascade into 60s timeouts.
             # The root fix is cooperative cancellation points in registry.dispatch, but
             # that requires registry-level changes — here we only ensure visibility.
+            # Note: reaching this branch for a tool in _INNER_TIMEOUT_TOOLS now means a
+            # genuine inner-layer hang, not the routine expiry it used to mean — the
+            # derived ceiling leaves the inner graceful path room to return first.
             pool_note = (
                 " (orphaned worker still running; dedicated read pool may degrade)"
                 if tool_name in _FAST_READ_TOOLS

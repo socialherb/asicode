@@ -8,6 +8,18 @@ from __future__ import annotations
 
 from typing import Any
 
+from .tool_handlers.shell_policy import (
+    DANGEROUS_SHELL_COMMANDS as _DANGEROUS_SHELL_COMMANDS,
+    SHELL_TIMEOUT_DEFAULT as _SHELL_TIMEOUT_DEFAULT,
+    SHELL_TIMEOUT_MAX as _SHELL_TIMEOUT_MAX,
+)
+
+# The bash schema states its approval set and timeout bounds by rendering the
+# policy constants, so an added dangerous command or a retuned bound reaches the
+# model automatically. Restating the literals let the description drift: it named
+# only `rm` after other commands became gated.
+_DANGEROUS_SHELL_COMMANDS_TEXT = ", ".join(sorted(_DANGEROUS_SHELL_COMMANDS))
+
 # Tool schemas in OpenAI format (adapted per provider in AgentLoop)
 
 
@@ -360,9 +372,12 @@ SCHEMA_READ_FILE = {
         "name": "read_file",
         "description": (
             "Read a file by path. 'path' is required — always pass a file path. "
-            "Without start_line/end_line: files up to 200 lines return full content; "
-            "larger files return only the line count (then call again with a range). "
+            "Without start_line/end_line: files up to 800 lines return full content; "
+            "larger files return the line count plus a symbol outline, so the follow-up "
+            "call can name an exact range instead of guessing. "
             "Use start_line and end_line (1-indexed, inclusive) to read specific sections. "
+            "Very large ranges are truncated at an output budget; the notice names the "
+            "line to resume from. "
             "Use when you need to inspect a line range before editing, or confirm context around a symbol. "
             "Each line is prefixed with its number and an indent gutter `│N│` = the leading-whitespace "
             "column count, so the exact indentation is readable without counting spaces. When constructing "
@@ -429,6 +444,40 @@ SCHEMA_GREP = {
         }
     }
 
+SCHEMA_GLOB = {
+        "name": "glob",
+        "description": (
+            "List repository files whose path matches a glob pattern, most recently "
+            "modified first. Use to answer 'what files exist' questions — locating files "
+            "by name or extension, surveying a directory, finding every test/config file — "
+            "instead of `bash ls`/`find`, which returns unbounded output and is not cached. "
+            "Searches file PATHS only; use grep to search file CONTENTS."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": (
+                        "Glob pattern. A pattern with no '/' matches the file name anywhere "
+                        "in the repo ('*.py', '*_test.go'); a pattern with '/' matches the "
+                        "full repo-relative path ('src/**/*.ts', 'tests/unit/*.py'). "
+                        "'**' spans directories, '*' and '?' do not."
+                    )
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory to restrict the search to (default: repo root)"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Max paths to return (default: 200, max: 1000)"
+                }
+            },
+            "required": ["pattern"]
+        }
+    }
+
 SCHEMA_READ_SYMBOL = {
         "name": "read_symbol",
         "description": (
@@ -475,9 +524,15 @@ SCHEMA_GET_PROJECT_INFO = {
 SCHEMA_BASH = {
         "name": "bash",
         "description": (
-            "Execute a shell command under bash (NOT zsh/sh). Destructive commands (rm) need approval. "
-            "Use for git, grep/rg, cat/head/tail, python3 -c, find, ls, wc, "
-            "sed (no -i), and any CLI without a dedicated tool."
+            "Execute a shell command under bash (NOT zsh/sh). "
+            f"Destructive commands ({_DANGEROUS_SHELL_COMMANDS_TEXT}) need approval — "
+            "to reap a process you started, prefer `kill <pid>` over pattern killers, "
+            "which match machine-wide and need approval. "
+            "Use for git, cat/head/tail, python3 -c, wc, "
+            "sed (no -i), and any CLI without a dedicated tool. "
+            "Prefer the dedicated tools where they exist: glob over `find`/`ls` "
+            "for locating files by path, grep over `grep`/`rg` for searching "
+            "contents — both stay inside the repo, cap their output and are cached."
         ),
         "parameters": {
             "type": "object",
@@ -494,7 +549,12 @@ SCHEMA_BASH = {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default: 120, max: 300)",
+                    "description": (
+                        f"Timeout in seconds (default: {_SHELL_TIMEOUT_DEFAULT}, "
+                        f"max: {_SHELL_TIMEOUT_MAX}; larger values are clamped). "
+                        "On expiry the command moves to a background job rather "
+                        "than being killed — poll it instead of re-running."
+                    ),
                 },
             },
             "required": ["command"],
@@ -1151,6 +1211,7 @@ AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     SCHEMA_WRITE_PLAN,
     SCHEMA_READ_FILE,
     SCHEMA_GREP,
+    SCHEMA_GLOB,      # path-pattern listing — the read-only alternative to `bash ls`/`find`
     SCHEMA_READ_SYMBOL,
     # SCHEMA_RUN_TESTS — removed: bash("pytest ...") is equivalent and more flexible; kept as internal dispatch only
     SCHEMA_GET_PROJECT_INFO,

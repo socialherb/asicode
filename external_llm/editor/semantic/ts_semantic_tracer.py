@@ -77,28 +77,40 @@ _PARSER_MISS = object()
 
 
 def _build_tsx_parser():
-    """Construct a tree-sitter parser for TSX, or None if unavailable."""
-    try:
-        import tree_sitter as _ts
-        import tree_sitter_typescript as _tst
+    """Construct a tree-sitter parser for TSX, or None if unavailable.
 
-        raw = _tst.language_tsx()
-        lang = _ts.Language(raw)
-        return _ts.Parser(lang)
+    Goes through ``languages.tree_sitter_utils`` — the repo's single grammar
+    loader — rather than importing a per-language grammar package directly.
+    These two builders used to do ``import tree_sitter_typescript`` /
+    ``import tree_sitter_javascript``, and neither package is declared in
+    ``pyproject.toml``: the only declared grammar source is
+    ``tree-sitter-language-pack``, which exposes grammars through
+    ``get_language()``, not as top-level ``tree_sitter_<lang>`` modules. A clean
+    ``pip install asicode`` therefore hit ``ImportError`` here, and because the
+    handler only logs at DEBUG, every TS/TSX/JS caller silently degraded with no
+    user-visible signal. Verified against a real export + clean venv: 71 tests
+    failed before, 0 after.
+
+    Dev machines masked this by having leftover individual grammar packages
+    installed, so it reproduced only outside the dev environment.
+    """
+    try:
+        from external_llm.languages import tree_sitter_utils as _tsu
+        return _tsu.get_parser("tsx")
     except Exception as e:
         logger.debug("TSX parser not available: %s", e)
         return None
 
 
 def _build_jsx_parser():
-    """Construct a tree-sitter parser for JavaScript (JSX-aware), or None."""
-    try:
-        import tree_sitter as _ts
-        import tree_sitter_javascript as _tsj
+    """Construct a tree-sitter parser for JavaScript (JSX-aware), or None.
 
-        raw = _tsj.language()
-        lang = _ts.Language(raw)
-        return _ts.Parser(lang)
+    Routed through ``tree_sitter_utils`` for the reason documented on
+    :func:`_build_tsx_parser`.
+    """
+    try:
+        from external_llm.languages import tree_sitter_utils as _tsu
+        return _tsu.get_parser("javascript")
     except Exception as e:
         logger.debug("JSX parser not available: %s", e)
         return None

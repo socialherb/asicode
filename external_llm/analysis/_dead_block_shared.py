@@ -42,6 +42,17 @@ _LANG_DEF_NODES: dict[str, dict[str, tuple]] = {
         "async_function_definition": ("function", False, True),
         "class_definition": ("class", True, True),
         "expression_statement": ("assignment", False, False),
+        # Wrapper-less assignment: the language-pack Python grammar puts
+        # `assignment` directly under `module`, where the standalone
+        # tree-sitter-python package interposes `expression_statement`. Both must
+        # be listed or module-level assignments are invisible on the grammar every
+        # real install actually gets. No double-count: `is_container=False` stops
+        # the walk at the outer node, so the nested `assignment` under an
+        # `expression_statement` is never visited.
+        # Deliberately NOT in _LANG_ASSIGN_WRAPPERS — a bare `assignment` holds its
+        # name identifier as a DIRECT child (field `left`), so the plain
+        # _ts_child_by_type() lookup already finds it.
+        "assignment": ("assignment", False, False),
         "annotated_assignment": ("assignment", False, False),
     },
     "typescript": {
@@ -181,12 +192,27 @@ def _ts_extract_all_list(source: str, language: str = "python") -> set:
     if tree is None:
         return set()
     # Query: __all__ = [ ... ]
+    #
+    # Both module-child shapes are matched. Python tree-sitter grammars disagree
+    # on whether a statement-position assignment is wrapped: the standalone
+    # ``tree-sitter-python`` package yields
+    # ``module → expression_statement → assignment``, while the grammar bundled in
+    # ``tree-sitter-language-pack`` yields ``module → assignment`` with no wrapper.
+    # Only the pack is a declared dependency, so a wrapper-only query silently
+    # matched NOTHING for every real install — ``__all__`` was ignored outright
+    # and public re-exports got reported as dead code. The alternation keeps the
+    # ``(module ...)`` anchor, so this stays equivalent to the ``ast`` twin
+    # ``_extract_all_list``, which only scans ``tree.body``.
     query_str = """
-(module (expression_statement
+(module [
+  (expression_statement (assignment
+    left: (identifier) @name
+    right: (list (string (string_content) @item))))
   (assignment
     left: (identifier) @name
-    right: (list (string (string_content) @item))) @def
-  (#eq? @name "__all__")))
+    right: (list (string (string_content) @item)))
+ ] @def
+ (#eq? @name "__all__"))
 """
     matches = _ts_query_matches(source, language, query_str)
     names: set = set()
@@ -198,11 +224,12 @@ def _ts_extract_all_list(source: str, language: str = "python") -> set:
     # Detect dynamic __all__ (assignment to variable/expression, not literal list)
     if not names:
         any_all_query = """
-    (module (expression_statement
-      (assignment
-        left: (identifier) @name)
-      (#eq? @name "__all__")))
-    """
+(module [
+  (expression_statement (assignment left: (identifier) @name))
+  (assignment left: (identifier) @name)
+ ] @def
+ (#eq? @name "__all__"))
+"""
         if _ts_query_matches(source, language, any_all_query):
             names.add("*__dynamic__*")
     return names

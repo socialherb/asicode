@@ -300,7 +300,7 @@ class DependencyGraphBuilder:
         imports: set[str] = set()
 
         try:
-            with open(abs_path, errors='ignore') as f:
+            with open(abs_path, errors='ignore', encoding="utf-8") as f:
                 content = f.read(100000)
 
             # Try AST first

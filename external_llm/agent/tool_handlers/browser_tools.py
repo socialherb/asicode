@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import atexit
 import importlib
+import importlib.util
 import logging
 import os
+import pathlib
 import subprocess
 import sys
 import threading
@@ -44,14 +46,60 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ── Optional Playwright dependency ───────────────────────────────────── #
-try:
-    from playwright.sync_api import TimeoutError as _PlaywrightTimeout
-    from playwright.sync_api import sync_playwright
+# Availability is probed WITHOUT executing the package: importing
+# playwright.sync_api costs ~22ms and this module is loaded on every
+# ToolRegistry construction (BrowserActionToolsMixin is a base class, so it
+# cannot be deferred), while the browser tools are used by almost no run.
+# Same pattern as vector_cache's numpy/faiss/sentence_transformers probes.
+HAS_PLAYWRIGHT = importlib.util.find_spec("playwright") is not None
 
-    HAS_PLAYWRIGHT = True
-except ImportError:
-    HAS_PLAYWRIGHT = False
-    _PlaywrightTimeout = Exception
+
+# True only when the Chromium BROWSER BINARY is present, not just the Python
+# package. ``HAS_PLAYWRIGHT`` reflects the package; ``playwright install`` (a
+# separate ~150MB download) is required before any browser can launch.
+# Distinguishing them lets tests SKIP on package-present/binary-absent
+# machines instead of FAILING with ``Executable doesn't exist``. Worst case
+# (Playwright cache layout change) this returns False and over-skips, never
+# makes the suite red. Filesystem-only — no driver subprocess, no import cost.
+def _playwright_browser_installed() -> bool:
+    if not HAS_PLAYWRIGHT:
+        return False
+    base = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if base:
+        cache = pathlib.Path(base)
+    elif sys.platform == "darwin":
+        cache = pathlib.Path.home() / "Library" / "Caches" / "ms-playwright"
+    elif sys.platform == "win32":
+        cache = pathlib.Path.home() / "AppData" / "Local" / "ms-playwright"
+    else:
+        cache = pathlib.Path.home() / ".cache" / "ms-playwright"
+    return bool(cache.is_dir() and any(cache.glob("chromium-*/chrome-*")))
+
+
+PLAYWRIGHT_BROWSER_AVAILABLE = _playwright_browser_installed()
+
+# Bound on first use by _ensure_playwright_imported(); _reload_playwright_module()
+# rebinds the same three names after a late install.
+sync_playwright = None
+_PlaywrightTimeout = Exception
+
+
+def _ensure_playwright_imported() -> bool:
+    """Import playwright.sync_api on first use; return True when usable."""
+    global sync_playwright, _PlaywrightTimeout
+    if sync_playwright is not None:
+        return True
+    if not HAS_PLAYWRIGHT:
+        return False
+    try:
+        from playwright.sync_api import TimeoutError as _PwTimeout
+        from playwright.sync_api import sync_playwright as _sync_pw
+    except ImportError as e:
+        logger.debug("playwright import failed (HAS_PLAYWRIGHT was stale): %s", e)
+        return False
+    sync_playwright = _sync_pw
+    _PlaywrightTimeout = _PwTimeout
+    return True
 
 # ── Dedicated single-thread executor for all Playwright work ─────────── #
 # Playwright's sync API binds its greenlet driver to the thread that called
@@ -204,7 +252,7 @@ class BrowserActionToolsMixin:
                 error="'action' is required. Choose: navigate, click, type, extract, screenshot, evaluate, wait, close",
             )
 
-        if not HAS_PLAYWRIGHT:
+        if not HAS_PLAYWRIGHT or not _ensure_playwright_imported():
             with BrowserActionToolsMixin._pw_install_lock:
                 if not self._ensure_playwright_installed():
                     return self._make_result(
@@ -407,6 +455,9 @@ class BrowserActionToolsMixin:
     def _get_browser(self):
         """Lazy-init and return the shared Playwright browser instance."""
         if BrowserActionToolsMixin._browser is None:
+            # Callers reach here only past a HAS_PLAYWRIGHT guard, but bind
+            # explicitly so a direct _get_browser() cannot hit `None()`.
+            _ensure_playwright_imported()
             p = sync_playwright().start()
             try:
                 BrowserActionToolsMixin._browser = p.chromium.launch(headless=True)
@@ -484,7 +535,7 @@ class BrowserActionToolsMixin:
         unavailable or the render wedges; Playwright per-call timeouts / eval
         errors propagate as their own exception types for the caller to handle.
         """
-        if not HAS_PLAYWRIGHT:
+        if not HAS_PLAYWRIGHT or not _ensure_playwright_imported():
             with BrowserActionToolsMixin._pw_install_lock:
                 if not self._ensure_playwright_installed():
                     raise RuntimeError(

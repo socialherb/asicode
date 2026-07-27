@@ -91,6 +91,29 @@ CLOUD_PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
     ("glm-",      "zai"),
 )
 
+# ── Cloud models: text-only (reject image input) ──────────────────────────────
+# Bare-model-name prefix match (route prefixes like "openrouter/deepseek/…"
+# stripped first). DeepSeek models (chat/reasoner/v4-flash/v4-pro) accept only
+# string content — an image_url part draws HTTP 400 regardless of image size.
+# Verified 2026-07-26 on three independent sources: (1) opencode Go rejected a
+# 67-byte 1x1 PNG for BOTH v4-flash and v4-pro while the same route carried
+# images fine for kimi-k3 (so it is the model, not the gateway); (2) OpenRouter
+# metadata lists both v4 models as modality=text->text, input=['text'];
+# (3) DeepSeek's official API docs describe no image/vision input. Only add
+# entries verified text-only on EVERY route — per-route rejections belong to
+# the runtime strip-and-retry net in openai_client, which keys on
+# (base_url, model).
+# DeepSeek models verified text-only on EVERY route.  Exclude prefixes that
+# would falsely match vision-capable models (deepseek-vl, deepseek-vl2,
+# deepseek-ocr).  Unlisted models are caught at runtime by the strip-and-retry
+# net in openai_client.
+TEXT_ONLY_MODEL_PREFIXES: tuple[str, ...] = (
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "deepseek-r1",
+    "deepseek-v4",
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Query API — import these functions instead of duplicating detection logic
@@ -154,3 +177,9 @@ def detect_cloud_provider(model: str) -> Optional[str]:
         if m.startswith(prefix):
             return provider
     return None
+
+
+def text_only_model(model: str) -> bool:
+    """True if this cloud model is known to reject image (vision) input."""
+    bare = _norm(model).split("/")[-1]
+    return bare.startswith(TEXT_ONLY_MODEL_PREFIXES)

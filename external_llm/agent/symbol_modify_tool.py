@@ -44,9 +44,17 @@ from .repair_helpers import _strip_redundant_dataclass_decorator, _strip_redunda
 # `gofmt -e`). These fall through to the literal-aware brace-balance gate so
 # a symbol-range scan that left an orphan `}` (or dropped a brace) is rejected
 # before write instead of corrupting the file.
+# JS/TS need regex-literal + template-escape aware lexing; a backtick or
+# quote inside a regex (``.replace(/```/g, "")``) otherwise reads as a string
+# opener and flips literal parity for every following line.
+_JS_FAMILY = frozenset({
+    LanguageId.JAVASCRIPT, LanguageId.TYPESCRIPT,
+})
+
 _BRACE_LANGUAGES_NO_COMPILER = frozenset({
     LanguageId.KOTLIN, LanguageId.RUST, LanguageId.C, LanguageId.CPP,
     LanguageId.JAVA, LanguageId.SCALA, LanguageId.SWIFT, LanguageId.CSHARP,
+    LanguageId.JAVASCRIPT, LanguageId.TYPESCRIPT, LanguageId.GO,
 })
 
 logger = logging.getLogger(__name__)
@@ -1046,14 +1054,14 @@ def _find_symbol_range_via_treesitter(
             find_all_symbols as _ts_find_all_symbols,
         )
         from ..languages.tree_sitter_utils import (
-            get_available_languages as _ts_available_languages,
+            is_language_available as _ts_language_available,
         )
     except ImportError:
         return None
     lang_id = LanguageId.from_path(file_path).value
     if lang_id not in _TS_LANG_MODULE_MAP or lang_id == "python":
         return None
-    if lang_id not in _ts_available_languages():
+    if not _ts_language_available(lang_id):
         return None  # grammar not installed → caller falls back to regex
     try:
         syms = _ts_find_all_symbols(source, lang_id)
@@ -1265,16 +1273,29 @@ def _post_edit_syntax_ok(
     noisy ROLLBACK. Validating here turns that into a clean fall-through.
 
     For JS/TS/JSX/TSX files, uses ``node --check`` (if available) to catch syntax
-    errors before write. For GO files, uses ``gofmt -e`` (if available).
+    errors before write. For GO files, uses ``gofmt -e`` (if available). Neither
+    binary is declared anywhere in ``pyproject.toml``, so for most installs the
+    toolchain-free tiers below are the ones that actually run. A tool that is
+    absent and a tool that times out take the SAME path — an earlier version
+    returned True on infra failure, making a crashed node strictly more
+    permissive than no node at all.
 
-    For brace languages without an inline compiler, verifies literal-aware brace
-    balance. When ``source`` (the pre-edit content) is supplied, the check is
-    RELATIVE — only edits that CHANGE the net brace count are rejected. The
-    absolute ``net == 0`` form false-rejected any edit to a file with a
-    pre-existing imbalance (a scanner limitation on brace-bearing raw/template
-    strings, or genuinely broken code the user is mid-fixing). The corruption
-    this gate exists to catch — an orphan ``}`` left by a bad symbol-range scan
-    — always shifts the balance, so the delta is the precise signal.
+    Toolchain-free tiers, applied in order to brace languages:
+
+    1. Literal-aware brace balance. When ``source`` (the pre-edit content) is
+       supplied the check is RELATIVE — only edits that CHANGE the net brace
+       count are rejected. The absolute ``net == 0`` form false-rejected any
+       edit to a file with a pre-existing imbalance (a scanner limitation on
+       brace-bearing raw/template strings, or genuinely broken code the user is
+       mid-fixing). The orphan ``}`` this gate exists to catch always shifts the
+       balance, so the delta is the precise signal.
+    2. tree-sitter parse. Brace counting is blind to any error that leaves the
+       braces balanced (``function alpha( {``), which is most of them.
+       tree-sitter sees the parse itself and — unlike node/gofmt — ships as a
+       CORE dependency. Additive only: it can reject where tier 1 passed, never
+       accept where tier 1 refused. Rejecting requires the pre-edit source to
+       have parsed clean, so tier 2 never fires on a file's own pre-existing
+       errors (same reasoning that made tier 1 relative).
 
     All other languages are passed through unchanged (they rely on post-write
     rollback or manual detection).
@@ -1303,8 +1324,13 @@ def _post_edit_syntax_ok(
                     if r.returncode == 0:
                         return True
                 return False
-            except (subprocess.TimeoutExpired, OSError):
-                return True  # fall through on infra failure
+            except (subprocess.TimeoutExpired, OSError) as e:
+                # Fall THROUGH to the toolchain-free tiers below — do not
+                # `return True`. Returning here made an infra failure strictly
+                # more permissive than node simply being absent (absence
+                # reaches those tiers and rejects an orphan brace; a timeout
+                # used to wave the same edit through).
+                logger.debug("node --check unavailable (%s) — using fallback tiers", e)
     if lid is LanguageId.GO:
         gofmt_path = shutil.which("gofmt")
         if gofmt_path:
@@ -1316,27 +1342,63 @@ def _post_edit_syntax_ok(
                     timeout=10,
                 )
                 return r.returncode == 0 and not r.stderr
-            except (subprocess.TimeoutExpired, OSError):
-                return True  # fall through on infra failure
+            except (subprocess.TimeoutExpired, OSError) as e:
+                # Fall THROUGH, not `return True` — see the node branch above.
+                logger.debug("gofmt unavailable (%s) — using fallback tiers", e)
     # Brace-delimited languages without an inline compiler (Kotlin/Rust/C/C++/
     # Java/Scala/Swift/C#): verify literal-aware brace balance so a symbol-range
     # scan that left an orphan `}` (or dropped a brace) is rejected before write
     # instead of corrupting the file. A real compiler is stronger, but this
     # catches the known corruption class in net terms and needs no toolchain.
     if lid in _BRACE_LANGUAGES_NO_COMPILER:
-        new_net = net_brace_count(content)
+        _js = lid in _JS_FAMILY
+        new_net = net_brace_count(content, js_lexing=_js)
         if source:
             # Relative delta: reject only edits that shift the net brace count.
             # See docstring — catches the orphan-brace corruption class while no
             # longer false-rejecting edits to files with a pre-existing imbalance.
             # ``_source_net`` (precomputed once by the caller for brace languages)
             # avoids re-scanning the same pre-edit content on each fallback tier.
-            src_net = _source_net if _source_net is not None else net_brace_count(source)
+            src_net = (_source_net if _source_net is not None
+                       else net_brace_count(source, js_lexing=_js))
             if new_net != src_net:
                 return False
         elif new_net != 0:
             return False
+        # Tier 2 — tree-sitter. Brace counting is blind to any error that keeps
+        # the braces balanced (`function alpha( {` counts the same as
+        # `function alpha() {`), and that is most of them. tree-sitter sees the
+        # parse itself, and unlike node/gofmt it is a CORE dependency
+        # (tree-sitter-language-pack), so this tier is the one users actually
+        # have — node is not declared anywhere in pyproject.
+        #
+        # Purely ADDITIVE: it can only reject more, never accept more, so it
+        # cannot regress the tiers above. Rejecting requires the pre-edit source
+        # to have parsed CLEAN — otherwise a legitimate edit to an
+        # already-broken file (the exact case the relative brace delta was
+        # introduced for) would be false-rejected on the file's own pre-existing
+        # errors. Content is checked first so the common valid case costs one
+        # parse, not two.
+        if source and _ts_syntax_valid(content, lid) is False:
+            if _ts_syntax_valid(source, lid) is True:
+                return False
     return True
+
+
+def _ts_syntax_valid(text: str, lid: "LanguageId") -> Optional[bool]:
+    """Whether *text* parses clean for *lid*, or None when unanswerable.
+
+    None (grammar missing, validator raised) is distinct from False and must be
+    treated as "no opinion" by callers — the same trust contract the rg
+    prefilters use, so an unavailable grammar never reads as a syntax error.
+    """
+    try:
+        from ..languages.syntax_validator import SyntaxValidator
+
+        return bool(SyntaxValidator.validate_syntax(text, lid).ok)
+    except Exception as e:  # grammar missing / validator failure -> no opinion
+        logger.debug("tree-sitter syntax tier unavailable for %s: %s", lid, e)
+        return None
 
 
 # ── Public API ─────────────────────────────────────────────────────────────
@@ -1394,8 +1456,9 @@ def modify_symbol(
     # Pre-edit net brace count, computed ONCE for brace languages so the three
     # fallback tiers don't each re-scan the same source (net_brace_count is O(n)).
     source_net: Optional[int] = None
-    if LanguageId.from_path(rel_path) in _BRACE_LANGUAGES_NO_COMPILER:
-        source_net = net_brace_count(source)
+    _src_lid = LanguageId.from_path(rel_path)
+    if _src_lid in _BRACE_LANGUAGES_NO_COMPILER:
+        source_net = net_brace_count(source, js_lexing=_src_lid in _JS_FAMILY)
 
     # ── Try 1: AST precise (Python only) ──
     if LanguageId.from_path(rel_path) is LanguageId.PYTHON:

@@ -27,6 +27,9 @@ from typing import Any, Optional
 from .config.thresholds import config as _cfg
 from .performance_metrics import get_global_collector
 from .rag_configs import CodeTokenizer
+# Deterministic, source-prioritized descent order shared with the symbol /
+# call-graph walkers — keeps the RAG corpus reproducible and source-first.
+from ._shared_utils import _walk_dir_sort_key
 
 logger = logging.getLogger(__name__)
 
@@ -100,13 +103,36 @@ def _bm25_score(
 # ── Snippet extraction ────────────────────────────────────────────────────────
 
 def _extract_snippet(text: str, query_tokens: list[str], window: int = 120) -> tuple[str, int]:
-    """Return (snippet, 1-indexed line) for the best-matching line."""
+    """Return (snippet, 1-indexed line) for the best-matching line.
+
+    Optimization: skip lines that cannot contain a query token, so the expensive
+    ``_TOKENIZER.tokenize()`` runs only on candidate lines (~188 ms for a 10k-line
+    file otherwise; a top_k=10 search over this repo spent ~970 ms here).
+
+    The prefilter tests against the LOWERCASED line, because every token
+    ``tokenize()`` emits is a lowercased contiguous substring of the raw text:
+    it lowercases, then sub-splits on CamelCase/underscore boundaries, and
+    min_token_len/stop-words only ever DROP tokens (``rag_configs.tokenize``).
+    Case-folding is therefore load-bearing, not cosmetic — a case-sensitive
+    check misses ``write`` in ``WriteToolHandler`` and silently returns a worse
+    line (measured: 14.3% of lookups diverged).
+
+    ``best_score`` starts at 0, not -1, for the same reason: the unfiltered loop
+    always evaluated line 0 and so fell back to line 1 for a zero-hit document.
+    With a prefilter line 0 may be skipped, so seeding 0 preserves that default.
+    Together these make the output byte-identical to the unfiltered scan
+    (verified: 0 divergences over 110 files x 20 queries).
+    """
     lines = text.splitlines()
     if not lines:
         return "", 1
     q_set = set(query_tokens)
-    best_line, best_score = 0, -1
+    best_line, best_score = 0, 0
     for i, line in enumerate(lines):
+        # Prefilter: no query token as a substring => tokenize() cannot match either.
+        lowered = line.lower()
+        if not any(qt in lowered for qt in q_set):
+            continue
         hit = sum(1 for t in _TOKENIZER.tokenize(line) if t in q_set)
         if hit > best_score:
             best_score, best_line = hit, i
@@ -149,7 +175,7 @@ class RAGSearcher:
             try:
                 from .vector_cache import HAS_FAISS, HAS_NUMPY, HAS_SENTENCE_TRANSFORMERS, VectorCacheManager
                 if HAS_SENTENCE_TRANSFORMERS and HAS_NUMPY and HAS_FAISS:
-                    self.vector_cache_manager = VectorCacheManager(".asicode/vector_cache")
+                    self.vector_cache_manager = VectorCacheManager(str(self.repo_root / ".asicode" / "vector_cache"))
                 else:
                     logger.warning("Vector cache dependencies not fully installed, disabling")
                     self.vector_cache_enabled = False
@@ -174,6 +200,11 @@ class RAGSearcher:
         self._df: dict[str, int] = {}
         self._avgdl: float = 0.0
         self._n_docs: int = 0
+        # True when the corpus walk hit _MAX_FILES and is therefore incomplete
+        # (some source files are invisible to search). Surfaced via the
+        # ``index_truncated`` property and a build-time warning so the agent
+        # can tell "no relevant docs" from "index truncated, may be missing".
+        self._index_truncated: bool = False
         # Running total of doc lengths → O(1) avgdl. Maintained under
         # ``_index_lock`` alongside the parallel arrays; replaces the per-file
         # ``sum(self._doc_lengths)`` O(n) recompute in invalidate_files.
@@ -638,6 +669,13 @@ class RAGSearcher:
                 return
             elapsed = time.monotonic() - t0
             logger.debug("RAG index built: %d docs in %.2fs", self._n_docs, elapsed)
+            if self._index_truncated:
+                logger.warning(
+                    "RAG index for %s TRUNCATED at %d files (cap %d) — files beyond "
+                    "the cap are INVISIBLE to find_relevant_files. Raise "
+                    "RAG_MAX_FILES if the repo is larger.",
+                    self.repo_root, self._n_docs, _MAX_FILES,
+                )
             self._built = True
 
     def _get_cancel_event(self) -> Optional[threading.Event]:
@@ -732,20 +770,33 @@ class RAGSearcher:
         # descending into hidden/vendor subtrees (node_modules, .git, etc.).
         # rglob visits every entry then filters, which is 70x+ slower on
         # repos with large vendor trees.
+        self._index_truncated = False
         for root, dirs, files in os.walk(self.repo_root):
-            # Prune in-place: skip hidden dirs and known vendor/noise dirs
-            dirs[:] = [
-                d for d in dirs
-                if not d.startswith(".") and d not in _SKIP_DIRS
-            ]
+            # Prune in-place, then SORT so the descent is deterministic across
+            # machines and source-prioritized (real code before tests/fixtures),
+            # mirroring ._shared_utils._walk_repo_files. Without this, os.walk's
+            # filesystem-enumeration order can starve entire subtrees (e.g. on
+            # this very repo the first 600 hits were all tests/ and
+            # external_llm/ got ZERO coverage).
+            dirs[:] = sorted(
+                [d for d in dirs if not d.startswith(".") and d not in _SKIP_DIRS],
+                key=_walk_dir_sort_key,
+            )
+            files.sort()
             for fname in files:
                 p = Path(root) / fname
                 if p.suffix.lower() not in _INDEXED_EXTS:
                     continue
                 results.append(p)
                 if len(results) >= _MAX_FILES:
+                    self._index_truncated = True
                     return results
         return results
+
+    @property
+    def index_truncated(self) -> bool:
+        """True if the corpus walk hit the file cap (index is incomplete)."""
+        return self._index_truncated
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────

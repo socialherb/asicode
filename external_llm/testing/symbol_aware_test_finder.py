@@ -300,7 +300,7 @@ class SymbolAwareTestFinder:
             abs_path = os.path.join(self._repo_root, test_file)
             if not os.path.isfile(abs_path):
                 return False
-            with open(abs_path, errors='ignore') as f:
+            with open(abs_path, errors='ignore', encoding="utf-8") as f:
                 content = f.read(50000)  # limit read size
             # Look for symbol as whole word
             idx = content.find(symbol)
@@ -320,7 +320,7 @@ class SymbolAwareTestFinder:
             abs_path = os.path.join(self._repo_root, test_file)
             if not os.path.isfile(abs_path):
                 return False
-            with open(abs_path, errors='ignore') as f:
+            with open(abs_path, errors='ignore', encoding="utf-8") as f:
                 content = f.read(50000)
             # Simple import check
             return (

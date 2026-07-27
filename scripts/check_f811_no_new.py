@@ -54,7 +54,7 @@ def _load_baseline() -> set[str]:
     if not BASELINE.exists():
         return set()
     baseline: set[str] = set()
-    for line in BASELINE.read_text().splitlines():
+    for line in BASELINE.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#"):
             baseline.add(stripped)
@@ -93,7 +93,7 @@ def _write_baseline(errors: set[str]) -> None:
         "#\n"
     )
     lines = sorted(errors)
-    BASELINE.write_text(header + "\n".join(lines) + ("\n" if lines else ""))
+    BASELINE.write_text(header + "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def main() -> int:

@@ -535,8 +535,9 @@ def _markdown_lines(text: str, width: int) -> Optional[list[str]]:
         import io as _io
 
         from rich.console import Console
-        from rich.markdown import Markdown
         from rich.theme import Theme
+        from external_llm.common.rich_markdown import markdown_cls
+        Markdown = markdown_cls()
     except Exception:
         return None
     try:
@@ -580,6 +581,7 @@ def _format_tool_input(tool_name: str, inp: dict) -> str:
         "read_file": "path",
         "read_symbol": "name",
         "grep": "pattern",
+        "glob": "pattern",
         "find_symbol": "name",
         "find_references": "name",
         "find_relevant_files": "query",
@@ -618,7 +620,18 @@ def _disp_width(s: str) -> int:
 
 
 def _truncate(s: str, max_cells: int = 60) -> str:
-    """Truncate string to a display-cell budget (CJK-aware)."""
+    """Truncate string to a display-cell budget (CJK-aware).
+
+    The result is ALWAYS a single physical row: newlines and runs of
+    whitespace are collapsed first (mirroring ``_spinner_safe`` in the main
+    CLI). Without this fold, a multi-line tool arg — e.g. a bash heredoc
+    command — passes the width check (``_disp_width`` counts ``\\n`` as a
+    1-cell char) yet renders across several rows. The in-place live line is
+    written with ``\\r\\x1b[2K`` (see ``_render_live``), which only clears
+    the *last* wrapped row, so every 0.25s re-render leaves an orphan line
+    behind — ~360 orphans for a 90s command.
+    """
+    s = " ".join(s.split()) if s else ""
     if _disp_width(s) <= max_cells:
         return s
     out, w = [], 0

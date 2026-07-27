@@ -39,10 +39,40 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
-import httpx
-
 if TYPE_CHECKING:
+    import httpx
+
     from ..tool_registry import ToolResult
+else:
+    class _LazyHttpx:
+        """Defers ``import httpx`` to the first actual attribute access.
+
+        tool_handlers/__init__ imports this module on every ToolRegistry
+        construction (ToolRegistry inherits the mixin, so it cannot be loaded
+        lazily), but httpx is only needed once a search or fetch really runs.
+        The import costs ~40ms and pulls 244 modules — including click and
+        rich, via httpx's own ``_main`` CLI module — on every cold start and
+        every subagent process spawn.
+
+        Attribute access forwards to the real module and caches it, so all
+        ``httpx.X`` uses below work unchanged.
+
+        Deliberately NOT ``__slots__``-ed: tests monkeypatch attributes onto
+        this object (``setattr(httpx, "Client", fake)``), which needs a real
+        ``__dict__``. A patched attribute shadows ``__getattr__`` until
+        ``monkeypatch.undo()`` removes it, restoring the lazy forward.
+        """
+
+        _mod = None
+
+        def __getattr__(self, name: str):
+            mod = _LazyHttpx._mod
+            if mod is None:
+                import httpx as _real_httpx
+                mod = _LazyHttpx._mod = _real_httpx
+            return getattr(mod, name)
+
+    httpx = _LazyHttpx()
 
 logger = logging.getLogger(__name__)
 
@@ -86,21 +116,41 @@ _FETCH_BINARY_CONTENT_PREFIXES = (
 # Transient (retryable) HTTP errors shared by all search backends. A single tuple
 # keeps SearXNG / DuckDuckGo / Brave on one retry policy instead of each backend
 # ad-hoc-listing a subset (SearXNG used to be the only one with any retry).
-_TRANSIENT_HTTP_ERRORS = (
-    httpx.ConnectError,
-    httpx.RemoteProtocolError,
-    httpx.ReadTimeout,
-    httpx.ReadError,          # parent of ReadTimeout; also covers abrupt stream drops
-    httpx.ConnectTimeout,
-    httpx.PoolTimeout,
-)
+# Built on first use rather than at import: naming an httpx exception class here
+# would resolve the lazy module and re-introduce the import cost this module
+# exists to avoid. ``except`` takes an expression, so the call sites read the
+# same as a tuple constant.
+_TRANSIENT_HTTP_ERRORS_CACHE: Optional[tuple] = None
+
+
+def _transient_http_errors() -> tuple:
+    """Transient (retryable) network errors, resolved lazily. See above."""
+    global _TRANSIENT_HTTP_ERRORS_CACHE
+    if _TRANSIENT_HTTP_ERRORS_CACHE is None:
+        _TRANSIENT_HTTP_ERRORS_CACHE = (
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+            httpx.ReadTimeout,
+            httpx.ReadError,      # parent of ReadTimeout; also covers abrupt stream drops
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+        )
+    return _TRANSIENT_HTTP_ERRORS_CACHE
 
 # Connect-level failures ("host unreachable / TCP handshake blocked"). These are
-# a SUBSET of _TRANSIENT_HTTP_ERRORS that must NOT be retried: unlike a slow read
+# a SUBSET of _transient_http_errors() that must NOT be retried: unlike a slow read
 # or a 429, an immediate re-connect to an unreachable host just re-pays the whole
 # connect timeout. They fail fast so the fallback chain (and the session circuit
 # breaker) move on — the fix for an IP-blocked DuckDuckGo burning ~15s x2 per search.
-_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
+_CONNECT_ERRORS_CACHE: Optional[tuple] = None
+
+
+def _connect_errors() -> tuple:
+    """Connect-level failures, resolved lazily. See _transient_http_errors."""
+    global _CONNECT_ERRORS_CACHE
+    if _CONNECT_ERRORS_CACHE is None:
+        _CONNECT_ERRORS_CACHE = (httpx.ConnectError, httpx.ConnectTimeout)
+    return _CONNECT_ERRORS_CACHE
 
 # Transient HTTP status codes worth retrying: rate-limiting (429) and gateway /
 # overload responses (502/503/504). Shared by every backend routed through
@@ -113,7 +163,17 @@ _RETRYABLE_HTTP_STATUSES = frozenset({429, 502, 503, 504})
 # fast) paired with a patient read budget (some engines are genuinely slow). The
 # old flat ``timeout=15.0`` spent the full 15s on every connect attempt, so an
 # IP-blocked DuckDuckGo cost ~15s x2 retries ~= 31s per search; connect=4 caps that.
-_SEARCH_HTTP_TIMEOUT = httpx.Timeout(connect=4.0, read=15.0, write=15.0, pool=15.0)
+_SEARCH_HTTP_TIMEOUT_CACHE: Optional[Any] = None
+
+
+def _search_http_timeout():
+    """The shared search timeout, resolved lazily. See _transient_http_errors."""
+    global _SEARCH_HTTP_TIMEOUT_CACHE
+    if _SEARCH_HTTP_TIMEOUT_CACHE is None:
+        _SEARCH_HTTP_TIMEOUT_CACHE = httpx.Timeout(
+            connect=4.0, read=15.0, write=15.0, pool=15.0,
+        )
+    return _SEARCH_HTTP_TIMEOUT_CACHE
 
 # Seconds a backend is skipped (session circuit breaker) after a connect-level
 # failure. Long enough that a run of searches does not each re-pay a hard IP
@@ -1195,7 +1255,7 @@ class WebSearchToolsMixin:
         # cost 20s despite the deadline firing on time, making the deadline
         # decorative. Shut down without waiting and let the straggler's thread
         # finish on its own; its result is simply dropped. (A live HTTP request
-        # cannot be cancelled, but it is bounded by _SEARCH_HTTP_TIMEOUT.)
+        # cannot be cancelled, but it is bounded by _search_http_timeout().)
         pool = ThreadPoolExecutor(max_workers=len(runnable), thread_name_prefix="websearch")
         try:
             futures = {pool.submit(fn): name for name, fn in runnable}
@@ -1210,7 +1270,7 @@ class WebSearchToolsMixin:
                         self._trip_backend_cooldown(name)
                         errors.append(f"{name}: {e}")
                         logger.warning("web_search: %s walled (%s); sidelining it", name, e)
-                    except _CONNECT_ERRORS as e:
+                    except _connect_errors() as e:
                         connect_failed.add(name)
                         errors.append(f"{name}: {e}")
                         logger.warning("web_search: %s connect-failed (%s)", name, e)
@@ -1386,7 +1446,7 @@ class WebSearchToolsMixin:
                     continue
                 # Non-SearXNG connect-level failure (unreachable / IP-blocked host):
                 # trip the session breaker so later searches skip it during cooldown.
-                if isinstance(e, _CONNECT_ERRORS):
+                if isinstance(e, _connect_errors()):
                     self._trip_backend_cooldown(name)
                 last_error = f"{name}: {e}"
                 logger.warning("web_search: %s failed (%s), trying next backend", name, e)
@@ -1475,7 +1535,7 @@ class WebSearchToolsMixin:
         Shared by all three search backends so SearXNG / DuckDuckGo / Brave use one
         retry policy. Two retry triggers, each backed off ``retries`` times:
 
-        * transient NETWORK errors (``_TRANSIENT_HTTP_ERRORS``: connect/read
+        * transient NETWORK errors (``_transient_http_errors()``: connect/read
           timeouts, protocol errors) — retry after ``backoff`` seconds.
         * transient HTTP STATUS codes (``retry_statuses``: 429 rate-limit,
           502/503/504 gateway overload) — retry after the server's ``Retry-After``
@@ -1494,12 +1554,12 @@ class WebSearchToolsMixin:
                     resp = client.get(url, params=params, headers=headers)
                 else:
                     resp = client.post(url, data=data, headers=headers)
-            except _TRANSIENT_HTTP_ERRORS as e:
+            except _transient_http_errors() as e:
                 last_err = e
-                # Connect-level failures are not retried (see _CONNECT_ERRORS): the
+                # Connect-level failures are not retried (see _connect_errors()): the
                 # host is unreachable, so an immediate re-connect just re-pays the
                 # connect timeout. Fail fast to the caller / fallback chain.
-                if isinstance(e, _CONNECT_ERRORS):
+                if isinstance(e, _connect_errors()):
                     raise
                 if attempt < retries - 1:
                     logger.warning(
@@ -1584,7 +1644,7 @@ class WebSearchToolsMixin:
         }
         data = {"q": query}
 
-        with httpx.Client(timeout=_SEARCH_HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
+        with httpx.Client(timeout=_search_http_timeout(), follow_redirects=True, headers=headers) as client:
             resp = self._http_request_with_retry(client, "POST", url, data=data)
             resp.raise_for_status()
 
@@ -1620,7 +1680,7 @@ class WebSearchToolsMixin:
         }
         params = {"query": query}
 
-        with httpx.Client(timeout=_SEARCH_HTTP_TIMEOUT, follow_redirects=True, headers=headers) as client:
+        with httpx.Client(timeout=_search_http_timeout(), follow_redirects=True, headers=headers) as client:
             resp = self._http_request_with_retry(client, "GET", url, params=params)
             resp.raise_for_status()
 
@@ -1641,7 +1701,7 @@ class WebSearchToolsMixin:
         }
         params = {"q": query, "count": max_results}
 
-        with httpx.Client(timeout=_SEARCH_HTTP_TIMEOUT) as client:
+        with httpx.Client(timeout=_search_http_timeout()) as client:
             resp = self._http_request_with_retry(client, "GET", url, params=params, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -1749,7 +1809,7 @@ class WebSearchToolsMixin:
 
         # Retry policy is shared with the other backends via _http_request_with_retry
         # (previously SearXNG was the only backend with any retry; DDG/Brave had none).
-        with httpx.Client(timeout=_SEARCH_HTTP_TIMEOUT, follow_redirects=True) as client:
+        with httpx.Client(timeout=_search_http_timeout(), follow_redirects=True) as client:
             resp = self._http_request_with_retry(client, "GET", url, params=params)
             resp.raise_for_status()
             data = resp.json()
@@ -2276,7 +2336,7 @@ class WebSearchToolsMixin:
                             header_charset = stream_resp.charset_encoding
                             break  # success — exit retry loop
 
-                    except _TRANSIENT_HTTP_ERRORS as e:
+                    except _transient_http_errors() as e:
                         last_err = e
                         if attempt < 2:
                             logger.warning(

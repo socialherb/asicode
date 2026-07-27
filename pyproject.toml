@@ -1,6 +1,6 @@
 [project]
 name = "asicode"
-version = "0.2.14"
+version = "0.2.15"
 description = "Autonomous Software Improvement — AST-precise code editing agent with verification gates (CLI + MCP server)"
 readme = "README.md"
 license = "MIT"
@@ -38,10 +38,6 @@ dependencies = [
   # regex heuristics, which contradicts the AST-over-regex design principle.
   # The loader also still resolves individual tree_sitter_<lang> modules.
   "tree-sitter-language-pack>=1.10",
-  # Dependency-graph analysis (change-impact, import graph). Pure-Python and
-  # light; without it the graph silently degrades to a simplified fallback,
-  # so it is a core dependency rather than an extra.
-  "networkx>=3.0",
   # PEP 440 version comparison for the update-notice check
   # (utils/version_check.py). NOT implicitly present in a base install —
   # only pytest pulled it in dev envs — and the string-inequality fallback
@@ -99,6 +95,7 @@ config = [
 dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.6",
+    "pytest-timeout>=2.3",  # Prevent hung tests from blocking CI (300s default timeout)
     "pre-commit>=4.0",
 ]
 
@@ -115,11 +112,13 @@ lint = [
     "pyright[nodejs]>=1.1",
 ]
 
-# Fast code search. asicode falls back to system `grep` when ripgrep is absent,
-# so this is OPTIONAL, not a hard dependency. Kept out of the core install so a
-# ripgrep install failure (sdist build on platforms without a prebuilt wheel —
-# e.g. Windows, macOS-x86_64, linux-aarch64, musl) cannot break the base install.
-# Install with: pip install '.[search]'
+# Fast code search. ripgrep is OPTIONAL, not a hard dependency: kept out of the
+# core install so a ripgrep install failure (sdist build on platforms without a
+# prebuilt wheel — e.g. Windows, macOS-x86_64, linux-aarch64, musl) cannot break
+# the base install. When rg is absent, symbol search degrades GRACEFULLY — Python
+# symbols (via AST) still resolve, while non-Python symbol search (which needs rg
+# to walk/index provider files) returns empty instead of crashing. Install rg for
+# full multi-language symbol search: pip install '.[search]'
 search = [
     "ripgrep>=15.0",
 ]

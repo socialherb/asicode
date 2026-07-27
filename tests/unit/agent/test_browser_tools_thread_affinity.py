@@ -19,7 +19,7 @@ import pytest
 
 import external_llm.agent.tool_handlers.browser_tools as browser_tools
 from external_llm.agent.tool_handlers.browser_tools import (
-    HAS_PLAYWRIGHT,
+    PLAYWRIGHT_BROWSER_AVAILABLE,
     BrowserActionToolsMixin,
 )
 
@@ -98,7 +98,10 @@ def test_browser_action_serializes_concurrent_calls(monkeypatch):
     assert max_active == 1, f"calls overlapped: max_active={max_active}"
 
 
-@pytest.mark.skipif(not HAS_PLAYWRIGHT, reason="Playwright not installed")
+@pytest.mark.skipif(
+    not PLAYWRIGHT_BROWSER_AVAILABLE,
+    reason="Playwright Chromium binary not installed (run `playwright install chromium`)",
+)
 def test_real_browser_navigates_across_caller_threads():
     """End-to-end: a real browser drives cleanly when called from many threads.
 

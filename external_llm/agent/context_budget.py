@@ -84,7 +84,9 @@ _CONTEXT_LIMITS: dict[str, int] = {
     # minimax-m2.7/m2.5: 205_000 tokens — per OpenRouter model specs (non-standard size).
     "minimax-m2.7":     205_000,
     "minimax-m2.5":     205_000,
-    # hy3-preview (opencode provider) — unverified, keep conservative 128K
+    # Tencent Hy3 (opencode provider) — GA as "hy3"; keep conservative 128K.
+    # hy3-preview is aliased to hy3 in _MODEL_ALIASES (asi.py); both resolve here.
+    "hy3":              128_000,
     "hy3-preview":      128_000,
 }
 
@@ -132,7 +134,7 @@ def _ensure_override_cache_loaded() -> None:
     try:
         if not os.path.exists(_OVERRIDE_CACHE_FILE):
             return
-        with open(_OVERRIDE_CACHE_FILE) as _f:
+        with open(_OVERRIDE_CACHE_FILE, encoding="utf-8") as _f:
             _data = json.load(_f)
         _now = time.time()
         for _model, _entry in _data.items():

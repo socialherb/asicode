@@ -1,10 +1,13 @@
 """Read-only tool handlers for ToolRegistry."""
 from __future__ import annotations
 
+import functools
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..config.thresholds import config as _cfg
 from ..rag_configs import CodeTokenizer
 from ..rag_searcher import _bm25_score as _bm25
 
@@ -26,6 +29,10 @@ logger = logging.getLogger(__name__)
 # include it — the format is copy-safe by construction. See design insight:
 # expose indent as structured metadata, not something to be inferred.
 _INDENT_GUTTER_BAR = "│"  # U+2502 — box-drawing vertical, never a valid code prefix
+
+# Method names listed per class in read_file's over-cap outline. Matches the
+# get_file_outline tool's own cap so the two views of a file agree.
+_METHODS_PER_CLASS = 15
 
 
 # ── File-extension → language-label map (shared by read_file / read_symbol) ──
@@ -81,8 +88,167 @@ def _split_source_lines(text: str) -> list[str]:
     return parts
 
 
+@functools.lru_cache(maxsize=256)
+def _glob_to_regex(pattern: str) -> re.Pattern:
+    """Translate a glob into a separator-aware regex.
+
+    ``fnmatch.translate`` is unusable here: its ``*`` also matches ``/``, so
+    ``src/*.py`` would wrongly match ``src/a/b/c.py``. ``PurePath.match`` does
+    not support recursive ``**`` before 3.13 and ``glob.translate`` is 3.13+,
+    while this package supports 3.10 — hence a local translator.
+
+    Semantics (POSIX glob, the shape every agent already knows):
+      ``**/`` zero or more directories · ``**`` any characters incl. ``/``
+      ``*`` any run of non-``/`` · ``?`` one non-``/`` · ``[abc]`` a class
+
+    Memoised: one glob call matches the pattern against every path in the repo
+    index, and agents re-issue the same handful of patterns across turns.
+    """
+    out: list[str] = []
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")       # `**/x` must also match a bare `x`
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif c == "*":
+            out.append("[^/]*")
+            i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "[":
+            j = i + 1
+            if j < n and pattern[j] in "!^":
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j >= n:                    # unterminated class → literal '['
+                out.append(re.escape(c))
+                i += 1
+            else:
+                body = pattern[i + 1:j]
+                if body.startswith(("!", "^")):
+                    body = "^" + body[1:]
+                out.append(f"[{body}]")
+                i = j + 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
 class ReadToolsMixin:
     """Mixin providing read-only tool implementations for ToolRegistry."""
+
+    # Above this many matches the mtime sort is skipped (it stats every hit).
+    _GLOB_MTIME_SORT_LIMIT = 2000
+
+    def _tool_glob(self, args: dict[str, Any]) -> "ToolResult":
+        """List repository files matching a glob pattern, newest first.
+
+        Fills the gap that made ``bash ls``/``find`` the only way to answer
+        "what files are here?" — a path that leaves the repo boundary, returns
+        unbounded output, and cannot be result-cached. The file set comes from
+        ``git ls-files`` (``.gitignore``-aware, NUL-separated so non-ASCII paths
+        survive), falling back to a pruned walk outside a git checkout.
+        """
+        import os
+        import time
+
+        pattern = str(args.get("pattern", "") or "").strip()
+        if not pattern:
+            return self._make_result(ok=False, content="", error="'pattern' is required")
+
+        scope = str(args.get("path", "") or "").strip()
+        max_results = max(1, min(int(args.get("max_results", 200) or 200), 1000))
+
+        root = Path(self._effective_repo_root)
+        if scope:
+            scope = self._correct_bias_path(scope)
+            scoped = self._secure_path(scope, confine=True)
+            if scoped is None:
+                return self._make_result(
+                    ok=False, content="",
+                    error=f"path {scope!r} is outside the repository",
+                )
+            try:
+                prefix = scoped.resolve().relative_to(root.resolve()).as_posix()
+            except ValueError:
+                return self._make_result(
+                    ok=False, content="",
+                    error=f"path {scope!r} is outside the repository",
+                )
+            prefix = "" if prefix == "." else prefix.rstrip("/") + "/"
+        else:
+            prefix = ""
+
+        # Reuse the TTL-cached repo index the write tools already maintain,
+        # so a glob costs a dict lookup rather than another `git ls-files`.
+        from .write_tools import _repo_file_index
+        paths = _repo_file_index(str(root))
+
+        # A pattern with no separator matches the BASENAME anywhere ("*.py"
+        # finds every .py file), which is what both humans and models mean by
+        # it. Patterns containing "/" are matched against the full repo-
+        # relative path.
+        rx = _glob_to_regex(pattern)
+        basename_only = "/" not in pattern
+
+        matches: list[str] = []
+        for rel in paths:
+            if prefix and not rel.startswith(prefix):
+                continue
+            target = os.path.basename(rel) if basename_only else rel
+            if rx.match(target):
+                matches.append(rel)
+
+        if not matches:
+            _scope_note = f" under {prefix.rstrip('/')!r}" if prefix else ""
+            return self._make_result(
+                ok=True,
+                content=f"No files match {pattern!r}{_scope_note}.",
+            )
+
+        truncated = False
+        if len(matches) <= self._GLOB_MTIME_SORT_LIMIT:
+            # Newest first: "what was touched recently" is the question a glob
+            # is usually standing in for.
+            def _mtime(rel: str) -> float:
+                try:
+                    return (root / rel).stat().st_mtime
+                except OSError:
+                    return 0.0
+            matches.sort(key=_mtime, reverse=True)
+        # else: already path-sorted by _repo_file_index — deterministic, and
+        # stat()ing thousands of files to order a list nobody will read whole
+        # is not worth it.
+
+        if len(matches) > max_results:
+            truncated = True
+            shown = matches[:max_results]
+        else:
+            shown = matches
+
+        header = f"{len(matches)} file(s) match {pattern!r}"
+        if prefix:
+            header += f" under {prefix.rstrip('/')!r}"
+        if truncated:
+            header += f" — showing the first {len(shown)}"
+        _now = time.time()
+        lines = [header]
+        for rel in shown:
+            try:
+                age_days = (_now - (root / rel).stat().st_mtime) / 86400.0
+                lines.append(f"  {rel}  ({age_days:.0f}d)")
+            except OSError:
+                lines.append(f"  {rel}")
+        return self._make_result(ok=True, content="\n".join(lines))
 
     def _tool_read_file(self, args: dict[str, Any]) -> "ToolResult":
         """Read a file by path with optional line range.
@@ -112,13 +278,11 @@ class ReadToolsMixin:
         end_line = args.get("end_line")
 
         if start_line is None and end_line is None:
-            if len(lines) > 200:
+            if len(lines) > _cfg.lines.READ_FILE_FULL_LINES:
                 return self._make_result(
                     ok=True,
-                    content=(
-                        f"`{path}` has {len(lines)} lines. "
-                        f"Specify start_line and end_line to read a specific range."
-                    ),
+                    content=self._over_cap_guidance(path, len(lines)),
+                    metadata={"over_line_cap": True, "line_count": len(lines)},
                 )
             s, e = 1, len(lines)
         else:
@@ -131,6 +295,36 @@ class ReadToolsMixin:
                 )
 
         numbered_lines = [_format_numbered_line(i, ln) for i, ln in enumerate(lines[s - 1 : e], start=s)]
+        # Char budget. Applied here rather than only on the no-range path
+        # because an explicit range is the documented way around the line cap,
+        # so it is the path most able to overrun the context window.  Truncate
+        # on a line boundary and name the resumption line, so continuing is one
+        # unambiguous call rather than another guess.
+        truncated_at: int | None = None
+        partial_line: int | None = None  # line emitted only as a prefix (mid-line truncation)
+        budget = _cfg.lines.READ_FILE_MAX_CHARS
+        if sum(len(ln) + 1 for ln in numbered_lines) > budget:
+            kept: list[str] = []
+            used = 0
+            for i, ln in enumerate(numbered_lines):
+                used += len(ln) + 1
+                if used > budget:
+                    truncated_at = s + i  # first line NOT emitted
+                    break
+                kept.append(ln)
+            # A single line wider than the whole budget would otherwise emit
+            # nothing and report a resumption line that never advances. Emit a
+            # prefix of it and advance past it, but flag that its tail was
+            # dropped mid-line: start_line is line-granular, so re-reading
+            # cannot recover the rest. Without this signal a caller mistakes
+            # the partial line for the full line and edits on a truncated view
+            # (minified JS/CSS, single-line JSON, base64 blobs).
+            if not kept:
+                partial_line = s
+                kept = [numbered_lines[0][:budget]]
+                truncated_at = s + 1
+            numbered_lines = kept
+            e = truncated_at - 1
         content = "\n".join(numbered_lines)
 
         lang = path.split(".")[-1] if "." in path else ""
@@ -143,8 +337,75 @@ class ReadToolsMixin:
             result_content += f"\n```{lang_label}\n{content}\n```"
         else:
             result_content += f"\n```\n{content}\n```"
+        if truncated_at is not None:
+            if partial_line is not None:
+                result_content += (
+                    f"\n\n[Truncated at the {budget:,}-char output budget. "
+                    f"Line {partial_line} alone exceeds it, so only its first "
+                    f"{budget:,} chars were returned; the REST OF THAT LINE was "
+                    f"dropped and is NOT recoverable by re-reading (start_line is "
+                    f"line-granular). Continue at start_line={truncated_at} for the "
+                    f"next line.]"
+                )
+            else:
+                result_content += (
+                    f"\n\n[Truncated at the {budget:,}-char output budget. "
+                    f"Lines {truncated_at}–{len(lines)} were not returned — "
+                    f"call read_file again with start_line={truncated_at}.]"
+                )
 
-        return self._make_result(ok=True, content=result_content)
+        meta: dict[str, Any] = {}
+        if truncated_at is not None:
+            meta = {"truncated": True, "resume_line": truncated_at, "line_count": len(lines)}
+            if partial_line is not None:
+                meta["partial_line"] = partial_line
+        return self._make_result(ok=True, content=result_content, metadata=meta)
+
+    def _over_cap_guidance(self, path: str, line_count: int) -> str:
+        """Message for a no-range read of a file past ``READ_FILE_FULL_LINES``.
+
+        Carries the outline, not just the line count.  The bare count made the
+        model choose ``start_line``/``end_line`` blind, so it typically spent
+        two or three reads homing in; with the symbol map it can name the range
+        it wants on the next call.  Falls back to the plain count when the
+        outline is empty (unsupported language, parse failure) so this path can
+        never be worse than what it replaces.
+        """
+        head = (
+            f"`{path}` has {line_count} lines — too long to return whole "
+            f"(cap {_cfg.lines.READ_FILE_FULL_LINES})."
+        )
+        try:
+            symbols = self._symbol_searcher.get_file_outline(path)
+        except Exception:
+            logger.debug("read_file: outline failed for %s", path, exc_info=True)
+            symbols = []
+        if not symbols:
+            return head + " Call read_file again with start_line and end_line."
+
+        cap = _cfg.lines.READ_FILE_OUTLINE_MAX_SYMBOLS
+        rows: list[str] = []
+        for s in symbols[:cap]:
+            rows.append(f"  line {s.line:>5}  [{s.kind}] {s.name}")
+            # Methods carry no line of their own in the outline, so listing the
+            # NAMES is what makes them reachable: read_symbol takes a name, and
+            # a file that is one 2000-line class would otherwise offer nothing
+            # between "class at line 350" and a blind range.
+            methods = s.methods or []
+            if methods:
+                shown = ", ".join(methods[:_METHODS_PER_CLASS])
+                more = f" (+{len(methods) - _METHODS_PER_CLASS} more)" if len(methods) > _METHODS_PER_CLASS else ""
+                rows.append(f"           methods: {shown}{more}")
+        if len(symbols) > cap:
+            rows.append(f"  … {len(symbols) - cap} more symbols (get_file_outline for the full map)")
+
+        return (
+            head
+            + "\n\nOutline:\n"
+            + "\n".join(rows)
+            + "\n\nNext: read_symbol with a name above (exact, no range needed), "
+              "or read_file with start_line/end_line."
+        )
 
     def _tool_grep(self, args: dict[str, Any]) -> "ToolResult":
         """Search for a pattern across files using grep (or ripgrep if available)."""
@@ -375,7 +636,22 @@ class ReadToolsMixin:
 
         defs = self._symbol_searcher.find_symbol(name, kind=kind, search_path=search_path)
         if not defs:
-            return self._make_result(ok=True, content=f"No definitions found for '{name}'.")
+            # Distinguish "symbol genuinely absent" from "the file index was
+            # truncated at the cap, so the definition may live in an
+            # un-indexed file". Without this note the agent treats a silent
+            # truncation as proof of absence (fail-silent → re-creating an
+            # existing symbol or giving up).
+            _trunc = self._symbol_searcher.index_was_truncated(search_path)
+            _note = ""
+            if _trunc:
+                _note = (
+                    " NOTE: the file index was truncated at its cap, so this "
+                    "symbol may exist in an un-indexed file — try grep/bash, "
+                    "narrow search_path, or the cap may need raising."
+                )
+            return self._make_result(
+                ok=True, content=f"No definitions found for '{name}'.{_note}"
+            )
 
         lines: list[str] = [f"Found {len(defs)} definition(s) for '{name}':\n"]
         for d in defs:
@@ -471,7 +747,12 @@ class ReadToolsMixin:
                 sig = f" — {s.signature}" if s.signature else ""
                 lines.append(f"{prefix} {loc}{sig}")
 
-        lines.append("\nUse bash with cat or sed to examine specific symbols (e.g. `sed -n 'X,Yp' <file>`).")
+        # Point at the read tools, not at `cat`/`sed`. Their output carries the
+        # `│N│` indent gutter that write tools depend on for correct
+        # old_string/indentation, and it goes through _secure_path; a raw shell
+        # dump has neither, so steering here was training the model out of the
+        # repo's own safety net.
+        lines.append("\nUse read_symbol to pull one of these by name, or read_file with start_line/end_line.")
         return self._make_result(
             ok=True, content="\n".join(lines),
             metadata={"path": path, "symbol_count": len(symbols)},
@@ -498,7 +779,7 @@ class ReadToolsMixin:
             lines.append(f"  {i}. {r.file}  (score: {r.score:.2f}, line ~{r.line})")
             if r.snippet.strip():
                 lines.append(f"     {r.snippet[:110]}")
-        lines.append("\nUse bash with cat or sed to inspect these files.")
+        lines.append("\nUse read_file to inspect these, or get_file_outline first if a file is large.")
         return self._make_result(
             ok=True, content="\n".join(lines),
             metadata={"files_found": [r.file for r in results], "result_count": len(results)},

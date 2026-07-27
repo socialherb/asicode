@@ -77,8 +77,12 @@ except ImportError:
 # Per-language top-level definition node types (direct children of program root
 # only; Python ``decorated_definition`` wrappers are unwrapped before matching).
 _LANG_TOP_LEVEL_NODES: dict[str, set] = {
+    # "assignment" and "expression_statement" are the same statement under the two
+    # Python grammars (standalone tree-sitter-python wraps, the
+    # tree-sitter-language-pack bundle does not); only the pack is a declared
+    # dependency, so both shapes must be listed.
     "python": {"function_definition", "async_function_definition", "class_definition",
-               "expression_statement"},
+               "expression_statement", "assignment"},
     "typescript": {"function_declaration", "class_declaration", "interface_declaration",
                    "type_alias_declaration", "enum_declaration", "lexical_declaration",
                    "variable_declaration", "module_declaration"},
@@ -99,6 +103,7 @@ _LANG_KIND_MAP: dict[str, str] = {
     "async_function_definition": "function",
     "class_definition": "class",
     "expression_statement": "assignment",
+    "assignment": "assignment",  # wrapper-less form (language-pack grammar)
     # TS/JS
     "function_declaration": "function",
     "class_declaration": "class",
@@ -176,8 +181,8 @@ def _ts_collect_top_level_definitions(source: str, language: str = "python") -> 
 
         # ── Extract name node(s) ──────────────────────────────────────
         name_nodes = []
-        if ct == "expression_statement":  # Python assignment wrapper
-            assign_node = _ts_child_by_type(node, ("assignment",))
+        if ct in ("expression_statement", "assignment"):  # Python assignment, ±wrapper
+            assign_node = node if ct == "assignment" else _ts_child_by_type(node, ("assignment",))
             if assign_node is None:
                 continue
             left = assign_node.child_by_field_name("left")

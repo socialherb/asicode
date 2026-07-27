@@ -306,7 +306,7 @@ class ExperienceStore:
         try:
             if self._explicit_path:
                 if os.path.isfile(self._store_path):
-                    with open(self._store_path) as f:
+                    with open(self._store_path, encoding="utf-8") as f:
                         data = json.load(f)
             else:
                 from external_llm.editor.learning.strategy_state import read_namespace, write_namespace
@@ -318,7 +318,7 @@ class ExperienceStore:
                     )
                     if os.path.isfile(legacy_path):
                         try:
-                            with open(legacy_path) as f:
+                            with open(legacy_path, encoding="utf-8") as f:
                                 legacy_data = json.load(f)
                             if isinstance(legacy_data, list) and legacy_data:
                                 write_namespace("experience_store", legacy_data)

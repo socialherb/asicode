@@ -39,6 +39,7 @@ _ARG_ALIASES: dict[str, dict[str, str]] = {
     "edit_file": {"file_path": "path", "filepath": "path"},
     "create_file": {"file_path": "path", "filepath": "path"},
     "grep": {"file_path": "path", "filepath": "path"},
+    "glob": {"file_path": "path", "filepath": "path", "glob": "pattern"},
     "run_lint": {"file_path": "path", "filepath": "path"},
     # Schema uses "file_path"; accept the "path" family.
     "modify_symbol": {"path": "file_path"},

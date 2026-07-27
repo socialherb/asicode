@@ -301,3 +301,103 @@ def test_strip_malloc_noise_is_line_exact():
     assert s(half) == half
     # ...and is removed once the remainder lands in the same buffer.
     assert s(half + "Logging: x\nkeep\n") == "keep\n"
+
+
+# ── Reaped-result ring buffer ─────────────────────────────────────────────
+#
+# `bash` hands a timed-out command to this manager and returns a Job ID for the
+# agent to poll later. The periodic reaper deletes finished jobs, so without a
+# retention window the agent's own result answered "not found". Two things have
+# to hold for the ring to be worth anything: the output must be READ from the
+# pipe before the snapshot, and what survives must be the TAIL.
+
+
+def _real_job(mgr, script: str, drain: bool = False) -> str:
+    """Start a real subprocess job and wait for it to exit.
+
+    With ``drain=False`` the pipe is deliberately NOT read while waiting —
+    get_info()/list_jobs() drain as a side effect and would mask the
+    walk-away workflow (agent starts a job, goes off, comes back after the
+    reaper ran). Only safe for payloads that fit in the ~64 KiB OS pipe buffer.
+
+    ``drain=True`` mirrors what the production reaper does every tick
+    (``_reap_tick`` drains running jobs precisely to avoid pipe-full deadlock);
+    required for payloads larger than the pipe buffer, which would otherwise
+    block in ``write()`` and never exit.
+    """
+    import subprocess as _sp
+
+    proc = _sp.Popen(["bash", "-c", script], stdout=_sp.PIPE, stderr=_sp.PIPE, text=True)
+    job_id = mgr.start(script, proc)
+    job = mgr.get(job_id)
+    deadline = time.monotonic() + 30
+    while proc.poll() is None and time.monotonic() < deadline:
+        if drain:
+            job.read_output()
+        time.sleep(0.02)
+    return job_id
+
+
+def test_reaped_job_output_survives_when_never_polled_before_cleanup():
+    """`_snapshot_job_locked` does no I/O, so whatever `read_output()` had not
+    yet pulled out of the pipe was simply absent. Cleanup must drain first, or
+    the ring preserves an empty string — a retrieval that *looks* successful
+    while having lost the entire result."""
+    mgr = BackgroundJobManager(max_jobs=5, reap_interval=9999.0)
+    try:
+        job_id = _real_job(mgr, "sleep 0.2; echo BUILD_OK_FINAL")
+        assert mgr.cleanup() == 1
+        info = mgr.get_info(job_id)
+        assert info is not None, "reaped job vanished entirely"
+        assert info.status == "completed"
+        assert "BUILD_OK_FINAL" in info.stdout, f"output lost: {info.stdout!r}"
+    finally:
+        mgr.shutdown()
+
+
+def test_reaped_output_keeps_the_tail_not_the_head():
+    """A job is backgrounded because it is long, and a long command's answer is
+    at the END. A leading slice preserves boilerplate and drops the verdict."""
+    mgr = BackgroundJobManager(max_jobs=5, reap_interval=9999.0)
+    try:
+        job_id = _real_job(
+            mgr,
+            "for i in $(seq 1 4000); do echo line-$i-xxxxxxxxxxxxxxxxxxxx; done; "
+            "echo FINAL_ANSWER_42",
+            drain=True,   # payload exceeds the OS pipe buffer
+        )
+        mgr.cleanup()
+        info = mgr.get_info(job_id)
+        assert info is not None
+        assert len(info.stdout) > bjm._REAPED_OUTPUT_CAP, "test payload too small to elide"
+        assert "FINAL_ANSWER_42" in info.stdout, "the tail (the answer) was dropped"
+        assert info.stdout.startswith(bjm._TRUNCATION_MARKER), "elision not announced"
+        assert "line-1-" not in info.stdout, "kept the head instead of the tail"
+    finally:
+        mgr.shutdown()
+
+
+def test_reaped_ring_is_bounded_and_evicts_oldest():
+    mgr = BackgroundJobManager(max_jobs=2, reap_interval=9999.0)
+    try:
+        first = _real_job(mgr, "echo one")
+        mgr.cleanup()
+        for _ in range(bjm._REAPED_RESULTS_MAX):
+            _real_job(mgr, "echo x")
+            mgr.cleanup()
+        assert len(mgr._reaped_results) <= bjm._REAPED_RESULTS_MAX
+        assert mgr.get_info(first) is None, "oldest entry was not evicted"
+    finally:
+        mgr.shutdown()
+
+
+def test_short_output_is_preserved_verbatim():
+    mgr = BackgroundJobManager(max_jobs=5, reap_interval=9999.0)
+    try:
+        job_id = _real_job(mgr, "echo hello")
+        mgr.cleanup()
+        info = mgr.get_info(job_id)
+        assert info.stdout == "hello\n"
+        assert not info.stdout.startswith(bjm._TRUNCATION_MARKER)
+    finally:
+        mgr.shutdown()

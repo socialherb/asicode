@@ -13,7 +13,10 @@ import os
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    import numpy
 
 from external_llm.common.atomic_io import atomic_write_json
 
@@ -87,31 +90,57 @@ def _embedding_model_candidates() -> list:
             candidates.append(name)
     return candidates
 
-try:
-    import numpy as np
-    HAS_NUMPY = True
-except ImportError:
-    HAS_NUMPY = False
+# Detect availability WITHOUT loading the full numpy/faiss modules (~100ms combined, +175 imported modules).
+# Actual imports are deferred to _ensure_np_imported() / _ensure_faiss_imported().
+import importlib.util as _importlib_util
+
+HAS_NUMPY = _importlib_util.find_spec("numpy") is not None
+if not HAS_NUMPY:
     logger.warning("NumPy not installed, vector cache disabled")
 
-try:
-    import faiss
-    HAS_FAISS = True
-except ImportError:
-    HAS_FAISS = False
+HAS_FAISS = _importlib_util.find_spec("faiss") is not None
+if not HAS_FAISS:
     logger.warning("FAISS not installed, vector cache disabled")
+
+# Lazy module references — actual imports at first use
+_np = None
+_faiss = None
 
 # SentenceTransformer is an optional dependency
 # Detect availability WITHOUT loading the heavy sentence_transformers/transformers/torch stack (~4s).
 # The actual import is deferred to _ensure_st_imported(), called from get_global_embedding_model() etc.
-import importlib.util as _importlib_util
-
 HAS_SENTENCE_TRANSFORMERS = _importlib_util.find_spec("sentence_transformers") is not None
 if not HAS_SENTENCE_TRANSFORMERS:
     logger.warning("SentenceTransformers not installed, vector cache disabled")
 # Module-level attribute kept for patch() compatibility in tests.
 # Replaced with the real class on first lazy import via _ensure_st_imported().
 SentenceTransformer = None
+def _ensure_np_imported() -> None:
+    """Lazy import of numpy (first call ~40ms, subsequent calls no-op)."""
+    global _np
+    if _np is not None:
+        return
+    if not HAS_NUMPY:
+        return
+    try:
+        import numpy as _n
+        _np = _n
+    except ImportError:
+        logger.debug("numpy import failed (HAS_NUMPY was stale)")
+
+
+def _ensure_faiss_imported() -> None:
+    """Lazy import of faiss (first call ~60ms, subsequent calls no-op)."""
+    global _faiss
+    if _faiss is not None:
+        return
+    if not HAS_FAISS:
+        return
+    try:
+        import faiss as _f
+        _faiss = _f
+    except ImportError:
+        logger.debug("faiss import failed (HAS_FAISS was stale)")
 
 
 def _ensure_st_imported() -> None:
@@ -326,19 +355,13 @@ class VectorCacheManager:
         # loaded model. Falls back to the configured name when nothing loaded.
         self.model_name = get_loaded_embedding_model_name() or get_configured_embedding_model_name()
 
-        # Load or create FAISS index
-        self.index, self.id_to_doc = self._load_or_create_index()
-
-        # Reverse lookup: doc_id → row index, so add_document's duplicate check
-        # is O(1) instead of an O(n) linear scan of id_to_doc.values(). Built
-        # once here from the loaded metadata and kept in sync by add_document /
-        # clear (the only two sites that mutate id_to_doc).
-        self._doc_id_to_idx: dict[str, int] = {
-            doc["doc_id"]: idx
-            for idx, doc in self.id_to_doc.items()
-            if isinstance(doc, dict) and "doc_id" in doc
-        }
-
+        # Lazy: FAISS index and metadata are loaded on first use (add_document,
+        # search, or clear).  This avoids ~124 MB JSON parse + 561 MB RSS during
+        # ToolRegistry construction at REPL startup when the cache may never be
+        # queried (e.g. rag_enabled=False).
+        self.index = None
+        self.id_to_doc: dict[int, dict] = {}
+        self._doc_id_to_idx: dict[str, int] = {}
 
         # Dirty flag: set True whenever the in-memory index/metadata mutates
         # (add_document / clear), cleared by a successful _save_index(). This
@@ -353,6 +376,21 @@ class VectorCacheManager:
         # the next startup rebuilds — so a clean exit with no adds never needs
         # to re-dump.
         self._dirty = False
+
+    def _ensure_index_loaded(self) -> None:
+        """Lazily load (or create) the FAISS index and metadata on first use.
+
+        Safe to call multiple times — no-op after the first successful load.
+        """
+        if self.index is not None:
+            return
+        self.index, self.id_to_doc = self._load_or_create_index()
+        # Rebuild reverse-lookup from loaded metadata.
+        self._doc_id_to_idx = {
+            doc["doc_id"]: idx
+            for idx, doc in self.id_to_doc.items()
+            if isinstance(doc, dict) and "doc_id" in doc
+        }
 
     def _cached_model_matches(self) -> bool:
         """True if the persisted cache was built with the current embedding model.
@@ -375,6 +413,7 @@ class VectorCacheManager:
         """
         if not HAS_NUMPY or not HAS_FAISS:
             return None, {}
+        _ensure_faiss_imported()
 
         if self.index_path.exists() and self.metadata_path.exists():
             if not self._cached_model_matches():
@@ -384,7 +423,7 @@ class VectorCacheManager:
                 )
             else:
                 try:
-                    index = faiss.read_index(str(self.index_path))
+                    index = _faiss.read_index(str(self.index_path))
                     with open(self.metadata_path, encoding="utf-8") as f:
                         _raw = json.load(f)
                     # JSON object keys are strings; restore the int row indices
@@ -402,6 +441,30 @@ class VectorCacheManager:
                             index.ntotal, len(id_to_doc),
                         )
                     else:
+                        # ── Legacy-entry migration: drop persisted 'content' ──
+                        # Entries written before content was removed from the
+                        # metadata carry a full copy of each file (~35 KB × 3359
+                        # ≈ 117 MB of a 124 MB metadata.json — 96% of it). Simply
+                        # not writing content for NEW entries leaves those alone
+                        # forever: the load path would read them back and
+                        # _save_index dumps id_to_doc verbatim, re-persisting the
+                        # bulk on every save. So strip on load, and mark dirty so
+                        # the next save rewrites the file WITHOUT content — the
+                        # 124 MB shrinks to ~5 MB once, permanently, instead of
+                        # every session paying a 0.33 s parse and ~500 MB of RSS
+                        # to reconstruct data nothing reads.
+                        _stripped = 0
+                        for _doc in id_to_doc.values():
+                            if isinstance(_doc, dict) and "content" in _doc:
+                                del _doc["content"]
+                                _stripped += 1
+                        if _stripped:
+                            self._dirty = True
+                            logger.info(
+                                "Vector cache: dropped legacy 'content' from %d entries; "
+                                "metadata will be rewritten without it on next save",
+                                _stripped,
+                            )
                         logger.info(f"Loaded vector cache with {index.ntotal} documents")
                         return index, id_to_doc
                 except Exception as e:
@@ -415,7 +478,7 @@ class VectorCacheManager:
                             pass
 
         # Create new index
-        index = faiss.IndexFlatIP(self.dimension)  # Inner product for cosine similarity
+        index = _faiss.IndexFlatIP(self.dimension)  # Inner product for cosine similarity
         id_to_doc = {}
         return index, id_to_doc
 
@@ -430,8 +493,9 @@ class VectorCacheManager:
         """Save FAISS index and metadata to disk."""
         if not HAS_NUMPY or not HAS_FAISS or self.index is None:
             return
+        _ensure_faiss_imported()
         try:
-            faiss.write_index(self.index, str(self.index_path))
+            _faiss.write_index(self.index, str(self.index_path))
             atomic_write_json(self.metadata_path, self.id_to_doc, indent=None, ensure_ascii=True)
             self._write_model_marker()
             # Persisted state now matches in-memory state.
@@ -450,7 +514,7 @@ class VectorCacheManager:
             self.dimension = get_global_embedding_dimension()
             self.model_name = get_loaded_embedding_model_name() or self.model_name
 
-    def _compute_embedding(self, text: str) -> np.ndarray:
+    def _compute_embedding(self, text: str) -> "numpy.ndarray":
         """Compute embedding for text."""
         self._ensure_model_loaded()
         if self.embedding_model is None:
@@ -465,9 +529,13 @@ class VectorCacheManager:
 
     def add_document(self, file_path: str, content: str):
         """Add a document to the vector cache."""
+        self._ensure_index_loaded()
         self._ensure_model_loaded()
         if not HAS_NUMPY or not HAS_FAISS or self.index is None or self.embedding_model is None:
             return
+
+        _ensure_np_imported()
+        _ensure_faiss_imported()
 
         try:
             # Check if document already exists
@@ -486,18 +554,25 @@ class VectorCacheManager:
             # subsequent search with a KeyError on the orphaned row.
             metadata = {
                 'file_path': file_path,
-                'content': content,
+                # Intentionally NOT storing full content: content is the ~96%
+                # of metadata.json size (35 KB per entry × 3359 files ≈ 117 MB),
+                # and snippets are extracted from the BM25 _doc_texts in the
+                # RAGSearcher layer.  The BM25 index and vector cache index are
+                # built from the same documents so _doc_texts is always
+                # populated; vector cache search falls back to "" for the rare
+                # desync case, which _vector_search handles gracefully (empty
+                # snippet, re-read from disk).
                 'doc_id': doc_id,
                 # Coerce numpy float32 scalar → Python float so the metadata
                 # dict is JSON-serializable (metadata is persisted as JSON, not
                 # pickle). Note: embedding_norm is not read back by any caller.
-                'embedding_norm': float(np.linalg.norm(embedding)),
+                'embedding_norm': float(_np.linalg.norm(embedding)),
             }
 
             # Normalize so FAISS IndexFlatIP inner product = cosine similarity.
             # search() already normalizes the query vector (L370); the indexed
             # vectors must also be normalized for the math to work correctly.
-            faiss.normalize_L2(embedding)
+            _faiss.normalize_L2(embedding)
 
             # Add to index, then record metadata. If the index mutated but the
             # dict assignment never ran we'd desync; rebuilding metadata first
@@ -526,9 +601,15 @@ class VectorCacheManager:
 
     def search(self, query: str, top_k: int = 5) -> list[dict]:
         """Search for documents similar to query."""
+        self._ensure_index_loaded()
         self._ensure_model_loaded()
         if not HAS_NUMPY or not HAS_FAISS or self.index is None or self.index.ntotal == 0 or self.embedding_model is None:
             return []
+        # Every other _faiss user guards itself; search() reaches _faiss only
+        # when self.index is already set, which today only _load_or_create_index
+        # does (and it imports faiss). Guard anyway — the except below turns a
+        # None _faiss into a silent empty result, not a crash.
+        _ensure_faiss_imported()
 
         try:
             # Compute query embedding
@@ -537,7 +618,7 @@ class VectorCacheManager:
 
             # Normalize for cosine similarity (FAISS inner product expects normalized vectors)
             # We'll normalize both query and indexed vectors
-            faiss.normalize_L2(query_embedding)
+            _faiss.normalize_L2(query_embedding)
 
             # Search
             distances, indices = self.index.search(query_embedding, min(top_k, self.index.ntotal))
@@ -558,7 +639,7 @@ class VectorCacheManager:
                     cosine_sim = max(0.0, min(1.0, float(dist)))
                     results.append({
                         "file_path": doc["file_path"],
-                        "content": doc["content"],
+                        "content": "",  # content stored in BM25 _doc_texts, not here
                         "score": cosine_sim,
                         "from_cache": True
                     })
@@ -570,6 +651,7 @@ class VectorCacheManager:
 
     def clear(self):
         """Clear the vector cache."""
+        self._ensure_index_loaded()
         if HAS_NUMPY and HAS_FAISS and self.index is not None:
             self.index.reset()
             self.id_to_doc.clear()
@@ -587,10 +669,11 @@ class VectorCacheManager:
         """
         if not HAS_NUMPY or not HAS_FAISS or self.index is None:
             return
+        _ensure_faiss_imported()
         if not getattr(self, "_dirty", False):
             return
         try:
-            faiss.write_index(self.index, str(self.index_path))
+            _faiss.write_index(self.index, str(self.index_path))
             atomic_write_json(self.metadata_path, self.id_to_doc, indent=None, ensure_ascii=True)
             # Keep the model marker in sync so the next process doesn't discard
             # this index as stale.

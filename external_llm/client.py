@@ -47,6 +47,15 @@ class LLMMessage:
     reasoning_content: Optional[str] = None
     # Attached images (provider-agnostic). Each item: {"media_type": "image/png", "data": "<base64>"}
     # Each provider client converts these to its native format (Anthropic content blocks, Gemini inlineData).
+    #
+    # IN-MEMORY ONLY — these dicts must never be serialized to disk.  Two things
+    # depend on that: ``providers._images_to_text`` caches its OCR output back
+    # into each dict as ``ocr_text`` (so the token estimator can count it, see
+    # ``_shared_utils._images_ocr_len``), and ``data`` already holds a full
+    # base64 payload.  Persisting these would write both to disk on every turn.
+    # If a persistence path is ever added, move the OCR cache out FIRST and make
+    # ``_msg_token_fingerprint`` track wherever it moved to — otherwise the
+    # estimator silently returns a stale pre-OCR under-count.
     images: Optional[list[dict[str, str]]] = None
 
 

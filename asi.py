@@ -18,7 +18,6 @@ Environment variables:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 import logging.handlers
@@ -353,29 +352,91 @@ class _MarginIO:
     def errors(self):      return getattr(self._s, "errors", "strict")
 
 
-try:
-    import shutil as _shutil
+# Lazy rich.console import: detect availability WITHOUT loading the ~29-40ms stack.
+# Console instances are created on first use via _ensure_console_imported() /
+# _ensure_log_console_imported(). This preserves the --version/--help fast path
+# (no rich.console loaded) while keeping the spinner/Live functionality intact.
+import importlib.util as _importlib_util
 
-    from rich.console import Console
-    from rich.logging import RichHandler
-    _RICH = True
-    _console_width = max(40, _shutil.get_terminal_size().columns - _CONSOLE_MARGIN * 2)
+_RICH = _importlib_util.find_spec("rich.console") is not None
+_console_width = 0  # lazy: set by _ensure_console_widths()
+_log_console_width = 0  # lazy: set by _ensure_console_widths()
+_console = None  # lazy: _ensure_console_imported() creates on first use
+_margin_stderr = None  # lazy: _ensure_log_console_imported() creates on first use
+_log_console = None  # lazy: _ensure_log_console_imported() creates on first use
+_console_widths_ready = False
+
+
+def _ensure_console_widths() -> None:
+    """Seed both module-level console widths from the terminal size (idempotent).
+
+    MUST run before any Console(...) construction. Rich treats ``width=0`` as a
+    zero-column viewport and renders NOTHING — not merely narrow output, but
+    zero lines — so a Console built while these are still 0 silently swallows
+    everything printed through it.
+
+    This used to be free: both widths were computed at module import, next to the
+    two eager ``Console(...)`` calls. Once Console creation went lazy, each
+    ``_ensure_*_imported()`` became a possible FIRST toucher, so the widths can
+    no longer live in only one of them. (Regression this guards: the stdout
+    ``_out_console`` is normally built first — banner/help/status/_print — and
+    ``_ensure_console_imported()``, which owned the width, only runs when the
+    first spinner starts. Every startup line vanished.)
+
+    ``_SIGWINCH`` also assigns ``_console_width`` directly; recomputing here
+    afterwards just re-reads the same live terminal size, so the two agree.
+    """
+    global _console_width, _log_console_width, _console_widths_ready
+    if _console_widths_ready:
+        return
+    import shutil as _shutil
+    _cols = _shutil.get_terminal_size().columns
+    _console_width = max(40, _cols - _CONSOLE_MARGIN * 2)
     # _log_console_width: MarginIO only adds left _CONSOLE_MARGIN, so right margin removal is unnecessary.
     # → terminal_width - left_margin makes the log line fill the terminal exactly.
-    _log_console_width = max(40, _shutil.get_terminal_size().columns - _LOG_MARGIN)
-    # _console: for spinner/Live only — uses cursor-movement ANSI escapes, so MarginIO is not applicable.
-    _console = Console(file=sys.stderr, width=_console_width, force_terminal=True)
-    # _log_console: for RichHandler only — wrapped in _margin_stderr(MarginIO) to align INFO logs
-    # from col 0 → col _LOG_MARGIN. Unlike spinner/Live, it does not use cursor-movement escapes,
-    # so left-margin injection is safe. (_margin_stderr.reset_bol() on spinner→log transition.)
-    _margin_stderr = _MarginIO("stderr", _LOG_MARGIN)
-    _log_console = Console(file=_margin_stderr, width=_log_console_width, force_terminal=True)
-except ImportError:
-    _RICH = False
-    _console = None  # type: ignore
-    _margin_stderr = None  # type: ignore
-    _log_console = None  # type: ignore
-    RichHandler = None  # type: ignore
+    _log_console_width = max(40, _cols - _LOG_MARGIN)
+    _console_widths_ready = True
+
+
+def _ensure_console_imported() -> None:
+    """Lazily create _console (spinner/Live) on first use. No-op if Rich unavailable."""
+    global _console, _RICH
+    if _console is not None or not _RICH:
+        return
+    _ensure_console_widths()
+    try:
+        from rich.console import Console
+        # _console: for spinner/Live only — uses cursor-movement ANSI escapes, so MarginIO is not applicable.
+        _console = Console(file=sys.stderr, width=_console_width, force_terminal=True)
+    except ImportError:
+        # find_spec() found rich.console but importing it failed (broken install).
+        # Clear _RICH so the `_RICH and _console` call sites take the plain-text
+        # branch instead of dereferencing None — this restores the pre-lazy
+        # meaning of _RICH ("import actually succeeded"), which find_spec alone
+        # cannot promise.
+        _RICH = False
+        logging.getLogger(__name__).debug("rich.console import failed — falling back to plain output")
+
+
+def _ensure_log_console_imported() -> None:
+    """Lazily create _log_console (RichHandler) on first use. No-op if Rich unavailable."""
+    global _log_console, _margin_stderr, _RICH
+    if _log_console is not None or not _RICH:
+        return
+    _ensure_console_widths()
+    try:
+        from rich.console import Console
+        # _log_console: for RichHandler only — wrapped in _margin_stderr(MarginIO) to align INFO logs
+        # from col 0 → col _LOG_MARGIN. Unlike spinner/Live, it does not use cursor-movement escapes,
+        # so left-margin injection is safe. (_margin_stderr.reset_bol() on spinner→log transition.)
+        _margin_stderr = _MarginIO("stderr", _LOG_MARGIN)
+        _log_console = Console(file=_margin_stderr, width=_log_console_width, force_terminal=True)
+    except ImportError:
+        _RICH = False  # see _ensure_console_imported()
+        logging.getLogger(__name__).debug("rich.console import failed — falling back to plain output")
+
+
+RichHandler = None  # type: ignore[assignment] — set lazily in _setup_logging()
 
 
 class _ShimmerSpinner:
@@ -757,8 +818,15 @@ def _setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
     handlers: list[logging.Handler] = []
 
     # ── Terminal handler ──
-    if _RICH and RichHandler and _log_console:
-        class _RowSafeRichHandler(_RowSafeEmitMixin, RichHandler):
+    _rh_class = RichHandler  # module-level None; lazy-import below
+    _ensure_log_console_imported()
+    if _RICH and _log_console and _rh_class is None:
+        try:
+            from rich.logging import RichHandler as _rh_class  # type: ignore[assignment]
+        except ImportError:
+            logging.getLogger(__name__).debug("RichHandler not available — fall back to StreamHandler")
+    if _RICH and _log_console and _rh_class is not None:
+        class _RowSafeRichHandler(_RowSafeEmitMixin, _rh_class):  # type: ignore[name-defined]
             def render_message(self, record, message):  # type: ignore[override]
                 # Terminal logs are always cropped to one line. In narrow terminals, long logs
                 # would soft-wrap into indented continuation lines, breaking the spinner row,
@@ -851,75 +919,54 @@ def _setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
 
 # ─── Output helpers (uses stdout-only console) ────────────────────────────────────
 
-if _RICH:
-    from rich.theme import Theme as _RichTheme
-    _out_console = Console(file=_MarginIO("stdout"), width=_console_width, force_terminal=True, theme=_RichTheme({
-        # headings — blue/sky/teal series, purple removed
-        "markdown.h1":          f"bold {_C['blue']}",
-        "markdown.h1.border":   _C["border"],
-        "markdown.h2":          f"bold {_C['sky']}",
-        "markdown.h3":          f"bold {_C['teal']}",
-        "markdown.h4":          f"bold {_C['text']}",
-        # inline code — sky text, no background
-        "markdown.code":        _C["sky"],
-        # code block
-        "markdown.code_block":  _C["text"],
-        # links
-        "markdown.link":        f"underline {_C['blue']}",
-        "markdown.link_url":    _C["muted"],
-        # bullets/numbers
-        "markdown.item.bullet": _C["peach"],
-        "markdown.item.number": _C["peach"],
-        # horizontal rule
-        "markdown.hr":          _C["border"],
-        # blockquote
-        "markdown.block_quote": f"italic {_C['muted']}",
-    }))
-else:
-    _out_console = None
+_out_console = None  # lazy: _ensure_out_console_imported() creates on first use
 
 
-def _patch_rich_md_tables_wrap() -> None:
-    """Force Rich markdown table cells to wrap long content instead of cropping with "…".
-
-    Rich's ``Markdown`` builds table columns via ``TableElement.__rich_console__``
-    → ``Table.add_column(heading)`` with no ``overflow`` override, so the column
-    default ``overflow="ellipsis"`` applies: a cell whose content exceeds its
-    (proportionally-sized) column is truncated mid-content with "…" and the rest
-    is permanently lost. This most visibly breaks the ✦ design-chat final-response
-    panel when the LLM emits structured data as a markdown table (e.g. rows of
-    CJK terminology and definitions) — long Korean/CJK cells get cut at the right
-    edge regardless of terminal width. (Reproduced: every other markdown element — paragraph,
-    heading, list, blockquote — already wraps; only tables ellipsize.)
-
-    Wrap ``TableElement.__rich_console__`` so each yielded ``Table`` has its
-    ellipsis columns switched to ``overflow="fold"``, making cells wrap to
-    multiple lines — consistent with how paragraphs/headings already wrap, and
-    width-agnostic (works at any terminal size). Idempotent via a marker attr.
-    Applied globally because every markdown render site (✦ final, ⊙ self-review,
-    💭 thinking) wants the same no-truncation behaviour; there is no site that
-    prefers ellipsis."""
+def _ensure_out_console_imported() -> None:
+    """Lazily create _out_console (stdout Markdown output) on first use. No-op if Rich unavailable."""
+    global _out_console, _RICH
+    if _out_console is not None or not _RICH:
+        return
+    _ensure_console_widths()  # width=0 would make this Console print nothing at all
     try:
-        from rich.markdown import TableElement as _TE
-    except Exception:
-        return
-    if getattr(_TE, "_asicode_fold_patched", False):
-        return
-    _orig = _TE.__rich_console__
+        from rich.console import Console
+        from rich.theme import Theme as _RichTheme
+        _out_console = Console(file=_MarginIO("stdout"), width=_console_width, force_terminal=True, theme=_RichTheme({
+            # headings — blue/sky/teal series, purple removed
+            "markdown.h1":          f"bold {_C['blue']}",
+            "markdown.h1.border":   _C["border"],
+            "markdown.h2":          f"bold {_C['sky']}",
+            "markdown.h3":          f"bold {_C['teal']}",
+            "markdown.h4":          f"bold {_C['text']}",
+            # inline code — sky text, no background
+            "markdown.code":        _C["sky"],
+            # code block
+            "markdown.code_block":  _C["text"],
+            # links
+            "markdown.link":        f"underline {_C['blue']}",
+            "markdown.link_url":    _C["muted"],
+            # bullets/numbers
+            "markdown.item.bullet": _C["peach"],
+            "markdown.item.number": _C["peach"],
+            # horizontal rule
+            "markdown.hr":          _C["border"],
+            # blockquote
+            "markdown.block_quote": f"italic {_C['muted']}",
+        }))
+    except ImportError:
+        _RICH = False  # see _ensure_console_imported()
+        logging.getLogger(__name__).debug("rich.console import failed — falling back to plain output")
 
-    def _fold(self, console, options):
-        for _item in _orig(self, console, options):
-            for _c in getattr(_item, "columns", None) or ():
-                if _c.overflow == "ellipsis":
-                    _c.overflow = "fold"
-            yield _item
-
-    _TE.__rich_console__ = _fold
-    _TE._asicode_fold_patched = True
 
 
-if _RICH:
-    _patch_rich_md_tables_wrap()
+def _rich_markdown_cls():
+    """Lazy ``rich.markdown.Markdown`` accessor (delegates to shared module).
+
+    Importing ``rich.markdown`` costs ~16ms; lazy import defers cost to the
+    first actual Markdown render.  Idempotent — cached inside the shared module.
+    """
+    from external_llm.common.rich_markdown import markdown_cls
+    return markdown_cls()
 
 
 def _strip_ansi(text: str) -> str:
@@ -1125,6 +1172,7 @@ def _render_run_diff(
     max_files: int = 20, max_lines_per_file: int = 60,
 ) -> bool:
     """Render colored diffs for every file the run changed. Returns True if shown."""
+    _ensure_out_console_imported()
     if not baseline:
         return False
     files = _changed_files_since(repo_root, baseline)
@@ -1155,6 +1203,7 @@ def _render_run_diff(
         title.append(f"+{total_add}", style=_C["green"])
         title.append(" ")
         title.append(f"−{total_rem}", style=_C["red"])
+        _ensure_out_console_imported()
         _out_console.print()
         _out_console.print(title)
         _out_console.rule(style=_C["border"])
@@ -1225,6 +1274,7 @@ def _print_run_change_summary(repo_root: str, baseline: Optional[dict]) -> bool:
     Prints only this lightweight summary so it's always visible even when the
     full diff (RUN_DIFF) is off — details via /diff, revert via /undo.
     """
+    _ensure_out_console_imported()
     stats = _run_changed_stats(repo_root, baseline)
     if not stats:
         return False
@@ -1352,95 +1402,13 @@ _SLASH_GROUPS: list[tuple[str, tuple[str, ...]]] = [
 # alias → canonical name
 _SLASH_ALIASES: dict[str, str] = {}
 # ── Per-provider known model list ──────────────────────────────────────────────
-# For display in the /model command. Should be kept in sync with _KNOWN_MODELS in
-# tools/kp_correctness_verify.py, but also defined here for CLI self-containment.
-_KNOWN_MODELS: dict[str, list[str]] = {
-    "anthropic": [
-        "claude-fable-5",
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-        "claude-sonnet-4-6",
-        "claude-sonnet-4-5",
-        "claude-haiku-4-5-20251001",
-    ],
-    "deepseek": [
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-    ],
-    "openai": [
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-4o",
-        "gpt-4o-mini",
-        "o3",
-        "o3-mini",
-        "o4-mini",
-    ],
-    "google": [
-        "gemini-3.5-flash",
-        "gemini-3.1-pro",
-        "gemini-3-flash",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-    ],
-    "zai": [
-        "glm-5.2",
-        "glm-5.1",
-        "glm-5-turbo",
-        "glm-5",
-        "glm-4.7",
-    ],
-    "openrouter": [
-        "deepseek/deepseek-v4-flash",
-        "deepseek/deepseek-v4-pro",
-        "anthropic/claude-sonnet-5",
-        "anthropic/claude-sonnet-4-6",
-        "google/gemini-2.5-pro",
-        "zai/glm-5.2",
-        "qwen/qwen3.6",
-    ],
-    "opencode": [
-        # Complete list from https://opencode.ai/zen/go/v1/models (20 models)
-        "glm-5.2",
-        "glm-5.1",
-        "glm-5",
-        "deepseek-v4-pro",
-        "deepseek-v4-flash",
-        "kimi-k3",
-        "kimi-k2.7-code",
-        "kimi-k2.6",
-        "kimi-k2.5",
-        "mimo-v2.5-pro",
-        "mimo-v2.5",
-        "mimo-v2-pro",
-        "mimo-v2-omni",
-        "minimax-m3",
-        "minimax-m2.7",
-        "minimax-m2.5",
-        "qwen3.7-max",
-        "qwen3.7-plus",
-        "qwen3.6-plus",
-        "qwen3.5-plus",
-        "hy3-preview",
-    ],
-}
-
-# Mapping from old/typo model names users might type → correct model names
-_MODEL_ALIASES: dict[str, str] = {
-    # Anthropic: models that switched to dateless format
-    "claude-sonnet-4-20250514": "claude-sonnet-4-6",
-    "claude-opus-4-20250514": "claude-opus-4-8",
-    "claude-haiku-4-20250514": "claude-haiku-4-5-20251001",
-    "claude-sonnet-4-5-20250514": "claude-sonnet-4-6",
-    "claude-opus-4-5-20250514": "claude-opus-4-8",
-    # OpenCode Go: old model IDs → current model IDs
-    "deepseek-v4": "deepseek-v4-pro",
-    "kimi-k2": "kimi-k2.6",
-    "mimo-m1": "mimo-v2.5",
-    "qwq-32b": "qwen3.7-plus",
-}
+# Single source: external_llm/model_catalog.py — shared with the kp verify
+# tool and the webapp picker endpoint (three hand-synced copies drifted apart
+# before it existed). Edit the catalog module, not these names.
+from external_llm.model_catalog import (
+    KNOWN_MODELS as _KNOWN_MODELS,
+    MODEL_ALIASES as _MODEL_ALIASES,
+)
 
 # Per-provider API key environment variable names
 _API_KEY_ENV_MAP: dict[str, str] = {
@@ -2096,6 +2064,7 @@ def _grouped_slash_commands() -> list[tuple[str, list[tuple]]]:
 
 def _render_help() -> None:
     """Render the slash-command palette, sectioned by _SLASH_GROUPS."""
+    _ensure_out_console_imported()
     if _RICH and _out_console:
         from rich import box
         from rich.table import Table
@@ -2137,6 +2106,7 @@ def _render_status(repo_root: str, provider: str, model: str, mode: str,
                    reasoning_effort: Optional[str] = None,
                    helper: str = "") -> None:
     """Render a compact session status block."""
+    _ensure_out_console_imported()
     pt = session_tokens.get("prompt", 0)
     ct = session_tokens.get("completion", 0)
     # Cost (dollars) is an estimate, not an exact bill, so it's not shown in /status.
@@ -2215,6 +2185,7 @@ def _bar_panel(content, title=None, color: str = "", padding=(0, 2)):
 
 
 def _print(msg: str, style: str = "", end: str = "\n") -> None:
+    _ensure_out_console_imported()
     if _RICH and _out_console:
         # Sync MarginIO BOL state in case a direct sys.stdout.write() call happened before.
         # _out_console writes via _MarginIO(sys.stdout); direct writes bypass it and can
@@ -2240,6 +2211,7 @@ def _print_banner(repo_root: str = "") -> None:
     right-aligned on the same line) and rule follow.
     No separate ghost title is ever rendered.
     """
+    _ensure_out_console_imported()
     if _RICH and _out_console:
         import time as _bt
 
@@ -3050,7 +3022,7 @@ _WRITE_PREVIEW_TOOLS = frozenset({
 
 # Read/analysis tools whose result structure is "item listing" — 3 lines is more useful
 _THREE_LINE_PREVIEW_TOOLS = frozenset({
-    "grep", "find_relevant_files", "find_references", "search_web",
+    "grep", "glob", "find_relevant_files", "find_references", "search_web",
     "analyze_change_impact", "run_structural_scan", "get_project_info",
     "query_dependency_graph", "get_file_outline", "find_symbol",
 })
@@ -3548,6 +3520,7 @@ class _ProgressPrinter:
 
         color/icon_color are either _C palette keys or a style/hex string to use as-is.
         """
+        _ensure_out_console_imported()
         _style = _C.get(color, color)
         _istyle = _C.get(icon_color or color, color)
         if _RICH and _out_console:
@@ -3828,6 +3801,7 @@ class _ProgressPrinter:
         _safe_msg = self._spinner_safe(msg, _max)
         self._spinner_msg = _safe_msg
         self._spinner_running = True
+        _ensure_console_imported()
         if _RICH and _console:
             self._spawn_rich_live(_safe_msg)
         else:
@@ -4006,6 +3980,7 @@ class _ProgressPrinter:
                     "get_project_info": "path",
                     "list_directory": "path",
                     "grep": "pattern",
+                    "glob": "pattern",
                     "find_symbol": "name",
                     "find_references": "name",
                     "find_tests_for_symbol": "name",
@@ -4580,7 +4555,7 @@ class _ProgressPrinter:
                     # Live "… thinking" spinner has ended — switch to completion label.
                     # Title: 💭 thought for 6.2s. Body is markdown-rendered.
                     if _RICH and _out_console:
-                        from rich.markdown import Markdown as _RichMD
+                        _RichMD = _rich_markdown_cls()
                         from rich.segment import Segment as _Seg
                         from rich.segment import Segments as _Segs
                         from rich.style import Style as _Style
@@ -4663,7 +4638,7 @@ class _ProgressPrinter:
                 else:  # "issues"
                     _content = (data.get("content", "") or "").strip()
                     if _RICH and _out_console:
-                        from rich.markdown import Markdown as _RichMD
+                        _RichMD = _rich_markdown_cls()
                         from rich.text import Text as _RichTxt
                         _f = _out_console.file
                         if hasattr(_f, "reset_bol"):
@@ -4951,7 +4926,7 @@ def _cli_checkpoint_cb(question_data: dict) -> dict:
         # design_thinking·self-review). reset_bol() syncs _MarginIO's _bol state to BOL after a raw print.
         # Falls back to existing _wrap_cjk plain-text loop when Rich is unavailable.
         if _RICH and _out_console:
-            from rich.markdown import Markdown as _RichMD
+            _RichMD = _rich_markdown_cls()
             _f = _out_console.file
             if hasattr(_f, "reset_bol"):
                 _f.reset_bol()
@@ -5879,6 +5854,7 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
 
                 def _debounced_on_resize(self):
                     try:
+                        import asyncio
                         _loop = asyncio.get_running_loop()
                     except RuntimeError:
                         _orig_on_resize(self)
@@ -6127,6 +6103,7 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
     # ── running event-loop guard ──────────────────────────────────
     _ev_loop_running = False
     try:
+        import asyncio
         _ev_loop_running = asyncio.get_running_loop().is_running()
     except RuntimeError:
         pass  # no running loop
@@ -6245,6 +6222,7 @@ def _prompt_input(chat_mode: str = "code", status: str = "") -> str:
     `status` is a short dim line (e.g. "claude / sonnet · thinking ON") shown
     above the prompt so the active model + thinking state are always visible.
     """
+    _ensure_out_console_imported()
     _mode_tag = "[General] " if chat_mode == "general" else ("[Orchestrator] " if chat_mode == "orchestrator" else "")
     _display_mode = "General mode" if chat_mode == "general" else ("Orchestrator mode" if chat_mode == "orchestrator" else "Code mode")
     if _RICH and _out_console:
@@ -6311,7 +6289,7 @@ def _show_result(
 
     if _RICH and _out_console:
         from rich.console import Group
-        from rich.markdown import Markdown as _RichMD
+        _RichMD = _rich_markdown_cls()
         from rich.text import Text
 
         renderables = []
@@ -6648,11 +6626,11 @@ def _seed_terminal_config(term_path: str, shared_path: str) -> None:
         os.makedirs(os.path.dirname(term_path), exist_ok=True)
         _tmp = term_path + ".tmp"
         if os.path.exists(shared_path):
-            with open(shared_path) as _sf:
+            with open(shared_path, encoding="utf-8", errors="replace") as _sf:
                 _data = _sf.read()
         else:
             _data = "{}"
-        with open(_tmp, "w") as _tf:
+        with open(_tmp, "w", encoding="utf-8") as _tf:
             _tf.write(_data)
         os.replace(_tmp, term_path)
     except OSError:
@@ -6832,7 +6810,7 @@ def run_repl(args: argparse.Namespace) -> None:
         last-writer-wins lost update rather than JSON corruption.
         """
         try:
-            with open(_thinking_state_path) as _tf:
+            with open(_thinking_state_path, encoding="utf-8") as _tf:
                 _cfg = json.load(_tf)
         except (FileNotFoundError, json.JSONDecodeError):
             _cfg = {}
@@ -6842,7 +6820,7 @@ def run_repl(args: argparse.Namespace) -> None:
         os.makedirs(os.path.dirname(_thinking_state_path), exist_ok=True)
         _tmp = _thinking_state_path + ".tmp." + str(os.getpid())
         try:
-            with open(_tmp, "w") as _tf:
+            with open(_tmp, "w", encoding="utf-8") as _tf:
                 json.dump(_cfg, _tf)
             os.replace(_tmp, _thinking_state_path)
         except OSError:
@@ -7390,7 +7368,7 @@ def run_repl(args: argparse.Namespace) -> None:
     # for unconfigured slots.
     _dev_models: dict[str, tuple[str, str]] = {}
     try:
-        with open(_thinking_state_path) as _tf:
+        with open(_thinking_state_path, encoding="utf-8") as _tf:
             _tsd = json.load(_tf)
         if "thinking_state" in _tsd:
             _thinking_state = _tsd["thinking_state"]
@@ -8252,6 +8230,7 @@ def run_repl(args: argparse.Namespace) -> None:
             # (WARNING+ passes, file handlers unaffected)
             _tool_running_filter.active = True
             try:
+                import asyncio
                 _claude_result = asyncio.run(_run_collaborate_session(
                     _claude_registry, _claude_config, _claude_task,
                     context=_claude_context,
@@ -8553,7 +8532,7 @@ def run_repl(args: argparse.Namespace) -> None:
                     if _RICH and _out_console:
                         try:
                             from rich.console import Group as _RichGroup
-                            from rich.markdown import Markdown as _RichMD
+                            _RichMD = _rich_markdown_cls()
                             from rich.text import Text as _RichTxt
                             _f = _out_console.file
                             if hasattr(_f, "reset_bol"):
@@ -8884,7 +8863,7 @@ def run_repl(args: argparse.Namespace) -> None:
             elif _RICH and _out_console:
                 try:
                     from rich.console import Group as _RichGroup
-                    from rich.markdown import Markdown as _RichMD
+                    _RichMD = _rich_markdown_cls()
                     from rich.text import Text as _RichTxt
                     # Final answer also gets left gutter bar — same family as … thinking (mid-utterance),
                     # with title ✦(blue) to distinguish as "this turn's final answer"
@@ -10116,7 +10095,7 @@ def main() -> None:
         _seed_terminal_config(_term_cfg, _shared_cfg_path)
         _saved_cfg_path = _term_cfg
     try:
-        with open(_saved_cfg_path) as _cf:
+        with open(_saved_cfg_path, encoding="utf-8") as _cf:
             _saved_cfg = json.load(_cf)
     except (FileNotFoundError, json.JSONDecodeError):
         _saved_cfg = {}

@@ -189,6 +189,12 @@ class TurnContext:
     budget_warned: bool = False
     fail_streak: dict = field(default_factory=dict)
     noop_confirmed: bool = False
+    # True when IntentResolver never produced a classification (LLM failure,
+    # unparseable response, no IntentResult attached). ``read_only_request``
+    # still defaults to False in that case so a legitimate edit is never
+    # blocked — but the "write intent finished with no patch" gate must not
+    # fire on a premise nothing established. See intent_is_undetermined().
+    intent_undetermined: bool = False
     no_tool_nudge_count: int = 0
     search_first_hint_done: bool = False
     reads_since_last_edit: int = 0

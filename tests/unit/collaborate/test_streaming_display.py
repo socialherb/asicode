@@ -130,6 +130,72 @@ class TestToolInputFormatting:
         ) == f"{long_path}:1-5"
 
 
+class TestTruncateSingleRow:
+    """Regression guard: _truncate output must NEVER contain a newline.
+
+    The in-place live line (_render_live) is written with ``\\r\\x1b[2K``,
+    which erases only the *last* physical row. A multi-line tool arg that
+    survives _truncate renders across several rows, so every 0.25s ticker
+    re-render leaves an orphan line behind — ~360 for a 90s command. See the
+    _truncate docstring and ``_render_live`` MUST-fit-one-row contract.
+    """
+
+    def test_fold_happens_even_when_under_budget(self):
+        # The pre-fix bug: _disp_width(s) <= max_cells returned s UNCHANGED,
+        # so a short 2-line string kept its newline. The cell budget must NOT
+        # gate the fold — a 3-cell "a\nb" passes a 60-cell check yet wraps.
+        from external_llm.repl.collaborate.streaming_display import _truncate
+
+        out = _truncate("import sys\nprint('hi')", max_cells=60)
+        assert "\n" not in out
+        assert out == "import sys print('hi')"
+
+    def test_heredoc_hint_has_no_newline_wide_terminal(self):
+        # Exact reproduction: a bash heredoc command spanning 3 logical lines.
+        # On a wide terminal the folded width fits, so pre-fix the whole thing
+        # (with \n) was returned — wrapping under \r\x1b[2K.
+        from external_llm.repl.collaborate.streaming_display import _truncate
+
+        heredoc = "cd /repo && python3 -u - <<'PYEOF'\nimport sys\nprint('hi')"
+        out = _truncate(heredoc, max_cells=120)
+        assert "\n" not in out
+        assert "PYEOF" in out and "import sys" in out
+
+    def test_live_line_render_has_no_newline(self):
+        # End-to-end through _render_live: a bash tool_call with a heredoc
+        # command must render as a single physical row.
+        import os as _os
+
+        from external_llm.repl.collaborate import streaming_display as mod
+
+        heredoc = "cd /repo && timeout 90 python3 -u - <<'PYEOF'\nimport sys\nprint('x')"
+        old_cols = mod.shutil.get_terminal_size
+        old_out = sys.stdout
+        disp = None
+        try:
+            # Force a wide terminal so the un-folded hint WOULD have wrapped.
+            mod.shutil.get_terminal_size = lambda *a, **kw: _os.terminal_size((120, 24))
+            fake = io.StringIO()
+            fake.isatty = lambda: True
+            sys.stdout = fake
+            disp = StreamingDisplay()
+            disp.handle_event(
+                SessionEvent(
+                    type="tool_call",
+                    content="bash",
+                    metadata={"tool_name": "bash", "input": {"command": heredoc}},
+                )
+            )
+            rendered = fake.getvalue()
+            # The live line written via \r\x1b[2K must contain no bare newline.
+            assert "\n" not in rendered, rendered
+        finally:
+            if disp is not None:
+                disp.stop()
+            mod.shutil.get_terminal_size = old_cols
+            sys.stdout = old_out
+
+
 class TestMarkdownRendering:
     """Verify final-answer markdown rendering."""
 
@@ -322,3 +388,38 @@ class TestVerdictConfidenceGuard:
         plain = re.sub(r"\x1b\[[0-9;]*m", "", buf.getvalue())
         assert "100%" in plain
         assert "150%" not in plain
+
+
+class TestMarkdownTableFoldPatch:
+    """Verify the ``rich.markdown.TableElement`` fold patch is applied."""
+
+    def test_table_cell_no_ellipsis(self):
+        """Table cells with long content must NOT contain ``"…"`` (fold vs ellipsis)."""
+        md = (
+            "| Command | Description |\n"
+            "|---|---|\n"
+            "| `verylongcommandwithoutspaces` | This is a very long description without any spaces that would normally be truncated |\n"
+            "| `short` | Short desc |\n"
+        )
+        lines = _markdown_lines(md, width=40)
+        assert lines is not None
+        for line in lines:
+            assert "…" not in line, f"fold patch failed: ellipsis found in {line!r}"
+
+    def test_markdown_imports_use_shared_ssot_module(self):
+        """All ``from rich.markdown import`` sites must go through
+        ``external_llm.common.rich_markdown.markdown_cls()``, NOT import
+        ``Markdown`` directly — otherwise the fold patch is silently bypassed.
+        """
+        import subprocess
+        proc = subprocess.run(
+            ["grep", "-rn", r'from rich\.markdown import', "external_llm", "asi.py", "webapp"],
+            capture_output=True, text=True, timeout=10,
+        )
+        # Only legitimate site: the shared module itself (which uses it inside markdown_cls)
+        lines = [l for l in proc.stdout.splitlines() if l.strip() and "rich_markdown.py" not in l]
+        assert not lines, (
+            f"Direct `from rich.markdown import` bypasses the shared module — "
+            f"use `markdown_cls()` from `external_llm.common.rich_markdown` instead. Found:\n"
+            + "\n".join(lines)
+        )

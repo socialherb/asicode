@@ -42,7 +42,6 @@ asi.py::<module>::_list_provider_model_choices::0
 asi.py::<module>::_load_dotenv::0
 asi.py::<module>::_maybe_show_update_notice::0
 asi.py::<module>::_notify_above_prompt::0
-asi.py::<module>::_patch_rich_md_tables_wrap::0
 asi.py::<module>::_prompt_auth_retry_key::0
 asi.py::<module>::_resolve_repo_root::0
 asi.py::<module>::_restart_cli::0
@@ -52,7 +51,7 @@ asi.py::<module>::_run_esc_watcher::1
 asi.py::<module>::_run_with_cancel::0
 asi.py::<module>::_save_key_to_dotenv::2
 asi.py::<module>::_seed_terminal_config::0
-asi.py::<module>::_setup_logging::0
+asi.py::<module>::_setup_logging::1
 asi.py::<module>::_show_result::0
 asi.py::<module>::_show_result::1
 asi.py::<module>::_terminal_config_path::0
@@ -319,9 +318,6 @@ external_llm/agent/symbol_modify_tool.py::<module>::_find_symbol_range_via_trees
 external_llm/agent/symbol_modify_tool.py::<module>::_find_symbol_range_via_treesitter::1
 external_llm/agent/symbol_search.py::<module>::SymbolSearcher::_extract_all_python_symbols::1
 external_llm/agent/symbol_search.py::<module>::SymbolSearcher::_find_subclasses::0
-external_llm/agent/symbol_search.py::<module>::SymbolSearcher::_index_via_treesitter::0
-external_llm/agent/symbol_search.py::<module>::SymbolSearcher::_index_via_treesitter::1
-external_llm/agent/symbol_search.py::<module>::SymbolSearcher::_index_via_treesitter::2
 external_llm/agent/symbol_search.py::<module>::SymbolSearcher::_is_dataclass::1
 external_llm/agent/symbol_search.py::<module>::SymbolSearcher::_nonpy_index_for::0
 external_llm/agent/symbol_search.py::<module>::SymbolSearcher::_nonpy_index_for::1
@@ -400,9 +396,9 @@ external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_rec
 external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_recover_args_from_raw::1
 external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_recover_args_from_raw::2
 external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_tool_anchor_edit::1
-external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_tool_apply_patch::1
-external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_tool_apply_patch::2
-external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_tool_apply_patch::3
+external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_tool_apply_patch_impl::1
+external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_tool_apply_patch_impl::2
+external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_tool_apply_patch_impl::3
 external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_tool_edit_ast::0
 external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_tool_edit_file::3
 external_llm/agent/tool_handlers/write_tools.py::<module>::WriteToolsMixin::_tool_edit_file::4
@@ -423,12 +419,11 @@ external_llm/agent/tool_handlers/write_tools.py::<module>::_find_block_end_line:
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::__del__::0
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_bash_command_segments_via_ts::0
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_bash_command_segments_via_ts::1
-external_llm/agent/tool_registry.py::<module>::ToolRegistry::_dispatch_impl::5
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_has_file_redirect_via_ts::0
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_has_file_redirect_via_ts::1
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_invalidate_cache_after_write::1
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_invalidate_cache_after_write::2
-external_llm/agent/tool_registry.py::<module>::ToolRegistry::_invalidate_cache_after_write::3
+external_llm/agent/tool_registry.py::<module>::ToolRegistry::_invalidate_cache_after_write::4
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_repair_verify_failure::0
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_repair_verify_failure::1
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_repair_verify_failure::2
@@ -532,7 +527,6 @@ external_llm/editor/semantic/libcst_transform_utils.py::<module>::stmt_contains_
 external_llm/editor/semantic/primitive_reconstructor.py::<module>::reconstruct_from_ir::0
 external_llm/editor/semantic/primitive_reconstructor.py::<module>::reconstruct_from_ir::1
 external_llm/editor/semantic/semantic_rewriter.py::<module>::_apply_ops_via_libcst::1
-external_llm/editor/semantic/semantic_tracer.py::<module>::_find_callee_trace_via_resolver::0
 external_llm/editor/semantic/semantic_tracer.py::<module>::extract_trace_from_files::0
 external_llm/editor/semantic/semantic_tracer.py::<module>::extract_trace_from_files::1
 external_llm/editor/semantic/synthesis_planner.py::<module>::plan_synthesis::0
@@ -597,7 +591,7 @@ external_llm/languages/python_provider.py::<module>::PythonSyntaxProvider::find_
 external_llm/languages/python_provider.py::<module>::PythonSyntaxProvider::validate_semantics::4
 external_llm/languages/syntax_validator.py::<module>::SyntaxValidator::find_symbol_in_file::0
 external_llm/languages/tree_sitter_utils.py::<module>::0
-external_llm/languages/tree_sitter_utils.py::<module>::parse_to_tree::0
+external_llm/languages/tree_sitter_utils.py::<module>::_parse_to_tree_uncached::0
 external_llm/languages/typescript_provider.py::<module>::TypeScriptSyntaxProvider::_run_tsc_semantic::4
 external_llm/languages/typescript_provider.py::<module>::TypeScriptSyntaxProvider::_run_tsc_semantic::5
 external_llm/languages/typescript_provider.py::<module>::TypeScriptSyntaxProvider::get_test_command::0

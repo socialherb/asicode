@@ -7,6 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from unittest.mock import patch
+
+from external_llm.agent import symbol_modify_tool as smt
 from external_llm.agent.symbol_modify_tool import (
     _apply_ast_precise,
     _apply_surgical_edit,
@@ -1926,6 +1929,70 @@ class TestBlockPastSymbolBoundaryError:
             assert Path(path).read_text() == original
         finally:
             os.unlink(path)
+
+
+class TestPreWriteGateWithoutToolchain:
+    """The pre-write syntax gate when node/gofmt are NOT installed.
+
+    Regression: JS/TS/Go used to skip the gate entirely without their
+    compiler, so an orphan `}` from a bad symbol-range scan was written
+    straight to disk. They now fall through to the brace-balance check like
+    the other brace languages — which in turn requires JS-aware lexing,
+    because a backtick inside a regex (``.replace(/```/g, "")``) otherwise
+    opens a bogus template literal and voids the tally for the rest of the
+    file. No test covered the toolchain-absent path before.
+    """
+
+    GOOD_JS = 'function a() {\n  return 1;\n}\n'
+    BAD_JS = 'function a() {\n  return 1;\n}\n}\n'
+    GOOD_GO = 'package m\n\nfunc A() int {\n\treturn 1\n}\n'
+    BAD_GO = 'package m\n\nfunc A() int {\n\treturn 1\n}\n}\n'
+
+    @staticmethod
+    def _no_toolchain():
+        return patch.object(smt.shutil, "which", return_value=None)
+
+    @pytest.mark.parametrize("path,good,bad", [
+        ("x.js", GOOD_JS, BAD_JS),
+        ("x.ts", GOOD_JS, BAD_JS),
+        ("x.go", GOOD_GO, BAD_GO),
+    ])
+    def test_orphan_brace_rejected_without_compiler(self, path, good, bad):
+        with self._no_toolchain():
+            assert smt._post_edit_syntax_ok(good, path, good) is True
+            assert smt._post_edit_syntax_ok(bad, path, good) is False
+
+    def test_regex_containing_backtick_does_not_void_the_tally(self):
+        """`.replace(/```/g, "")` must not flip literal parity."""
+        src = (
+            'function f(s) {\n'
+            '  const q = s.replace(/```/g, "");\n'
+            '  return q;\n'
+            '}\n'
+            'function g() {\n'
+            '  return 2;\n'
+            '}\n'
+        )
+        # js_lexing understands the regex; the plain scanner does not.
+        assert net_brace_count(src, js_lexing=True) == 0
+        with self._no_toolchain():
+            assert smt._post_edit_syntax_ok(src, "x.js", src) is True
+            assert smt._post_edit_syntax_ok(src + "}\n", "x.js", src) is False
+
+    def test_regex_with_lone_brace_is_not_a_false_reject(self):
+        """A regex like /[{]/ is balanced code, not a brace-count change."""
+        base = 'function f() {\n  return 1;\n}\n'
+        edited = 'function f() {\n  const re = /[{]/;\n  return re;\n}\n'
+        with self._no_toolchain():
+            assert smt._post_edit_syntax_ok(edited, "x.js", base) is True
+
+    def test_division_is_not_treated_as_a_regex(self):
+        """C-family `/` is division — js_lexing must stay opt-in."""
+        c_src = 'int f(void) { int a = b / c; int d = e / f; return a; }\n'
+        assert net_brace_count(c_src) == 0
+        with self._no_toolchain():
+            assert smt._post_edit_syntax_ok(c_src, "x.c", c_src) is True
+            assert smt._post_edit_syntax_ok(c_src + "}\n", "x.c", c_src) is False
 
 
 if __name__ == "__main__":

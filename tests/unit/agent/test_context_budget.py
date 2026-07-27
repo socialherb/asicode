@@ -1862,19 +1862,24 @@ class TestToolSchemaTokenCacheEviction:
         """After cap(8) entries, the 9th evicts the OLDEST (FIFO), not all."""
         from external_llm.agent._shared_utils import (
             estimate_tokens_from_tool_schemas,
+            _tool_schema_fingerprint,
             _tool_schema_token_cache,
         )
         _tool_schema_token_cache.clear()
-        # Build 9 unique list objects (KEEP ALL alive to avoid id() reuse by GC)
-        lists = [[{"n": i}] for i in range(9)]
+        # Distinct-content schemas (distinct name-sets) are required now that the
+        # key is a content fingerprint (len, names) rather than id(): nameless or
+        # content-equal lists would collide to a single key. Production tool
+        # schemas always carry a ``name``, so this mirrors real usage.
+        lists = [[{"name": f"tool_{i}", "n": i}] for i in range(9)]
         for lst in lists:
             estimate_tokens_from_tool_schemas(lst)
-        # FIFO cap=8 → exactly 8 entries retained; oldest (lists[0]) evicted.
+        # FIFO cap=8 -> exactly 8 entries retained; oldest (lists[0]) evicted.
         assert len(_tool_schema_token_cache) == 8
-        assert id(lists[0]) not in _tool_schema_token_cache, "oldest entry should be evicted"
+        fps = [_tool_schema_fingerprint(lst) for lst in lists]
+        assert fps[0] not in _tool_schema_token_cache, "oldest entry should be evicted"
         # The newest (lists[8]) and a middle entry (lists[4]) must survive.
-        assert id(lists[8]) in _tool_schema_token_cache
-        assert id(lists[4]) in _tool_schema_token_cache
+        assert fps[8] in _tool_schema_token_cache
+        assert fps[4] in _tool_schema_token_cache
 
     def test_cache_hit_for_surviving_entry(self):
         """A surviving entry (within cap) must still hit the cache (no json.dumps)."""
@@ -1886,8 +1891,8 @@ class TestToolSchemaTokenCacheEviction:
         import external_llm.agent._shared_utils as _su
 
         _tool_schema_token_cache.clear()
-        # Fill to cap exactly (8 distinct ids, none evicted).
-        lists = [[{"n": i}] for i in range(8)]
+        # Fill to cap exactly (8 distinct name-sets, none evicted).
+        lists = [[{"name": f"tool_{i}", "n": i}] for i in range(8)]
         for lst in lists:
             estimate_tokens_from_tool_schemas(lst)
         assert len(_tool_schema_token_cache) == 8
@@ -1897,3 +1902,70 @@ class TestToolSchemaTokenCacheEviction:
             hit = estimate_tokens_from_tool_schemas(lists[7])
         mock_dumps.assert_not_called()
         assert hit is not None
+
+
+class TestEstimatorImageOcrAccounting:
+    """``_images_to_text`` writes ``ocr_text`` into each image dict IN PLACE, so
+    the list length never changes.  The fingerprint must track the OCR length
+    too — otherwise the pre-OCR flat estimate stays cached and a Korean-heavy
+    OCR payload is under-counted into a context overflow."""
+
+    def test_cache_invalidated_when_ocr_text_written_in_place(self):
+        from external_llm.agent._shared_utils import _estimate_single_message_tokens
+        msg = LLMMessage(role="user", content="")
+        msg.images = [{"data": "x", "media_type": "image/png"}]
+        before = _estimate_single_message_tokens(msg)
+        # Exactly what providers._images_to_text does: in-place key write,
+        # len(images) unchanged.
+        msg.images[0]["ocr_text"] = "한" * 4000
+        after = _estimate_single_message_tokens(msg)
+        assert after > before, "stale flat estimate returned after in-place OCR write"
+        assert after == 4000 // 2
+
+    def test_flat_cap_is_a_floor_not_a_replacement(self):
+        """Short OCR text must not drop the estimate below the provider cap."""
+        from external_llm.agent._shared_utils import (
+            _estimate_single_message_tokens,
+            _IMAGE_BLOCK_TOKEN_ESTIMATE,
+        )
+        msg = LLMMessage(role="user", content="")
+        msg.images = [{"data": "x", "ocr_text": "hi"}]
+        assert _estimate_single_message_tokens(msg) == _IMAGE_BLOCK_TOKEN_ESTIMATE
+
+    def test_non_dict_image_entries_degrade_instead_of_raising(self):
+        """The estimator must never crash a turn on a malformed images list."""
+        from external_llm.agent._shared_utils import (
+            _estimate_single_message_tokens,
+            _IMAGE_BLOCK_TOKEN_ESTIMATE,
+        )
+        msg = LLMMessage(role="user", content="")
+        msg.images = [{"data": "x"}, "not-a-dict", None]
+        assert _estimate_single_message_tokens(msg) == 3 * _IMAGE_BLOCK_TOKEN_ESTIMATE
+
+
+class TestImagesStayInMemory:
+    """``LLMMessage.images`` dicts carry a base64 payload plus a cached
+    ``ocr_text``, and the token estimator's staleness guard
+    (``_msg_token_fingerprint``) relies on that cache living in the dict.  Both
+    facts assume the dicts are never persisted.  This pins the invariant so a
+    future serialization path fails here instead of silently writing megabytes
+    per turn — and forces a rethink of where the OCR cache lives."""
+
+    def test_no_shipping_code_serializes_message_images(self):
+        import subprocess
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parents[3]
+        # Any dump/serialize call whose argument mentions `.images` or an
+        # images key would show up as these two tokens on one line.
+        hits = subprocess.run(
+            ["git", "grep", "-nE",
+             r"(json\.dump|asdict|pickle\.dump|\.model_dump).*images",
+             "--", "external_llm", "webapp"],
+            cwd=repo, capture_output=True, text=True, timeout=30,
+        )
+        assert hits.stdout == "", (
+            "LLMMessage.images may now be persisted — see the invariant note on "
+            "LLMMessage.images in external_llm/client.py before allowing this:\n"
+            + hits.stdout
+        )

@@ -733,3 +733,64 @@ class TestProviderFallbackPatterns:
         for name, src in cases:
             pat = sp.regex.replace("{name}", re.escape(name))
             assert re.search(pat, src), f"Scala def {name!r} must match: {src!r}"
+
+
+# ── index_was_truncated: distinguish "absent" from "not indexed" ────────────
+# find_symbol returns ok=True with an empty list both when a symbol genuinely
+# does not exist AND when the file index was truncated at the cap. The
+# index_was_truncated() method lets callers annotate the empty result so the
+# agent does not wrongly conclude "symbol does not exist" (fail-silent).
+
+class TestIndexWasTruncated:
+    def test_false_when_full_tree_indexed(self, tmp_path):
+        """A small repo (well under the cap) is never truncated."""
+        (tmp_path / "a.py").write_text("x = 1\n")
+        (tmp_path / "b.py").write_text("y = 2\n")
+        searcher = SymbolSearcher(str(tmp_path))
+        # Trigger a walk by searching for a (missing) symbol.
+        searcher.find_symbol("does_not_exist")
+        assert searcher.index_was_truncated() is False
+
+    def test_true_when_walk_hit_the_cap(self, tmp_path, monkeypatch):
+        """When the walk hits the file cap, index_was_truncated() must report
+        True so a subsequent find_symbol miss can be annotated as unreliable."""
+        import external_llm.agent.symbol_search as ss
+        import external_llm.agent._shared_utils as su
+
+        # More files than the cap; name them so they are all distinct .py files.
+        for i in range(6):
+            (tmp_path / f"mod{i}.py").write_text(f"v{i} = {i}\n")
+        # Clear the per-root cache so the patched cap governs the walk.
+        su._PY_WALK_CACHE.clear()
+        monkeypatch.setattr(ss, "_MAX_PY_FILES", 3)
+
+        searcher = SymbolSearcher(str(tmp_path))
+        searcher.find_symbol("missing_symbol")  # forces a walk
+        assert searcher.index_was_truncated() is True, (
+            "walk that hit the cap must report index_was_truncated=True"
+        )
+
+    def test_unknown_symbol_in_truncated_index_is_flagged(self, tmp_path, monkeypatch):
+        """The end-to-end property: a symbol that exists in an UN-indexed file
+        (beyond the cap) yields a find_symbol miss AND index_was_truncated=True.
+        This is exactly the scenario where the agent must be told 'may exist in
+        un-indexed files' rather than 'does not exist'."""
+        import external_llm.agent.symbol_search as ss
+        import external_llm.agent._shared_utils as su
+
+        src = tmp_path / "src"
+        src.mkdir()
+        # a.py .. e.py each define a uniquely-named symbol; cap=2 means only
+        # the first ~2 files are indexed, so symbols in later files are missed.
+        for i in range(5):
+            (src / f"f{i}.py").write_text(f"def unique_sym_{i}():\n    pass\n")
+        su._PY_WALK_CACHE.clear()
+        monkeypatch.setattr(ss, "_MAX_PY_FILES", 2)
+
+        searcher = SymbolSearcher(str(tmp_path))
+        # A symbol that DOES exist, but in a file beyond the cap → not found.
+        defs = searcher.find_symbol("unique_sym_4")
+        assert defs == [], "symbol in un-indexed file must be missed"
+        assert searcher.index_was_truncated() is True, (
+            "miss must be flagged as unreliable (index truncated)"
+        )

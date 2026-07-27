@@ -2276,6 +2276,70 @@ class PatchEngine:
             except OSError as exc:
                 logger.error("tolerant_git_apply: rollback of %s failed: %s", path, exc)
 
+    @staticmethod
+    def context_free_hunks(patch_text: str) -> list[str]:
+        """``"file @@hdr"`` for every hunk carrying NO context line.
+
+        Such a hunk is placed purely by its line number, and nothing downstream
+        can check that number. ``_verify_c0_placement`` says so itself — it
+        skips them because there is no context to match the file against — but
+        the exposure is wider than that method's name suggests: a hunk with no
+        context has nothing to match on ANY strategy, so it is placed blind by
+        the very first ``git apply`` in the ladder, never reaching the ``-C0``
+        path the verifier guards.
+
+        Nothing else catches it either. A stale line number quietly relocates
+        the insert, and if the result is still parseable the post-write syntax
+        gate passes it: measured, ``@@ -8,0 +9,2 @@`` landed two statements
+        after a ``return``, producing unreachable code that compiled fine and
+        reported ok=True. So this is reported rather than refused — a
+        context-free hunk is legitimate output for ``diff -U0``, and refusing
+        would break working callers to catch a malformed minority. The agent
+        gets told which hunks were unverifiable and can re-read the file.
+
+        New files are excluded: there is no prior content to misplace against.
+        """
+        out: list[str] = []
+        cur: Optional[str] = None
+        cur_is_new = False
+        hdr: str = ""
+        body: Optional[list[str]] = None
+
+        def _flush() -> None:
+            if body is not None and cur and not cur_is_new:
+                if not any(ln[:1] == " " for ln in body):
+                    out.append(f"{cur} {hdr}".strip())
+
+        for line in patch_text.splitlines():
+            if line.startswith("diff --git ") or line.startswith("--- "):
+                _flush(); body = None
+                cur_is_new = line.startswith("--- /dev/null")
+                continue
+            if line.startswith("+++ "):
+                _flush(); body = None
+                p = line[4:].strip()
+                if p.startswith("b/"):
+                    p = p[2:]
+                cur = None if p == "/dev/null" else p
+                continue
+            if line.startswith("@@"):
+                _flush()
+                hdr = line.split("@@")[1].join(["@@", "@@"]) if "@@" in line[2:] else line
+                body = [] if cur is not None else None
+                continue
+            if body is None:
+                continue
+            if line[:1] in (" ", "+", "-"):
+                body.append(line)
+            elif line == "":
+                body.append(" ")
+            elif line.startswith("\\"):
+                continue
+            else:
+                _flush(); body = None
+        _flush()
+        return out
+
     def _verify_c0_placement(self, patch_text: str) -> tuple[bool, str]:
         """Content-verify hunk placement after a ``-C0`` (context-free) git apply.
 

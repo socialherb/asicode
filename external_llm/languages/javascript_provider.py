@@ -93,9 +93,9 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
                 logger.debug("node not installed; falling back to tree-sitter")
                 return tree_sitter_syntax_fallback(content, LanguageId.JAVASCRIPT, file_path)
             except subprocess.TimeoutExpired:
-                return SyntaxValidationResult(ok=True, language=LanguageId.JAVASCRIPT)
+                return tree_sitter_syntax_fallback(content, LanguageId.JAVASCRIPT, file_path)
             except Exception:
-                return SyntaxValidationResult(ok=True, language=LanguageId.JAVASCRIPT)
+                return tree_sitter_syntax_fallback(content, LanguageId.JAVASCRIPT, file_path)
 
             if proc.returncode == 0:
                 return SyntaxValidationResult(ok=True, language=LanguageId.JAVASCRIPT)

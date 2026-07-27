@@ -1,23 +1,46 @@
 from __future__ import annotations
 
+import re
+from functools import lru_cache
 from typing import Optional
 
 from external_llm.agent.language_hint import _HANGUL_END, _HANGUL_START
 
+# Identifier scanner (see _extract_identifiers).  Two alternatives, Hangul
+# FIRST so a Hangul run terminates at the first non-Hangul char instead of
+# being swallowed by the ``\w*`` tail ("로그인test" → 로그인 + test).
+#
+#   [가-힣]+     one Hangul run (U+AC00-U+D7A3, matching _HANGUL_START/_END)
+#   [^\W\d]\w*   identifier: start = word-char that is not a decimal digit,
+#                tail = word-chars.  In Python's re, ``\w`` is exactly
+#                "str.isalnum() or '_'", so the tail matches the char scan
+#                verbatim; ``\d`` is category Nd only, so the START class is
+#                slightly wider than ``str.isalpha() or '_'`` — reconciled by
+#                the re-scan guard in _extract_identifiers.
+_IDENT_RE = re.compile(r"[가-힣]+|[^\W\d]\w*")
 
-def _extract_identifiers(text: str) -> list[str]:
-    """Extract identifier-like tokens via char scan (replaces ``re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*")``)."""
+
+def _scan_identifiers(text: str) -> list[str]:
+    """Reference char-scan implementation of :func:`_extract_identifiers`.
+
+    Kept as the exactness oracle for the regex fast path: it is the only place
+    that expresses "identifier start = ``str.isalpha()`` or ``_``" precisely,
+    which no ``re`` character class can (``re`` has no Unicode-category
+    escapes).  Called from the fast path only for the rare match that begins
+    with a non-alphabetic word char, and from the equivalence test.
+    """
     if not text:
         return []
     tokens: list[str] = []
     i = 0
-    while i < len(text):
+    n = len(text)
+    while i < n:
         ch = text[i]
         # Hangul run
         if _HANGUL_START <= ch <= _HANGUL_END:
             start = i
             i += 1
-            while i < len(text) and _HANGUL_START <= text[i] <= _HANGUL_END:
+            while i < n and _HANGUL_START <= text[i] <= _HANGUL_END:
                 i += 1
             tokens.append(text[start:i])
             continue
@@ -25,7 +48,7 @@ def _extract_identifiers(text: str) -> list[str]:
         if ch.isalpha() or ch == '_':
             start = i
             i += 1
-            while i < len(text) and (text[i].isalnum() or text[i] == '_'):
+            while i < n and (text[i].isalnum() or text[i] == '_'):
                 i += 1
             tokens.append(text[start:i])
             continue
@@ -33,11 +56,45 @@ def _extract_identifiers(text: str) -> list[str]:
     return tokens
 
 
-def _split_camel_case(token: str) -> list[str]:
-    """Split CamelCase token into parts: ``XMLParser`` → ``['XML', 'Parser']``.
-    Pure char-by-char scanner — no regex dependencies."""
-    if not token:
+def _extract_identifiers(text: str) -> list[str]:
+    """Extract identifier-like tokens (Latin/Unicode identifiers + Hangul runs).
+
+    Regex-driven: the equivalent char-by-char scan (:func:`_scan_identifiers`)
+    burned ~8.6s of self time and ~34M ``len()`` calls building this repo's own
+    BM25 index, because every character cost several Python-level method calls.
+    ``re`` runs the same scan in C.
+
+    Exactness: ``_IDENT_RE``'s start class ``[^\\W\\d]`` excludes decimal digits
+    (Nd) but NOT the two other numeric categories — Nl (``Ⅷ``) and the No
+    digits (``①``, ``²``) — which ``str.isalpha()`` rejects.  Such a character
+    would start a token here but be skipped by the scanner, so any match not
+    beginning with a letter/underscore is re-scanned with the oracle.  Those
+    characters occur only in prose/decorative comments, so the guard costs one
+    ``str.isalpha()`` per token and fires essentially never.
+    """
+    if not text:
         return []
+    tokens: list[str] = []
+    for tok in _IDENT_RE.findall(text):
+        first = tok[0]
+        if first.isalpha() or first == '_':
+            tokens.append(tok)
+        else:
+            # Nl/No lead char: the scanner skips it and restarts after, which
+            # can also re-expose a Hangul boundary ("①로그인test").
+            tokens.extend(_scan_identifiers(tok))
+    return tokens
+
+
+def _scan_camel_case(token: str) -> tuple[str, ...]:
+    """Split a CamelCase token: ``XMLParser`` → ``('XML', 'Parser')``.
+
+    Returns a tuple because :func:`_split_camel_case_cached` shares one result
+    object across every caller — a list would let a single in-place mutation
+    poison the cache for the process lifetime.
+    """
+    if not token:
+        return ()
     parts: list[str] = []
     start = 0
     for i in range(1, len(token)):
@@ -56,7 +113,25 @@ def _split_camel_case(token: str) -> list[str]:
             parts.append(token[start:i])
             start = i
     parts.append(token[start:])
-    return [p for p in parts if p]  # drop empties
+    return tuple(p for p in parts if p)  # drop empties
+
+
+# Identifiers repeat heavily in source code — measured 19.1x (401k occurrences,
+# 21k distinct) across this repo — so the split is memoised rather than redone
+# per occurrence.  The cap bounds a long-lived process indexing many repos;
+# distinct-identifier counts sit well under it for a single tree, so the LRU
+# behaves as a plain memo in the common case.
+_split_camel_case_cached = lru_cache(maxsize=100_000)(_scan_camel_case)
+
+
+def _split_camel_case(token: str) -> list[str]:
+    """List-returning wrapper over the memoised splitter.
+
+    Copies out of the shared tuple so callers keep a mutable, private result.
+    The hot path (:meth:`CodeTokenizer.tokenize`) only iterates, so it uses
+    ``_split_camel_case_cached`` directly and skips this copy.
+    """
+    return list(_split_camel_case_cached(token))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -85,12 +160,16 @@ class CodeTokenizer:
     ``_tokenize_request`` (relevance_scorer), ``_tokenize`` (rag_searcher), and
     ``_extract_symbol_candidates`` (context_packs).
 
+    Every emitted form is kept — the joined identifier AND its parts — so a
+    query for either matches.  Parts that are stop words are dropped, which is
+    why ``is`` does not appear below.
+
     Usage::
 
         tok = CodeTokenizer()
-        tok.tokenize("isAsync")         # -> ["is", "async"]
-        tok.tokenize("XMLParser")       # -> ["xml", "parser"]
-        tok.tokenize("is_async")        # -> ["is", "async"]
+        tok.tokenize("isAsync")         # -> ["async", "isasync"]
+        tok.tokenize("XMLParser")       # -> ["parser", "xml", "xmlparser"]
+        tok.tokenize("is_async")        # -> ["async", "is_async"]
         tok.tokenize("로그인")           # -> ["로그인"] (Korean)
     """
 
@@ -112,6 +191,10 @@ class CodeTokenizer:
         self.min_token_len = min_token_len
         self._split_underscore = split_underscore
         self._split_camel = split_camel
+        # Per-instance memo of a raw token's sorted sub-forms (see ``tokenize``).
+        # Config is fixed at construction, so a token's expansion is a pure
+        # function of the token within an instance.
+        self._token_cache: dict[str, list[str]] = {}
 
     def tokenize(self, text: str) -> list[str]:
         """Tokenize text into filtered, lowercased tokens.
@@ -122,36 +205,60 @@ class CodeTokenizer:
         if not text:
             return []
 
-        # Step 1: Extract raw identifier tokens (char scanner, no regex)
+        # Step 1: Extract raw identifier tokens
         raw_tokens = _extract_identifiers(text)
 
-        # Step 2: Sub-split each raw token
+        # Step 2: Sub-split each raw token. A token's sub-forms are a pure
+        # function of the token given this instance's (immutable) config, so
+        # memoise per-instance: identifiers repeat heavily across source
+        # (measured ~96% hit rate over a 1139-file index) and this collapses
+        # the per-token set()/sorted() into a single dict lookup. The cache is
+        # bounded by the vocabulary, which is far smaller than occurrence
+        # counts, so it stays flat over a build. Mirrors the existing
+        # _split_camel_case_cached memo one level down.
         result: list[str] = []
+        cache = self._token_cache
         for token in raw_tokens:
-            t_lower = token.lower()
-            sub_tokens: set[str] = set()
-
-            # Original token (if meaningful)
-            if len(t_lower) >= self.min_token_len and t_lower not in self.stop_words:
-                sub_tokens.add(t_lower)
-
-            # CamelCase split: "isAsync" → {is, async}, "XMLParser" → {xml, parser}
-            if self._split_camel and token.isascii():
-                parts = _split_camel_case(token)
-                for p in parts:
-                    p_lower = p.lower()
-                    if len(p_lower) >= self.min_token_len and p_lower not in self.stop_words:
-                        sub_tokens.add(p_lower)
-
-            # Underscore split: "is_async" → {is, async}
-            if self._split_underscore and "_" in t_lower:
-                for part in t_lower.split("_"):
-                    if len(part) >= self.min_token_len and part not in self.stop_words:
-                        sub_tokens.add(part)
-
-            result.extend(sorted(sub_tokens))
+            sub = cache.get(token)
+            if sub is None:
+                sub = self._expand_token(token)
+                cache[token] = sub
+            result.extend(sub)
 
         return result
+
+    def _expand_token(self, token: str) -> list[str]:
+        """Lowercased, filtered sub-token forms of one raw token, sorted.
+
+        Pure function of ``token`` for a given (construction-time) config, so
+        ``tokenize`` memoises its result per-instance. ``tokenize`` only reads
+        the returned list (``extend``), so sharing one cached object across
+        occurrences is safe.
+        """
+        t_lower = token.lower()
+        sub_tokens: set[str] = set()
+
+        # Original token (if meaningful)
+        if len(t_lower) >= self.min_token_len and t_lower not in self.stop_words:
+            sub_tokens.add(t_lower)
+
+        # CamelCase split: "isAsync" → {is, async}, "XMLParser" → {xml, parser}
+        if self._split_camel and token.isascii():
+            # Cached (tuple) form: this loop only reads, so it must not pay
+            # for the defensive copy _split_camel_case makes.
+            parts = _split_camel_case_cached(token)
+            for p in parts:
+                p_lower = p.lower()
+                if len(p_lower) >= self.min_token_len and p_lower not in self.stop_words:
+                    sub_tokens.add(p_lower)
+
+        # Underscore split: "is_async" → {is, async}
+        if self._split_underscore and "_" in t_lower:
+            for part in t_lower.split("_"):
+                if len(part) >= self.min_token_len and part not in self.stop_words:
+                    sub_tokens.add(part)
+
+        return sorted(sub_tokens)
 
 
 

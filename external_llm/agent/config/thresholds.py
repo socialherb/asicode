@@ -114,6 +114,27 @@ class LineLimits:
     STRATEGY_CHARS_PER_TOKEN: float = 3.5
     UI_FULL_MAX_LINES: int = 1000
 
+    # ── read_file output budget ──────────────────────────────────────────
+    # Largest file read_file returns in full when the model passes no line
+    # range. 200 -> 800: the median module in this repo is 281 lines, so the
+    # old cap made the MEDIAN file cost two round-trips (59% of files here
+    # exceeded 200; 21% exceed 800). The model had to pick a range with no
+    # idea what was where, so it usually guessed twice. Over the cap the tool
+    # now returns the file outline instead of a bare line count, so one extra
+    # call is enough and it is an informed one.
+    READ_FILE_FULL_LINES: int = 800
+    # Hard ceiling on emitted content, applied to EVERY read_file path —
+    # including an explicit start_line/end_line, which previously had no cap
+    # at all: `end_line=999999` on a 6.4K-line module returned ~388K chars
+    # (~130K tokens), enough to blow the whole context window in one call.
+    # Sized like BASH_OUTPUT_MAX_CHARS for worst-case token density (~2
+    # chars/token for dense ASCII => ~30K tokens), not for prose.
+    READ_FILE_MAX_CHARS: int = 60_000
+    # Symbols listed in the over-cap outline before truncating. Enough to
+    # cover a large module's public surface without the outline itself
+    # becoming the thing that costs a round-trip.
+    READ_FILE_OUTLINE_MAX_SYMBOLS: int = 60
+
     # Budget for RTP-lite lightweight file preview.
     # 8K → 24K: enough for small-to-medium projects (2-4 files ~20K chars)
     # without losing the "lite" character versus full RTP (30K default).
@@ -302,9 +323,9 @@ class CountLimits:
     AGENT_NO_TOOL_NUDGE_MAX: int = 3
     AGENT_NO_PROGRESS_THRESHOLD: int = 5
     AGENT_FAIL_LOOP_LARGE: int = 3
-    SYMBOL_MAX_PY_FILES: int = 600
-    SYMBOL_MAX_TS_FILES: int = 300
-    RAG_MAX_FILES: int = 600
+    SYMBOL_MAX_PY_FILES: int = 3000
+    SYMBOL_MAX_TS_FILES: int = 1500
+    RAG_MAX_FILES: int = 3000
     AST_CACHE_MAX: int = 16
     ROUTING_POLICY_CACHE_TTL_S: float = 300.0
     RUN_STORE_TOP_K: int = 3

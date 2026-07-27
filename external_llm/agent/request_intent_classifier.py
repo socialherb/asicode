@@ -38,6 +38,13 @@ _ROUTING_INTENT_NORMALIZE: dict = {
     "refactor": "explore_and_edit", "exploration": "explore_and_edit",
     "modify": "explore_and_edit", "extend": "explore_and_edit",
     "create": "explore_and_edit",
+    # IntentResult default / classification-failure sentinel (IntentResolver emits
+    # intent_type="unknown" on every failure path: LLM-unavailable, parse failure,
+    # empty request — intent_models.py:41). NOT label drift: it is an internal
+    # first-class sentinel, not an LLM-output spelling variation. All failure paths
+    # also set lane_hint ∈ {"planner","main_agent"} → routing already resolves to
+    # explore_and_edit, so this entry changes ONLY the drift-warning noise, not behavior.
+    "unknown": "explore_and_edit",
     "question": "question",  # recognized (handled in routing_intent_from_intent_result)
 }
 
@@ -67,6 +74,41 @@ def normalize_routing_label(label: str) -> str:
 def is_non_edit_intent(intent: RoutingIntent) -> bool:
     """True when the agent must not run normal patch/write execution modes."""
     return intent != "explore_and_edit"
+
+
+# ``IntentResolver`` metadata sources that mean "classification never happened".
+# All three are failure paths, not classifications: minimal_fallback (LLM call
+# raised / no client), llm_parse_failed (response was not parseable JSON),
+# empty_request (nothing to classify). See intent_resolver.py:791-830.
+_UNDETERMINED_INTENT_SOURCES = frozenset({
+    "minimal_fallback", "llm_parse_failed", "empty_request",
+})
+
+
+def intent_is_undetermined(intent_result: object) -> bool:
+    """True when intent resolution never produced a real classification.
+
+    ``routing_intent_from_intent_result`` maps every failure path to
+    ``explore_and_edit`` so a legitimate edit is never blocked — that default is
+    correct for *permission*. It is wrong for *expectation*: the caller cannot
+    conclude "the user asked for an edit" from a result the resolver failed to
+    produce, and a gate that fires on an unproven premise is a false-positive
+    machine. This predicate separates the two so only permission keeps the
+    edit-leaning default.
+
+    Concretely it distinguishes a real ``intent_type="unknown"`` classification
+    from the failure paths that also emit ``"unknown"`` — the sentinel alone
+    cannot tell them apart (see ``_ROUTING_INTENT_NORMALIZE["unknown"]``), which
+    is why the metadata source is the signal.
+
+    ``None`` (router never attached an ``IntentResult``) is undetermined too.
+    """
+    if intent_result is None:
+        return True
+    _meta = getattr(intent_result, "metadata", None)
+    if isinstance(_meta, dict):
+        return str(_meta.get("source", "")) in _UNDETERMINED_INTENT_SOURCES
+    return False
 
 
 def routing_intent_from_intent_result(intent_result: object) -> RoutingIntent:
