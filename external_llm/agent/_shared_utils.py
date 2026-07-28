@@ -206,6 +206,23 @@ _WALK_CACHE_TTL: float = 30.0
 # eviction under the GIL stays consistent with the lock-free, single-threaded
 # design; the current repo is the newest entry, stale repos are evicted first.
 _WALK_CACHE_MAX_ENTRIES: int = 8
+# Generation counters — bumped by post-write invalidation so a walk that was
+# already in flight cannot resurrect its pre-write result into the cache (the
+# `pop()` alone loses the race: it runs while os.walk is still collecting, and
+# the store that follows re-inserts the stale list under a FRESH timestamp, so
+# the staleness lasts a full TTL rather than being cut short).
+#
+# A single-element LIST, not a bare int, and that is load-bearing twice over:
+#   * cross-module — the invalidator reaches these via ``from _shared_utils
+#     import _PY_WALK_GEN``, and ``+= 1`` on an imported int rebinds only the
+#     importer's local, leaving this module's value at 0. Silently. Mutating a
+#     shared list element is visible to every holder without ``global``.
+#   * in-module — ``_walk_repo_files`` reads the counter before the walk and
+#     again before the store, so it needs the counter OBJECT, not a copy of the
+#     value taken at call time.
+# Both mistakes are no-ops that read as working code, so keep the list.
+_PY_WALK_GEN: list[int] = [0]
+_TS_WALK_GEN: list[int] = [0]
 # 3‑tuple: (timestamp, files, was_truncated).  ``was_truncated`` is True when
 # the walk exited early because ``max_files`` was reached — on cache hit the
 # caller's own cap must be checked (no truncated list may masquerade as a full
@@ -256,7 +273,7 @@ def _walk_should_skip_dir(d: str) -> bool:
     )
 
 
-def _walk_repo_files(root, max_files: int, cache: dict, keep) -> list:
+def _walk_repo_files(root, max_files: int, cache: dict, keep, gen_counter: list[int]) -> list:
     """Shared walk engine behind :func:`_walk_py_files` / :func:`_walk_ts_js_files`.
 
     Returns every file under *root* for which ``keep(name)`` is true, skipping
@@ -267,6 +284,14 @@ def _walk_repo_files(root, max_files: int, cache: dict, keep) -> list:
     tree can't exhaust memory/time before the caller's cap check runs, and
     memoizes the result in *cache* (per-root, TTL-bounded via
     :data:`_WALK_CACHE_TTL`, FIFO-bounded via :func:`_capped_put`).
+
+    *gen_counter* is the caller's generation counter ITSELF — pass
+    ``_PY_WALK_GEN``, never ``[_PY_WALK_GEN]``. Wrapping it builds a private
+    box holding a copy of the value, so the re-check below compares a snapshot
+    against itself and can never fire (that shipped once, inert but
+    reading as correct). Read before the slow walk; if it moves while we
+    collect, an invalidation landed mid-flight and the result must NOT be
+    cached. See :data:`_PY_WALK_GEN`.
 
     The two callers pass *distinct* caches so an extension set never
     masquerades as the other, and a single ``os.walk`` pass per extension set
@@ -290,6 +315,10 @@ def _walk_repo_files(root, max_files: int, cache: dict, keep) -> list:
             # Truncated and the cached result doesn't have enough files for this
             # caller's cap — re-walk to collect the required number.
 
+    # Read generation BEFORE the slow os.walk — if invalidation bumps it while
+    # we collect, the result is stale and must NOT be cached.
+    _gen_before = gen_counter[0]
+
     results: list = []
     _was_truncated = False
     for dirpath, dirnames, filenames in os.walk(root):
@@ -309,6 +338,8 @@ def _walk_repo_files(root, max_files: int, cache: dict, keep) -> list:
                 results.append(Path(dirpath) / name)
                 if len(results) >= max_files:
                     _was_truncated = True
+                    if gen_counter[0] != _gen_before:
+                        return list(results[:max_files])  # invalidated mid-walk
                     _capped_put(cache, key, (_walk_time.monotonic(), results, True))
                     _warn_walk_truncated(key, max_files, len(results))
                     # Slice + shallow-copy, mirroring the cache-HIT path above. Without
@@ -317,6 +348,8 @@ def _walk_repo_files(root, max_files: int, cache: dict, keep) -> list:
                     # for every subsequent caller — the invariant documented at the HIT
                     # path must hold on both paths.
                     return list(results[:max_files])
+    if gen_counter[0] != _gen_before:
+        return list(results[:max_files])  # invalidated mid-walk
     _capped_put(cache, key, (_walk_time.monotonic(), results, _was_truncated))
     # See note above: return a copy, not the cached object.
     return list(results[:max_files])
@@ -327,7 +360,7 @@ def _walk_py_files(root, max_files: int) -> list:
 
     Results are cached per root for ``_WALK_CACHE_TTL`` seconds.
     """
-    return _walk_repo_files(root, max_files, _PY_WALK_CACHE, lambda n: n.endswith(_PY_EXTENSIONS))
+    return _walk_repo_files(root, max_files, _PY_WALK_CACHE, lambda n: n.endswith(_PY_EXTENSIONS), _PY_WALK_GEN)
 
 
 def _walk_ts_js_files(root, max_files: int) -> list:
@@ -339,8 +372,44 @@ def _walk_ts_js_files(root, max_files: int) -> list:
     ``.tsx`` — the primary source files of a TypeScript project.
     """
     return _walk_repo_files(
-        root, max_files, _TS_WALK_CACHE, lambda n: n.endswith(_TS_JS_EXTENSIONS)
+        root, max_files, _TS_WALK_CACHE, lambda n: n.endswith(_TS_JS_EXTENSIONS), _TS_WALK_GEN
     )
+
+
+def invalidate_walk_caches() -> None:
+    """Drop the file-walk caches so a just-written file is visible.
+
+    Both layers must move together, which is the whole reason this lives here
+    rather than in ``tool_registry``: dropping the entries without bumping the
+    generation leaves an in-flight walk free to re-insert its pre-write result
+    (see :data:`_PY_WALK_GEN`). Callers should not have to know that — the same
+    reasoning ``SymbolSearcher.invalidate_nonpy_caches`` records for its own
+    two-layer drop.
+
+    Clears EVERY entry, and takes no root, because these caches are not keyed by
+    the repo root — they are keyed by whatever root was walked.
+    ``find_symbol(..., search_path="external_llm/agent")`` resolves that to a
+    SUBDIRECTORY (``SymbolSearcher._resolve_search_root``) and caches under it,
+    so a caller popping one repo-root key left every scoped entry behind:
+    measured, a repo-root pop cleared 1 of 2 live keys, and the surviving
+    subtree entry then answered a scoped find_symbol with a pre-write file list
+    for the full TTL. That is the "cannot find the symbol it just wrote" symptom
+    this fan-out exists to kill, and the generation counter cannot catch it —
+    the counter only stops an in-flight walk from storing, never an entry that
+    is already stored.
+
+    Wholesale is also what makes the root moot: the two callers disagreed on
+    ``repo_root`` vs ``_effective_repo_root``, and neither matched the searcher's
+    own root reliably. Cost is bounded — ``_WALK_CACHE_MAX_ENTRIES`` caps these
+    at 8 entries, and the generation counter is already process-wide, so this
+    adds no over-invalidation that was not already accepted. The sibling that
+    got this right from the start is ``invalidate_nonpy_caches``, which likewise
+    clears rather than pops.
+    """
+    for _cache in (_PY_WALK_CACHE, _TS_WALK_CACHE):
+        _cache.clear()
+    for _gen in (_PY_WALK_GEN, _TS_WALK_GEN):
+        _gen[0] += 1
 
 
 def make_tool_signature(tool_name: str, tool_args: Any) -> str:
@@ -1864,6 +1933,81 @@ _WIRE_CONTENT_KEY_MARKERS: dict[str, Any] = {
     'functionResponse': _tok_function_response,
 }
 
+# ── Intra-type drift guard ───────────────────────────────────────────────────
+# The fail-safes above catch an unknown block TYPE and an untyped Gemini part.
+# Neither catches drift INSIDE a known type: a registered tokenizer's answer was
+# final, so a payload arriving under a key that tokenizer does not read counted
+# as ~0.  Measured before this guard: a `thinking` block's `signature` — which
+# Anthropic sends on EVERY extended-thinking block and which this client mirrors
+# back verbatim (anthropic_client.py appends `raw_content` unchanged) — counted 0
+# tokens at 615 chars; a 40 KB payload under `thinking.summary` or
+# `tool_use.partial_json` (a real streaming field) likewise counted 0 and 4.
+# That is the same silent under-count, and the same context-overflow 400, that
+# the unknown-type fail-safe exists to prevent.
+#
+# So: each tokenizer declares the keys it consumes, and whatever is left over is
+# counted wholesale. Drift then fails toward OVER-counting, matching the policy
+# the rest of this subsystem already follows.
+_WIRE_BLOCK_CONSUMED_KEYS: dict[str, frozenset[str]] = {
+    'tool_use': frozenset({'input', 'name'}),
+    'tool_result': frozenset({'content'}),
+    'thinking': frozenset({'thinking'}),
+    'redacted_thinking': frozenset({'data'}),
+    'functionCall': frozenset({'functionCall', 'function_call'}),
+    'functionResponse': frozenset({'functionResponse', 'function_response'}),
+    # image is a flat provider-cap estimate that deliberately ignores the
+    # base64 payload (see _IMAGE_BLOCK_TOKEN_ESTIMATE) — counting `source`
+    # wholesale would reintroduce the ~130k-token screenshot it exists to avoid.
+    'image': frozenset({'source', 'data'}),
+}
+
+# Keys that are pure wire structure. They ride along on every block and carry no
+# payload, so counting them would inflate every correct-shape estimate without
+# protecting against anything. `text` is here because the generic text pre-pass
+# in _estimate_single_message_tokens already counted it for EVERY block type.
+_WIRE_STRUCTURAL_KEYS: frozenset[str] = frozenset({
+    'type', 'index', 'cache_control', 'text',
+})
+
+# Keys that a tokenizer does not read but that legitimately ride on the block.
+# They are COUNTED (they are on the wire and billed) but never WARNED about:
+# they are not drift, they are fields the tokenizers were simply never taught.
+# Warning on them would make the drift counter fire on every single request and
+# turn a signal that exists to catch a real regression into constant noise.
+_WIRE_EXPECTED_EXTRA_KEYS: dict[str, frozenset[str]] = {
+    'tool_use': frozenset({'id'}),
+    'tool_result': frozenset({'tool_use_id', 'is_error'}),
+    # Anthropic sends `signature` on every extended-thinking block and this
+    # client mirrors it back unchanged, so it is billed on every such turn.
+    # Counting it is the leak this guard was written for; it is expected, so it
+    # must not also raise a drift warning forever.
+    'thinking': frozenset({'signature'}),
+    'redacted_thinking': frozenset({'signature'}),
+}
+
+
+def _count_unconsumed_payload(block: dict, btype: str) -> tuple[int, tuple[str, ...]]:
+    """Tokens in *block* its tokenizer did not read, and which of those are drift.
+
+    Returns ``(tokens, drift_keys)``. Everything unconsumed is counted; only the
+    keys that are neither consumed nor expected are reported as drift, so the
+    warning stays a regression signal rather than a per-request refrain.
+    ``drift_keys`` is empty in the overwhelmingly common case, established by one
+    set difference.
+    """
+    consumed = _WIRE_BLOCK_CONSUMED_KEYS.get(btype)
+    if consumed is None:
+        return 0, ()
+    residual = {
+        k: v for k, v in block.items()
+        if k not in consumed and k not in _WIRE_STRUCTURAL_KEYS and v not in (None, '', [], {})
+    }
+    if not residual:
+        return 0, ()
+    expected = _WIRE_EXPECTED_EXTRA_KEYS.get(btype, frozenset())
+    drift = tuple(sorted(k for k in residual if k not in expected))
+    return _cjk_tokens_from_jsonable(residual), drift
+
 # The canonical set of wire block types this subsystem must recognise.  The
 # contract test asserts the registry covers exactly this set.  When a provider
 # adds a new type, add its fixture here AND register a tokenizer.
@@ -1914,6 +2058,31 @@ def _warn_unknown_block_type(btype: str) -> None:
             "counted wholesale (fail-safe). Add it to _WIRE_BLOCK_TOKENIZERS in "
             "external_llm/agent/_shared_utils.py and update CANONICAL_WIRE_BLOCK_TYPES.",
             btype,
+        )
+
+
+def _warn_block_key_drift(btype: str, key: str) -> None:
+    """Record a payload key a registered tokenizer does not read.
+
+    Shares the counter and the one-time-per-entry discipline with
+    :func:`_warn_unknown_block_type` (entries are namespaced ``type.key``, which
+    cannot collide with a bare type name), but says something different: the
+    block type IS known, so the fix is to teach its tokenizer — or, if the key
+    is expected and simply unread, to list it in
+    ``_WIRE_EXPECTED_EXTRA_KEYS`` so it stops being reported as drift.
+    """
+    entry = f"{btype}.{key}"
+    with _unknown_block_types_lock:
+        prev = _warned_unknown_block_types.get(entry, 0)
+        _warned_unknown_block_types[entry] = prev + 1
+        should_warn = prev == 0
+    if should_warn:
+        logger.warning(
+            "LLM content-block %r carries payload key %r that its tokenizer does not "
+            "read — counted wholesale (fail-safe). Teach the %s tokenizer to read it, "
+            "or add it to _WIRE_EXPECTED_EXTRA_KEYS in "
+            "external_llm/agent/_shared_utils.py if it is expected.",
+            btype, key, btype,
         )
 
 
@@ -2111,6 +2280,15 @@ def _estimate_single_message_tokens(m: object) -> int:
                         break
             if tokenizer is not None:
                 mt += tokenizer(block)
+                # A registered tokenizer reads the keys it knows; anything else
+                # on the block is still on the wire and still billed. Counting
+                # the residual is what keeps intra-type drift from going silent
+                # (see _WIRE_BLOCK_CONSUMED_KEYS).
+                _extra, _drift_keys = _count_unconsumed_payload(block, btype)
+                if _extra:
+                    mt += _extra
+                    for _k in _drift_keys:
+                        _warn_block_key_drift(btype, _k)
             elif btype in (None, '', 'text'):
                 # 'text' blocks and blocks without a type whose payload is covered
                 # by the generic text pre-pass above — these are safe to skip.

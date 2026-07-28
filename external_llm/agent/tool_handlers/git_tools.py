@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re as _re
+import shlex
 import shutil as _shutil
 import subprocess
 import uuid
@@ -25,9 +26,14 @@ logger = logging.getLogger(__name__)
 from .shell_policy import ARG_COMMAND_INTRODUCERS as _ARG_COMMAND_INTRODUCERS
 from .shell_policy import COMMAND_INTRODUCING_KEYWORDS as _COMMAND_INTRODUCING_KEYWORDS
 from .shell_policy import COMMAND_WRAPPERS as _COMMAND_WRAPPERS
+from .shell_policy import DANGEROUS_EXECUTABLE_PREFIXES as _DANGEROUS_EXECUTABLE_PREFIXES
 from .shell_policy import DANGEROUS_FLAG_COMBOS as _DANGEROUS_FLAG_COMBOS
 from .shell_policy import DANGEROUS_SHELL_COMMANDS as _DANGEROUS_SHELL_COMMANDS
+from .shell_policy import EVAL_BUILTINS as _EVAL_BUILTINS
 from .shell_policy import FORBIDDEN_FLAGS as _FORBIDDEN_FLAGS
+from .shell_policy import SHELL_INTERPRETERS as _SHELL_INTERPRETERS
+from .shell_policy import WRAPPER_POSITIONAL_ARGS as _WRAPPER_POSITIONAL_ARGS
+from .shell_policy import WRAPPER_VALUE_FLAGS as _WRAPPER_VALUE_FLAGS
 from .shell_policy import SHELL_TIMEOUT_DEFAULT as _SHELL_TIMEOUT_DEFAULT
 from .shell_policy import SHELL_TIMEOUT_MAX as _SHELL_TIMEOUT_MAX
 
@@ -289,6 +295,48 @@ def _heredoc_body_intervals(command: str) -> list:
     return spans
 
 
+def _blank_heredoc_bodies(command: str) -> str:
+    """Return *command* with every heredoc BODY replaced by spaces.
+
+    Length-preserving, because :func:`_split_shell_separators` locates
+    separators by byte position in the string the tokens came from — a
+    substitution that changed length would misalign every position after it.
+
+    The danger scan needs "the command, minus heredoc bodies": body text is
+    data written to a file, not commands to run, so ``rm`` inside one must not
+    prompt. It previously got that by truncating at the first ``<<`` and
+    scanning only what came before, which also discarded every command AFTER
+    the body:
+
+        cat <<EOF > f.txt
+        hello
+        EOF
+        rm -rf victim          <- never scanned, ran with no prompt
+
+    That is the defect fixed for a bare newline in 8955a266, reached by a
+    different route, and it applied equally to `git reset --hard` and to a
+    truncating `>` redirect on the opener line itself (`cat <<EOF > src/main.py`
+    destroys the file whether or not the body is dangerous). Blanking instead of
+    truncating keeps the body unscanned while leaving everything around it —
+    opener line included — visible to the scan.
+
+    Spans come from :func:`_heredoc_body_intervals`, so the closing delimiter
+    line is blanked too (it is inside the span) and an unterminated heredoc
+    blanks to end-of-string — conservative, and no worse than the truncation it
+    replaces.
+    """
+    spans = _heredoc_body_intervals(command)
+    if not spans:
+        return command
+    out = list(command)
+    for start, end in spans:
+        for i in range(start, min(end, len(out))):
+            # Newlines are separators to _normalize_for_scan; blank them too so
+            # a body cannot re-arm the executable slot for its own text.
+            out[i] = " "
+    return "".join(out)
+
+
 def _literal_intervals(command: str) -> list:
     """Combined "do-not-rewrite" regions: shell quotes AND heredoc bodies.
 
@@ -342,7 +390,331 @@ _SHELL_SEPARATOR_SPLIT_RE = _re.compile(r"([;&|]+)")
 # whole class, rather than the enumerated {"|", "&&", "||", ";"} this replaced,
 # also covers a bare `&` (`sleep 30 & rm -rf x`) and `;;`, which the fixed set
 # let slip past as if they were ordinary words.
-_SEPARATOR_ONLY_RE = _re.compile(r"[;&|]+")
+# A bare `{` or `}` is a shell GROUPING token (`{ rm x; }`), which otherwise
+# lands in the executable slot and leaves the real command behind it looking
+# like an argument. Matched as a single character so `find -exec rm {} \;` —
+# where the placeholder is the two-character token `{}` — is untouched.
+_SEPARATOR_ONLY_RE = _re.compile(r"[;&|]+|[{}]")
+
+
+_ANSI_C_SIMPLE_ESCAPES = {
+    "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f",
+    "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+    "\\": "\\", "'": "'", '"': '"', "?": "?",
+}
+
+
+def _decode_ansi_c(body: str) -> str:
+    """Decode the body of a bash ``$'...'`` ANSI-C quoted string.
+
+    Covers the obfuscation vectors that hide a dangerous executable name:
+    ``\\xNN`` hex (``$'\\x72\\x6d'`` → ``rm``), ``\\NNN`` octal
+    (``$'\\162\\155'`` → ``rm``), and the simple named escapes. ``\\cX`` control
+    chars are decoded too. Unknown escapes pass the following character through
+    literally (bash's behaviour).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(body)
+    while i < n:
+        c = body[i]
+        if c != "\\" or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        nxt = body[i + 1]
+        if nxt == "x":
+            j = i + 2
+            hexs = ""
+            while j < n and len(hexs) < 2 and body[j] in "0123456789abcdefABCDEF":
+                hexs += body[j]
+                j += 1
+            if hexs:
+                out.append(chr(int(hexs, 16)))
+                i = j
+            else:
+                out.append("\\x")
+                i += 2
+        elif nxt in "01234567":
+            j = i + 1
+            octs = ""
+            while j < n and len(octs) < 3 and body[j] in "01234567":
+                octs += body[j]
+                j += 1
+            out.append(chr(int(octs, 8) & 0xFF))
+            i = j
+        elif nxt == "c" and i + 2 < n:
+            ctrl = body[i + 2]
+            out.append("\x7f" if ctrl == "?" else chr(ord(ctrl.upper()) & 0x1F))
+            i += 3
+        elif nxt in _ANSI_C_SIMPLE_ESCAPES:
+            out.append(_ANSI_C_SIMPLE_ESCAPES[nxt])
+            i += 2
+        else:
+            out.append(nxt)
+            i += 2
+    return "".join(out)
+
+
+# Punctuation that the token scan reads as structure rather than as text:
+# separators (_SEPARATOR_ONLY_RE), redirects, and substitution/quote openers.
+# Neutralised inside a decoded ANSI-C literal — see _shlex_safe_literal.
+_LITERAL_STRUCTURAL_CHARS = ";&|{}()<>`$\n"
+
+
+def _shlex_safe_literal(s: str) -> str:
+    """Render *s* as a single, structurally inert shlex word.
+
+    A ``$'...'`` ANSI-C body is one literal word in bash, so it must survive
+    the later ``shlex.split`` as one token (internal quotes/spaces must not
+    re-split it or unbalance the whole scan). Single-quote wrapping with the
+    standard ``'\\''`` escape does that much.
+
+    Quoting alone is NOT enough, though, because ``shlex.split`` STRIPS the
+    quotes: a body that decodes to ``;`` comes back as the bare token ``;``,
+    which ``_SEPARATOR_ONLY_RE.fullmatch`` cannot tell from a real separator.
+    Measured: ``echo $'\\x3b' rm -f /tmp/x`` raised an rm prompt, though bash
+    passes that ``;`` to echo as data and never runs rm — data promoted to
+    structure, breaking the "quoted prose never counts" contract this scan is
+    built on.
+
+    So structural punctuation is replaced with ``_`` here. The substitution is
+    lossless for this scan's purposes: the only thing it ever asks of a decoded
+    body is whether it NAMES a dangerous executable, and no executable basename
+    contains any of these characters. A body that decodes to ``rm`` is
+    untouched and still reaches the executable slot.
+    """
+    for ch in _LITERAL_STRUCTURAL_CHARS:
+        s = s.replace(ch, "_")
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _normalize_for_scan(command: str) -> str:
+    """Make implicit command boundaries explicit before the policy scan.
+
+    ``shlex.split`` treats a NEWLINE as ordinary whitespace, so a multi-line
+    script collapses into one segment and every executable after line 1 is
+    classified as an argument of line 1's command. That is the same defect the
+    ``;`` handling above exists to fix, for the separator a model reaches for
+    most naturally — measured: ``cd build\\nrm -rf artifacts`` ran with no
+    approval prompt, while the ``;`` and ``&&`` spellings of it both prompted.
+
+    Subshell parentheses have the same effect by a different route: ``(rm x)``
+    tokenises as ``['(rm', 'x)']`` and ``Path('(rm').name`` is not ``rm``.
+
+    Both are rewritten to ``;`` — only in the copy the SCAN reads. The command
+    that actually executes is never touched. Quoted regions are left alone, so
+    a newline inside ``git commit -m "line1<newline>line2"`` stays part of the
+    message, and ``grep "(foo)"`` keeps its literal parens.
+
+    Command substitution is executed by the shell in BOTH quoting contexts, so
+    both are surfaced, by different routes:
+
+    * Unquoted — ``$(...)`` needs nothing beyond the ``(``/``)`` rule above, and
+      backticks join it in the same rule (opener and closer both become ``;``).
+    * Inside double quotes — the opener closes the surrounding double quote with
+      ``"`` then inserts a ``;`` boundary, and the matching closer inserts
+      ``; "`` to reopen it. Bare ``(`` without ``$`` is left alone here, because
+      inside double quotes it is literal text: prose like ``"fix (rm) stuff"``
+      must not invent a prompt.
+
+    Single-quoted substitutions are deliberately untouched — ``'$(rm x)'`` and
+    ``'`rm x`'`` are literal strings to the shell, so surfacing them would be a
+    false prompt, not a catch.
+
+    Substitution bodies (``$(...)`` and backtick) are themselves unquoted command
+    lines, so a nested ``$(...)``, nested quoted ``"$(...)"``, or bare ``( ... )``
+    inside one is surfaced too — depth-counted for ``$(...)`` and boundary-emitted
+    for the backtick body, so the matching closer (not an inner ``)``) reopens the
+    surrounding quote. Without that the inner command stayed literal: ``"`echo
+    $(rm x)`"`` and ``"`echo "$(rm x)"`"`` both ran with no prompt.
+
+    A genuinely nested command line — ``bash -c "rm x"`` — is handled separately
+    in the token scan (``_shell_c_payload_index`` splices the payload back in and
+    re-runs every rule on it), not by this normaliser.
+    """
+    out: list[str] = []
+    in_single = in_double = False
+    escaped = False
+    # Command substitution state inside double quotes (0 = not inside one).
+    # Positive = depth of unmatched ``(`` after ``$(``.
+    cmdsub_depth = 0
+    in_dq_backtick = False  # inside backtick substitution within double quotes
+    i = 0
+    while i < len(command):
+        ch = command[i]
+
+        if escaped:
+            out.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\" and not in_single:
+            out.append(ch)
+            escaped = True
+            i += 1
+            continue
+
+        # ── bash $'...' ANSI-C quoting & ${IFS} word-split glue ─────────
+        # Both execute real commands but shlex mis-tokenises them, so the
+        # executable name never reaches the scan:
+        #   `$'rm'`        → shlex token "$rm" (looks like a variable) → skipped
+        #   `$'\x72\x6d'`  → "$rm" again (hex-obfuscated "rm")
+        #   `rm${IFS}-f`   → one opaque token → basename is not "rm"
+        # The ANSI-C body is decoded to one literal word (bash semantics) and
+        # emitted shlex-safe; unquoted ${IFS}/$IFS becomes a split boundary.
+        # Only in the top-level unquoted region: inside quotes ${IFS} does not
+        # word-split, and $'...' is not ANSI-C quoting there.
+        if (ch == "$" and not in_single and not in_double
+                and cmdsub_depth == 0 and not in_dq_backtick):
+            if i + 1 < len(command) and command[i + 1] == "'":
+                j = i + 2
+                body = []
+                while j < len(command):
+                    c = command[j]
+                    if c == "\\" and j + 1 < len(command):
+                        body.append(c)
+                        body.append(command[j + 1])
+                        j += 2
+                        continue
+                    if c == "'":
+                        break
+                    body.append(c)
+                    j += 1
+                out.append(_shlex_safe_literal(_decode_ansi_c("".join(body))))
+                i = j + 1  # consume the closing quote
+                continue
+            if command[i:i + 6] == "${IFS}":
+                out.append(" ")
+                i += 6
+                continue
+            if command[i:i + 4] == "$IFS" and (
+                i + 4 >= len(command)
+                or not (command[i + 4].isalnum() or command[i + 4] == "_")
+            ):
+                out.append(" ")
+                i += 4
+                continue
+
+        # ── single-quote boundary ──────────────────────────────────
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            i += 1
+            continue
+
+        # ── double-quote boundary ──────────────────────────────────
+        if ch == '"' and not in_single:
+            if in_dq_backtick and cmdsub_depth == 0:
+                # Inside a backtick body a ``"`` opens a NESTED quote, but the
+                # body still runs as an unquoted command line. Emitting it
+                # verbatim re-wraps the body's commands in a quoted token (hiding
+                # them from the scan), and resetting state orphans the
+                # substitution — both left ``"`echo "$(rm x)"`"`` running
+                # unprompted. A boundary surfaces the body's commands while
+                # leaving quote balance intact: only the backtick's own closer
+                # reopens the surrounding double quote.
+                out.append(" ; ")
+                i += 1
+                continue
+            in_double = not in_double
+            cmdsub_depth = 0
+            in_dq_backtick = False
+            out.append(ch)
+            i += 1
+            continue
+
+        # ── inside single quotes: literal ──────────────────────────
+        if in_single:
+            out.append(ch)
+            i += 1
+            continue
+
+        # ── inside double-quoted backtick substitution ─────────────
+        # The body is an unquoted command line, exactly like a ``$(...)`` body,
+        # so a nested ``$(...)`` or bare ``( )`` inside it really executes and
+        # must be surfaced. Emitting the body literally left
+        # ``"`echo $(rm x)`"`` running with no prompt: the closing backtick was
+        # the only char this branch acted on, so the inner ``$(rm x)`` survived
+        # intact, shlex split it into the non-executable token ``$(rm``, and the
+        # scan never saw ``rm``. ``$(`` here enters the cmdsub machinery below;
+        # that handler reopens the *backtick* state (not the double quote) when
+        # its depth returns to 0, which is why the guard excludes cmdsub_depth>0.
+        if in_dq_backtick and cmdsub_depth == 0:
+            if ch == "`":
+                in_dq_backtick = False
+                out.append(' ; "')
+            elif ch == "$" and i + 1 < len(command) and command[i + 1] == "(":
+                out.append(" ; ")
+                cmdsub_depth = 1
+                i += 2
+                continue
+            elif ch == "\n" or ch in "()":
+                out.append(" ; ")
+            else:
+                out.append(ch)
+            i += 1
+            continue
+
+        # ── inside double-quoted $(...) command substitution ───────
+        # The BODY of a substitution is an unquoted command line, so the
+        # unquoted rule applies inside it too: every ``(``, ``)`` and backtick
+        # is a boundary, not a literal. Emitting them literally is what left
+        # nested ``"$(echo $(rm x))"`` invisible — the inner ``(`` stayed glued
+        # to its command, producing the token ``$(rm``, whose Path(...).name is
+        # not ``rm``. Depth still counts the parens so the CLOSER of the outer
+        # substitution is the one that reopens the double quote.
+        if cmdsub_depth > 0:
+            if ch == "(":
+                cmdsub_depth += 1
+                out.append(" ; ")
+            elif ch == ")":
+                cmdsub_depth -= 1
+                if cmdsub_depth == 0:
+                    # Nested inside a double-quoted backtick: the backtick's own
+                    # closer reopens the double quote, so do not reopen it here.
+                    out.append(" ; " if in_dq_backtick else ' ; "')
+                else:
+                    out.append(" ; ")
+            elif ch in "\n`":
+                out.append(" ; ")
+            else:
+                out.append(ch)
+            i += 1
+            continue
+
+        # ── inside double quotes (normal, not in a cmdsub) ─────────
+        if in_double:
+            # $(
+            if ch == "$" and i + 1 < len(command) and command[i + 1] == "(":
+                out.append('" ; ')
+                cmdsub_depth = 1
+                i += 2
+                continue
+            # backtick
+            if ch == "`":
+                out.append('" ; ')
+                in_dq_backtick = True
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+            continue
+
+        # ── unquoted ───────────────────────────────────────────────
+        # The backtick is here for the same reason ``(`` is: it opens a command
+        # substitution that the shell really executes, and without a boundary
+        # ``echo `rm -rf x``` tokenises as ``['echo', '`rm', ...]`` whose
+        # ``Path('`rm').name`` is not ``rm``. Both the opener and the closer map
+        # to ``;``, exactly as ``(`` and ``)`` do — the substitution's body is a
+        # command line, and what surrounds it is another one.
+        if ch == "\n" or ch in "()`":
+            out.append(" ; ")
+        else:
+            out.append(ch)
+        i += 1
+
+    return "".join(out)
 
 
 def _matches_forbidden_flag(token: str, forbidden: set) -> bool:
@@ -447,6 +819,87 @@ _SHORT_FLAG_BUNDLE_RE = _re.compile(r"^-[A-Za-z]{2,}$")
 
 # `>`, `>>`, `2>`, `&>`, `<`, and their glued-target forms (`>out.txt`).
 _REDIRECT_RE = _re.compile(r"^(?:\d+|&)?(>>|>|<)(.*)$")
+
+
+# A `-c` payload can itself be `bash -c "..."`. Bounded by DEPTH, not by a total
+# count of expansions: siblings are self-limiting because each one costs input
+# characters (`bash -c A; bash -c B; ...` needs the text to spell them all),
+# whereas nesting multiplies. A total budget got that backwards — measured, a
+# budget of 8 spent on nine harmless `bash -c "ls"` siblings left the `rm` in the
+# tenth unscanned, while raising the same budget cost nothing on deep input
+# (852 ms → 821 ms at depth 11, because the time is the outer string's length,
+# not the expansion count).
+_SHELL_C_MAX_DEPTH = 8
+
+# `-c`, and the bundled spellings a model actually writes (`sh -lc`, `sh -ec`).
+# The bundle is short flags only, so `--color` is excluded by the anchor.
+_SHELL_C_FLAG_RE = _re.compile(r"^-[A-Za-z]*c$")
+
+
+def _shell_c_payload_index(tokens: list, start: int) -> Optional[int]:
+    """Index of the command string of a ``<shell> -c <payload>``, or None.
+
+    *start* is the position just past the shell's own name. Scans that segment
+    only — a ``-c`` after the next separator belongs to a different command, and
+    ``bash script.sh; grep -c x`` must not hand grep's count flag to the shell.
+    """
+    for i in range(start, len(tokens)):
+        tok = tokens[i]
+        if _SEPARATOR_ONLY_RE.fullmatch(tok):
+            return None
+        if _SHELL_C_FLAG_RE.match(tok):
+            return i + 1 if i + 1 < len(tokens) else None
+    return None
+
+
+def _segment_end_index(tokens: list, start: int) -> int:
+    """Index one past the last token of the segment beginning at *start*.
+
+    The `eval` counterpart of :func:`_shell_c_payload_index`'s segment bound:
+    `eval` has no flag marking where its payload begins and ends, so the payload
+    is "everything up to the next separator". ``eval rm -rf x; ls`` must not
+    swallow the ``ls``.
+    """
+    for i in range(start, len(tokens)):
+        if _SEPARATOR_ONLY_RE.fullmatch(tokens[i]):
+            return i
+    return len(tokens)
+
+
+def _is_dangerous_executable(name: str) -> bool:
+    """True if the reduced basename *name* is a DANGEROUS_SHELL_COMMANDS hit.
+
+    Exact membership first, then the prefix families in
+    ``DANGEROUS_EXECUTABLE_PREFIXES`` — see that constant for why `mkfs` needed
+    one (its listed spelling is the only one nobody types).  A prefix match
+    still reports the REAL name in the approval prompt, so the user is asked
+    about `mkfs.ext4`, not about an abstraction of it.
+    """
+    if name in _DANGEROUS_SHELL_COMMANDS:
+        return True
+    return any(
+        name.startswith(_pref) and len(name) > len(_pref)
+        for _pref in _DANGEROUS_EXECUTABLE_PREFIXES
+    )
+
+
+def _expand_shell_c_payload(payload: str) -> list:
+    """Tokenise a ``-c`` payload the same way the top-level command was.
+
+    Returns [] when the payload cannot be read as a command line, which leaves
+    the caller's token stream untouched — the payload then stays the opaque
+    string it has always been. Failing open matches the rest of this scan: it is
+    an advisory prompt, and a payload shlex cannot parse is one the shell will
+    reject too.
+    """
+    if not payload or not payload.strip():
+        return []
+    _scan = _normalize_for_scan(_blank_heredoc_bodies(payload))
+    try:
+        _parts = shlex.split(_scan)
+    except ValueError:
+        return []
+    return _split_shell_separators(_parts, _scan)
 
 
 def _segment_flag_combo_hit(exe: Optional[str], tokens: list) -> bool:
@@ -877,25 +1330,29 @@ class ShellToolsMixin:
 
         _SHELL_SYNTAX = {"for", "in", "do", "done", "if", "then", "else", "fi", "while", "until", "echo"}
 
-        # heredoc syntax (<<) cannot be parsed by shlex.split → extract only the header portion for permission check
+        # Scan a copy with heredoc BODIES blanked and newlines / subshell parens
+        # turned into explicit separators; the string that EXECUTES stays
+        # untouched below.
         # NOTE: _re is the module-level `import re as _re` (see top of file).
         # Do NOT re-import here — a local `import re as _re` makes Python treat
         # _re as a function-local name across the WHOLE body, so the earlier
         # _re.search() calls (find -o grouping, ~L175) raise UnboundLocalError
         # before this line ever runs.
-        _is_heredoc = bool(_re.search(r"<<\s*['\"]?\w", command))
-        if _is_heredoc:
-            # Parse only the heredoc head (first line or portion before <<) with shlex to extract the execution command
-            _heredoc_header = _re.split(r"<<", command, maxsplit=1)[0].strip()
-            try:
-                parts = shlex.split(_heredoc_header) if _heredoc_header else []
-            except Exception:
-                parts = _heredoc_header.split()
-        else:
-            try:
-                parts = shlex.split(command)
-            except Exception as e:
+        _scan_command = _normalize_for_scan(_blank_heredoc_bodies(command))
+        # A heredoc body is script text, not shell syntax, so an apostrophe in
+        # its prose ("don't") leaves shlex with an unbalanced quote. Blanking
+        # the bodies removes that, but an opener whose body never starts (the
+        # `<<EOF` is the final line) can still reach shlex unbalanced — so the
+        # tolerant split is kept for commands that carry an opener at all.
+        # Detected with the same _HEREDOC_OPENER_RE the blanking uses, so the
+        # two cannot disagree about what a heredoc is (the previous inline
+        # `<<\s*['\"]?\w` missed `<<-DELIM`, which the blanker handles).
+        try:
+            parts = shlex.split(_scan_command)
+        except Exception as e:
+            if not _HEREDOC_OPENER_RE.search(command):
                 return self._make_result(ok=False, content="", error=f"Invalid command syntax: {e}")
+            parts = _scan_command.split()
 
         if not parts:
             return self._make_result(ok=False, content="", error="Empty command")
@@ -912,19 +1369,46 @@ class ShellToolsMixin:
         flag_combo_exes: set = set()
         redirect_targets: list = []
         expect_redirect_target = False
+        # Wrapper state, all scoped to the segment being scanned: which wrapper
+        # opened it (its flag table), how many positional operands still precede
+        # the real command, and whether the previous token was a flag whose value
+        # is the next token.
+        wrapper_ctx: Optional[str] = None
+        positional_skip = 0
+        skip_flag_value = False
 
         def _close_segment() -> None:
             """Evaluate the finished segment's flag combos (call before reset)."""
             if _segment_flag_combo_hit(segment_exe, segment_tokens):
                 flag_combo_exes.add(segment_exe)
 
-        for token in _split_shell_separators(parts, command):
+        # _scan_command, not command: the splitter locates separators by byte
+        # position in the string its tokens came from, so feeding it the raw
+        # command after normalising would misalign every position.
+        # Materialised, and walked by index, so a `<shell> -c "<payload>"` found
+        # mid-scan can splice the payload's own tokens in right here. Re-entering
+        # the SAME loop is deliberate: the nested command then gets every rule
+        # this scan already implements — wrappers, env assignments, redirects,
+        # flag combos, basename reduction — instead of a second, poorer copy of
+        # them drifting alongside the original.
+        _tokens = _split_shell_separators(parts, _scan_command)
+        # Nesting depth of each token, spliced in lockstep with _tokens, so the
+        # bound is per-payload rather than per-command — see _SHELL_C_MAX_DEPTH.
+        _depths = [0] * len(_tokens)
+        _ti = 0
+        while _ti < len(_tokens):
+            token = _tokens[_ti]
+            _token_depth = _depths[_ti]
+            _ti += 1
             if _SEPARATOR_ONLY_RE.fullmatch(token):
                 _close_segment()
                 expect_executable = True
                 segment_exe = None
                 segment_tokens = []
                 expect_redirect_target = False
+                wrapper_ctx = None
+                positional_skip = 0
+                skip_flag_value = False
                 continue
             if expect_redirect_target:
                 # Detached target of the `>` seen on the previous token.
@@ -939,6 +1423,13 @@ class ShellToolsMixin:
                         redirect_targets.append(_glued)
                     else:
                         expect_redirect_target = True
+                continue
+            if skip_flag_value:
+                # Value of a wrapper flag seen on the previous token (`-u` in
+                # `sudo -u me rm`). Not appended to segment_tokens: it is the
+                # flag's operand, not a flag of this segment, and letting a value
+                # like `--hard` into the combo vocabulary would invent a prompt.
+                skip_flag_value = False
                 continue
             segment_tokens.append(token)
             # ── Tokens that PRECEDE a command without being one ──────────────
@@ -985,10 +1476,32 @@ class ShellToolsMixin:
                     )
                 # A flag is never the executable, so it must not consume the
                 # expectation — `xargs -n1 rm` still has to reach `rm`.
+                #
+                # ...but its VALUE would, if the value is a separate token. Only
+                # while still looking for the executable: once the segment has
+                # one, a `-u` belongs to that command and its value is an
+                # ordinary argument.
+                if (
+                    expect_executable
+                    and wrapper_ctx
+                    and token in _WRAPPER_VALUE_FLAGS.get(wrapper_ctx, frozenset())
+                ):
+                    skip_flag_value = True
+                continue
+            if expect_executable and token in _COMMAND_WRAPPERS:
+                # Remember WHICH wrapper: its flag table decides whether a later
+                # `-u me` swallows one more token. Basename-reduced so
+                # `/usr/bin/sudo -u me rm` is the same rule as `sudo -u me rm`.
+                wrapper_ctx = Path(token).name
+                positional_skip = _WRAPPER_POSITIONAL_ARGS.get(wrapper_ctx, 0)
+                continue
+            if expect_executable and positional_skip > 0:
+                # `chroot /mnt rm -rf x` — the operand before the command is not
+                # the command. Consumed here so `rm` still reaches the check.
+                positional_skip -= 1
                 continue
             if expect_executable and (
-                token in _COMMAND_WRAPPERS
-                or _WRAPPER_NUM_ARG_RE.match(token)   # wrapper arg: `timeout 5s rm`
+                _WRAPPER_NUM_ARG_RE.match(token)      # wrapper arg: `timeout 5s rm`
                 or _ENV_ASSIGN_RE.match(token)        # `FOO=bar rm ...`
             ):
                 continue
@@ -1008,8 +1521,35 @@ class ShellToolsMixin:
                 if name in _SHELL_SYNTAX:
                     continue
                 segment_exe = name
-                if name in _DANGEROUS_SHELL_COMMANDS:
+                if _is_dangerous_executable(name):
                     dangerous_executables.add(name)
+                if name in _EVAL_BUILTINS and _token_depth < _SHELL_C_MAX_DEPTH:
+                    # `eval` re-parses its own operands as a command line, so
+                    # the payload is every token up to the next separator,
+                    # space-joined — which is not an approximation but eval's
+                    # actual semantics (see shell_policy.EVAL_BUILTINS).
+                    # Spliced through the same fence-and-re-enter path as
+                    # `bash -c`, so the payload gets every rule this scan
+                    # implements rather than a second, poorer copy of them.
+                    _eval_end = _segment_end_index(_tokens, _ti)
+                    _nested = _expand_shell_c_payload(" ".join(_tokens[_ti:_eval_end]))
+                    if _nested:
+                        _repl = [";", *_nested, ";"]
+                        _tokens[_ti:_eval_end] = _repl
+                        _depths[_ti:_eval_end] = [_token_depth + 1] * len(_repl)
+                if name in _SHELL_INTERPRETERS and _token_depth < _SHELL_C_MAX_DEPTH:
+                    _payload_at = _shell_c_payload_index(_tokens, _ti)
+                    if _payload_at is not None:
+                        _nested = _expand_shell_c_payload(_tokens[_payload_at])
+                        if _nested:
+                            # Fenced by separators so the payload cannot inherit
+                            # this segment's executable slot, nor leak its own
+                            # trailing state into what follows `bash -c "..."`.
+                            _repl = [";", *_nested, ";"]
+                            _tokens[_payload_at:_payload_at + 1] = _repl
+                            _depths[_payload_at:_payload_at + 1] = (
+                                [_token_depth + 1] * len(_repl)
+                            )
 
         _close_segment()  # the last segment ends without a trailing separator
 

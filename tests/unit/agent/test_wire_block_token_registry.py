@@ -13,6 +13,7 @@ import json
 
 from external_llm.agent._shared_utils import (
     CANONICAL_WIRE_BLOCK_TYPES,
+    _WIRE_BLOCK_CONSUMED_KEYS,
     _WIRE_BLOCK_TOKENIZERS,
     _WIRE_CONTENT_KEY_MARKERS,
     _count_block_wholesale,
@@ -385,3 +386,91 @@ class TestWireDriftCounter:
         # A fresh occurrence after reset restarts at 1 (new observation window).
         _warn_unknown_block_type(_uid)
         assert get_unknown_block_type_counts().get(_uid, 0) == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. Intra-type drift: a payload key the tokenizer does not read
+# ══════════════════════════════════════════════════════════════════════════════
+# The unknown-TYPE fail-safe above seals drift at the type level only. A
+# registered tokenizer's answer used to be final, so a payload arriving under a
+# key it does not read counted as ~0 — the same silent under-count, reachable
+# without any new block type appearing.
+
+class TestIntraTypeDrift:
+    _BIG = "y" * 40000
+
+    def test_unread_key_is_not_dropped(self):
+        """40 KB under a key no tokenizer reads must not count as ~0.
+
+        Both spellings are real: `partial_json` is what Anthropic streams for
+        `input_json_delta`, and a `thinking` variant carrying a summary is the
+        shape this guard is a bet against.
+        """
+        for block in (
+            {"type": "thinking", "summary": self._BIG},
+            {"type": "tool_use", "id": "1", "name": "f", "partial_json": self._BIG},
+        ):
+            n = _estimate_single_message_tokens(_msg_with_raw_content([block]))
+            assert n > 5000, f"under-counted {block['type']} drift: {n} tokens"
+
+    def test_thinking_signature_is_counted(self):
+        """Anthropic sends `signature` on every extended-thinking block and this
+        client mirrors raw_content back verbatim, so it is billed every turn.
+        `_tok_thinking` reads only `thinking`, which dropped it to 0.
+        """
+        think = "reason. " * 100
+        sig = "ErUBCkYIBBgCIkA" + "x" * 600
+        without = _estimate_single_message_tokens(
+            _msg_with_raw_content([{"type": "thinking", "thinking": think}])
+        )
+        with_sig = _estimate_single_message_tokens(
+            _msg_with_raw_content([{"type": "thinking", "thinking": think, "signature": sig}])
+        )
+        assert with_sig > without + 100, (
+            f"signature contributed {with_sig - without} tokens for {len(sig)} chars"
+        )
+
+    def test_expected_extra_keys_do_not_warn(self):
+        """Counted, but never reported as drift.
+
+        `id` / `tool_use_id` / `signature` ride on normal traffic. Warning about
+        them would fire the drift counter on every request and bury the signal
+        it exists to carry — the counter must stay empty for ordinary blocks.
+        """
+        reset_unknown_block_type_counts()
+        for block in (
+            {"type": "thinking", "thinking": "t", "signature": "sig"},
+            {"type": "tool_use", "id": "toolu_01ABC", "name": "f", "input": {"q": "x"}},
+            {"type": "tool_result", "tool_use_id": "toolu_01ABC",
+             "content": "out", "is_error": False},
+        ):
+            _estimate_single_message_tokens(_msg_with_raw_content([block]))
+        assert get_unknown_block_type_counts() == {}, (
+            "ordinary wire fields reported as drift — the signal is now noise"
+        )
+
+    def test_real_drift_is_reported_under_a_namespaced_key(self):
+        reset_unknown_block_type_counts()
+        _estimate_single_message_tokens(
+            _msg_with_raw_content([{"type": "thinking", "brand_new_field": "x" * 200}])
+        )
+        assert get_unknown_block_type_counts().get("thinking.brand_new_field") == 1
+
+    def test_image_payload_stays_a_flat_estimate(self):
+        """The residual counter must not undo _IMAGE_BLOCK_TOKEN_ESTIMATE.
+
+        Images are charged by pixel geometry, not payload length; wholesale
+        counting a 300 KB base64 screenshot yields ~130k "tokens" and starves
+        the budget. `source`/`data` are declared consumed for exactly this.
+        """
+        n = _estimate_single_message_tokens(_msg_with_raw_content([
+            {"type": "image", "source": {"type": "base64", "data": "A" * 300000}}
+        ]))
+        assert n < 3000, f"image payload counted wholesale: {n} tokens"
+
+    def test_every_registered_tokenizer_declares_its_keys(self):
+        """A new tokenizer without a consumed-key set would silently re-open the
+        hole for its own type — the residual counter no-ops when the entry is
+        missing."""
+        missing = set(_WIRE_BLOCK_TOKENIZERS) - set(_WIRE_BLOCK_CONSUMED_KEYS)
+        assert missing == set(), f"tokenizers with no consumed-key declaration: {missing}"

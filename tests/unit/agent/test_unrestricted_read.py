@@ -59,6 +59,22 @@ class TestRestrictedByDefault:
         assert result.ok is True
         assert "x = 1" in result.content
 
+    def test_grep_blocks_absolute_outside(self, tmp_path):
+        """grep must share the repo-boundary gate — the only read tool that lacked it."""
+        repo, secret = _make_repo_and_outside(tmp_path)
+        reg = ToolRegistry(str(repo), AgentConfig())
+        result = reg._tool_grep({"pattern": "root", "path": str(secret.parent)})
+        assert result.ok is False
+        assert "outside" in (result.error or "")
+
+    def test_grep_in_repo_still_works(self, tmp_path):
+        repo, _ = _make_repo_and_outside(tmp_path)
+        # repo/inside.py contains "x = 1"
+        reg = ToolRegistry(str(repo), AgentConfig())
+        result = reg._tool_grep({"pattern": "x", "path": "."})
+        assert result.ok is True
+        assert "inside.py" in result.content
+
 
 class TestUnrestrictedRead:
     def test_secure_path_allows_absolute_outside(self, tmp_path):
@@ -87,6 +103,14 @@ class TestUnrestrictedRead:
         result = reg._tool_read_file({"path": "inside.py"})
         assert result.ok is True
         assert "x = 1" in result.content
+
+    def test_grep_reads_cross_repo_unrestricted(self, tmp_path):
+        """unrestricted_read=True: grep must reach outside repo (parity with read_file)."""
+        repo, secret = _make_repo_and_outside(tmp_path)
+        reg = ToolRegistry(str(repo), AgentConfig(unrestricted_read=True))
+        result = reg._tool_grep({"pattern": "cross-repo", "path": str(secret.parent)})
+        assert result.ok is True
+        assert "cross-repo" in result.content
 
 
 class TestInheritance:

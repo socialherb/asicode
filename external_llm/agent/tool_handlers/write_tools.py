@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from ...common.atomic_io import atomic_write_text
+from ...common.indent_utils import format_numbered_line
 from ...common.repo_files import git_list_repo_files
 from ...languages import LanguageId
 from ...languages.comment_syntax import comment_syntax_for
@@ -662,6 +663,7 @@ except ImportError:
 # failure signal in this repo. The index below lets `_suggest_missing_paths`
 # offer "Did you mean: a/b/foo.py?" hints, mirroring the existing behaviour.
 _FILE_INDEX_TTL = 60.0
+_FILE_INDEX_GEN: int = 0  # incremented on invalidation; stale writes skip cache store
 # Bounded (cap 8) via the shared ``_capped_put`` — same discipline as the
 # sibling per-repo file-list caches ``_PY_WALK_CACHE`` / ``_TS_WALK_CACHE``.
 # Without it a long-lived orchestrator visiting many repos grew this dict
@@ -687,6 +689,36 @@ def _git_list_tracked_files(repo_root: str) -> Optional[list[str]]:
     return git_list_repo_files(repo_root)
 
 
+def _file_index_key(repo_root: str) -> str:
+    """Canonical cache key for *repo_root*.
+
+    Callers reach this cache by different spellings of the same directory —
+    ``ToolRegistry.repo_root`` is resolved in ``__init__`` while
+    ``_effective_repo_root`` may carry an unresolved staging override — and on
+    macOS ``/var`` vs ``/private/var`` made one repo occupy two entries of an
+    8-entry cache. Worse, the invalidator could then clear a key the reader
+    never used. One canonical key makes both agree.
+    """
+    try:
+        return str(Path(repo_root).resolve())
+    except OSError:
+        return str(repo_root)
+
+
+def invalidate_repo_file_index(repo_root: str) -> None:
+    """Drop the cached file listing for *repo_root*.
+
+    Called from the post-write invalidation paths: the index is otherwise
+    TTL-only, so a file created this turn stayed invisible to ``glob`` (and
+    absent from "Did you mean:" suggestions) for up to ``_FILE_INDEX_TTL``
+    seconds — the same "cannot find what it just wrote" symptom the walk and
+    symbol caches were fixed for.
+    """
+    global _FILE_INDEX_GEN
+    _FILE_INDEX_CACHE.pop(_file_index_key(repo_root), None)
+    _FILE_INDEX_GEN += 1
+
+
 def _repo_file_index(repo_root: str) -> list[str]:
     """Return a sorted list of repo-relative file paths, cached per repo_root.
 
@@ -700,19 +732,28 @@ def _repo_file_index(repo_root: str) -> list[str]:
 
     Rebuilt when older than ``_FILE_INDEX_TTL`` seconds so a stale index
     (files added/moved) self-heals without paying the listing cost on every
-    call. A git failure or a partial os.walk abort is NOT cached, so the next
-    call retries a full listing instead of serving an incomplete index.
+    call, and dropped outright by :func:`invalidate_repo_file_index` after a
+    write so the TTL is a backstop rather than the only freshness mechanism.
+    A git failure or a partial os.walk abort is NOT cached, so the next call
+    retries a full listing instead of serving an incomplete index.
     """
     import time as _time
+    global _FILE_INDEX_GEN
     now = _time.monotonic()
-    cached = _FILE_INDEX_CACHE.get(repo_root)
+    key = _file_index_key(repo_root)
+    cached = _FILE_INDEX_CACHE.get(key)
     if cached and (now - cached[0]) < _FILE_INDEX_TTL:
         return cached[1]
+    # Read generation BEFORE the slow listing — if invalidation bumps it while
+    # we collect, the result is stale and must NOT be cached.
+    _gen_before = _FILE_INDEX_GEN
 
     # Primary: git ls-files (fast + .gitignore-aware + non-ASCII safe)
     git_paths = _git_list_tracked_files(str(repo_root))
     if git_paths is not None:
-        _capped_put(_FILE_INDEX_CACHE, repo_root, (now, git_paths))
+        if _FILE_INDEX_GEN != _gen_before:
+            return git_paths  # invalidated mid-collection — return fresh, skip cache
+        _capped_put(_FILE_INDEX_CACHE, key, (now, git_paths))
         return git_paths
 
     # Fallback: os.walk with a hardcoded skip-set (no .gitignore awareness)
@@ -731,7 +772,9 @@ def _repo_file_index(repo_root: str) -> list[str]:
         # call (best-effort) but let the next call retry the full walk.
         return sorted(paths)
     paths.sort()
-    _capped_put(_FILE_INDEX_CACHE, repo_root, (now, paths))
+    if _FILE_INDEX_GEN != _gen_before:
+        return paths  # invalidated mid-collection — return fresh, skip cache
+    _capped_put(_FILE_INDEX_CACHE, key, (now, paths))
     return paths
 
 
@@ -1099,12 +1142,18 @@ class WriteToolsMixin:
                                 if idx >= 0:
                                     start = max(0, idx - 2)
                                     end = min(len(file_lines), idx + 8)
+                                    # Gutter format, not "NNN: line": this block
+                                    # is immediately followed by "copy the EXACT
+                                    # text", and a bare listing hides the one
+                                    # column the mismatch is usually about.
                                     ctx = "\n".join(
-                                        f"{start+j+1:4d}: {file_lines[start+j]}"
+                                        format_numbered_line(start + j + 1, file_lines[start + j])
                                         for j in range(end - start)
                                     )
                                     ctx_hint = (
-                                        f"\nClosest match found near line {idx+1}:\n```\n{ctx}\n```\n"
+                                        f"\nClosest match found near line {idx+1} "
+                                        f"(│N│ = leading-whitespace count; copy the code after it, "
+                                        f"not the gutter):\n```\n{ctx}\n```\n"
                                         f"Copy the EXACT text from this block into 'before'."
                                     )
 
@@ -1115,12 +1164,15 @@ class WriteToolsMixin:
                             )
                         else:
                             preview = "\n".join(
-                                f"{i+1:4d}: {_item_}" for i, _item_ in enumerate(file_lines[:60])
+                                format_numbered_line(i + 1, _item_)
+                                for i, _item_ in enumerate(file_lines[:60])
                             )
                             hints.append(
                                 f"HINT: 'before' text not found in '{path}'. "
-                                f"Use find_symbol to locate the target, then bash (cat) at the "
-                                f"returned line. First 60 lines:\n```\n{preview}\n```"
+                                f"Use find_symbol to locate the target, then read_file with "
+                                f"start_line/end_line around it — NOT bash cat, which omits the "
+                                f"│N│ indent gutter that this mismatch is usually about. "
+                                f"First 60 lines:\n```\n{preview}\n```"
                             )
                 except Exception:
                     pass  # non-critical: error message building must not block
@@ -1400,8 +1452,10 @@ class WriteToolsMixin:
                 return self._make_result(
                     ok=False, content="", error=(
                         f"write_plan rejected: {ph_err}\n"
-                        "ACTION: Use bash (cat) on the target file first, then use the actual "
-                        "text from the file in 'before', and your desired replacement in 'after'."
+                        "ACTION: Use read_file on the target file first, then use the actual "
+                        "text from the file in 'before', and your desired replacement in 'after'. "
+                        "read_file, not bash cat: its │N│ gutter shows each line's exact "
+                        "leading-whitespace count, which 'before' has to match."
                     ),
                 )
 
@@ -2448,14 +2502,19 @@ class WriteToolsMixin:
         except ImportError as e:
             logger.warning(f"PatchEngine not available, falling back to legacy apply: {e}")
             result = self._apply_patch_text(patch_text, path_hint=path)
-            import time as _time2
+            # Clock discipline: start_time is monotonic() (captured at method entry),
+            # so the elapsed MUST also be monotonic(). time.time() is wall-clock —
+            # subtracting it from a monotonic start yields ~1.7e9s garbage (the Unix
+            # epoch offset), not a real duration. (Currently masked because dispatch
+            # overwrites result.execution_time after the handler returns, but kept
+            # correct so a direct handler call or a dispatch refactor can't leak it.)
             if result.execution_time < 1e-9:
-                result.execution_time = _time2.time() - start_time
+                result.execution_time = _time.monotonic() - start_time
             return result
         except Exception as e:
             logger.exception("Unexpected error in patch engine")
-            import time as _time3
-            execution_time = _time3.time() - start_time
+            # Same monotonic discipline as the ImportError branch above.
+            execution_time = _time.monotonic() - start_time
             return self._make_result(
                 ok=False,
                 content="",
@@ -3062,7 +3121,13 @@ class WriteToolsMixin:
             _missing = (file_path or "").strip()
             if not _missing:
                 return ""
-            _paths = _repo_file_index(str(self.repo_root))
+            # _effective_repo_root, matching BOTH the other reader (glob) and
+            # the two invalidation routines. Reading a different root's index
+            # than the invalidator clears is the exact intermittency 1dd10ddb's
+            # sibling fix (5a1c405f) called out — "the invalidator could clear a
+            # key the reader never used". Latent today (_repo_root_override is
+            # never assigned, so the two expressions agree) but free to align.
+            _paths = _repo_file_index(str(self._effective_repo_root))
             if not _paths:
                 return ""
             _tgt_base = os.path.basename(_missing).lower()
@@ -4297,18 +4362,45 @@ class WriteToolsMixin:
         )
 
     def _tool_create_file(self, args: dict[str, Any]) -> "ToolResult":
-        """Create a new file with the given content.
+        """Create or overwrite a file with the given content.
 
-        Creates parent directories automatically if they don't exist.
-        Fails if the file already exists (use write_plan for overwrites).
+        Creates parent directories automatically. Fails if the file already
+        exists (use ``overwrite=True`` to replace).
+
+        Reachable via the apply_patch create_file / multi-symbol fallbacks
+        (``_try_apply_patch_create_file_fallback`` /
+        ``_try_apply_patch_multi_symbol_fallback``), so this handler MUST carry
+        the same safety every other write handler does — it was the lone
+        exception, which made those fallback paths LESS safe than the main
+        PatchEngine path they recover from:
+
+        * **Repo confinement** — ``_secure_path(confine=True)`` rejects any path
+          escaping repo_root (absolute paths, ``..`` traversal). Without it,
+          ``Path(repo_root) / abs_path`` collapses to ``abs_path`` and the
+          fallback could write outside the repo. ``unrestricted_read`` is a READ
+          capability only — mirrors edit_text / modify_symbol / edit_ast /
+          anchor_edit.
+        * **Blocking syntax gate** — content is validated in memory BEFORE any
+          byte touches disk: Python via ``compile()``; every other registered
+          language via its provider's ``validate_syntax``, refusing genuine
+          SYNTAX_ERROR and soft-failing cross-file-resolvable errors (mirrors
+          dispatch's ``_should_soft_fail_verify``). New files have no
+          pre-snapshot, so the dispatch-level ``_verify_after_write`` (which has
+          nothing to compare against) can't catch a malformed creation — this
+          in-handler gate does.
+        * **Atomic write** — ``atomic_write_text`` (mkstemp + fsync +
+          os.replace), so a crash / SIGKILL / disk-full never leaves a partial
+          or empty file.
         """
         import time as _time
         start_time = _time.monotonic()
         args = self._recover_args_from_raw(args, ("path",))
-        file_path = (args.get("path") or "").strip()
+        file_path = (args.get("path") or args.get("file_path") or "").strip()
         content = args.get("content", "")
+        if not isinstance(content, str):
+            content = str(content)
         description = args.get("description", "")
-        overwrite = args.get("overwrite", False)
+        overwrite = bool(args.get("overwrite", False))
 
         if not file_path:
             # If __raw_arguments is present, the JSON was likely truncated during streaming
@@ -4318,29 +4410,128 @@ class WriteToolsMixin:
                 _raw_hint = f" (raw args: {_raw[:120]})"
             return self._make_result(ok=False, error=f"path is required{_raw_hint}", execution_time=0)
 
-        _norm = Path(self.repo_root) / file_path
+        # ── Repo confinement (defense in depth — matches every other write handler) ──
+        _secured = self._secure_path(file_path, confine=True)
+        if _secured is None:
+            return self._make_result(
+                ok=False, error=f"Path blocked (outside repo): {file_path}", execution_time=0,
+            )
+        _norm = _secured
 
-        if _norm.exists() and not overwrite:
+        _existed = _norm.exists()
+        if _existed and not overwrite:
             return self._make_result(
                 ok=False,
                 error=f"File already exists: {file_path} (use overwrite=True to replace)",
                 execution_time=0,
             )
 
+        # ── Blocking syntax gate (in memory, before disk) ──
+        # Python: compile() catches parse errors only (no undefined-name cascade
+        # at compile time → no soft-fail needed). Non-Python: provider
+        # validate_syntax + _should_soft_fail_verify, mirroring edit_text/dispatch.
+        # _gate_snapshots keys the pre-write content under the SAME path the
+        # provider reports (file_path) so origin-skip matches; a None value (new
+        # file) makes _should_soft_fail_verify skip the origin guard and apply
+        # pure FailureType classification — exactly what dispatch does for a
+        # _MISSING_SNAP new-file entry.
+        _orig_content = None
+        if _existed:
+            try:
+                _orig_content = _norm.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                _orig_content = None
+        _gate_snapshots = {file_path: _orig_content}
+        _gate_soft_failed = False
+
+        _lang = LanguageId.from_path(file_path)
+        if _lang is LanguageId.PYTHON:
+            try:
+                compile_quiet(content, file_path, "exec")
+            except SyntaxError as _se:
+                return self._make_result(
+                    ok=False,
+                    error=(
+                        f"create_file refused (file NOT written): content has a Python "
+                        f"syntax error in {file_path}: {_se.msg} at line {_se.lineno}"
+                    ),
+                    metadata={
+                        "file_path": file_path,
+                        "failure_class": "syntax_invalid_after_edit",
+                        "written": False,
+                    },
+                    execution_time=_time.monotonic() - start_time,
+                )
+            except Exception as _ce:
+                # Not a SyntaxError — compile() also raises ValueError (source
+                # with NUL bytes), RecursionError (deeply nested literals), etc.
+                # Those say nothing about the content being malformed, so the
+                # gate opens rather than refusing a legitimate write. Logged
+                # because a silent skip here is indistinguishable from a gate
+                # that ran and passed.
+                logger.debug(
+                    "create_file: Python syntax gate skipped for %s (%s: %s)",
+                    file_path, type(_ce).__name__, _ce,
+                )
+        elif _lang is not LanguageId.UNKNOWN:
+            try:
+                from ...languages import LanguageRegistry as _LR_CF
+                _provider = _LR_CF.instance().get(file_path)
+            except Exception:
+                _provider = None
+            if _provider is not None and _provider.capabilities().has_syntax_validator:
+                try:
+                    _val = _provider.validate_syntax(file_path, content)
+                except Exception:
+                    _val = None
+                if _val is not None and not _val.ok:
+                    _errs = _val.errors or []
+                    if _errs:
+                        _detail = f"{_errs[0].file}:{_errs[0].line}:{_errs[0].col}: {_errs[0].message}"
+                        for _e in _errs[1:3]:
+                            _detail += f"; L{_e.line}:{_e.col} {_e.message}"
+                        if len(_errs) > 3:
+                            _detail += f" (+{len(_errs) - 3} more syntax errors)"
+                    else:
+                        _detail = f"syntax error in {file_path}"
+                    # Mirror dispatch soft-fail: keep cross-file-resolvable errors;
+                    # refuse only genuine syntax errors.
+                    if not self._should_soft_fail_verify(_detail, _gate_snapshots):
+                        return self._make_result(
+                            ok=False,
+                            error=(
+                                f"create_file refused (file NOT written): content would "
+                                f"introduce a syntax error in {file_path}: {_detail}"
+                            ),
+                            metadata={
+                                "file_path": file_path,
+                                "syntax_error": _detail,
+                                "failure_class": "syntax_invalid_after_edit",
+                                "written": False,
+                            },
+                            execution_time=_time.monotonic() - start_time,
+                        )
+                    _gate_soft_failed = True  # soft-fail → fall through and write
+
+        # ── Atomic write ──
         try:
-            _norm.parent.mkdir(parents=True, exist_ok=True)
-            _norm.write_text(content, encoding="utf-8")
+            atomic_write_text(str(_norm), content)
         except Exception as e:
             return self._make_result(
-                ok=False, error=f"Failed to create {file_path}: {e}"
+                ok=False, error=f"Failed to create {file_path}: {e}", execution_time=0,
             )
 
         _exec = _time.monotonic() - start_time
+        _verb = "Overwrote" if _existed else "Created"
         _desc = f" ({description})" if description else ""
         _size = len(content)
+        _meta: dict[str, Any] = {"file_path": file_path}
+        if _gate_soft_failed:
+            _meta["syntax_gate"] = "soft_fail"
         return self._make_result(
             ok=True,
-            content=f"Created: {file_path}{_desc} ({_size} chars) [{_exec:.1f}s]",
+            content=f"{_verb}: {file_path}{_desc} ({_size} chars) [{_exec:.1f}s]",
+            metadata=_meta,
             execution_time=_exec,
         )
 

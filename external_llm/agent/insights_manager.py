@@ -514,7 +514,16 @@ _ARCHIVE_CACHE_MAX_ENTRIES: int = 8
 def _archive_capped_put(cache: dict, key, value, sibling_versions: dict | None = None) -> None:
     """Set ``cache[key] = value`` then FIFO-evict the oldest entry if over cap.
 
-    Pure-dict, GIL-atomic — no lock needed (matches the lock-free cache family).
+    Pure-dict, no lock needed (matches the lock-free cache family).
+
+    ``next(iter(cache))`` is NOT atomic under free-threaded CPython (PEP 703) or
+    against a concurrent inserter/deleter: it can raise ``RuntimeError`` (dict
+    resized during iteration) or ``StopIteration`` (concurrent drain). Both are
+    caught and end eviction, leaving the cache temporarily over cap — harmless,
+    and far better than propagating out of an insights-cache write. This mirrors
+    ``_shared_utils._capped_put``, the twin of this function, which has always
+    guarded it; this one claimed "GIL-atomic" and did not, so only one of the
+    two was actually prepared for it.
 
     When ``sibling_versions`` is given, the per-path write-version counter for an
     evicted key is popped in LOCKSTEP with the content-cache entry. This keeps
@@ -528,7 +537,14 @@ def _archive_capped_put(cache: dict, key, value, sibling_versions: dict | None =
     """
     cache[key] = value
     while len(cache) > _ARCHIVE_CACHE_MAX_ENTRIES:
-        _oldest = next(iter(cache))
+        try:
+            _oldest = next(iter(cache))
+        except (RuntimeError, StopIteration):
+            _logger.debug(
+                "_archive_capped_put: concurrent dict resize, stopping eviction "
+                "(cap=%s, size=%s)", _ARCHIVE_CACHE_MAX_ENTRIES, len(cache),
+            )
+            break
         cache.pop(_oldest, None)
         if sibling_versions is not None:
             sibling_versions.pop(_oldest, None)

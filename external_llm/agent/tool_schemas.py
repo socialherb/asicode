@@ -308,7 +308,7 @@ SCHEMA_WRITE_PLAN = {
             "Use when edits span multiple files, require create_file/replace_file ops, or need atomic execution. "
             "SIZE LIMIT: inline 'content' is for SMALL files only (under ~200 lines). "
             "Writing or rewriting a whole large file inline reliably breaks JSON escaping — "
-            "write large files with bash (heredoc or python3) instead, then use write_plan "
+            "write large files with bash (heredoc with QUOTED delimiter: << 'EOF') or python3 instead, then use write_plan "
             "for the remaining small edits. Its `insert_after`/`insert_after_line` ops are the natural fit for APPENDING at end-of-file (positional — no text matching, no splice-boundary friction)."
         ),
         "parameters": {
@@ -378,6 +378,9 @@ SCHEMA_READ_FILE = {
             "Use start_line and end_line (1-indexed, inclusive) to read specific sections. "
             "Very large ranges are truncated at an output budget; the notice names the "
             "line to resume from. "
+            "Binary files — and text declaring a UTF-16/32 BOM — are reported as such "
+            "instead of being returned as replacement characters; the notice names the "
+            "tool that can read them (read_image, or bash `file`/`iconv`). "
             "Use when you need to inspect a line range before editing, or confirm context around a symbol. "
             "Each line is prefixed with its number and an indent gutter `│N│` = the leading-whitespace "
             "column count, so the exact indentation is readable without counting spaces. When constructing "
@@ -791,6 +794,7 @@ SCHEMA_GET_FILE_OUTLINE = {
 
 SCHEMA_SAVE_INSIGHT = {
         "name": "save_insight",
+        "x_design_chat_only": True,
         "description": (
             "Save a technical insight/design decision from exploration. "
             "Only for non-obvious findings useful in future sessions. "
@@ -815,6 +819,7 @@ SCHEMA_SAVE_INSIGHT = {
 
 SCHEMA_DELETE_INSIGHT = {
         "name": "delete_insight",
+        "x_design_chat_only": True,
         "description": (
             "Delete a design insight from .asicode/design_insights.md by matching its header line. "
             "Read the file first with the design-chat context to see available entries. "
@@ -841,6 +846,7 @@ SCHEMA_DELETE_INSIGHT = {
 
 SCHEMA_EDIT_INSIGHT = {
         "name": "edit_insight",
+        "x_design_chat_only": True,
         "description": (
             "Edit (replace) an existing design insight in .asicode/design_insights.md. "
             "Read the file first with the design-chat context to see available entries. "
@@ -1053,6 +1059,7 @@ SCHEMA_READ_IMAGE = {
 }
 SCHEMA_SEARCH_DESIGN_HISTORY = {
             "name": "search_design_history",
+            "x_design_chat_only": True,
             "description": "Search design chat history across sessions using BM25 + optional semantic vector search. Space-separated keywords -> BM25 relevance ranking (CodeTokenizer tokenizes CamelCase/snake_case). Pass target_session_id for other sessions (files in .asicode/design_sessions/). Use when: recalling decisions/file paths from older turns, resuming after interruption, cross-session recall, user asks about old conversations. NOT for: info already visible in current context (recent turns or already-injected summaries).\n\n**The results are from past conversation history — code state, file contents, and decisions may have changed since those turns. Always verify against the current codebase before acting on retrieved information.**\n\nSession listing: query \"list sessions\" or \"세션 목록\" to list all sessions.\nField-specific search: use search_field=decisions for saved decisions, search_field=summary for compressed summaries, search_field=all for all fields.",
             "parameters": {
                 "type": "object",
@@ -1254,3 +1261,52 @@ for _schema in AGENT_TOOL_SCHEMAS:
 # tool-call names in agent_turn_pipeline). Computed once at import; avoids the
 # per-turn list() copy + set comprehension that get_tool_schemas() would incur.
 AGENT_TOOL_NAMES: frozenset = frozenset(s["name"] for s in AGENT_TOOL_SCHEMAS)
+
+# Tools whose handler lives on DesignChatLoop, NOT on ToolRegistry: the design
+# chat loop intercepts them by name before dispatch. ToolRegistry.dispatch has
+# no entry for them, so advertising them to the coding-agent lane produced a
+# tool the model could call but never use — "Unknown tool: save_insight.
+# Available tools: [...]" — with no way for it to tell that from a real bug.
+#
+# Default-excluded rather than default-included: forgetting to opt IN hides a
+# working tool (visible, harmless), while forgetting to opt OUT advertises a
+# broken one (silent, and only the model pays). Enforced by
+# test_every_advertised_tool_has_a_handler.
+DESIGN_CHAT_ONLY_TOOL_NAMES: frozenset = frozenset(
+    s["name"] for s in AGENT_TOOL_SCHEMAS if s.get("x_design_chat_only")
+)
+
+
+def _schema_variant(*, python_only: bool, design_chat: bool) -> list[dict[str, Any]]:
+    return [
+        s for s in AGENT_TOOL_SCHEMAS
+        if (python_only or not s.get("x_python_only"))
+        and (design_chat or not s.get("x_design_chat_only"))
+    ]
+
+
+# The four (lang_filter × surface) variants, built once at import.
+# Keyed ``(include_python_only, include_design_chat)``.
+#
+# Module-level rather than memoized per registry: the filtering depends only on
+# module constants, so every registry would compute an identical list. Sharing
+# makes the selection a dict lookup and keeps one object per variant instead of
+# one per registry.
+#
+# Note this is NOT what makes the token cache work — despite what the old
+# per-instance memo's comment implied, ``estimate_tokens_from_tool_schemas``
+# keys on a CONTENT fingerprint, explicitly "not id() so GC address reuse can
+# never poison it". Identity stability here saves an allocation, nothing more;
+# a fresh equal list per call would hit that cache just as well.
+#
+# Callers must NOT mutate these lists or their dicts. (Verified at the time of
+# writing: every consumer iterates, and the one that extends the list —
+# ``orchestrator._obr_base`` — copies with ``list(...)`` first.)
+TOOL_SCHEMA_VARIANTS: dict[tuple[bool, bool], list[dict[str, Any]]] = {
+    (p, d): (AGENT_TOOL_SCHEMAS if (p and d) else _schema_variant(python_only=p, design_chat=d))
+    for p in (True, False) for d in (True, False)
+}
+TOOL_NAME_VARIANTS: dict[tuple[bool, bool], frozenset] = {
+    key: frozenset(s["name"] for s in schemas)
+    for key, schemas in TOOL_SCHEMA_VARIANTS.items()
+}

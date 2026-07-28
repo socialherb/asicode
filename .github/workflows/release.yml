@@ -35,8 +35,77 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Behaviour gate in front of an IRREVERSIBLE upload. Until this existed the
+  # only thing between a tag push and PyPI was `twine check` (metadata) plus an
+  # import smoke — nothing ran a single test, because p11-ci.yml is excluded
+  # from the public export and the private repo has no remote. So `lint.yml`
+  # was the only workflow that ever executed, and it only gates
+  # F401/F811/F821/F823 + three AST checks.
+  #
+  # This runs against the EXPORTED tree, which is what the public repo and the
+  # wheel contain — lane/, webapp/, tools/ and their coupled tests are absent
+  # here. That distinction matters: a clean install of the exported tree found a
+  # segfault the private tree could not (see the tree-sitter core pin), because
+  # the development environment already held a working core.
+  #
+  # ripgrep is installed explicitly rather than relied upon: several read-path
+  # tests need it, and pinning its presence keeps the job deterministic instead
+  # of tracking whatever the runner image happens to ship.
+  test:
+    name: Unit tests (exported tree, clean install)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ripgrep
+
+      - name: Install package + test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Unit tests
+        # No deselections: every test in tests/unit runs on the exported tree.
+        # The five that were previously --deselect-ed were each fixed to run in
+        # CI, so the gate is clean rather than carrying permanent debt (a
+        # perpetually-red gate trains everyone to bypass it):
+        #
+        #   * test_symbol_search_rg_absent (2) — rewrote from a subprocess that
+        #     scrubbed rg out of PATH (which cannot reliably hide /usr/bin/rg on
+        #     a runner where rg, git and the interpreter share that dir, and rg
+        #     is reachable from PATH entries a single which() does not enumerate)
+        #     to a DETERMINISTIC monkeypatch of shutil.which + subprocess.run at
+        #     the symbol_search module level. It fires the exact FileNotFoundError
+        #     every rg call site must catch, on any host, rg installed or not.
+        #   * test_shell_shims::test_missing_command — made platform-aware: macOS
+        #     (shim active) asserts rc=1/"missing command"; Linux (real GNU
+        #     timeout, shim inert) asserts rc=125/"missing operand" (measured in
+        #     a clean python:3.12-slim container).
+        #   * test_ast_cache_mutation_guard and test_operation_kind_landmine_guard
+        #     — both scan external_llm/, which in the export is a STRICT SUBSET
+        #     of the private tree (lane/ and other private editor subpackages are
+        #     dropped). A subset of a clean tree is clean, so they pass; verified
+        #     by running both against a locally-built export snapshot. The
+        #     "different file set" hunch that originally deselected them was wrong.
+        run: |
+          python -m pytest tests/unit -q
+
   publish:
     name: Build and publish to PyPI
+    # The gate. A failing test job blocks the upload; PyPI rejects re-uploads,
+    # so there is no undo once publish runs. Note the tag is already pushed by
+    # the time this fails — recovery is fix, delete the tag, re-tag.
+    needs: test
     runs-on: ubuntu-latest
     # id-token: write is required for PyPI Trusted Publishing (OIDC): the
     # pypa/gh-action-pypi-publish action mints a short-lived upload token from

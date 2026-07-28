@@ -49,6 +49,29 @@ def min_indent(lines: list[str]) -> int:
     return min(vals) if vals else 0
 
 
+INDENT_GUTTER_BAR = "│"  # U+2502 — box-drawing vertical, never a valid code prefix
+
+
+def format_numbered_line(lineno: int, line: str) -> str:
+    """Format one source line as ``"  NNN │N│ code"`` with an indent gutter.
+
+    The gutter value ``N`` is the leading-whitespace count — the SAME metric
+    :func:`min_indent` and :func:`detect_indent_char` compute from, which is
+    why this renderer lives beside them rather than in a tool handler. Empty
+    lines show ``0``. The bar is U+2502 so it is visually distinct from ASCII
+    ``|`` used in code (type unions, bitwise-or) and uncopyable as a prefix.
+
+    Shown to the model by ``read_file``/``read_symbol`` so it can see exact
+    indentation without guessing — the guesswork that produces the
+    "old_string not found" mismatches in edit_text/anchor_edit/modify_symbol.
+    Any other model-facing source preview must use this, not a local
+    ``f"{i}: {line}"``, or it hands back a listing missing the one column the
+    failure is usually about.
+    """
+    indent = len(line) - len(line.lstrip()) if line.strip() else 0
+    return f"{lineno:>6} {INDENT_GUTTER_BAR}{indent:>2}{INDENT_GUTTER_BAR} {line}"
+
+
 def _continuation_rows(text: str, lines: Optional[list[str]] = None) -> set[int]:
     """1-based rows of physical lines that *continue* a previous logical line.
 

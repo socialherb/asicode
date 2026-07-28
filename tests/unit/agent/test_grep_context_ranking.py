@@ -90,21 +90,84 @@ def test_grep_context_match_keeps_neighbors(tool_registry):
         f"{out_lines[match_idx:match_idx + 3]}")
 
 
-def test_grep_flat_ranking_still_active(tool_registry):
-    """Control: with context==0, BM25 re-ranking of flat match-lines must still
-    run — a line whose content is richer in the query token ranks above a line
-    with a single occurrence. Guards against the context-gate accidentally
-    disabling ALL ranking.
+def test_grep_flat_no_ranking_when_results_fit(tool_registry):
+    """grep output preserves native file/line order — ranking's only job is to
+    select which results survive a cap, never to scramble the display order.
+
+    What this actually guards is the ``_top.sort()`` in ``_tool_grep``: BM25
+    selects the top N by score and that line puts the survivors back in native
+    order. Skipping ranking entirely (the ``len(lines) > max_results`` guard)
+    and running it on a set that fits are therefore INDISTINGUISHABLE in the
+    output — verified by mutation: forcing the branch to run with 2 results
+    changes nothing. So this is an order-contract test, not a branch test, and
+    it fails exactly when ``_top.sort()`` is removed.
     """
     root = pathlib.Path(tool_registry.repo_root)
-    # query-neutral filenames so filename tokenization cannot affect the order
-    (root / "alpha.py").write_text("# mytoken once\n")
-    (root / "omega.py").write_text("# mytoken mytoken mytoken\n")
+    # Order is asserted WITHIN one file, not across files. ripgrep walks
+    # directories in parallel and its inter-file output order is nondeterministic
+    # (there is no --sort here — adding one would force rg single-threaded for
+    # every grep the agent runs). The cross-file spelling of this assertion
+    # therefore flaked: measured 3 order flips in 400 runs under CPU load, often
+    # enough to fail a full-suite run and never reproduce in isolation. Line
+    # order inside one file is deterministic, and it targets the property more
+    # directly anyway — the damage ranking would do is intra-file spatial
+    # locality (lines 136, 112, 36 instead of 36, 112, 136).
+    #
+    # The bait: the LATER line scores higher under BM25 (three occurrences vs
+    # one), so a lost _top.sort() pulls it to the front.
+    (root / "alpha.py").write_text(
+        "# mytoken once\n"
+        "filler = 1\n"
+        "# mytoken mytoken mytoken\n"
+    )
     res = tool_registry.dispatch(
         "grep", {"pattern": "mytoken", "context": 0, "path": "."}
     )
     assert res.ok, res.error
     assert "mytoken" in res.content
-    # omega (3 occurrences) must rank above alpha (1 occurrence)
-    assert res.content.index("omega.py") < res.content.index("alpha.py"), (
-        f"BM25 ranking inactive: omega should rank above alpha.\n{res.content}")
+    assert res.content.index("alpha.py:1:") < res.content.index("alpha.py:3:"), (
+        f"native line order not preserved (line 1 must precede line 3) — "
+        f"_top.sort() lost?\n{res.content}")
+
+
+def test_grep_reports_true_match_count_when_ranking_runs(tool_registry):
+    """The header count and the "refine your pattern" notice must describe the
+    MATCH set, not the displayed set.
+
+    Regression: the ranking branch selects the top ``max_results`` and discards
+    the rest, and ``total``/``truncated`` were computed from ``lines`` *after*
+    that selection. A pattern with 400 matches reported "(5 matches)" with no
+    truncation notice — the agent concludes it has seen every hit and stops
+    searching. Only stop-word patterns escaped (``tokenize("import") == []``
+    skips ranking), so ordinary identifier searches were the broken case.
+    """
+    root = pathlib.Path(tool_registry.repo_root)
+    for f in range(4):
+        # 100 matches each => 400 total, far above the max_results=5 below.
+        (root / f"bulk{f}.py").write_text("".join(f"mytoken_{i}\n" for i in range(100)))
+
+    res = tool_registry.dispatch(
+        "grep", {"pattern": "mytoken", "context": 0, "path": ".", "max_results": 5}
+    )
+    assert res.ok, res.error
+    header = res.content.splitlines()[0]
+    assert "(400 matches)" in header, (
+        f"header must report the true match count, not the displayed count.\n{header}")
+    assert "of 400 matches" in res.content, (
+        f"truncation notice missing — agent cannot tell results were dropped.\n{res.content}")
+
+
+def test_grep_ranked_survivors_are_in_file_line_order(tool_registry):
+    """When ranking DOES run, the surviving results are still displayed in
+    native file/line order — ranking selects, it does not reorder."""
+    root = pathlib.Path(tool_registry.repo_root)
+    (root / "bulk.py").write_text("".join(f"mytoken_{i}\n" for i in range(300)))
+
+    res = tool_registry.dispatch(
+        "grep", {"pattern": "mytoken", "context": 0, "path": ".", "max_results": 10}
+    )
+    assert res.ok, res.error
+    nums = _line_numbers(res.content)
+    assert nums, res.content
+    assert nums == sorted(nums), (
+        f"ranked survivors must be re-sorted into file/line order: {nums}")

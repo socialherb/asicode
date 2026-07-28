@@ -6,7 +6,7 @@ AgentLoop inherits ContextManagerMixin, so all methods have full access to
 self.config, self.registry, self._check_small_model(), etc.
 
 Moved here:
-  - Module-level git cache (_git_cache, _git_cache_ts, _GIT_CACHE_TTL, _clear_git_cache)
+  - Module-level git cache (_git_cache, _git_cache_gen, _GIT_CACHE_TTL, _clear_git_cache)
   - ContextTier class
   - _SMALL_MODEL_PATTERNS constant
   - System prompt template (_SYSTEM_PROMPT_TEMPLATE)
@@ -22,28 +22,34 @@ import time
 
 from ..languages import LanguageId
 from ..languages.capabilities import AnalysisCapability, is_supported
+from ._shared_utils import _capped_put
 from .config.thresholds import config
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Module-level git result cache (10 s TTL)
+# Module-level git result cache (10 s TTL, per-root keyed)
 # ---------------------------------------------------------------------------
+# {repo_root: (monotonic_ts, {"branch": ..., "status": ..., ...})}
+# Per-root so a request for repo B cannot receive repo A's snapshot — the
+# webapp is a long-lived server process where ToolRegistry is created per-request
+# but the module-level cache spans requests / repos.
 
-_git_cache: dict[str, str] = {}
-_git_cache_ts: float = 0.0
+_git_cache: dict[str, tuple[float, dict[str, str]]] = {}
+_git_cache_gen: int = 0  # incremented on invalidation; stale writes skip cache store
 _GIT_CACHE_TTL: float = 10.0
-# Guards _git_cache / _git_cache_ts. Held only for the fast cache-check and
+_GIT_CACHE_MAX_ENTRIES = 8
+# Guards _git_cache. Held only for the fast cache-check and
 # the final store — NOT while running git subprocesses (which can be slow).
 _git_cache_lock = threading.Lock()
 
 
 def _clear_git_cache() -> None:
     """Reset the git result cache (call after any write operation)."""
-    global _git_cache, _git_cache_ts
+    global _git_cache, _git_cache_gen
     with _git_cache_lock:
         _git_cache = {}
-        _git_cache_ts = 0.0
+        _git_cache_gen += 1
 
 
 def _run_git_raw(repo_root: str, *args: str) -> str:
@@ -52,10 +58,23 @@ def _run_git_raw(repo_root: str, *args: str) -> str:
     Module-level primitive used by get_git_snapshot so the snapshot fetch is
     parallelisable via a thread pool (it cannot be an instance method: the pool
     needs a picklable / plain callable, not a bound ``self._run_git``).
+
+    ``-c core.quotePath=false`` because this output is shown to the MODEL:
+    ``status --short`` C-quotes non-ASCII paths by default, so a repo with
+    Korean/CJK filenames put ``M "\\355\\225\\234\\352\\270\\200...py"`` into the
+    system prompt (see ``_build_session_context``'s "Modified files (git
+    status)" block). The model cannot use that as a path, and copying it into a
+    tool call produces a file-not-found on a name nobody has. Set here rather
+    than at each call site so every snapshot field is covered at once.
+
+    ``quotePath=false``, not ``-z``: these results are displayed as text, so
+    newline-separated output is what the callers want; ``-z`` is the right tool
+    only where the output is PARSED into paths (see
+    ``common.repo_files.git_list_repo_files``).
     """
     try:
         r = subprocess.run(
-            ["git", *list(args)],
+            ["git", "-c", "core.quotePath=false", *list(args)],
             cwd=repo_root,
             capture_output=True, text=True, check=False, timeout=8,
         )
@@ -65,7 +84,7 @@ def _run_git_raw(repo_root: str, *args: str) -> str:
 
 
 def get_git_snapshot(repo_root: str) -> dict[str, str]:
-    """Return a TTL-cached git snapshot shared across the agent.
+    """Return a TTL-cached git snapshot, per-root, shared across the agent.
 
     Single source of truth for per-run git state, consumed by:
       - _collect_git_info (rollback snapshot: head_hash, has_changes)
@@ -75,6 +94,10 @@ def get_git_snapshot(repo_root: str) -> dict[str, str]:
     run: 3 here + 2 there); now a single shared snapshot fetches branch, status
     and last-commit log in PARALLEL once, cached for _GIT_CACHE_TTL seconds.
 
+    Cache is keyed by *repo_root* so a long-lived server process (webapp) that
+    serves multiple repos cannot leak repo A's snapshot to repo B's request.
+    Entries are FIFO-bounded via _capped_put (cap _GIT_CACHE_MAX_ENTRIES).
+
     The cache is cleared after any successful write operation (_clear_git_cache
     is registered as a write-success callback), so a stale snapshot never
     follows a successful edit. Double-checked locking keeps the slow git
@@ -83,13 +106,18 @@ def get_git_snapshot(repo_root: str) -> dict[str, str]:
 
     Returns {branch, status, head_hash, last_commit}; missing repo_root -> {}.
     """
-    global _git_cache, _git_cache_ts
+    global _git_cache, _git_cache_gen
     if not repo_root:
         return {}
     _now = time.monotonic()
     with _git_cache_lock:
-        if _git_cache and (_now - _git_cache_ts) < _GIT_CACHE_TTL:
-            return dict(_git_cache)
+        _entry = _git_cache.get(repo_root)
+        if _entry is not None and (_now - _entry[0]) < _GIT_CACHE_TTL:
+            return dict(_entry[1])
+    # Read generation BEFORE the slow git subprocesses — if invalidation bumps
+    # the generation while we're collecting, the result is stale and must NOT be
+    # cached (it would resurrect the very state _clear_git_cache just killed).
+    _gen_before = _git_cache_gen
     # Cache miss: fetch all needed git data in parallel OUTSIDE the lock
     # (git subprocesses are slow; concurrent callers must not serialise on
     # the lock while git runs).
@@ -123,10 +151,14 @@ def get_git_snapshot(repo_root: str) -> dict[str, str]:
         _fresh["head_hash"], _fresh["last_commit"] = _log_line, ""
     # Store under lock; re-check in case another thread populated meanwhile.
     with _git_cache_lock:
-        if _git_cache and (_now - _git_cache_ts) < _GIT_CACHE_TTL:
-            return dict(_git_cache)
-        _git_cache = dict(_fresh)
-        _git_cache_ts = _now
+        _entry = _git_cache.get(repo_root)
+        if _entry is not None and (_now - _entry[0]) < _GIT_CACHE_TTL:
+            return dict(_entry[1])
+        # Generation changed while we were collecting — invalidation ran
+        # mid-collection; don't cache stale data, just return it fresh.
+        if _git_cache_gen != _gen_before:
+            return _fresh
+        _capped_put(_git_cache, repo_root, (_now, _fresh), _GIT_CACHE_MAX_ENTRIES)
         return _fresh
 
 

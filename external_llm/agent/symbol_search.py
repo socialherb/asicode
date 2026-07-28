@@ -31,6 +31,7 @@ from ..languages import (
 )
 from ._shared_utils import (
     _WALK_CACHE_TTL,
+    _capped_put,
 )
 from ._shared_utils import (
     _walk_py_files as _shared_walk_py_files,
@@ -38,6 +39,7 @@ from ._shared_utils import (
 from ._shared_utils import (
     _walk_ts_js_files as _shared_walk_ts_js_files,
 )
+from ._thread_pool import shared_pool as _shared_pool
 # Walk-cache introspection — lets find_symbol distinguish a genuine miss
 # ("symbol absent") from a truncated index ("symbol may live in un-indexed
 # files"). Both caches are module-global in ._shared_utils.
@@ -344,10 +346,10 @@ def _nonpy_indexable_files(root: Path) -> Optional[tuple[list[str], int]]:
         )
     except (OSError, subprocess.SubprocessError) as e:
         logger.debug("nonpy file list: rg failed (%s)", e)
-        _NONPY_FILES_CACHE[key] = (_time.monotonic(), None, 0)
+        _capped_put(_NONPY_FILES_CACHE, key, (_time.monotonic(), None, 0))
         return None
     if proc.returncode not in (0, 1):
-        _NONPY_FILES_CACHE[key] = (_time.monotonic(), None, 0)
+        _capped_put(_NONPY_FILES_CACHE, key, (_time.monotonic(), None, 0))
         return None
     files: list[str] = []
     total = 0
@@ -362,7 +364,7 @@ def _nonpy_indexable_files(root: Path) -> Optional[tuple[list[str], int]]:
             # Vanished between walk and stat — the scan skips it too, so the
             # only consequence is a slightly low byte total for the cap.
             logger.debug("nonpy file list: cannot size %s (%s)", p, e)
-    _NONPY_FILES_CACHE[key] = (_time.monotonic(), files, total)
+    _capped_put(_NONPY_FILES_CACHE, key, (_time.monotonic(), files, total))
     return files, total
 
 
@@ -465,6 +467,34 @@ def _rg_py_files_containing(root: Path, token: str) -> Optional[set[str]]:
     return _rg_list_py_files(root, ["--word-regexp", "--fixed-strings", "--", token])
 
 
+# {(root, matcher_args): (timestamp, files)} for the Python prefilter spawns.
+# Keyed by QUERY, so it is sized for the distinct symbols looked up inside one
+# TTL window (a handful), not for repos like the walk caches it sits beside —
+# hence a larger cap than their 8. Not larger still: a value is a set of
+# absolute paths, and the word-match fallback can return most of the repo, so
+# the cap is also the memory bound.
+_RG_PY_FILTER_CACHE: dict[tuple, tuple[float, set[str]]] = {}
+_RG_PY_FILTER_MAX_ENTRIES: int = 32
+
+
+def invalidate_py_prefilter_cache() -> None:
+    """Drop the Python prefilter memo so a just-written file is visible.
+
+    Sibling of :meth:`SymbolSearcher.invalidate_nonpy_caches`, and needed for
+    the same reason: the memo below is TTL-based, and 30 s of staleness is fine
+    for drift but NOT for the agent's own writes — it edits a file and looks up
+    the symbol it just added in the same turn. Without this the memo would
+    reintroduce "find_symbol answers 'No definitions found' for a function that
+    is on disk" (commit 77008787) on the *Python* side, which is the one side
+    that was already correct.
+
+    Cleared wholesale rather than per-path: the key is the rg QUERY, so there is
+    no path to match against — an entry's value is a file set, and a newly
+    created file is absent from every one of them.
+    """
+    _RG_PY_FILTER_CACHE.clear()
+
+
 def _rg_list_py_files(root: Path, matcher_args: list[str]) -> Optional[set[str]]:
     """Core rg runner for the find_symbol prefilters.
 
@@ -472,10 +502,34 @@ def _rg_list_py_files(root: Path, matcher_args: list[str]) -> Optional[set[str]]
     *matcher_args*, or None when the answer cannot be trusted (rg missing,
     error, timeout). Shared by the word-match and definition-pattern
     prefilters so the trust contract (None vs empty set) stays identical.
+
+    Memoized per ``(root, matcher_args)`` for :data:`_WALK_CACHE_TTL`, the same
+    window the sibling walk caches use. The repeat this exists for is not a
+    retry but a SEQUENCE: ``find_symbol(X)`` followed by ``read_symbol(X)``
+    issues the identical query twice (measured: 12 subprocess spawns in a 30
+    tool-call stub run, of which 2 were byte-identical rg invocations at ~29 ms
+    each), and the tool-result cache cannot dedupe those because they arrive
+    under different tool names.
+
+    Only trustworthy answers are memoized. A None means "fall back to scanning
+    every file", and caching that would keep a transient rg timeout suppressing
+    the prefilter for a full TTL — recomputing it is both correct and cheap
+    (the rg-missing path is one ``shutil.which``).
     """
     rg = shutil.which("rg")
     if not rg:
         return None
+    # AFTER the rg check, deliberately. Reading the memo first would let a warm
+    # entry answer for a machine where rg has since disappeared, turning the
+    # documented "None = prefilter untrustworthy, scan everything" contract into
+    # a stale set — caught by test_rg_missing_returns_none_for_full_scan_fallback.
+    # The spawn is what this skips, and the spawn is downstream of here anyway.
+    _key = (str(root), tuple(matcher_args))
+    _hit = _RG_PY_FILTER_CACHE.get(_key)
+    if _hit is not None and (_time.monotonic() - _hit[0]) < _WALK_CACHE_TTL:
+        # Copy: callers own the result and the intersection at the call site
+        # mutates it, which would otherwise poison every later hit.
+        return set(_hit[1])
     try:
         proc = subprocess.run(
             [rg, "--files-with-matches", "--type", "py",
@@ -501,6 +555,8 @@ def _rg_list_py_files(root: Path, matcher_args: list[str]) -> Optional[set[str]]
             # root makes them string-identical; per-path realpath() here cost
             # ~1,150 lstat-walking calls per find_symbol on this repo.
             out.add(str(root / line))
+    _capped_put(_RG_PY_FILTER_CACHE, _key, (_time.monotonic(), set(out)),
+                _RG_PY_FILTER_MAX_ENTRIES)
     return out
 
 
@@ -830,6 +886,30 @@ class SymbolSearcher:
                             # Return the class itself so modify_symbol can edit its body
                             return [parent_defs[0]]
 
+        # ── Non-Python probe, started early and collected below ──────────────
+        # The two prefilters this function runs are independent — both are a
+        # function of (root, search_name) alone — but they were sequential with
+        # the whole Python parse between them: rg #1 (definition patterns, ~14 ms
+        # here), parse, rg #2 (does any non-Python file even mention the name,
+        # ~8 ms). Starting #2 now overlaps it with both, so its cost comes off
+        # the wall clock rather than adding to it.
+        #
+        # Only for kind="any", which is the default and the one kind that reaches
+        # the collection point unconditionally (see the branch below: every other
+        # kind gets there only when Python found nothing). Speculating for those
+        # would spawn an rg whose answer is usually discarded — the point is to
+        # move work already certain to happen, not to add any.
+        _nonpy_probe = None
+        if kind == "any":
+            try:
+                _nonpy_probe = _shared_pool.submit(
+                    self._nonpy_index_worth_building, root, search_name
+                )
+            except RuntimeError:
+                # Pool shut down (interpreter teardown) — fall back to the
+                # inline call at the collection point.
+                _nonpy_probe = None
+
         # ── Python AST scan ──────────────────────────────────────────────────
         py_files = [root] if root.is_file() and LanguageId.from_path(str(root)) == LanguageId.PYTHON else _walk_py_files(root)
         # Narrow to files that actually contain the name before parsing any of
@@ -876,7 +956,7 @@ class SymbolSearcher:
                         break
 
         # ── Provider-aware search for registered languages (persistent index)
-        if (not results or kind == "any") and kind != "variable":
+        if not results or kind == "any":
             registry = LanguageRegistry.instance()
             # NOTE: this is a property of the STATIC provider registry, not of
             # the repo — the built-in providers always include non-Python ones,
@@ -886,7 +966,24 @@ class SymbolSearcher:
                 p.language_id().value not in ("python", "typescript", "javascript")
                 for p in set(registry._providers.values())
             )
-            if has_nonpy_provider and self._nonpy_index_worth_building(root, search_name):
+            # Collect the probe started before the Python scan. Guarded by
+            # has_nonpy_provider so the short-circuit the `and` used to give is
+            # preserved — that flag is documented above as always True today, but
+            # this must not become the reason it is.
+            #
+            # A probe failure must not lose the branch, so it falls back to the
+            # inline call — the same answer, just without the overlap.
+            _worth = False
+            if has_nonpy_provider:
+                if _nonpy_probe is not None:
+                    try:
+                        _worth = _nonpy_probe.result()
+                    except Exception as e:
+                        logger.debug("nonpy probe failed (%s) — retrying inline", e)
+                        _worth = self._nonpy_index_worth_building(root, search_name)
+                else:
+                    _worth = self._nonpy_index_worth_building(root, search_name)
+            if _worth:
                 # The persistent index already aggregates all non-Python
                 # providers in one rg pass; filter to this name/kind.
                 _idx = self._nonpy_index_for(root)
@@ -895,18 +992,27 @@ class SymbolSearcher:
                         "function", "async_function", "method",
                     ):
                         results.append(d)
+                    elif kind in ("variable", "any") and d.kind in (
+                        # Variable/constant declarations across languages.
+                        # "variable" covers Go var/short_var, "constant" covers
+                        # Go const + Rust const/static, "css_variable" covers
+                        # CSS custom properties (--name).
+                        "variable", "constant", "css_variable",
+                    ):
+                        results.append(d)
                     elif kind in ("class", "any") and d.kind in (
                         # All type/aggregate-like declarations across languages.
                         # "class"-group covers: OOP classes, interfaces, type
-                        # aliases, enums, CSS selectors/custom properties, plus
-                        # the struct/trait/record/module/protocol kinds emitted
-                        # by the Rust/C#/Ruby/PHP/Swift providers & AST path.
+                        # aliases, enums, CSS selectors (NOT custom properties —
+                        # those are in the variable group above), plus the
+                        # struct/trait/record/module/protocol kinds emitted by the
+                        # Rust/C#/Ruby/PHP/Swift providers & AST path.
                         # "namespace" covers Ruby modules / AST-normalized
                         # module-kind symbols.
                         "class", "interface", "type", "enum",
                         "struct", "trait", "record", "module", "protocol",
                         "namespace",
-                        "css_class", "css_id", "css_variable",
+                        "css_class", "css_id",
                     ):
                         results.append(d)
                     elif kind == "any":
@@ -1129,16 +1235,13 @@ class SymbolSearcher:
                 for d in defs[1:5]
             ]
 
-        # Add read guidance for the agent
-        if "file" in info and "line" in info:
-            info["read_guidance"] = (
-                f"To examine this symbol, use bash (cat -n) on "
-                f"`{info['file']}` starting around line {max(1, info['line'] - 10)}. "
-                "Read 30-50 lines around the definition to understand context."
-            )
-        else:
-            info["read_guidance"] = "Unable to generate read guidance due to missing file or line information."
-
+        # NOTE: no "read_guidance" key. It used to be built here on every call
+        # and no caller ever read it — both consumers cherry-pick specific keys
+        # (read_tools takes subclasses/reference_count/…, agent_tools takes
+        # signature/line). Its text also told the model to read with
+        # `bash (cat -n)`, which omits read_file's │N│ indent gutter, so the day
+        # someone serialised this dict wholesale the agent would have been
+        # steered off the tool that exists to prevent old_string mismatches.
         return info
 
     def get_file_outline(self, file_path: str) -> list[SymbolDef]:

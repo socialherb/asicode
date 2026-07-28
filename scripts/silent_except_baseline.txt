@@ -423,7 +423,7 @@ external_llm/agent/tool_registry.py::<module>::ToolRegistry::_has_file_redirect_
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_has_file_redirect_via_ts::1
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_invalidate_cache_after_write::1
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_invalidate_cache_after_write::2
-external_llm/agent/tool_registry.py::<module>::ToolRegistry::_invalidate_cache_after_write::4
+external_llm/agent/tool_registry.py::<module>::ToolRegistry::_invalidate_cache_after_write::5
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_repair_verify_failure::0
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_repair_verify_failure::1
 external_llm/agent/tool_registry.py::<module>::ToolRegistry::_repair_verify_failure::2

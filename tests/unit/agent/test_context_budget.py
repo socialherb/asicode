@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from external_llm.agent.context_budget import (
     _CONTEXT_LIMITS,
     _DEFAULT_CONTEXT_LIMIT,
@@ -1198,48 +1200,76 @@ class TestOverrideTTLAwareReductionCap:
 # 13. P4: Force cache save (skip debounce)
 # ══════════════════════════════════════════════════════════════════════════════
 
+@pytest.fixture
+def cache_file():
+    """The override-cache path, emptied first so existence is a real signal.
+
+    The path itself is redirected off the user's home for the whole session by
+    ``_isolate_context_override_cache`` in tests/conftest.py — see there for why
+    a per-test redirect cannot work (the atexit flush outlives it). This fixture
+    only guarantees a clean slate: these tests assert on the file APPEARING, so
+    a leftover from an earlier test would make them pass without a write.
+    """
+    import pathlib
+
+    import external_llm.agent.context_budget as cb
+    path = pathlib.Path(cb._OVERRIDE_CACHE_FILE)
+    if path.exists():
+        path.unlink()
+    return path
+
+
+def _enter_debounce_window(monkeypatch):
+    """Put the module INSIDE the debounce window.
+
+    Must be ``monkeypatch.setattr`` on the module. The original tests did
+    ``_last_cache_save = time.time()`` after importing the name, which rebinds a
+    function-local and leaves ``cb._last_cache_save`` at 0 — so the window was
+    never entered and the debounce was never actually exercised. Proven by
+    mutation: with ``force`` ignored outright,
+    ``test_force_save_skips_debounce`` still passed.
+    """
+    import external_llm.agent.context_budget as cb
+    monkeypatch.setattr(cb, "_last_cache_save", time.time())
+
+
 class TestOverrideCacheForceSave:
     """Verify that _save_override_cache(force=True) skips the debounce interval."""
 
     def teardown_method(self):
         _clear_overrides()
 
-    def test_force_save_skips_debounce(self):
+    def test_force_save_skips_debounce(self, cache_file, monkeypatch):
         """force=True writes to disk even within the debounce window."""
-        from external_llm.agent.context_budget import (
-            _save_override_cache, _last_cache_save, _OVERRIDE_CACHE_FILE,
-        )
-        import os
-        # Clean up any existing cache file
-        if os.path.exists(_OVERRIDE_CACHE_FILE):
-            os.remove(_OVERRIDE_CACHE_FILE)
-        # Simulate a recent save (within debounce interval)
-        _last_cache_save = time.time()
-        # Force save should write regardless
+        from external_llm.agent.context_budget import _save_override_cache
+        _enter_debounce_window(monkeypatch)
         _save_override_cache(force=True)
-        assert os.path.exists(_OVERRIDE_CACHE_FILE), "Force save should write to disk"
-        # Clean up
-        if os.path.exists(_OVERRIDE_CACHE_FILE):
-            os.remove(_OVERRIDE_CACHE_FILE)
+        assert cache_file.exists(), "force=True must write inside the debounce window"
 
-    def test_normal_save_is_debounced(self):
-        """force=False respects the debounce interval."""
-        from external_llm.agent.context_budget import (
-            _save_override_cache, _last_cache_save, _OVERRIDE_CACHE_FILE,
-        )
-        import os
-        if os.path.exists(_OVERRIDE_CACHE_FILE):
-            os.remove(_OVERRIDE_CACHE_FILE)
-        # Set a very recent save time
-        _last_cache_save = time.time()
-        _save_override_cache(force=False)  # should be debounced
-        # May or may not write depending on timing — so we can't assert
-        # absence.  Instead verify that calling force=True immediately after
-        # does write.
+    def test_normal_save_is_debounced(self, cache_file, monkeypatch):
+        """force=False inside the window must NOT write.
+
+        The absence assertion is the whole point and is now deterministic: the
+        window is entered explicitly, so there is no "may or may not write
+        depending on timing" to hedge against. Without it the pair could not
+        distinguish a working ``force`` from an ignored one.
+        """
+        from external_llm.agent.context_budget import _save_override_cache
+        _enter_debounce_window(monkeypatch)
+        _save_override_cache(force=False)
+        assert not cache_file.exists(), "debounce did not suppress the write"
         _save_override_cache(force=True)
-        assert os.path.exists(_OVERRIDE_CACHE_FILE)
-        if os.path.exists(_OVERRIDE_CACHE_FILE):
-            os.remove(_OVERRIDE_CACHE_FILE)
+        assert cache_file.exists(), "force=True must still write after a debounced call"
+
+    def test_save_writes_once_debounce_has_elapsed(self, cache_file, monkeypatch):
+        """force=False DOES write once the interval has passed — otherwise the
+        test above would also pass against a save that never writes at all."""
+        import external_llm.agent.context_budget as cb
+        monkeypatch.setattr(
+            cb, "_last_cache_save", time.time() - cb._CACHE_SAVE_INTERVAL - 1
+        )
+        cb._save_override_cache(force=False)
+        assert cache_file.exists()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 13. P2: Override cache snapshot under lock (thread safety)
@@ -1248,12 +1278,12 @@ class TestOverrideCacheForceSave:
 class TestOverrideCacheSnapshotSafety:
     """Verify _save_override_cache snapshots _override_meta under the lock."""
 
-    def test_snapshot_under_lock(self):
+    def test_snapshot_under_lock(self, cache_file):
         """Snapshot prevents 'dict changed size during iteration'."""
         from external_llm.agent.context_budget import (
-            _save_override_cache, _override_meta, _OVERRIDE_CACHE_FILE,
+            _save_override_cache, _override_meta,
         )
-        import os, threading
+        import threading
 
         # Simulate concurrent mutation during serialization
         _override_meta["test-model"] = {"ts": time.time(), "reductions": 1, "limit": 1000}
@@ -1271,9 +1301,7 @@ class TestOverrideCacheSnapshotSafety:
         from external_llm.agent.context_budget import _override_lock
         with _override_lock:
             _save_override_cache(force=True)
-        # Clean up
-        if os.path.exists(_OVERRIDE_CACHE_FILE):
-            os.remove(_OVERRIDE_CACHE_FILE)
+        # No file cleanup: the cache_file fixture points at tmp_path.
         _clear_overrides()
 
 
@@ -1783,36 +1811,51 @@ class TestToolRegistryMemo:
             "Filtered tool names must be the same object (id() stability)"
         )
 
-    def test_no_filter_still_uses_constant(self):
-        """lang_filter=None returns AGENT_TOOL_SCHEMAS (the module constant)."""
+    def test_no_filter_still_uses_a_shared_constant(self):
+        """lang_filter=None returns a shared module-level list, not a per-call copy.
+
+        It is no longer ``AGENT_TOOL_SCHEMAS`` itself: that list also holds the
+        design-chat-only tools (save_insight & co), whose handlers live on
+        DesignChatLoop, so handing it to the agent lane advertised tools that
+        answer "Unknown tool" on dispatch. The agent lane now gets the variant
+        without them — see test_tool_schema_handler_parity.
+        """
         from external_llm.agent.tool_registry import ToolRegistry
-        from external_llm.agent.tool_schemas import AGENT_TOOL_SCHEMAS
+        from external_llm.agent.tool_schemas import (
+            AGENT_TOOL_SCHEMAS,
+            DESIGN_CHAT_ONLY_TOOL_NAMES,
+            TOOL_SCHEMA_VARIANTS,
+        )
         reg = object.__new__(ToolRegistry)
         result = reg.get_tool_schemas(lang_filter=None)
-        assert result is AGENT_TOOL_SCHEMAS
+        assert result is TOOL_SCHEMA_VARIANTS[(True, False)]
+        assert not (DESIGN_CHAT_ONLY_TOOL_NAMES & {s["name"] for s in result})
+        # The design-chat surface still gets the unfiltered constant.
+        assert reg.get_tool_schemas(lang_filter=None, design_chat=True) is AGENT_TOOL_SCHEMAS
 
-    def test_clone_for_subagent_recomputes_memo_lazily(self):
-        """A clone does not inherit the parent's memo — re-computes on first call.
-        This is correct: the clone may have a different repo_language, and the
-        one-time recompute cost is negligible for the rare clone path.
+    def test_a_clone_shares_the_parent_variant(self):
+        """A clone gets the SAME list object as its parent for the same filters.
+
+        This replaces an earlier assertion that a clone must *not* share the
+        parent's list. That isolation was an artifact of per-instance
+        memoization, not a requirement: the lists are read-only by contract, and
+        the stated rationale ("the clone may have a different repo_language") is
+        satisfied by the lookup key, which encodes the filters. Sharing keeps one
+        object per variant instead of one per registry.
         """
         from external_llm.agent.tool_registry import ToolRegistry
         from external_llm.agent.tool_registry import LanguageId
         reg = object.__new__(ToolRegistry)
         reg._repo_language = LanguageId.TYPESCRIPT
-        # Memoize on parent
         parent_result = reg.get_tool_schemas(lang_filter=LanguageId.TYPESCRIPT)
         # Create a minimal clone (as clone_for_subagent does)
         clone = object.__new__(ToolRegistry)
         clone.repo_root = getattr(reg, "repo_root", "/tmp")
         clone._repo_language = LanguageId.TYPESCRIPT
-        # First call on clone should compute fresh (not use parent's memo)
-        clone_result = clone.get_tool_schemas(lang_filter=LanguageId.TYPESCRIPT)
-        assert clone_result is not parent_result, (
-            "Clone must NOT share parent's memoized list (isolated state)"
-        )
-        # But identical content
-        assert clone_result == parent_result
+        assert clone.get_tool_schemas(lang_filter=LanguageId.TYPESCRIPT) is parent_result
+        # A clone with a DIFFERENT language gets a different variant — the key,
+        # not per-instance state, is what keeps them apart.
+        assert clone.get_tool_schemas(lang_filter=LanguageId.PYTHON) is not parent_result
 
 
 class TestEstimatorReasoningContentNonStr:

@@ -73,6 +73,19 @@ def test_timeout_returns_124():
     assert rc == 124
 
 
+@pytest.mark.skipif(
+    shutil.which("timeout") is not None,
+    reason=(
+        "the shim's own `timeout` only exists when a real one does NOT: the "
+        "prelude is guarded by `if ! command -v timeout`. Where coreutils "
+        "provides /usr/bin/timeout (any Linux CI runner) the shim function is "
+        "never defined, so this would assert on GNU coreutils' usage output "
+        "instead of on the shim — measured there as rc=125 with only "
+        "\"Try 'timeout --help' for more information.\" on stderr, no "
+        "\"missing operand\" line at all. Pinning another project's message "
+        "format buys no coverage of ours, so skip rather than branch."
+    ),
+)
 def test_missing_command():
     rc, _, err = _run("timeout 5")
     assert rc == 1

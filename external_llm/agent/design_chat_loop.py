@@ -1496,7 +1496,12 @@ class DesignChatLoop:
     ) -> DesignChatResult:
         _max_iterations = max_tool_iterations if max_tool_iterations and max_tool_iterations > 0 else _cfg.counts.DESIGN_CHAT_MAX_TOOL_ITERATIONS
 
-        all_schemas = self.registry.get_tool_schemas(lang_filter=self.registry.repo_language)
+        # design_chat=True: the insight tools and search_design_history are
+        # dispatched by THIS loop (by name, below), not by ToolRegistry, so this
+        # is the only surface allowed to advertise them.
+        all_schemas = self.registry.get_tool_schemas(
+            lang_filter=self.registry.repo_language, design_chat=True
+        )
         if mode == "general":
             # /general mode: keep only non-code tools (web search, ask user, etc.)
             tool_schemas = [s for s in all_schemas if s["name"] in _GENERAL_MODE_TOOLS]

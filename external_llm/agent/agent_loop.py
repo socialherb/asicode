@@ -18,7 +18,7 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from external_llm.client import LLMClient, LLMConnectionError, LLMMessage, LLMRateLimitError, LLMServerUnavailableError, effective_content
 from path_security import normalize_rel_path
@@ -67,10 +67,25 @@ from .operation_models import OperationKind, PlanMode, StageContext
 from .performance_metrics import PerformanceCollector, get_global_collector
 
 # NOTE: PlannerAgent / OperationExecutor live in the (permanently-disabled) PLANNER
-# lane. They are imported through the single choke-point facade so that a future
-# removal of the lane directory is a one-file edit there (or facade deletion) and
-# does not break this import. See planner_lane_facade docstring for rationale.
-from .planner_lane_facade import OperationExecutor, PlannerAgent
+# lane and are reached through the single choke-point facade, so a future removal
+# of the lane directory is a one-file edit there. See planner_lane_facade.
+#
+# The facade is imported INSIDE _init_hybrid_components, not here, because a
+# module-level `from .planner_lane_facade import ...` pulls the whole lane
+# (operation_executor, 4.7k lines, plus planner_agent) into every process that
+# imports agent_loop — for code that routing can never select. Measured on this
+# repo (min of 5, 2026-07-29): `import external_llm.agent.agent_loop` 194 ms
+# before, 151 ms after, with 0 lane modules left in sys.modules.
+# _init_hybrid_components has exactly one caller, in the PLANNER lane path, so
+# in practice the lane import now never happens at all. This also makes the
+# source-run import path match the shipped wheel, which excludes the lane
+# outright — the private/public divergence CLAUDE.md warns about.
+#
+# Only the annotations below reference these names at module scope, and
+# `from __future__ import annotations` (line 7) keeps those unevaluated — which
+# is also why the TYPE_CHECKING import costs nothing at runtime.
+if TYPE_CHECKING:
+    from .planner_lane_facade import OperationExecutor, PlannerAgent
 from .reasoning_utils import reasoning_ab_kwargs
 from .request_intent_classifier import (
     intent_is_undetermined,
@@ -421,19 +436,27 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         self.agent_id = agent_id
         self.session_id = session_id
 
-        try:
-            from .session_state import SessionStateManager
-            self.session_state_manager = SessionStateManager(self.registry.repo_root)
-        except ImportError:
-            self.session_state_manager = None
-
-        if session_id and self.session_state_manager:
-            saved_state = self.session_state_manager.load_state(session_id)
-            if saved_state:
-                self.edit_history = saved_state.edit_history
-                self.plan = saved_state.plan
-                self.context = saved_state.context
-                logger.info(f"Loaded saved state for session_id={session_id}")
+        # NOTE: the session-state RESTORE surface used to live here (and a second
+        # copy in run(), see the note there). Both are gone; session_state.py
+        # itself is untouched and still has its own tests.
+        #
+        # Nothing in the app ever WROTE a session file: `save_state` /
+        # `SessionState.save()` have no shipping caller, only tests. So the
+        # restore could not fire — and if a file had ever existed it would have
+        # crashed on arrival, because it read `saved_state.context` while
+        # `SessionState` has no `context` attribute (`SessionStateManager.
+        # load_state` builds one from session_id/edit_history/plan only). That
+        # AttributeError sat unguarded in __init__.
+        #
+        # The three attributes it assigned — self.edit_history / self.plan /
+        # self.context — were assigned NOWHERE else and read nowhere at all, so
+        # removing the block leaves no reader without a value. Constructing the
+        # manager also mkdir'd `repo_root/.asicode/sessions/` on every AgentLoop
+        # for a directory nothing writes to; that stops too.
+        #
+        # Removed rather than implemented, for the same reason
+        # _filter_prepared_calls was: making it work means designing what a
+        # session save/restore should contain, which is a feature, not a repair.
         # Per-loop PerformanceCollector for session-isolated per-turn
         # summaries. The webapp dashboard reads the global collector
         # (get_global_collector(), which receives ALL sessions' data via
@@ -499,11 +522,6 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 reserve_for_output=config.context_budget_reserve_output,
             )
         try:
-            from .session_state import SessionState
-            self.session_state = SessionState(session_id=_new_session_id())
-        except (ImportError, TypeError):
-            self.session_state = None
-        try:
             from .slash_commands import SlashCommandRegistry
             self.slash_commands = SlashCommandRegistry()
         except ImportError:
@@ -530,8 +548,11 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 from .test_impact_selector import git_status_test_files
                 _pre = git_status_test_files(self.registry.repo_root)
                 self._pre_existing_dirty_files = set(_pre) if _pre else set()
-        except Exception:
-            pass  # stays None → filter skipped (no exclusion)
+        except Exception as e:
+            # Stays None → filter skipped (no exclusion). Logged because the
+            # silent version made "verification suddenly covers files the user
+            # had already dirtied" indistinguishable from "nothing was dirty".
+            logger.debug("pre-existing dirty-file snapshot failed: %s", e)
 
     def _resolve_routing_intent(self, route) -> str:
         """Resolve routing intent from route / config in one place."""
@@ -803,11 +824,23 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         return fallback
 
     def _init_hybrid_components(self) -> None:
-        """Lazy initialization of hybrid architecture components."""
+        """Lazy initialization of hybrid architecture components.
+
+        The PLANNER-lane symbols are imported HERE rather than at module scope
+        so that importing agent_loop does not drag the lane in for code routing
+        can never select (see the facade note at the top of this module). This
+        is the only place either name is used at runtime.
+
+        The facade resolves both to ``None`` when the lane is absent — which is
+        the normal state of the shipped wheel, where the lane is excluded — and
+        the ``except`` below turns the resulting TypeError into the same
+        ``_hybrid_init_failed`` degradation an import failure already produced.
+        """
         if self._operation_executor is not None or getattr(self, '_hybrid_init_failed', False):
             return
 
         try:
+            from .planner_lane_facade import OperationExecutor, PlannerAgent
             repo_root = getattr(self.registry, 'repo_root', '.')
             self._symbol_searcher = SymbolSearcher(repo_root)
             # config=self.config (not a captured cancel_event value) so the
@@ -2151,16 +2184,16 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         if not hasattr(self, "state") or self.state is None:
             self.state = {}
 
-        loaded_state = None
-        if self.session_state is not None:
-            loaded_state = self.session_state.load_state()
-
-        if loaded_state:
-            self.state['edit_history'] = loaded_state.get('edit_history', [])
-            self.state['plan'] = loaded_state.get('plan', [])
-            self.state['context'] = loaded_state.get('context', context)
-            self.state['agent_phase'] = loaded_state.get('agent_phase', 'initial')
-            self.state['tool_calls'] = loaded_state.get('tool_calls', [])
+        # NOTE: the second session-restore block lived here. It was unreachable
+        # by construction, not merely by circumstance: `SessionState.load_state()`
+        # returns None (it mutates self and falls off the end), so `loaded_state`
+        # was ALWAYS None and the five `self.state[...]` assignments below it
+        # never ran once. Nothing read those keys either — `state['agent_phase']`
+        # in particular was unrelated to the `_agent_phase` machine, which is a
+        # plain attribute. Doubly dead: the SessionState it called was built with
+        # a FRESH `_new_session_id()` each construction, so even a working
+        # load_state() would have looked for a file that cannot exist.
+        # See the companion note in __init__ for why this is removed, not fixed.
         _session_id = _new_session_id()
 
         _profile = getattr(self.config, 'agent_profile', None)
@@ -3251,7 +3284,9 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 if "block not found" in err_lower:
                     advice.append(
                         "BLOCK NOT FOUND: Use find_symbol to locate the exact function/method, "
-                        "then bash (cat) at the returned line. Copy the EXACT text into 'before'."
+                        "then read_file with start_line/end_line around the returned line. "
+                        "Copy the EXACT text into 'before' — read_file's │N│ gutter gives each "
+                        "line's leading-whitespace count, which bash cat does not show."
                     )
                 elif "anchor" in err_lower and ("not found" in err_lower or "match" in err_lower):
                     advice.append(

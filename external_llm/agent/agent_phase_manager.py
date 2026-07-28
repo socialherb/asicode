@@ -10,7 +10,6 @@ Moved here:
       _build_tool_hint()
       _build_phase_state_message()
       _advance_phase_after_success()
-      _filter_prepared_calls()
       _llm_call_simple()
       _run_self_review()
       _auto_test_and_inject()
@@ -21,6 +20,7 @@ import logging
 from typing import Any, Optional
 
 from ..client import LLMConnectionError, LLMRateLimitError, effective_content
+from .tool_handlers.shell_policy import is_verification_command
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +73,18 @@ class PhaseManagerMixin:
 
     def _build_phase_state_message(self, read_only_request: bool) -> str:
         """Build a compact state block that describes the current agent phase."""
+        # Every entry must name something the model can actually DO: this block
+        # is injected as a system message, so an impossible instruction is spent
+        # context that also invites a rejected call. Two were wrong —
+        # "run_lint/run_tests" name tools with no schema (get_tool_names()
+        # validation rejects them), and "bash cat" steers off read_file, whose
+        # │N│ indent gutter is what prevents the old_string mismatches this
+        # phase exists to avoid.
         next_expected = {
             "DISCOVER": "find_symbol or read-only exploration",
-            "READ": "bash cat or minimal next edit",
+            "READ": "read_file (start_line/end_line) or minimal next edit",
             "EDIT": "apply_patch/write_plan or answer",
-            "VERIFY": "run_lint/run_tests or answer",
+            "VERIFY": "bash running the tests/linter, or answer",
             "FINISH": "final answer only",
         }.get(self._agent_phase, "continue carefully")
 
@@ -112,29 +119,41 @@ class PhaseManagerMixin:
             if is_fs_op and tool_name == "bash":
                 self._agent_phase = "EDIT"  # stay in EDIT for next file
             elif tool_name == "bash":
-                pass  # bash doesn't change phase
+                # VERIFY -> FINISH, the transition that used to key off the
+                # run_lint / run_tests TOOLS. Those were removed from the
+                # schemas ("bash equivalents") but left as the only route into
+                # FINISH, so FINISH had been unreachable: the model has no
+                # schema for either, and get_tool_names() rejects them if it
+                # emits one. Verification is a bash command now, so that is
+                # what advances the phase — but only from VERIFY, because bash
+                # is the general-purpose tool and must not reshuffle the machine
+                # from every other state (it deliberately did nothing before).
+                if self._agent_phase == "VERIFY" and is_verification_command(
+                    str((tool_args or {}).get("command") or "")
+                ):
+                    self._agent_phase = "FINISH"
+                # otherwise bash does not change phase
             else:
                 self._agent_phase = "VERIFY"
-        elif tool_name in {"run_lint", "run_tests"}:
-            self._agent_phase = "FINISH"
 
-    def _filter_prepared_calls(
-    self,
-        prepared_calls: list[dict[str, Any]],
-        read_only_request: bool,
-    ) -> tuple:
-        """
-        Enforce:
-        - phase/state machine
-        - read-only tool filtering
-        """
-        notices: list[str] = []
-        filtered: list[dict[str, Any]] = []
-
-        for pc in prepared_calls:
-            filtered.append(pc)
-
-        return filtered, notices
+    # NOTE: _filter_prepared_calls used to live here. Its docstring claimed to
+    # "Enforce: phase/state machine, read-only tool filtering" and its body
+    # copied the list and returned it with an empty notice list — a pass-through
+    # called on every turn. Because the notices were always empty, three things
+    # hanging off it were dead too: the "[PHASE RULE]" messages built from them,
+    # the ``stream_callback("tool_filtered", ...)`` event, and the
+    # "Tool call filter: N/M blocked (guards/phase)" log (the count could never
+    # drop). All removed with it.
+    #
+    # Removed rather than implemented: read_only_request is a SOFT signal by
+    # design, not a permission boundary — get_tool_schemas documents that it
+    # "no longer filters write tools", and a7fa46b5 records why (every
+    # IntentResolver failure path yields read_only_request=False, so blocking on
+    # it would kill legitimate edits whenever intent resolution failed). Genuine
+    # filtering of unknown / language-masked tools still happens in
+    # agent_turn_pipeline._build_and_filter_prepared_calls and is untouched.
+    # The phase machine is advisory only: it shapes the [AGENT STATE] hint and
+    # nothing else.
 
     # ------------------------------------------------------------------
     # Simple (no-tool) LLM call — used by planner and reviewer

@@ -433,3 +433,157 @@ class TestNonPyProbeInProcessFastPath:
         p.write_text("package main\nfunc GoThing() {}\n", encoding="utf-8")
         assert ss._word_in_files([str(p), str(tmp_path / "gone.go")], "GoThing") is True
         assert ss._word_in_files([str(tmp_path / "gone.go")], "GoThing") is False
+
+
+class TestNonpyFilesCacheCap:
+    """``_NONPY_FILES_CACHE`` is the ONLY per-root cache that was not using
+    ``_capped_put`` — three plain assignments left it unbounded, growing on
+    every visited root. The fix replaced those three assignments with
+    ``_capped_put`` calls so the cache is FIFO-bounded at
+    ``_WALK_CACHE_MAX_ENTRIES`` (8), matching every sibling cache.
+    """
+
+    # Each mode reaches a DIFFERENT one of the three store sites, so a plain
+    # `=` reverted at any single site fails here. Driving the real function is
+    # the point: an earlier version of this test called ``_capped_put``
+    # directly and therefore passed with all three sites reverted — it was
+    # re-testing ``_capped_put`` (already covered by
+    # ``test_shared_utils.py::test_capped_put_evicts_oldest_when_over_cap``)
+    # rather than the fix it was written to guard.
+    @pytest.mark.parametrize("mode", ["success", "rg_bad_returncode", "rg_raises"])
+    def test_every_store_site_stays_capped(self, monkeypatch, mode):
+        """15 roots through ``_nonpy_indexable_files`` itself leave 8 entries."""
+        from types import SimpleNamespace
+
+        from external_llm.agent._shared_utils import _WALK_CACHE_MAX_ENTRIES
+
+        monkeypatch.setattr(ss.shutil, "which", lambda _name: REAL_RG)
+        monkeypatch.setattr(ss, "_nonpy_index_globs", lambda: ["*.go"])
+
+        def fake_run(cmd, **kwargs):
+            if mode == "rg_raises":
+                raise OSError("rg exploded")
+            # returncode 2 = rg error -> the "unanswerable" store site.
+            rc = 2 if mode == "rg_bad_returncode" else 0
+            # getsize() on this fake path raises OSError, which the walker logs
+            # and skips — the entry is still stored, which is what we assert.
+            return SimpleNamespace(returncode=rc, stdout="a.go\n", stderr="")
+
+        monkeypatch.setattr(ss.subprocess, "run", fake_run)
+
+        orig = dict(ss._NONPY_FILES_CACHE)
+        try:
+            ss._NONPY_FILES_CACHE.clear()
+            for i in range(15):
+                ss._nonpy_indexable_files(Path(f"/fake-root-{i:03d}"))
+
+            assert len(ss._NONPY_FILES_CACHE) == _WALK_CACHE_MAX_ENTRIES, (
+                f"[{mode}] _NONPY_FILES_CACHE size="
+                f"{len(ss._NONPY_FILES_CACHE)} (cap={_WALK_CACHE_MAX_ENTRIES}) — "
+                f"this store site is not going through _capped_put"
+            )
+            # The oldest 7 entries must be gone (15 - 8 = 7 evicted).
+            for i in range(7):
+                assert f"/fake-root-{i:03d}" not in ss._NONPY_FILES_CACHE, (
+                    f"[{mode}] /fake-root-{i:03d} survived FIFO eviction"
+                )
+            # The newest 8 entries must still be present.
+            for i in range(7, 15):
+                assert f"/fake-root-{i:03d}" in ss._NONPY_FILES_CACHE, (
+                    f"[{mode}] /fake-root-{i:03d} was evicted — "
+                    f"cap or eviction order broken"
+                )
+        finally:
+            ss._NONPY_FILES_CACHE.clear()
+            ss._NONPY_FILES_CACHE.update(orig)
+
+    def test_all_three_store_sites_use_capped_put(self):
+        """Greps the three assignment sites — they must call _capped_put,
+        not plain ``=``. A plain ``=`` would leak entries forever.
+        """
+        import inspect
+        import ast
+
+        src = inspect.getsource(ss._nonpy_indexable_files)
+        tree = ast.parse(src)
+        # Collect every assignment target that is _NONPY_FILES_CACHE[...] = ...
+        plain_assignments = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Subscript):
+                        value = ast.get_source_segment(src, target.value)
+                        if value and "_NONPY_FILES_CACHE" in value:
+                            plain_assignments.append(target.lineno)
+        assert not plain_assignments, (
+            f"_nonpy_indexable_files has plain `= _NONPY_FILES_CACHE[key]` "
+            f"at lines {plain_assignments} — must use _capped_put instead"
+        )
+
+
+# ── The non-Python probe runs concurrently with the Python prefilter ───────
+# Both are a function of (root, search_name) alone, but they used to be
+# sequential with the whole Python parse between them. find_symbol now starts
+# the non-Python probe before the Python scan and collects it after, which took
+# 3 cold lookups on this repo from 110 ms to 96 ms (13%, ~4.9 ms per lookup,
+# four interleaved A/B alternations with no overlap between the two medians).
+
+
+def test_nonpy_probe_starts_before_the_python_scan(tmp_path, monkeypatch):
+    """The probe must be in flight while the Python prefilter runs.
+
+    Asserted by ordering, not by timing: the probe records when it STARTS, the
+    Python prefilter records when it FINISHES, and the probe's start must come
+    first. A timing assertion would be flaky on a loaded machine, and asserting
+    only that both ran would pass with the old sequential order too.
+    """
+    (tmp_path / "a.py").write_text("class Widget:\n    pass\n")
+    (tmp_path / "b.py").write_text("import Widget\n")
+
+    order: list[str] = []
+
+    real_defining = ss._rg_py_files_defining
+
+    def _slow_defining(root, token, kind):
+        out = real_defining(root, token, kind)
+        order.append("python-prefilter-done")
+        return out
+
+    def _probe(self, root, token):
+        order.append("nonpy-probe-start")
+        return False
+
+    monkeypatch.setattr(ss, "_rg_py_files_defining", _slow_defining)
+    monkeypatch.setattr(
+        ss.SymbolSearcher, "_nonpy_index_worth_building", _probe, raising=True
+    )
+
+    ss.SymbolSearcher(tmp_path).find_symbol("Widget")
+
+    assert order, "neither the probe nor the prefilter ran"
+    assert order[0] == "nonpy-probe-start", (
+        f"probe did not start before the Python prefilter finished: {order}"
+    )
+
+
+def test_nonpy_probe_failure_falls_back_inline(tmp_path, monkeypatch):
+    """A probe that raises must not lose the non-Python branch.
+
+    The pooled call is an optimisation; its failure has to degrade to the
+    inline call, not to "no non-Python results".
+    """
+    (tmp_path / "a.py").write_text("x = 1\n")
+    calls: list[str] = []
+
+    def _boom(self, root, token):
+        calls.append("called")
+        if len(calls) == 1:
+            raise RuntimeError("probe exploded")
+        return False
+
+    monkeypatch.setattr(
+        ss.SymbolSearcher, "_nonpy_index_worth_building", _boom, raising=True
+    )
+    # Must not propagate, and must have retried inline.
+    ss.SymbolSearcher(tmp_path).find_symbol("Widget")
+    assert len(calls) == 2, f"no inline retry after probe failure: {calls}"

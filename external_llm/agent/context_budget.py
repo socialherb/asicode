@@ -117,7 +117,17 @@ _override_meta: dict[str, dict] = {}
 # ── On-disk cache ──────────────────────────────────────────────────────────────
 # Persists overrides across restarts so a misconfigured 1M-fallback model doesn't
 # hard-fail on every fresh process.  Best-effort: corrupted/missing file ignored.
-_OVERRIDE_CACHE_FILE = os.path.join(
+# Overridable via ``ASICODE_CONTEXT_OVERRIDE_CACHE``, matching the convention
+# ``ASICODE_RUNS_DIR`` and ``ASICODE_WRITE_TOOL_FAILURE_LOG`` already follow.
+#
+# An env var rather than a patchable attribute because the write that needed
+# redirecting happens in an atexit flush, and 63 test files spawn Python
+# subprocesses: a child importing this module gets a fresh copy of the constant
+# and its own atexit handler, so no amount of in-process patching in the parent
+# reaches it. Measured — a bare ``python -c "import
+# external_llm.agent.context_budget"`` was enough to rewrite the real file to
+# ``{}`` at exit. Env vars are inherited, so this covers the children too.
+_OVERRIDE_CACHE_FILE = os.environ.get("ASICODE_CONTEXT_OVERRIDE_CACHE") or os.path.join(
     os.path.expanduser("~"), ".cache", "asicode", "context_override_cache.json",
 )
 _last_cache_save: float = 0

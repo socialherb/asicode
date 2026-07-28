@@ -544,7 +544,9 @@ class SuperContextBuilder:
         """Get git status"""
         try:
             result = subprocess.run(
-                ["git", "status", "--short"],
+                # core.quotePath=false: this block goes into the model's
+                # context, and git C-quotes non-ASCII paths by default.
+                ["git", "-c", "core.quotePath=false", "status", "--short"],
                 cwd=str(self.repo_root),
                 capture_output=True,
                 text=True,

@@ -33,7 +33,6 @@ from ._thread_pool import shared_pool
 from .argument_repairer import ArgumentRepairer
 from .call_graph import CallGraphIndexer
 from .config.thresholds import config as _cfg
-from .file_cache import get_global_file_cache
 from .lint_runner import LintRunner
 from .performance_metrics import get_global_collector
 from .rag_searcher import RAGSearcher
@@ -55,7 +54,7 @@ from .tool_handlers.test_tools import TestToolsMixin
 from .tool_handlers.web_search_tools import WebSearchToolsMixin
 from .tool_handlers.write_tools import WriteToolsMixin
 from .tool_safety import WriteSafetyManager
-from .tool_schemas import AGENT_TOOL_NAMES, AGENT_TOOL_SCHEMAS
+from .tool_schemas import TOOL_NAME_VARIANTS, TOOL_SCHEMA_VARIANTS
 
 logger = logging.getLogger(__name__)
 
@@ -563,8 +562,6 @@ class ToolRegistry(
         # edit_ast / anchor_edit). apply_patch consults this (Opt D) to refuse clobbering
         # a working-tree edit it cannot safely merge — see _tool_apply_patch guard.
         self._text_edited_files: set[str] = set()
-        # File content cache with mtime validation and LRU eviction (global singleton)
-        self._file_cache = get_global_file_cache()
         # Callbacks invoked after any successful write tool (apply_patch, write_file, etc.)
         # Used to propagate invalidation to dependent caches (e.g. RepositoryGraph).
         self._write_success_callbacks: list = []
@@ -658,7 +655,6 @@ class ToolRegistry(
         clone._symbol_searcher = self._symbol_searcher
         clone._rag_searcher = self._rag_searcher
         clone._call_graph = self._call_graph
-        clone._file_cache = self._file_cache
         clone._arg_repairer = self._arg_repairer
         clone._safety_manager = self._safety_manager
 
@@ -711,7 +707,6 @@ class ToolRegistry(
         clone._symbol_searcher = getattr(self, "_symbol_searcher", None)
         clone._rag_searcher = getattr(self, "_rag_searcher", None)
         clone._call_graph = getattr(self, "_call_graph", None)
-        clone._file_cache = getattr(self, "_file_cache", None)
         # Safety/repair: shared (thread-safe, stateless-per-call)
         clone._arg_repairer = getattr(self, "_arg_repairer", None)
         clone._safety_manager = getattr(self, "_safety_manager", None)
@@ -746,13 +741,7 @@ class ToolRegistry(
         return self._write_filter
 
     def _invalidate_cache_after_write(self, touched_paths: list[str]) -> None:
-        """Invalidate file cache, call graph, RAG, and graph caches for touched paths (called after patch apply)."""
-        import os
-        for p in touched_paths:
-            norm = p.strip().lstrip("/")
-            abs_path = os.path.join(self.repo_root, norm)
-            self._file_cache.invalidate(abs_path)
-
+        """Invalidate call graph, RAG, and graph caches for touched paths (called after patch apply)."""
         # Invalidate call graph index if any supported language file was touched
         from ..languages import LanguageId as _LId
         if any(_LId.from_path(p) != _LId.UNKNOWN for p in touched_paths) and hasattr(self, '_call_graph'):
@@ -771,17 +760,31 @@ class ToolRegistry(
         if hasattr(self, '_call_graph') and self._call_graph:
             try:
                 self._call_graph.invalidate_files(touched_paths)
-            except (AttributeError, TypeError):
-                pass
+            except (AttributeError, TypeError) as e:
+                logger.debug("post-write invalidation: GSG graph failed: %s", e)
 
         # Invalidate per-root file-walk caches so newly created files are
         # immediately visible to find_symbol / call-graph rebuilds.
         try:
-            from external_llm.agent._shared_utils import _PY_WALK_CACHE, _TS_WALK_CACHE
-            for _walk_cache in (_PY_WALK_CACHE, _TS_WALK_CACHE):
-                _walk_cache.pop(self.repo_root, None)
-        except Exception:
-            pass  # non-critical — never block execution
+            from external_llm.agent._shared_utils import invalidate_walk_caches
+            invalidate_walk_caches()
+        except Exception as e:
+            # Non-critical — never block execution. Logged because a failure
+            # here is the "cannot find the symbol it just wrote" class of bug,
+            # which is exactly what a silent handler makes unattributable.
+            logger.debug("post-write invalidation: walk caches failed: %s", e)
+
+        # Same reason, for the repo file LISTING (git ls-files). It backs the
+        # `glob` tool and the "Did you mean:" path suggester, and was TTL-only:
+        # a file created this turn stayed invisible to glob for a full 60 s
+        # while find_symbol — fixed above — already saw it.
+        try:
+            from external_llm.agent.tool_handlers.write_tools import (
+                invalidate_repo_file_index,
+            )
+            invalidate_repo_file_index(self._effective_repo_root)
+        except Exception as e:
+            logger.debug("post-write invalidation: repo file index failed: %s", e)
 
         # Same reason, for the non-Python symbol caches. Without this the
         # "cannot find a symbol in code it just wrote" symptom above persisted
@@ -796,13 +799,29 @@ class ToolRegistry(
         except Exception as e:
             logger.debug("post-write invalidation: non-Python caches failed: %s", e)
 
+        # The mirror image, for the Python find_symbol prefilter memo. Scoped to
+        # Python touches for the same reason the block above is scoped to
+        # non-Python ones: the memo only ever holds `rg --type py` answers, so a
+        # .go write cannot stale it. Unscoped it would drop a live memo on every
+        # write and give back the spawn it exists to avoid.
+        try:
+            if any(p.endswith((".py", ".pyi")) for p in touched_paths):
+                from external_llm.agent.symbol_search import (
+                    invalidate_py_prefilter_cache,
+                )
+                invalidate_py_prefilter_cache()
+        except Exception as e:
+            logger.debug("post-write invalidation: Python prefilter memo failed: %s", e)
+
         # Invalidate run-scoped graph cache for touched files
         try:
             from external_llm.graph.run_scoped_graph_cache import get_global_graph_cache
             graph_cache = get_global_graph_cache()
             graph_cache.invalidate_for_files(touched_paths)
-        except Exception:
-            pass  # non-critical — never block execution
+        except Exception as e:
+            # Non-critical — never block execution. Matches the logging every
+            # other step in this method already does.
+            logger.debug("post-write invalidation: run-scoped graph cache failed: %s", e)
 
     def _invalidate_caches_unknown_scope(self) -> None:
         """Post-write invalidation for a mutating call whose targets are unknown.
@@ -827,25 +846,35 @@ class ToolRegistry(
         correctness.
         """
         try:
-            self._file_cache.clear()
-        except Exception as e:
-            logger.debug("unknown-scope invalidation: file cache clear failed: %s", e)
-        try:
             cgi = getattr(getattr(self, "_call_graph", None), "call_graph_indexer", None)
             if cgi is not None:
                 cgi.invalidate()
         except Exception as e:
             logger.debug("unknown-scope invalidation: call-graph invalidate failed: %s", e)
         try:
-            from external_llm.agent._shared_utils import _PY_WALK_CACHE, _TS_WALK_CACHE
-            for _walk_cache in (_PY_WALK_CACHE, _TS_WALK_CACHE):
-                _walk_cache.pop(self.repo_root, None)
+            from external_llm.agent._shared_utils import invalidate_walk_caches
+            invalidate_walk_caches()
         except Exception as e:
             logger.debug("unknown-scope invalidation: walk cache pop failed: %s", e)
         try:
             self._symbol_searcher.invalidate_nonpy_caches()
         except Exception as e:
             logger.debug("unknown-scope invalidation: non-Python caches failed: %s", e)
+        try:
+            # Unconditional here, unlike the write-tool path: scope is unknown,
+            # and `bash` creating a .py file is the exact case this method was
+            # added for.
+            from external_llm.agent.symbol_search import invalidate_py_prefilter_cache
+            invalidate_py_prefilter_cache()
+        except Exception as e:
+            logger.debug("unknown-scope invalidation: Python prefilter memo failed: %s", e)
+        try:
+            from external_llm.agent.tool_handlers.write_tools import (
+                invalidate_repo_file_index,
+            )
+            invalidate_repo_file_index(self._effective_repo_root)
+        except Exception as e:
+            logger.debug("unknown-scope invalidation: repo file index failed: %s", e)
 
     def _ensure_asicode_gitignored(self) -> None:
         """Add .asicode/ to .gitignore if not already present.
@@ -1054,25 +1083,44 @@ class ToolRegistry(
     @staticmethod
     def _redirect_is_fd_dup(redirect_text: str) -> bool:
         """True if a tree-sitter-bash ``file_redirect`` node body is an fd
-        duplication/closure (``n>&m``, ``>&m``, ``n>&-``) rather than a file
-        write.
+        duplication/closure (``n>&m``, ``>&m``, ``n>&-``) or a known null / fd
+        sink (``2>/dev/null``, ``2>/dev/stdout``, ``2>/dev/stderr``,
+        ``2>/dev/fd/N``) rather than a file write. Append forms of the sinks
+        (``>>/dev/null``, ``2>>/dev/null``, ``&>>/dev/null``) count too.
 
         tree-sitter-bash tags BOTH real file redirects (``> f``, ``2>err``,
         ``&>all``) and fd-dups (``2>&1``) as ``file_redirect`` nodes, so the node
         type alone cannot tell them apart. The distinguishing token is an ``&``
         immediately after the ``>`` whose target is a file-descriptor number (or
-        ``-`` for close) — never a path. Applied to a PARSED node body, quoting
-        is already resolved by the grammar, so no quote tracking is needed here
+        ``-`` for close) — never a path.  Additionally, ``/dev/null``,
+        ``/dev/stdout``, ``/dev/stderr``, and ``/dev/fd/N`` are known sinks that
+        touch no real file on disk. Applied to a PARSED node body, quoting is
+        already resolved by the grammar, so no quote tracking is needed here
         (unlike the raw-command scanner).
         """
         gt = redirect_text.find(">")
         if gt < 0:
             return False
         after = redirect_text[gt + 1:].lstrip()
-        if not after.startswith("&"):
+        # ``find`` returns the FIRST ``>``, so on an APPEND redirect the second
+        # one is still sitting in *after* (``>>/dev/null`` -> ``>/dev/null``) and
+        # no sink below would match. Drop it, so the append forms (``>>``,
+        # ``2>>``, ``&>>``) classify exactly like their truncating twins. This
+        # cannot mask a real write: ``>>out.txt`` simply becomes ``out.txt``,
+        # which is no sink, and ``>&2`` never enters here (no leading ``>``).
+        if after.startswith(">"):
+            after = after[1:].lstrip()
+        if not after:
             return False
-        rest = after[1:]
-        return bool(rest) and (rest[0].isdigit() or rest[0] == "-")
+        # fd duplication/closure: n>&m, >&m, n>&-
+        if after.startswith("&"):
+            rest = after[1:]
+            return bool(rest) and (rest[0].isdigit() or rest[0] == "-")
+        # Known null/fd sinks — stderr discard, stdout/stderr redirection, fd
+        # pass-through.  These touch no real file on disk.
+        if after in ("/dev/null", "/dev/stdout", "/dev/stderr") or after.startswith("/dev/fd/"):
+            return True
+        return False
 
     @classmethod
     def _has_file_redirect_via_ts(cls, command: str):
@@ -1333,6 +1381,29 @@ class ToolRegistry(
     # overlapping entries instead of a full clear() (see _extract_write_target_paths).
     _PATH_SCOPED_READ_TOOLS = frozenset({"read_file", "get_file_outline", "read_image"})
 
+    def _resolve_repo_scope(self, path_arg: Any) -> Optional[frozenset]:
+        """Resolve a path arg to an absolute in-repo scope, or None.
+
+        Returns None for a blank arg, a bare repo root (repo-wide), or a path
+        that escapes ``self.repo_root``. The escape guard mirrors
+        ``SymbolSearcher._resolve_search_root`` (which rejects out-of-repo
+        paths) — important because ``find_references`` falls back to a
+        repo-wide rg when its search_path is rejected
+        (``_resolve_search_root(...) or self.repo_root``), so scoping such a
+        call to the rejected path would let a later in-repo write leave a
+        stale cache entry.
+        """
+        p = path_arg.strip() if isinstance(path_arg, str) else ""
+        if not p or p in (".", self.repo_root):
+            return None
+        full = os.path.normpath(
+            p if os.path.isabs(p) else os.path.join(self.repo_root, p)
+        )
+        root = os.path.normpath(self.repo_root)
+        if full != root and not full.startswith(root + os.sep):
+            return None  # escaped the repo — not a usable scope
+        return frozenset({full})
+
     def _extract_read_scope_paths(self, tool_name: str, args: dict) -> Optional[frozenset]:
         """Absolute path(s) a cached read-only result depends on, or None if
         unknown/repo-wide (e.g. a search with no path filter, or any tool not
@@ -1355,6 +1426,24 @@ class ToolRegistry(
                 full = p if os.path.isabs(p) else os.path.join(self.repo_root, p)
                 return frozenset({os.path.normpath(full)})
             return None  # no path filter → repo-wide search, unknown scope
+
+        # ── Symbol search tools ────────────────────────────────────────────
+        # read_symbol(file_path=) and find_symbol/find_references(search_path=)
+        # narrow their walk to one file/subtree, so a cached result depends
+        # only on files under it — same property grep/glob enjoy above, and the
+        # same reason a write elsewhere must NOT evict it. Three exclusions
+        # keep this from going stale (see _resolve_repo_scope):
+        #  • no path arg → repo-wide search → unknown scope (None)
+        #  • find_symbol + include_inheritance → get_symbol_info enriches with
+        #    subclasses/refs found ANYWHERE in the repo → repo-wide (None)
+        #  • a path escaping the repo → find_references falls back to a
+        #    repo-wide rg, so it can't be scoped to the rejected path.
+        if tool_name == "read_symbol":
+            return self._resolve_repo_scope(args.get("file_path"))
+        if tool_name in ("find_symbol", "find_references"):
+            if tool_name == "find_symbol" and args.get("include_inheritance"):
+                return None
+            return self._resolve_repo_scope(args.get("search_path"))
         return None
 
     def _extract_write_target_paths(self, tool_name: str, args: dict) -> Optional[frozenset]:
@@ -1784,10 +1873,29 @@ class ToolRegistry(
                     metadata={"blocked": "agent_profile", "profile": profile.name}
                 )
 
-        # Argument repair
+        # Argument repair (names, then types)
         repair = self._arg_repairer.repair(tool_name, args)
         if repair.repaired:
             args = repair.repaired_args
+        if repair.errors:
+            # A type the schema cannot accept and this layer will not guess.
+            # Refusing HERE rather than letting the handler raise is the whole
+            # point: the handler's `args.get(x, "").strip()` produces
+            # "AttributeError: 'list' object has no attribute 'strip'", which
+            # names neither the argument nor the expected type, so the model
+            # has nothing to correct and repeats the call.
+            return ToolResult(
+                ok=False,
+                content="",
+                error=(
+                    f"{tool_name}: invalid argument type(s). "
+                    + " ".join(repair.errors)
+                    + " Re-send the call with the types the schema declares."
+                ),
+                execution_time=0.0,
+                retryable=True,
+                metadata={"blocked": "argument_type", "tool": tool_name},
+            )
 
         gate_result = self._gate_check(tool_name, args)
         if gate_result is not None:
@@ -2254,17 +2362,22 @@ class ToolRegistry(
                 ))
         return results
 
+    @staticmethod
+    def _schema_variant_key(
+        lang_filter: Optional[LanguageId], design_chat: bool
+    ) -> tuple[bool, bool]:
+        """``(include_python_only, include_design_chat)`` for the variant tables."""
+        include_python_only = lang_filter is None or lang_filter is LanguageId.PYTHON
+        return include_python_only, design_chat
+
     def get_tool_schemas(
         self,
         read_only_request: bool = False,
         role: str = "agent",
         lang_filter: Optional[LanguageId] = None,
+        design_chat: bool = False,
     ) -> list[dict[str, Any]]:
         """Return tool schemas for the LLM API.
-
-        All lanes share the same tool schemas defined in ``AGENT_TOOL_SCHEMAS``.
-        The ``role`` parameter is kept for backward compatibility but no longer
-        filters tools — design chat and agent lane expose the same tool set.
 
         Args:
             read_only_request: Kept for backward compatibility — no longer filters
@@ -2273,49 +2386,40 @@ class ToolRegistry(
             lang_filter: When set to a non-Python LanguageId, schemas with
                 ``"x_python_only": True`` are excluded.  Pass ``None`` (default)
                 to include all tools (Python or mixed-language repos).
+            design_chat: Include tools whose handler lives on ``DesignChatLoop``
+                rather than on this registry (``"x_design_chat_only": True`` —
+                the insight tools and ``search_design_history``). Default False,
+                because dispatching one of them here returns "Unknown tool":
+                only the design chat loop, which intercepts them by name before
+                dispatch, may advertise them. See ``DESIGN_CHAT_ONLY_TOOL_NAMES``.
 
         Note:
-            Returns the shared ``AGENT_TOOL_SCHEMAS`` list directly when no
-            filtering is needed (no per-call copy). Callers must NOT mutate the
-            returned list or its dicts. When ``lang_filter`` filters out tools,
-            the filtered list is memoized per registry instance — stable object
-            identity enables the content-fingerprint-keyed token cache in
-            ``estimate_tokens_from_tool_schemas``. Callers must NOT mutate the
-            returned list or its dicts.
+            Returns one of four shared, import-time lists (see
+            ``tool_schemas.TOOL_SCHEMA_VARIANTS``) — no per-call copy and no
+            per-registry duplicate. Callers must NOT mutate the returned list or
+            its dicts; extend a ``list(...)`` copy instead, as
+            ``orchestrator._obr_base`` does.
         """
-        if lang_filter is not None and lang_filter is not LanguageId.PYTHON:
-            try:
-                return self._filtered_tool_schemas
-            except AttributeError:
-                _filtered = [s for s in AGENT_TOOL_SCHEMAS if not s.get("x_python_only")]
-                self._filtered_tool_schemas = _filtered
-                return _filtered
-        return AGENT_TOOL_SCHEMAS
+        return TOOL_SCHEMA_VARIANTS[self._schema_variant_key(lang_filter, design_chat)]
 
-    def get_tool_names(self, lang_filter: Optional[LanguageId] = None) -> frozenset:
+    def get_tool_names(
+        self, lang_filter: Optional[LanguageId] = None, design_chat: bool = False
+    ) -> frozenset:
         """Return the frozen set of known tool names for O(1) membership checks.
 
         Cheaper than calling :meth:`get_tool_schemas` and building a set each
         turn — useful for validating LLM-emitted tool-call names (see
         ``agent_turn_pipeline._build_and_filter_prepared_calls``).
 
-        Memoized per registry instance when ``lang_filter`` is set — stable
-        object identity avoids repeated frozenset construction every turn.
-
         Args:
             lang_filter: When set to a non-Python LanguageId, Python-only tools
                 (``"x_python_only": True``) are excluded so that a masked tool
                 is rejected at validation time, not only hidden from the schema.
                 Pass ``None`` (default) for the full set.
+            design_chat: See :meth:`get_tool_schemas`. Must match what was passed
+                there, or validation and advertisement disagree.
         """
-        if lang_filter is not None and lang_filter is not LanguageId.PYTHON:
-            try:
-                return self._filtered_tool_names
-            except AttributeError:
-                _filtered = frozenset(s["name"] for s in AGENT_TOOL_SCHEMAS if not s.get("x_python_only"))
-                self._filtered_tool_names = _filtered
-                return _filtered
-        return AGENT_TOOL_NAMES
+        return TOOL_NAME_VARIANTS[self._schema_variant_key(lang_filter, design_chat)]
 
     def has_tool_handler(self, tool_name: str) -> bool:
         """Return True if ``tool_name`` has a registered handler in this registry.
@@ -2474,13 +2578,32 @@ class ToolRegistry(
         """
         return list(self._applied_patches)
 
-    def __del__(self):
-        # Release the AsyncToolExecutor's ThreadPoolExecutor to avoid leaking
-        # worker threads when the registry is garbage-collected. Best-effort:
-        # __del__ must never raise, so swallow all errors.
-        try:
-            _exec = getattr(self, "async_executor", None)
-            if _exec is not None and hasattr(_exec, "shutdown"):
-                _exec.shutdown()
-        except Exception:
-            pass
+    # NO __del__. There used to be one here that called
+    # ``async_executor.shutdown()`` to "avoid leaking worker threads when the
+    # registry is garbage-collected". It was redundant, and it was harmful in
+    # two distinct ways:
+    #
+    # 1. It shut down a pool this object does not own. ``clone_with_filter``
+    #    SHARES the parent's AsyncToolExecutor (unlike ``clone_for_subagent``,
+    #    which sets it to None), so collecting a filtered clone shut down the
+    #    parent's live pool and every later parallel dispatch raised
+    #    "cannot schedule new futures after shutdown".
+    # 2. It did blocking pool shutdown from a GC finalizer, which can run at
+    #    any allocation point. ``tests/unit`` on 3.12 crashed the interpreter
+    #    outright (SIGSEGV) with ``Garbage-collecting`` atop
+    #    ``__del__ -> AsyncToolExecutor.shutdown -> ThreadPoolExecutor.shutdown``,
+    #    interrupting an unrelated ``symbol_search._walk_outline``.
+    #    (A separate SIGBUS was also seen on 3.14, but its stack is GC during
+    #    ``subprocess._close_pipe_fds`` with no repo finalizer visible, so it is
+    #    NOT attributed here — same class of hazard, unproven same cause.)
+    #
+    # Nothing replaces it because CPython already does this, finalizer-safely:
+    # ThreadPoolExecutor holds ``weakref.ref(self, weakref_cb)`` whose callback
+    # puts None on the work queue, so idle workers wake and exit once the
+    # executor becomes unreachable (thread.py, 3.12 L191 / 3.14 L226). Pinned by
+    # test_registry_executor_lifecycle.test_idle_workers_exit_when_executor_is_dropped
+    # so the justification fails loudly if that ever stops being true.
+    #
+    # If deterministic teardown is ever needed, add an explicit close()/context
+    # manager — the same conclusion design_chat_loop reached for its own
+    # ``__del__``-based flush (see its note on GC delaying finalization).

@@ -152,8 +152,7 @@ class TurnPipelineMixin:
         _rollback_patches, _try_readonly_early_finish, _build_tool_result_message,
         _trim_context
       - PhaseManagerMixin: _run_self_review, _auto_test_and_inject,
-        _build_tool_hint, _build_phase_state_message, _advance_phase_after_success,
-        _filter_prepared_calls
+        _build_tool_hint, _build_phase_state_message, _advance_phase_after_success
       - ContextManagerMixin: _trajectory_compress
     """
 
@@ -761,9 +760,9 @@ class TurnPipelineMixin:
                     "[ACTION REQUIRED] You described the change but applied NO patch.\n"
                     "You MUST output a tool call. Do NOT write code as plain text.\n\n"
                     "To CREATE a new file:\n"
-                    "  bash('cat > path << EOF\\n...content...\\nEOF') or bash('tee path << EOF\\n...\\nEOF')\n\n"
+                    "  write_plan with a create_file op, or bash(\"cat > path << 'EOF'\\n...content...\\nEOF\")\n\n"
                     "To MODIFY an existing file:\n"
-                    "  1. bash cat/pygmentize to see current content\n"
+                    "  1. read_file to see current content\n"
                     "  2. apply_patch with unified diff\n\n"
                     f"Task: {ctx.request[:2000]}"
                 )
@@ -1400,29 +1399,12 @@ class TurnPipelineMixin:
             LLMMessage(role="user", content=f"[PHASE RULE] {n}")
             for n in _unknown_tool_notices
         ]
-        _calls_before_filter = len(prepared_calls)
-        prepared_calls, phase_notices = self._filter_prepared_calls(
-            prepared_calls,
-            read_only_request=read_only_request,
-        )
-        if len(prepared_calls) < _calls_before_filter:
-            logger.info(
-                "Tool call filter: %d/%d blocked (guards/phase)",
-                _calls_before_filter - len(prepared_calls),
-                _calls_before_filter,
-            )
-        for notice in phase_notices:
-            phase_rule_messages.append(
-                LLMMessage(role="user", content=f"[PHASE RULE] {notice}")
-            )
-            if self.config.stream_callback:
-                try:
-                    self.config.stream_callback("tool_filtered", {
-                        "turn": turn_num,
-                        "notice": notice,
-                    })
-                except (AttributeError, TypeError):
-                    pass
+        # The phase/read-only pass through _filter_prepared_calls used to sit
+        # here. It never removed a call and never produced a notice, so the
+        # block that consumed its output was dead as well; see the note where
+        # that method was defined (agent_phase_manager) for why it is gone
+        # rather than implemented. Unknown / language-masked tools are still
+        # filtered above, and those notices still become [PHASE RULE] messages.
 
         if not prepared_calls:
             return _PreparedCallsResult(
@@ -1643,7 +1625,9 @@ class TurnPipelineMixin:
                         _recovery = (
                             "Do NOT call write_plan with the same arguments again. "
                             "Instead: (1) use find_symbol to locate the target, "
-                            "(2) use bash with cat or sed to see the exact text, "
+                            "(2) use read_file with start_line/end_line to see the exact text "
+                            "— not bash cat/sed, which hide the │N│ leading-whitespace count "
+                            "that 'before' must match, "
                             "(3) copy that exact text into 'before' and call write_plan again."
                         )
                     elif tool_name == "apply_patch":

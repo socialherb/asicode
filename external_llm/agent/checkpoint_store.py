@@ -71,13 +71,15 @@ class CheckpointStore:
             self.checkpoints = []
 
     def _save_checkpoints(self) -> None:
-        """Save checkpoints to JSON file (atomic write via tmp + os.replace).
+        """Save checkpoints to JSON file (atomic + durable write).
 
-        Writes to a sibling .tmp file first, then atomically renames it into
-        place. This prevents a truncated/partial checkpoints.json from being
-        left behind if the process is interrupted mid-write (e.g. disk full,
-        SIGKILL), which would otherwise cause _load_checkpoints() to silently
-        reset self.checkpoints to [] and lose the whole checkpoint index.
+        Uses ``atomic_write_json`` (sibling tmp file → ``fsync`` →
+        ``os.replace``), so the index is durable on disk before the rename.
+        This prevents a truncated/partial checkpoints.json from being left
+        behind if the process is interrupted mid-write (e.g. disk full,
+        SIGKILL, power loss), which would otherwise cause
+        _load_checkpoints() to silently reset self.checkpoints to [] and lose
+        the whole checkpoint index — even though each payload was fsync'd.
         Mirrors the atomic-write pattern in session_state.py:save_state().
 
         Concurrency: acquires an exclusive ``fcntl`` flock on the metadata
@@ -116,17 +118,20 @@ class CheckpointStore:
             merged.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
             self.checkpoints = merged
 
-            tmp_path = self.checkpoint_file.with_suffix('.json.tmp')
+            # atomic_write_json = tmp + fsync + os.replace, so the index is
+            # durable on disk before the rename. The previous hand-rolled form
+            # (tmp + os.replace) forgot the fsync: a crash/power-loss could
+            # leave a 0-byte index, and _load_checkpoints() would then silently
+            # reset self.checkpoints to [] — losing the whole index even though
+            # each payload was fsync'd (line 288). atomic_write_json is already
+            # imported above and used for the payloads.
             try:
-                with open(tmp_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.checkpoints, f, indent=2, ensure_ascii=False)
-                os.replace(tmp_path, self.checkpoint_file)  # POSIX atomic rename
+                atomic_write_json(
+                    self.checkpoint_file, self.checkpoints,
+                    indent=2, ensure_ascii=False,
+                )
             except OSError as e:
                 logger.error(f"Failed to save checkpoints: {e}")
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
                 raise
 
     def _scan_files(self, files=None) -> dict[Path, str]:

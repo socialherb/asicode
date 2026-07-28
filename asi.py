@@ -37,6 +37,44 @@ from typing import Any, Optional
 from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.image_utils import _check_clipboard_image, _extract_images_from_input
 
+
+def _silence_socks_dependency_warning() -> None:
+    """Pre-empt urllib3's "PySocks is not installed" warning leaking into the banner.
+
+    ``requests`` already silences it — ``requests/__init__.py`` installs
+    ``simplefilter("ignore", DependencyWarning)`` before importing
+    ``requests.adapters``, whose ``from urllib3.contrib.socks import ...`` is what
+    emits the warning (PySocks is an optional extra; urllib3 warns, then re-raises
+    ImportError, which requests catches). But that filter is only live for the
+    ~10ms between the two lines, and ``warnings.catch_warnings()`` is *not*
+    thread-safe: it snapshots the global filter list on entry and restores that
+    snapshot on exit, so any thread leaving such a block inside the window drops
+    requests' filter and the warning goes straight to stderr — landing inside the
+    startup banner.
+
+    asicode is exactly that shape: ``_kick_embedding_model_warmup()`` starts the
+    emb-warmup thread (importing sentence_transformers/torch runs ~20
+    ``catch_warnings`` blocks over several seconds) three lines before the main
+    thread imports ``requests`` via ``external_llm.client``. Measured collision
+    rate ~4% per startup, so it surfaces occasionally and confusingly.
+
+    Installing the filter here — at import time, before any thread exists — makes
+    it part of every later snapshot, so a restore can no longer drop it. Matched
+    by message rather than by ``urllib3.exceptions.DependencyWarning``
+    deliberately: importing urllib3 only to name the class costs ~80ms on the
+    cold-start path, more than asi's own module import.
+    """
+    import warnings
+
+    warnings.filterwarnings(
+        "ignore",
+        message="SOCKS support in urllib3 requires",
+        category=Warning,
+    )
+
+
+_silence_socks_dependency_warning()
+
 # ── prompt_toolkit: optional dependency — deferred import, only for REPL/interactive input ──────
 # Non-interactive paths (--subagent, --prompt, --json) never load it, saving ~77ms
 # (half of the module import cost) on cold start. _load_prompt_toolkit() binds on first entry.
@@ -2340,15 +2378,22 @@ _LANG_LABEL: dict[str, str] = {
 }
 
 def _git_ls_files(repo_root: str) -> list[str]:
-    """Tracked file paths in *repo_root* via `git ls-files`; [] on any failure."""
-    try:
-        out = subprocess.run(
-            ["git", "ls-files"],
-            cwd=repo_root, capture_output=True, text=True, timeout=3,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return out.stdout.splitlines() if out.returncode == 0 else []
+    """Repo-relative file paths in *repo_root*; [] on any failure.
+
+    Delegates to the ``common.repo_files`` SSOT rather than running
+    ``git ls-files`` here. The local version omitted ``-z``, and porcelain
+    output C-quotes non-ASCII paths — ``한글파일.py`` arrives as
+    ``"\\355\\225\\234...2.py"``, whose suffix is ``.py"`` (quote included), so
+    ``LanguageId.from_path`` returns UNKNOWN and every Korean/CJK-named source
+    file was invisible to :func:`_detect_repo_ts_languages`. That is precisely
+    the trap ``git_list_repo_files`` documents ``-z`` as REQUIRED for.
+
+    Also widens the set from tracked-only to tracked + untracked-not-ignored,
+    which is the right answer for "which languages are in this repo": a
+    just-created ``.ts`` file counts. Matches what ``glob`` already lists.
+    """
+    from external_llm.common.repo_files import git_list_repo_files
+    return git_list_repo_files(repo_root) or []
 
 
 def _detect_repo_ts_languages(files: list[str]) -> set[str]:

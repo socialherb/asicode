@@ -29,6 +29,7 @@ import textwrap
 from dataclasses import dataclass
 from typing import Optional
 
+from ..common.repo_files import git_list_repo_files
 from .models import LanguageId
 
 _logger = logging.getLogger(__name__)
@@ -375,19 +376,19 @@ def _pip_install(package: str) -> bool:
 
 
 def detect_repo_languages(repo_root: str) -> set[LanguageId]:
-    """Scan *repo_root* tracked files and return the set of LanguageId present.
+    """Scan *repo_root* files and return the set of LanguageId present.
 
-    Uses ``git ls-files`` for speed and to skip ignored/generated files.
-    Returns an empty set on any failure (non-git repo, timeout, etc.).
+    Sourced from the ``common.repo_files`` SSOT (``git ls-files -z``), not a
+    local ``git ls-files``. Without ``-z`` git C-quotes non-ASCII paths, so
+    ``한글파일.py`` arrived as ``"\\355\\225\\234...2.py"`` — suffix ``.py"``,
+    quote included — and ``LanguageId.from_path`` returned UNKNOWN for every
+    Korean/CJK-named file. A repo whose sources are all non-ASCII-named
+    detected no languages at all.
+
+    Returns an empty set on any failure (non-git repo, timeout, etc.), matching
+    the previous behaviour: ``git_list_repo_files`` returns None there.
     """
-    try:
-        out = subprocess.run(
-            ["git", "ls-files"],
-            cwd=repo_root, capture_output=True, text=True, timeout=5,
-        )
-        files = out.stdout.splitlines() if out.returncode == 0 else []
-    except (OSError, subprocess.SubprocessError):
-        files = []
+    files = git_list_repo_files(repo_root) or []
 
     langs: set[LanguageId] = set()
     for path in files:

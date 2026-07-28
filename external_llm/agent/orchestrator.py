@@ -576,7 +576,9 @@ def _build_git_context(repo_root: Optional[str]) -> str:
             cwd=repo_root, capture_output=True, text=True, timeout=5,
         ).stdout.strip()
         changed = _sp.run(
-            ["git", "diff", "--name-only", "HEAD~3..HEAD"],
+            # core.quotePath=false: this list is shown to the planner LLM, and
+            # git C-quotes non-ASCII paths by default (한글.py -> "\355\225\234...").
+            ["git", "-c", "core.quotePath=false", "diff", "--name-only", "HEAD~3..HEAD"],
             cwd=repo_root, capture_output=True, text=True, timeout=5,
         ).stdout.strip()
     except (OSError, _sp.SubprocessError):

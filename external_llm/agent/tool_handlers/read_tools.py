@@ -1,12 +1,14 @@
 """Read-only tool handlers for ToolRegistry."""
 from __future__ import annotations
 
+import codecs
 import functools
 import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...common.indent_utils import INDENT_GUTTER_BAR, format_numbered_line
 from ..config.thresholds import config as _cfg
 from ..rag_configs import CodeTokenizer
 from ..rag_searcher import _bm25_score as _bm25
@@ -28,7 +30,12 @@ logger = logging.getLogger(__name__)
 # the line (which starts at the code, past the gutter) cannot accidentally
 # include it — the format is copy-safe by construction. See design insight:
 # expose indent as structured metadata, not something to be inferred.
-_INDENT_GUTTER_BAR = "│"  # U+2502 — box-drawing vertical, never a valid code prefix
+# Re-exported under the historical private names: the renderer moved to
+# common/indent_utils so the write tools' failure previews can use it too
+# without read_tools <-> write_tools becoming an import cycle (read_tools
+# already imports _repo_file_index from write_tools).
+_INDENT_GUTTER_BAR = INDENT_GUTTER_BAR
+_format_numbered_line = format_numbered_line
 
 # Method names listed per class in read_file's over-cap outline. Matches the
 # get_file_outline tool's own cap so the two views of a file agree.
@@ -48,18 +55,94 @@ _EXT_LANG_MAP = {
 }
 
 
-def _format_numbered_line(lineno: int, line: str) -> str:
-    """Format one source line as ``"  NNN │N│ code"`` with an indent gutter.
+# ── Binary detection for read_file ─────────────────────────────────────────
+# read_file decoded every file as UTF-8 with errors="replace", so a .png/.pyc/
+# .so came back as thousands of U+FFFD replacement characters. That reads as
+# *content*: the model spends a turn interpreting it, and the write tools will
+# happily accept an edit against that garbled view. Sniff a prefix instead and
+# say what the file is. The prefix is read from the same handle that then reads
+# the body, so a text file costs no extra I/O and a 2 GB pack file is never
+# read in full just to be rejected.
+_BINARY_SNIFF_BYTES = 8192
 
-    The gutter value ``N`` is the count of leading whitespace characters
-    (spaces + tabs counted as width 1 each — the same metric write tools use to
-    compute ``min_indent``/``detect_indent_char`` in common/indent_utils). Empty
-    lines show ``0``. The bar is U+2502 so it is visually distinct from ASCII
-    ``|`` used in code (e.g. type unions, bitwise-or) and uncopyable as a line
-    prefix.
+# Bytes a text file may legitimately contain: printable ASCII, every byte a
+# UTF-8 multibyte sequence can use (0x80-0xFF, which also keeps legacy cp949 /
+# latin-1 sources out of the binary bucket), and the control codes that really
+# do appear in sources and captured terminal output.
+_TEXTUAL_BYTES = bytes(
+    sorted(
+        {0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x1B}  # BS TAB LF VT FF CR ESC
+        | set(range(0x20, 0x7F))                     # printable ASCII
+        | set(range(0x80, 0x100))                    # UTF-8 lead/continuation
+    )
+)
+
+# Share of the sniffed prefix allowed to be non-textual control bytes before
+# the file is called binary. Real text sits at ~0%; this only has to separate
+# that from formats carrying no NUL in their first 8 KiB.
+_BINARY_CONTROL_RATIO = 0.10
+
+# UTF-16/32 text is mostly NUL bytes, so the NUL rule alone would call it
+# "binary" — true of its UTF-8 decode, but useless guidance. A BOM names the
+# real encoding, so report that instead. The UTF-32 BOMs must be tested before
+# the UTF-16 ones they begin with.
+_BOM_ENCODINGS: tuple[tuple[bytes, str], ...] = (
+    (codecs.BOM_UTF8, ""),  # "" = genuine UTF-8 text; not binary
+    (codecs.BOM_UTF32_LE, "UTF-32 LE"),
+    (codecs.BOM_UTF32_BE, "UTF-32 BE"),
+    (codecs.BOM_UTF16_LE, "UTF-16 LE"),
+    (codecs.BOM_UTF16_BE, "UTF-16 BE"),
+)
+
+# Extensions read_image can OCR — the alternative worth naming by tool.
+_IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff"})
+
+_BINARY = "binary"
+
+
+def _classify_binary(head: bytes) -> str | None:
+    """Why ``head`` is not UTF-8 text, or ``None`` if it is.
+
+    Returns the BOM-declared encoding name ("UTF-16 LE") when the file is text
+    in another encoding, or ``_BINARY`` when it is not text at all. ``head`` is
+    only a prefix, so this is a heuristic — the one git uses (a NUL in the
+    first 8 KiB), widened to read a BOM and to catch headers carrying no NUL.
     """
-    indent = len(line) - len(line.lstrip()) if line.strip() else 0
-    return f"{lineno:>6} {_INDENT_GUTTER_BAR}{indent:>2}{_INDENT_GUTTER_BAR} {line}"
+    if not head:
+        return None
+    for bom, label in _BOM_ENCODINGS:
+        if head.startswith(bom):
+            return label or None
+    if b"\x00" in head:
+        return _BINARY
+    non_text = len(head.translate(None, _TEXTUAL_BYTES))
+    return _BINARY if non_text / len(head) > _BINARY_CONTROL_RATIO else None
+
+
+def _binary_guidance(path: str, size: int, verdict: str) -> str:
+    """Explain the refusal and name the tool that *can* read ``path``.
+
+    Both branches state that no content follows, so the message is never
+    mistaken for a short file.
+    """
+    if verdict != _BINARY:
+        codec = verdict.replace(" ", "").lower()
+        return (
+            f"`{path}` is text encoded as {verdict}, not UTF-8 ({size:,} bytes) — "
+            f"no content is shown, because decoding it as UTF-8 returns mojibake. "
+            f"Convert a copy first: bash `iconv -f {codec} -t utf-8 {path}`."
+        )
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    hint = (
+        "Use read_image to OCR it."
+        if ext in _IMAGE_EXTS
+        else "Identify or inspect it with bash (`file`, `xxd -l 256`)."
+    )
+    return (
+        f"`{path}` is a binary file ({size:,} bytes) — no content is shown, "
+        f"because reading it as UTF-8 returns replacement characters rather than "
+        f"anything editable. {hint}"
+    )
 
 
 def _split_source_lines(text: str) -> list[str]:
@@ -86,6 +169,53 @@ def _split_source_lines(text: str) -> list[str]:
     if parts and parts[-1] == "":
         parts = parts[:-1]
     return parts
+
+
+def _apply_char_budget(
+    numbered_lines: list[str], first_line: int, budget: int
+) -> tuple[list[str], int | None, int | None]:
+    """Cut ``numbered_lines`` to ``budget`` chars on a line boundary.
+
+    ``first_line`` is the **1-based** source line number of ``numbered_lines[0]``
+    — the same origin the lines were numbered with. Returns
+    ``(kept, truncated_at, partial_line)``:
+
+    * ``truncated_at`` — 1-based number of the first line NOT emitted, i.e. the
+      exact ``start_line=`` a caller passes to continue. ``None`` if all fit.
+    * ``partial_line`` — 1-based number of a line emitted as a PREFIX only
+      (that line alone exceeded the budget), else ``None``. Its tail cannot be
+      recovered by re-reading, because ``start_line`` is line-granular, so
+      callers MUST say so instead of offering a plain "continue here".
+
+    Shared by read_file and read_symbol. Duplicating this arithmetic is exactly
+    how read_symbol reintroduced both bugs 64a36e1c had already fixed for
+    read_file: an origin off by one (naming a line that WAS emitted, so the
+    caller re-reads it) and a resumption line that does not advance past an
+    over-wide line (naming that same line forever). Both are only correct when
+    derived from the same 1-based origin as the numbering, so the derivation
+    lives here once.
+    """
+    if sum(len(ln) + 1 for ln in numbered_lines) <= budget:
+        return numbered_lines, None, None
+
+    kept: list[str] = []
+    used = 0
+    # The prefix sum exceeds the budget, so the loop always breaks; the
+    # initialiser only keeps `truncated_at` bound for a type checker.
+    truncated_at = first_line + len(numbered_lines)
+    for i, ln in enumerate(numbered_lines):
+        used += len(ln) + 1
+        if used > budget:
+            truncated_at = first_line + i  # first line NOT emitted
+            break
+        kept.append(ln)
+
+    if not kept:
+        # One line wider than the whole budget: emitting nothing and naming
+        # this line as the resumption point is a loop (the retry returns the
+        # same over-wide line). Emit a prefix and advance PAST it instead.
+        return [numbered_lines[0][:budget]], first_line + 1, first_line
+    return kept, truncated_at, None
 
 
 @functools.lru_cache(maxsize=256)
@@ -269,10 +399,25 @@ class ReadToolsMixin:
         if not abs_path.is_file():
             return self._make_result(ok=False, content="", error=f"Not a file: {path!r}")
 
+        # Sniff a prefix before committing to the whole file, so a binary is
+        # rejected without ever being read past its header. The body is read
+        # from the same handle, so the text path pays for one open, not two.
         try:
-            lines = abs_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            with abs_path.open("rb") as fh:
+                head = fh.read(_BINARY_SNIFF_BYTES)
+                verdict = _classify_binary(head)
+                if verdict is not None:
+                    size = abs_path.stat().st_size
+                    return self._make_result(
+                        ok=True,
+                        content=_binary_guidance(path, size, verdict),
+                        metadata={"binary": True, "reason": verdict, "byte_size": size},
+                    )
+                raw = head + fh.read()
         except Exception as e:
             return self._make_result(ok=False, content="", error=f"Failed to read {path!r}: {e}")
+
+        lines = raw.decode("utf-8", errors="replace").splitlines()
 
         start_line = args.get("start_line")
         end_line = args.get("end_line")
@@ -287,11 +432,51 @@ class ReadToolsMixin:
             s, e = 1, len(lines)
         else:
             s = max(1, int(start_line or 1))
-            e = min(len(lines), int(end_line or len(lines)))
-            if s > len(lines) or s > e:
+            _requested_end = int(end_line) if end_line is not None else len(lines)
+            e = min(len(lines), _requested_end)
+            # Two different mistakes, which the single "out of range" message
+            # conflated — and it named the CLAMPED end, so asking for 9999-10005
+            # of a 200-line file was reported as "range 9999-200", a range the
+            # caller never asked for. Naming the wrong problem costs a turn: the
+            # model reads "file has 200 lines" after an inverted range whose
+            # bounds are both inside the file, and has nothing to act on.
+            #
+            # ok=False, not ok=True: a range that yields no lines is a failed
+            # call, not an answer. Reported as success it reads as "asked and
+            # answered" and the retry never happens — the same reasoning
+            # _tool_read_symbol records for its own missing-argument case.
+            # A zero or negative bound is malformed, not merely inverted, and
+            # "swap them" would be useless advice for it (swapping end_line=0
+            # gives start_line=0, equally wrong). Line numbers are 1-based.
+            if end_line is not None and _requested_end < 1:
                 return self._make_result(
-                    ok=True,
-                    content=f"Line range {s}–{e} is out of range (file has {len(lines)} lines).",
+                    ok=False, content="",
+                    error=(
+                        f"end_line must be 1 or greater (got {_requested_end}); "
+                        f"line numbers are 1-based. Omit end_line to read to the "
+                        f"end of {path!r} ({len(lines)} lines)."
+                    ),
+                )
+            # Guarded on end_line being SUPPLIED: with it omitted the default is
+            # the file's last line, and blaming an "end_line" the caller never
+            # sent is the same misdirection this block exists to remove
+            # (start_line=201 on a 200-line file is a past-the-end error, not an
+            # inverted range).
+            if end_line is not None and s > _requested_end:
+                return self._make_result(
+                    ok=False, content="",
+                    error=(
+                        f"start_line {s} is after end_line {_requested_end} "
+                        f"in {path!r} ({len(lines)} lines). Swap them."
+                    ),
+                )
+            if s > len(lines):
+                return self._make_result(
+                    ok=False, content="",
+                    error=(
+                        f"start_line {s} is past the end of {path!r}, which has "
+                        f"{len(lines)} lines."
+                    ),
                 )
 
         numbered_lines = [_format_numbered_line(i, ln) for i, ln in enumerate(lines[s - 1 : e], start=s)]
@@ -300,30 +485,13 @@ class ReadToolsMixin:
         # so it is the path most able to overrun the context window.  Truncate
         # on a line boundary and name the resumption line, so continuing is one
         # unambiguous call rather than another guess.
-        truncated_at: int | None = None
-        partial_line: int | None = None  # line emitted only as a prefix (mid-line truncation)
         budget = _cfg.lines.READ_FILE_MAX_CHARS
-        if sum(len(ln) + 1 for ln in numbered_lines) > budget:
-            kept: list[str] = []
-            used = 0
-            for i, ln in enumerate(numbered_lines):
-                used += len(ln) + 1
-                if used > budget:
-                    truncated_at = s + i  # first line NOT emitted
-                    break
-                kept.append(ln)
-            # A single line wider than the whole budget would otherwise emit
-            # nothing and report a resumption line that never advances. Emit a
-            # prefix of it and advance past it, but flag that its tail was
-            # dropped mid-line: start_line is line-granular, so re-reading
-            # cannot recover the rest. Without this signal a caller mistakes
-            # the partial line for the full line and edits on a truncated view
-            # (minified JS/CSS, single-line JSON, base64 blobs).
-            if not kept:
-                partial_line = s
-                kept = [numbered_lines[0][:budget]]
-                truncated_at = s + 1
-            numbered_lines = kept
+        # partial_line: emitted as a prefix only (mid-line truncation) — the
+        # caller must be told its tail is unrecoverable, see _apply_char_budget.
+        numbered_lines, truncated_at, partial_line = _apply_char_budget(
+            numbered_lines, s, budget
+        )
+        if truncated_at is not None:
             e = truncated_at - 1
         content = "\n".join(numbered_lines)
 
@@ -423,6 +591,18 @@ class ReadToolsMixin:
 
         search_path = args.get("path", "").strip() or "."
         search_path = self._correct_bias_path(search_path)
+        # Security gate: webapp path must be confined to repo_root (mirrors glob's gate).
+        # confine=False respects unrestricted_read: CLI can grep outside, webapp cannot.
+        #
+        # The RESOLVED path is deliberately discarded rather than substituted for
+        # search_path, because it is ABSOLUTE and rg echoes back whatever path it
+        # was given: searching "." prints "./a.py:1:...", searching the resolved
+        # root prints "/private/tmp/repo/a.py:1:..." (measured). Every consumer of
+        # this output — the model included — reads repo-relative paths, so
+        # substituting would reformat every grep result to no benefit. This is a
+        # gate only; the raw path is what gets searched.
+        if self._secure_path(search_path) is None:
+            return self._make_result(ok=False, content="", error=f"path {search_path!r} is outside the repository")
         max_results = min(int(args.get("max_results", 200)), 500)
         context = int(args.get("context", 0))
         ignore_case = args.get("ignore_case", False)
@@ -489,6 +669,15 @@ class ReadToolsMixin:
 
         if proc.returncode == 0 or (proc.returncode == 1 and proc.stdout.strip()):
             lines = proc.stdout.splitlines()
+            # Captured BEFORE the ranking block, which SELECTS the top
+            # ``max_results`` and discards the rest — after it, ``len(lines)`` is
+            # the displayed count, not the match count. Deriving the header and
+            # the truncation notice from the post-selection list reported
+            # "50 matches" for a pattern with 29,871 and suppressed the "refine
+            # your pattern" hint entirely, so the agent believed it had seen
+            # every hit and stopped searching. Only stop-word patterns
+            # (tokenize("import") == []) escaped, because they skip ranking.
+            total = len(lines)
 
             # BM25 ranking: re-rank FLAT match-lines (context==0) by relevance to
             # the search pattern. Each match line is treated as a pseudo-document
@@ -503,7 +692,7 @@ class ReadToolsMixin:
             # numbers shuffle out of order, and separators float to meaningless
             # spots (the more context requested, the worse the scramble). Native
             # group order must be preserved. See test_grep_context_* regression.
-            if len(lines) > 1 and context == 0:
+            if len(lines) > max_results and context == 0:
                 from collections import Counter
                 _tok = CodeTokenizer()
                 _qtokens = _tok.tokenize(pattern)
@@ -512,16 +701,9 @@ class ReadToolsMixin:
                     # BM25 on 50k+ lines is O(n*q) CPU — pre-cutting to a sensible
                     # cap keeps ranking quality (top N out of shuffled filesystem
                     # order ≅ top N out of K*N) while bounding worst-case time.
-                    # We take only the first max_results*20 or 5000 (whichever is
-                    # larger) lines, which comfortably covers the top max_results
-                    # (≤500) after re-ranking.  The tail is appended unsorted at the
-                    # end — it will be truncated away by the max_results cap below.
                     _bm25_cap = max(max_results * 20, 5000)
                     if len(lines) > _bm25_cap:
-                        _tail = lines[_bm25_cap:]
                         lines = lines[:_bm25_cap]
-                    else:
-                        _tail = []
                     _tokenized = [_tok.tokenize(_item_) for _item_ in lines]
                     _doc_tc: list[dict[str, int]] = [dict(Counter(t)) for t in _tokenized]
                     _doc_lens = [len(t) for t in _tokenized]
@@ -534,12 +716,15 @@ class ReadToolsMixin:
                         _bm25(_qtokens, _doc_tc[i], _doc_lens[i], _df, _n, _avgdl)
                         for i in range(_n)
                     ]
-                    lines = [lines[i] for i in sorted(range(_n), key=lambda i: _scores[i], reverse=True)]
-                    if _tail:
-                        lines.extend(_tail)
+                    # Select top-N by relevance, then restore file/line order for
+                    # readability. Ranking's job is which results survive the cap,
+                    # not the display order — BM25-scrambled order within a single
+                    # file (lines 136,112,36) is confusing and was never the intent.
+                    _top = sorted(range(_n), key=lambda i: _scores[i], reverse=True)[:max_results]
+                    _top.sort()
+                    lines = [lines[i] for i in _top]
 
-            truncated = len(lines) > max_results
-            total = len(lines)
+            truncated = total > max_results
 
             # --- Character-based truncation guard: prevent token explosion ---
             # context=N + long-line files (logs, JSON, stacktraces) can produce
@@ -589,7 +774,12 @@ class ReadToolsMixin:
         """
         name = args.get("name", "")
         if not name:
-            return self._make_result(ok=True, content="Symbol name is required.")
+            # ok=False: a missing required argument is a failed call, not an
+            # answer. Reported as success it reads to the model as "asked and
+            # answered", so the retry it needs never happens.
+            return self._make_result(
+                ok=False, content="", error="'name' is required (the symbol to read).",
+            )
         file_path = args.get("file_path") or None
         context_lines = int(args.get("context_lines", 10))
 
@@ -597,6 +787,19 @@ class ReadToolsMixin:
         if not defs:
             return self._make_result(ok=True, content=f"Symbol '{name}' not found.")
         sym = defs[0]
+
+        # When the name matches N definitions and the agent didn't pass
+        # file_path=, it picks the first silently.  Tell it how many there are
+        # and where the rest live — symmetry with _tool_find_symbol which
+        # already reports the count.
+        multi_header = ""
+        if len(defs) > 1:
+            _others = ", ".join(f"`{d.file}:{d.line}`" for d in defs[1:])
+            multi_header = (
+                f"Showing 1st of {len(defs)} definitions of `{name}`"
+                f" — others at {_others}"
+                f" (pass file_path= to narrow).\n\n"
+            )
 
         abs_path = Path(self.repo_root) / sym.file
         if not abs_path.exists():
@@ -611,10 +814,11 @@ class ReadToolsMixin:
             # Fallback: fixed window around the definition line.
             start = max(0, sym.line - 1 - context_lines)
             end = min(len(lines), sym.line + context_lines)
-        context = "\n".join(
+
+        numbered_lines = [
             _format_numbered_line(i, ln)
             for i, ln in enumerate(lines[start:end], start=start + 1)
-        )
+        ]
 
         lang = sym.file.split(".")[-1] if "." in sym.file else ""
         lang_label = _EXT_LANG_MAP.get(lang, lang)
@@ -622,9 +826,57 @@ class ReadToolsMixin:
         loc = f"{sym.file}:{sym.line}"
         if sym.end_line and sym.end_line > sym.line:
             loc += f"-{sym.end_line}"
-        content = (f"**{sym.kind}** `{name}` defined in `{loc}` — `│N│` = leading-indent column count\n"
-                   f"```{lang_label}\n{context}\n```")
-        return self._make_result(ok=True, content=content)
+
+        # ── Char budget ─────────────────────────────────────────────────────
+        # read_symbol was the ONLY read tool without one. A single symbol on a
+        # long file (WriteToolsMixin ≈ 350k chars / 89k tokens) could swallow the
+        # whole context window: context_budget.fit_messages() leaves it alone
+        # (deliberately) and SlidingWindowContext is message-count based — one
+        # giant message survives until it ages out.
+        #
+        # READ_FILE_MAX_CHARS is the SSOT cap shared by read_file / bash / grep,
+        # and _apply_char_budget is the SSOT for the arithmetic — `start` is a
+        # 0-based index, so the origin handed over is `start + 1`, matching the
+        # 1-based numbering above.
+        budget = _cfg.lines.READ_FILE_MAX_CHARS
+        kept, truncated_at, partial_line = _apply_char_budget(
+            numbered_lines, start + 1, budget
+        )
+        context = "\n".join(kept)
+
+        content = multi_header + (
+            f"**{sym.kind}** `{name}` defined in `{loc}`"
+            f" — `│N│` = leading-indent column count\n"
+            f"```{lang_label}\n{context}\n```")
+        if truncated_at is not None:
+            if partial_line is not None:
+                content += (
+                    f"\n\n[Truncated at the {budget:,}-char output budget. "
+                    f"Line {partial_line} alone exceeds it, so only its first "
+                    f"{budget:,} chars were returned; the REST OF THAT LINE was "
+                    f"dropped and is NOT recoverable by re-reading (start_line is "
+                    f"line-granular). Continue at start_line={truncated_at} for "
+                    f"the next line.]"
+                )
+            else:
+                content += (
+                    f"\n\n[Truncated at the {budget:,}-char output budget. "
+                    f"Lines {truncated_at}–{end} were not returned — "
+                    f"call read_file with start_line={truncated_at} to continue.]"
+                )
+
+        # Same metadata shape read_file emits, for the same reason: the prose
+        # notice above is for the model, but the agent loop and telemetry read
+        # the metadata. Emitting the notice WITHOUT these keys made read_symbol
+        # truncation the one form of dropped output no consumer could detect
+        # programmatically. ``line_count``/``resume_line`` are FILE line numbers
+        # (not symbol-relative) because the resumption call is a read_file.
+        meta: dict[str, Any] = {}
+        if truncated_at is not None:
+            meta = {"truncated": True, "resume_line": truncated_at, "line_count": len(lines)}
+            if partial_line is not None:
+                meta["partial_line"] = partial_line
+        return self._make_result(ok=True, content=content, metadata=meta)
 
     def _tool_find_symbol(self, args: dict[str, Any]) -> "ToolResult":
         name = args.get("name", "").strip()

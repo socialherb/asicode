@@ -413,3 +413,55 @@ class TestConservativeDefaultStillHolds:
                     "git log --oneline", "pwd", "whoami", "printenv",
                     "head -20 f", "wc -l f"):
             assert _mutates(cmd) is False, cmd
+
+
+class TestDevNullAndFdSinks:
+    """`2>/dev/null` is not a file write.
+
+    It was classified as one, so an ordinary read command took the full
+    mutating path: the tool-result cache plus every per-root cache (walk, file
+    index, non-Python symbols, prefilter memo, git snapshot) was dropped, and
+    the whole batch fell out of parallel execution. Measured cost of the
+    needless rebuild: ~47 ms for the walk / file-index / git-snapshot trio
+    alone, on top of losing every cached read_file result.
+
+    The direction of a miss here is safe (a false "mutating" only wastes work),
+    which is exactly why nothing surfaced it — hence explicit cases.
+    """
+
+    def test_stderr_discard_is_readonly(self):
+        for cmd in ("cat a.py 2>/dev/null",
+                    "git status 2>/dev/null",
+                    "grep -r x . 2>/dev/null | head",
+                    "find . -name '*.py' 2>/dev/null"):
+            assert _mutates(cmd) is False, cmd
+
+    def test_stdout_discard_forms_are_readonly(self):
+        # `>/dev/null 2>&1` is the single most common shape of all.
+        for cmd in ("ls >/dev/null 2>&1", "ls > /dev/null", "ls &>/dev/null"):
+            assert _mutates(cmd) is False, cmd
+
+    def test_append_sink_forms_are_readonly(self):
+        """`find` returns the FIRST `>`, so `>>` left a stray `>` on the target
+        and no sink matched — the append forms stayed classified as writes."""
+        for cmd in ("ls >>/dev/null", "cat a 2>>/dev/null", "ls &>>/dev/null",
+                    "ls >> /dev/null"):
+            assert _mutates(cmd) is False, cmd
+
+    def test_append_to_real_file_still_mutating(self):
+        for cmd in ("ls >>out.txt", "cat a 2>>err.log", "ls &>>/dev/nullx"):
+            assert _mutates(cmd) is True, cmd
+
+    def test_dev_std_streams_and_fd_paths_are_readonly(self):
+        for cmd in ("cat a >/dev/stdout", "cat a >/dev/stderr", "cat a 2>/dev/fd/3"):
+            assert _mutates(cmd) is False, cmd
+
+    def test_real_file_redirect_still_mutating(self):
+        """The sink allowance must not swallow a genuine write in the same
+        command — in either order, and for look-alike paths."""
+        for cmd in ("echo x > /tmp/real",
+                    "cat a >out.txt 2>/dev/null",
+                    "cat a 2>/dev/null >out.txt",
+                    "ls > /dev/nullx",
+                    "ls > /dev/null/foo"):
+            assert _mutates(cmd) is True, cmd

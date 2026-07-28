@@ -1,6 +1,6 @@
 [project]
 name = "asicode"
-version = "0.2.15"
+version = "0.2.16"
 description = "Autonomous Software Improvement — AST-precise code editing agent with verification gates (CLI + MCP server)"
 readme = "README.md"
 license = "MIT"
@@ -38,6 +38,32 @@ dependencies = [
   # regex heuristics, which contradicts the AST-over-regex design principle.
   # The loader also still resolves individual tree_sitter_<lang> modules.
   "tree-sitter-language-pack>=1.10",
+  # The tree-sitter CORE, pinned below 0.26 — and declared at all, which it was
+  # not. Only tree-sitter-language-pack was listed, and its own metadata says
+  # bare `Requires: tree-sitter` with no bound, so a fresh install resolved the
+  # core to whatever was newest. On 0.26.0 that segfaults.
+  #
+  # Measured in a clean python:3.12-slim container, 20 trials per combination of
+  # `SymbolSearcher.get_file_outline()` over one ordinary Python file:
+  #
+  #     core 0.26.0 + pack 1.13.5 -> 7/20 crashed
+  #     core 0.26.0 + pack 1.12.5 -> 9/20 crashed
+  #     core 0.25.2 + pack 1.13.5 -> 0/20
+  #     core 0.25.2 + pack 1.12.5 -> 0/20
+  #
+  # So the core decides and the pack is irrelevant. The crash is a SIGSEGV
+  # inside the node walk (get_node_text -> node.start_byte), nondeterministic
+  # and landing at a different site each run — GC, fork, realpath — which is
+  # why a single passing trial proves nothing here; the rate is only ~35-45%.
+  #
+  # This is NOT a test-only concern: get_file_outline is on the read_file path
+  # (_over_cap_guidance, for files past the output cap), so a plain
+  # `pip install asicode` could segfault the CLI on an ordinary large-file read.
+  # The dev environment masked it by having core 0.25.2 already pinned.
+  #
+  # Revisit by re-running the trial matrix against a newer core, not by reading
+  # release notes — and require a full 20-trial zero before raising the bound.
+  "tree-sitter>=0.25,<0.26",
   # PEP 440 version comparison for the update-notice check
   # (utils/version_check.py). NOT implicitly present in a base install —
   # only pytest pulled it in dev envs — and the string-inequality fallback

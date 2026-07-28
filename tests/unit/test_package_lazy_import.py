@@ -14,10 +14,28 @@ import importlib
 import sys
 import unittest.mock as mock
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_module_tree(restore_sys_modules):
+    """Put the purged ``external_llm*`` modules back after each test.
+
+    Delegates to the shared ``restore_sys_modules`` fixture (tests/conftest.py)
+    — see it for what leaking the purge costs. Concretely here: vector_cache's
+    ``patch(..., "HAS_FAISS", False)`` landed on the freshly-imported module
+    while ``VectorCacheManager.search`` kept reading ``True`` from the orphaned
+    original, so it returned real hits where the test required an empty list.
+    """
+
 
 def _purge_external_llm_tree() -> None:
     """Remove every ``external_llm*`` module from ``sys.modules`` so the next
-    import re-runs the package ``__init__`` from a clean state."""
+    import re-runs the package ``__init__`` from a clean state.
+
+    Only safe because ``_restore_module_tree`` puts the originals back when the
+    test ends — see that fixture for what leaking them costs.
+    """
     for mod in [m for m in sys.modules if m == "external_llm" or m.startswith("external_llm.")]:
         del sys.modules[mod]
 

@@ -3,18 +3,41 @@
 The incremental rebuild must produce results identical to a full re-parse for
 added / changed / removed files, and the cache must be bounded by an entry cap.
 """
+import itertools
 import os
 import textwrap
 import threading
+import time
 
 import pytest
 
 from external_llm.agent import symbol_index as si
 
 
+_MTIME_TICK = itertools.count(1)
+
+
 def _write(path, body):
+    """Write *body*, then stamp a strictly-increasing mtime.
+
+    The index detects change by ``os.path.getmtime`` (see
+    ``symbol_index._collect_mtimes``). A test that writes a file and rewrites it
+    moments later can land both writes in the SAME mtime tick, and the rebuild
+    then reuses the stale entry — the edit is invisible and the assertion fails.
+
+    That is filesystem-dependent, which is why it never appeared in local runs:
+    APFS timestamps at nanosecond resolution, so macOS always saw two distinct
+    mtimes. On the Linux CI filesystem it flaked at 2/5 runs, measured in a
+    clean python:3.12-slim container — enough to block roughly two releases in
+    five had it reached the release gate.
+
+    Stamping an explicit, monotonically increasing mtime here removes the
+    dependency on clock resolution entirely, rather than sleeping for a tick.
+    """
     with open(path, "w") as f:
         f.write(textwrap.dedent(body))
+    stamp = time.time() + next(_MTIME_TICK)
+    os.utime(path, (stamp, stamp))
 
 
 @pytest.fixture()

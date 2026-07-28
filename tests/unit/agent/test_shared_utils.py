@@ -668,10 +668,10 @@ def test_walk_repo_files_returns_cached_on_second_call(tmp_path):
 
     (tmp_path / "one.py").write_text("x = 1\n")
     cache: dict = {}
-    first = _walk_repo_files(tmp_path, 100, cache, lambda n: n.endswith(".py"))
+    first = _walk_repo_files(tmp_path, 100, cache, lambda n: n.endswith(".py"), [0])
     # Mutate the filesystem after the first walk; a TTL cache hit must ignore it.
     (tmp_path / "two.py").write_text("y = 2\n")
-    second = _walk_repo_files(tmp_path, 100, cache, lambda n: n.endswith(".py"))
+    second = _walk_repo_files(tmp_path, 100, cache, lambda n: n.endswith(".py"), [0])
     assert second is not first  # distinct object → shallow copy, not reference
     assert {p.name for p in second} == {"one.py"}  # two.py invisible (cached)
     assert {p.name for p in first} == {"one.py"}  # original also unchanged
@@ -690,11 +690,11 @@ def test_walk_repo_files_truncated_cache_does_not_leak_to_larger_cap(tmp_path):
     cache: dict = {}
 
     # First walk with cap=3 → truncated, 3 files cached.
-    small = _walk_repo_files(tmp_path, 3, cache, lambda n: n.endswith(".py"))
+    small = _walk_repo_files(tmp_path, 3, cache, lambda n: n.endswith(".py"), [0])
     assert len(small) == 3
 
     # Second walk with cap=5 → cache hit but truncated+insufficient → re-walk.
-    big = _walk_repo_files(tmp_path, 5, cache, lambda n: n.endswith(".py"))
+    big = _walk_repo_files(tmp_path, 5, cache, lambda n: n.endswith(".py"), [0])
     assert len(big) == 5, f"Expected 5 files, got {len(big)} — truncated cache leaked"
     assert {p.name for p in big} == {f"f{i}.py" for i in range(5)}
 
@@ -703,7 +703,7 @@ def test_walk_repo_files_truncated_cache_does_not_leak_to_larger_cap(tmp_path):
     # directly without re-slicing, so an over-long result would cause
     # redundant work (e.g. 4000-cap vulture cache served to a 600-cap
     # symbol_search call would index 4000 files instead of 600).
-    small2 = _walk_repo_files(tmp_path, 3, cache, lambda n: n.endswith(".py"))
+    small2 = _walk_repo_files(tmp_path, 3, cache, lambda n: n.endswith(".py"), [0])
     assert len(small2) == 3, "Cache hit must honor the caller's max_files cap"
     # Should have re-used the cache, not re-walked (verify by checking that
     # the result is a *different* object — copy, not reference).
@@ -723,11 +723,11 @@ def test_walk_repo_files_complete_cache_serves_smaller_cap_without_overshoot(tmp
     cache: dict = {}
 
     # First walk with a cap larger than the file count → complete, 8 files cached.
-    big = _walk_repo_files(tmp_path, 4000, cache, lambda n: n.endswith(".py"))
+    big = _walk_repo_files(tmp_path, 4000, cache, lambda n: n.endswith(".py"), [0])
     assert len(big) == 8
 
     # Second walk with a smaller cap → cache hit, but result sliced to the cap.
-    small = _walk_repo_files(tmp_path, 3, cache, lambda n: n.endswith(".py"))
+    small = _walk_repo_files(tmp_path, 3, cache, lambda n: n.endswith(".py"), [0])
     assert len(small) == 3, (
         "Complete cache must be sliced to the caller's cap — got "
         f"{len(small)} files for a max_files=3 request"
@@ -750,7 +750,7 @@ def test_walk_repo_files_miss_path_returns_copy_not_cached_object(tmp_path):
     for i in range(5):
         (tmp_path / f"a{i}.py").write_text("x = 1\n")
     cache: dict = {}
-    first = _walk_repo_files(tmp_path, 3, cache, lambda n: n.endswith(".py"))
+    first = _walk_repo_files(tmp_path, 3, cache, lambda n: n.endswith(".py"), [0])
     assert len(first) == 3
     cached_obj = cache[str(tmp_path)][1]
     assert first is not cached_obj, (
@@ -767,7 +767,7 @@ def test_walk_repo_files_miss_path_returns_copy_not_cached_object(tmp_path):
     sub.mkdir()
     (sub / "b.py").write_text("y = 1\n")
     cache2: dict = {}
-    complete = _walk_repo_files(sub, 100, cache2, lambda n: n.endswith(".py"))
+    complete = _walk_repo_files(sub, 100, cache2, lambda n: n.endswith(".py"), [0])
     assert len(complete) == 1
     cached_obj2 = cache2[str(sub)][1]
     assert complete is not cached_obj2, (
@@ -863,12 +863,12 @@ def test_walk_truncated_for_reflects_cap_hit(tmp_path):
     # (A complete walk cached first would shadow a later smaller-cap call via the
     # cache-hit guard, so the order matters here.)
     cache: dict = {}
-    _walk_repo_files(tmp_path, 2, cache, lambda n: n.endswith(".py"))
+    _walk_repo_files(tmp_path, 2, cache, lambda n: n.endswith(".py"), [0])
     assert _walk_truncated_for(tmp_path, cache) is True
 
     # A fresh complete walk (cap >> files) on a clean cache → not truncated.
     cache2: dict = {}
-    _walk_repo_files(tmp_path, 100, cache2, lambda n: n.endswith(".py"))
+    _walk_repo_files(tmp_path, 100, cache2, lambda n: n.endswith(".py"), [0])
     assert _walk_truncated_for(tmp_path, cache2) is False
 
     # Unknown root → False (not known-truncated).
@@ -884,7 +884,7 @@ def test_walk_repo_files_truncation_flag_cached_on_truncated_entry(tmp_path):
     for i in range(4):
         (tmp_path / f"f{i}.py").write_text("x\n")
     cache: dict = {}
-    _walk_repo_files(tmp_path, 2, cache, lambda n: n.endswith(".py"))
+    _walk_repo_files(tmp_path, 2, cache, lambda n: n.endswith(".py"), [0])
     _ts, _files, was_truncated = cache[str(tmp_path)]
     assert was_truncated is True, "truncated walk must cache was_truncated=True"
 

@@ -692,6 +692,32 @@ class TestSymbolSearch:
         assert len(results) == 1
         assert results[0].kind == "css_variable"
 
+    def test_css_custom_property_kind_variable_explicit(self, tmp_path):
+        """``kind='variable'`` must find CSS custom properties — they are the
+        variable-ish kind in CSS, not classes (the old branch put them in the
+        class group)."""
+        (tmp_path / "t.css").write_text(":root { --accent-color: #f00; }\n")
+        ss = SymbolSearcher(tmp_path)
+        results = ss.find_symbol("accent-color", kind="variable")
+        assert len(results) == 1
+        assert results[0].kind == "css_variable"
+
+    def test_css_custom_property_not_in_class_kind(self, tmp_path):
+        """``kind='class'`` must NOT return CSS custom properties — those are
+        variables, not classes."""
+        (tmp_path / "t.css").write_text(":root { --accent-color: #f00; }\n")
+        ss = SymbolSearcher(tmp_path)
+        results = ss.find_symbol("accent-color", kind="class")
+        assert len(results) == 0
+
+    def test_css_class_still_found_by_kind_class(self, tmp_path):
+        """Sanity: ``kind='class'`` must still find CSS class selectors."""
+        (tmp_path / "s.css").write_text(".hero-banner { display: flex; }\n")
+        ss = SymbolSearcher(tmp_path)
+        results = ss.find_symbol("hero-banner", kind="class")
+        assert len(results) == 1
+        assert results[0].kind == "css_class"
+
     def test_css_kebab_case_not_truncated(self, tmp_path):
         """The tree-sitter class_name node captures the full kebab-case name —
         unlike a \\w+ regex it does not truncate 'multi-word-name' at the first

@@ -406,6 +406,31 @@ class TestSaveCheckpointsErrorPaths:
                 store.delete(cid)
 
 
+class TestSaveCheckpointsDurability:
+    """The index write must be durable (fsync), not just atomic-rename."""
+
+    def test_index_save_uses_atomic_write_json(self, store):
+        """_save_checkpoints routes the index through atomic_write_json
+        (sibling tmp → fsync → os.replace) rather than a hand-rolled tmp +
+        os.replace that skipped fsync. Without fsync a crash/power-loss could
+        leave a 0-byte index and _load_checkpoints() would silently reset to
+        [] — losing the whole index even though each payload was fsync'd."""
+        from external_llm.agent import checkpoint_store as csm
+
+        cid = store.create("durability")
+        with patch.object(
+            csm, "atomic_write_json", wraps=csm.atomic_write_json
+        ) as spy:
+            store.delete(cid)  # triggers _save_checkpoints on the index
+        index_calls = [
+            ca for ca in spy.call_args_list
+            if str(ca.args[0]) == str(store.checkpoint_file)
+        ]
+        assert index_calls, (
+            "index write did not go through atomic_write_json (no fsync)"
+        )
+
+
 # ── Edge cases ────────────────────────────────────────────────────────────
 
 class TestEdgeCases:

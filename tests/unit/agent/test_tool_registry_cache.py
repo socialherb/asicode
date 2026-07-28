@@ -6,28 +6,11 @@ import tempfile
 import time
 from unittest.mock import Mock
 
-from external_llm.agent.file_cache import get_global_file_cache, reset_global_file_cache
 from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
-
-
-def test_global_file_cache_singleton():
-    """Test that get_global_file_cache() returns the same instance."""
-    # Singleton verification
-    cache1 = get_global_file_cache()
-    cache2 = get_global_file_cache()
-    assert cache1 is cache2, "Global file cache should be a singleton"
-
-    # ToolRegistry uses global cache verification
-    repo_root = tempfile.mkdtemp()
-    registry = ToolRegistry(repo_root, AgentConfig())
-    assert registry._file_cache is cache1, "ToolRegistry should use global cache"
 
 
 def test_cache_invalidation_across_agents():
     """Test that cache invalidation affects all agents."""
-    # Reset global cache to ensure clean state
-    reset_global_file_cache()
-
     repo_root = tempfile.mkdtemp()
     test_file = os.path.join(repo_root, "test.py")
 

@@ -197,3 +197,202 @@ def test_multi_line_truncation_has_no_partial_line_flag(tmp_path):
     assert res.metadata["truncated"] is True
     assert "partial_line" not in res.metadata
     assert "REST OF THAT LINE was dropped" not in res.content
+
+
+class TestMalformedRange:
+    """A zero line number is malformed, and must not read as "whole file".
+
+    ``int(end_line or len(lines))`` made ``end_line=0`` falsy-fall-back to the
+    last line, so a malformed range was silently reinterpreted as the widest
+    possible one: on a 10K-line file it returned the char budget's worth
+    (~60 KB, ≈15K tokens) instead of the ~3 KB outline guidance a no-range read
+    gets. The model never learned its argument was wrong.
+
+    NOTE the deliberate contrast with :meth:`TestOutputBudget.
+    test_explicit_range_is_capped`: a *well-formed* wide range (``end_line=
+    999999``) legitimately bypasses the line cap and is bounded by the char
+    budget instead. That is by design. Only a malformed bound errors.
+    """
+
+    def _long_file(self, tmp_path):
+        n = _cfg.lines.READ_FILE_FULL_LINES * 3
+        _write(tmp_path, "long.py", "\n".join(f"x = {i}" for i in range(n)))
+        return n
+
+    def test_end_line_zero_is_rejected_not_widened(self, tmp_path):
+        n = self._long_file(tmp_path)
+        res = _reg(tmp_path).dispatch("read_file", {"path": "long.py", "end_line": 0})
+        # ok=False since the range errors were split by mistake: a malformed
+        # bound is a failed call, not an answer (see the range-error tests
+        # below). The invariant this test was written for is unchanged — the
+        # response must stay small, i.e. NOT widened to the whole file.
+        assert res.ok is False
+        assert "1-based" in res.error
+        assert len(res.content) < 500, (
+            "end_line=0 returned a payload — it was widened to the whole file "
+            f"instead of reported as malformed (file has {n} lines)"
+        )
+        assert not res.metadata.get("truncated")
+
+    def test_string_zero_is_rejected_too(self, tmp_path):
+        """Models quote numbers; the coercion must not reopen the hole."""
+        self._long_file(tmp_path)
+        res = _reg(tmp_path).dispatch("read_file", {"path": "long.py", "end_line": "0"})
+        assert res.ok is False and "1-based" in res.error
+
+    def test_well_formed_range_still_works(self, tmp_path):
+        self._long_file(tmp_path)
+        res = _reg(tmp_path).dispatch(
+            "read_file", {"path": "long.py", "start_line": 10, "end_line": 20}
+        )
+        assert res.ok and "lines 10–20" in res.content
+
+
+class TestReadSymbolCharBudget:
+    """read_symbol shares read_file's char budget — and must share its
+    *arithmetic*, not reimplement it.
+
+    read_symbol originally had no budget at all (``read_symbol("WriteToolsMixin")``
+    returned ~356K chars / ~89K tokens in one tool result, while ``read_file`` on
+    the same file refused at its 800-line cap and steered the model here).
+    The budget was then added as a COPY of read_file's loop, against a 0-based
+    origin, which reintroduced both defects the tests above pin for read_file:
+    a resume line naming an already-emitted line, and no partial-line flag on an
+    over-wide line. Both derivations now live in ``_apply_char_budget``.
+    """
+
+    def _sym_file(self, tmp_path, body_lines: int, width: int):
+        body = "\n".join("    # " + "w" * width for _ in range(body_lines))
+        _write(tmp_path, "big.py", f"def target():\n{body}\n    return 1\n")
+
+    def test_symbol_body_is_capped(self, tmp_path):
+        budget = _cfg.lines.READ_FILE_MAX_CHARS
+        self._sym_file(tmp_path, body_lines=4000, width=200)  # ~800K chars raw
+        res = _reg(tmp_path).dispatch("read_symbol", {"name": "target"})
+        assert res.ok, res.error
+        assert len(res.content) < budget * 1.2, "read_symbol must respect the output budget"
+        assert "Truncated at the" in res.content
+
+    def test_resume_line_is_the_first_line_not_emitted(self, tmp_path):
+        """The regression: ``start + len(kept)`` (0-based origin) named the LAST
+        emitted line, so continuing there re-read a line the caller already had."""
+        self._sym_file(tmp_path, body_lines=4000, width=200)
+        res = _reg(tmp_path).dispatch("read_symbol", {"name": "target"})
+        assert res.ok, res.error
+        import re as _re
+        resume = int(_re.search(r"start_line=(\d+)", res.content).group(1))
+        emitted = [int(m.group(1)) for m in
+                   _re.finditer(r"^\s*(\d+) │", res.content, _re.M)]
+        assert emitted, res.content
+        assert resume == emitted[-1] + 1, (
+            f"resume must be the first line NOT emitted: emitted through "
+            f"{emitted[-1]}, resume={resume}")
+        assert f"Lines {resume}–" in res.content, (
+            "the prose range must start at the first un-emitted line")
+
+    def test_oversized_single_line_advances_and_flags_partial(self, tmp_path):
+        """An over-wide line must advance PAST itself and say the tail is gone.
+
+        Regression: read_symbol named that same line as the resume point (so the
+        retry returned the identical prefix) and omitted read_file's
+        unrecoverable-tail warning, so the caller believed re-reading would
+        recover the rest."""
+        budget = _cfg.lines.READ_FILE_MAX_CHARS
+        _write(tmp_path, "one.py",
+               "def target():\n    x = '" + "z" * (budget * 2) + "'\n    return x\n")
+        res = _reg(tmp_path).dispatch("read_symbol", {"name": "target"})
+        assert res.ok, res.error
+        assert len(res.content) < budget * 1.2
+        # Line 1 ("def target():") fits, line 2 is the over-wide one.
+        assert "start_line=2" in res.content, res.content[-300:]
+
+    def test_symbol_within_budget_is_untouched(self, tmp_path):
+        _write(tmp_path, "s.py", "def target():\n    return 42\n")
+        res = _reg(tmp_path).dispatch("read_symbol", {"name": "target"})
+        assert res.ok, res.error
+        assert "return 42" in res.content
+        assert "Truncated at the" not in res.content
+
+    def test_truncation_is_visible_in_metadata(self, tmp_path):
+        """The prose notice is for the model; the agent loop and telemetry read
+        ``metadata``. Emitting one without the other made read_symbol truncation
+        the only dropped output no consumer could detect programmatically."""
+        self._sym_file(tmp_path, body_lines=4000, width=200)
+        res = _reg(tmp_path).dispatch("read_symbol", {"name": "target"})
+        assert res.ok, res.error
+        assert res.metadata["truncated"] is True
+        # resume_line is a FILE line number — the resumption call is a read_file.
+        assert res.metadata["resume_line"] > 1
+        assert f"start_line={res.metadata['resume_line']}" in res.content
+        assert res.metadata["line_count"] == 4002  # def + 4000 body + return
+        assert "partial_line" not in res.metadata
+
+    def test_partial_line_is_flagged_in_metadata(self, tmp_path):
+        """``partial_line`` fires only when the window's FIRST line is itself
+        over-budget — that is the sole case where output is dropped MID-line and
+        so cannot be recovered by resuming at a line boundary. A later over-wide
+        line (see ``test_oversized_single_line_advances_and_flags_partial``) is
+        ordinary line-boundary truncation and must NOT set the flag, or it stops
+        being a reliable signal of unrecoverable loss."""
+        budget = _cfg.lines.READ_FILE_MAX_CHARS
+        params = ", ".join(f"a{i}=1" for i in range(9000))  # def line > budget
+        _write(tmp_path, "one.py", f"def target({params}):\n    return 1\n")
+        res = _reg(tmp_path).dispatch("read_symbol", {"name": "target"})
+        assert res.ok, res.error
+        assert res.metadata["partial_line"] == 1
+        assert res.metadata["resume_line"] == 2, "must advance past the over-wide line"
+        assert "REST OF THAT LINE was dropped" in res.content
+
+    def test_untruncated_symbol_has_no_truncation_metadata(self, tmp_path):
+        _write(tmp_path, "s.py", "def target():\n    return 42\n")
+        res = _reg(tmp_path).dispatch("read_symbol", {"name": "target"})
+        assert res.ok, res.error
+        assert res.metadata == {}
+
+
+# ── Range errors must name the right mistake ─────────────────────────────────
+# One message covered two unrelated errors and reported the CLAMPED end, so
+# asking for 9999-10005 of a 200-line file came back as "Line range 9999-200 is
+# out of range" — a range the caller never sent. And an INVERTED range whose
+# bounds both sit inside the file was answered with "file has 200 lines", which
+# tells the model nothing it can act on. Both returned ok=True, so the failure
+# read as "asked and answered" and no retry followed (the reasoning
+# _tool_read_symbol already records for its own missing-argument case).
+
+
+def _range_err(tmp_path, **args):
+    _write(tmp_path, "big.py", "".join(f"l{i}=1\n" for i in range(1, 201)))
+    res = _reg(tmp_path).dispatch("read_file", {"path": "big.py", **args})
+    return res
+
+
+def test_inverted_range_says_so(tmp_path):
+    res = _range_err(tmp_path, start_line=50, end_line=10)
+    assert res.ok is False, "an empty range is a failed call, not an answer"
+    assert "50" in res.error and "10" in res.error
+    assert "after end_line" in res.error
+
+
+def test_past_end_of_file_says_so(tmp_path):
+    res = _range_err(tmp_path, start_line=9999, end_line=10005)
+    assert res.ok is False
+    assert "past the end" in res.error
+    # The clamped end must not be reported back as if the caller asked for it.
+    assert "9999–200" not in res.error and "9999-200" not in res.error
+
+
+def test_start_past_end_without_end_line_is_not_called_inverted(tmp_path):
+    """With end_line omitted the default IS the last line, so blaming an
+    "end_line" the caller never sent repeats the misdirection being fixed."""
+    res = _range_err(tmp_path, start_line=201)
+    assert res.ok is False
+    assert "past the end" in res.error
+    assert "end_line" not in res.error
+
+
+def test_end_line_past_eof_still_reads_to_eof(tmp_path):
+    """Clamping a too-large end_line is correct and must keep working — only a
+    range that yields NO lines is an error."""
+    res = _range_err(tmp_path, start_line=198, end_line=10005)
+    assert res.ok is True
+    assert "l198=1" in res.content and "l200=1" in res.content
