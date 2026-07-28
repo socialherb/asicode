@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from unittest.mock import mock_open
 
@@ -220,13 +222,37 @@ class TestRoutingPolicy:
         assert len(policy._rules[2]["conditions"]) == 0
 
 
+def _expire_cache(monkeypatch, rp):
+    """Force ``load_policy``'s TTL check to see the cache as stale.
+
+    NOT ``_last_check = 0.0``. The check is
+    ``time.monotonic() - _last_check < _CACHE_TTL``, and ``monotonic()`` counts
+    from an arbitrary origin — on Linux, system boot. A machine with days of
+    uptime reports ~600000, so ``600000 - 0.0`` clears the 300 s TTL and the
+    cache expires as intended. A freshly booted CI runner reports tens of
+    seconds, so ``30 - 0.0`` is BELOW the TTL and the cache is treated as
+    FRESH — the exact opposite of what the caller asked for.
+
+    That is not hypothetical: it is why v0.2.16's release gate failed. Two
+    tests returned the cached ``None`` instead of re-reading, and two more
+    (``test_no_file_returns_none`` / ``test_invalid_json_returns_none``)
+    PASSED for the wrong reason — they assert ``None`` and got the cached
+    ``None`` without ever reaching the code they exist to exercise.
+
+    Anchoring to the current clock instead makes the value expired by
+    construction, whatever the origin. Matches the idiom the tests further down
+    this class already use (``time.monotonic() - 3600``).
+    """
+    monkeypatch.setattr(rp, "_last_check", time.monotonic() - rp._CACHE_TTL - 1)
+
+
 class TestLoadPolicy:
     """Tests for load_policy() — file I/O + caching."""
 
     def test_no_file_returns_none(self, monkeypatch):
         """When routing_policy.json does not exist, load_policy returns None."""
         import external_llm.agent.routing_policy as rp
-        monkeypatch.setattr(rp, "_last_check", 0.0)
+        _expire_cache(monkeypatch, rp)
         monkeypatch.setattr(rp, "_cached_policy", None)
         monkeypatch.setattr(rp, "_cached_mtime", 0.0)
         monkeypatch.setattr("os.path.exists", lambda _: False)
@@ -236,7 +262,7 @@ class TestLoadPolicy:
     def test_valid_file_returns_policy(self, monkeypatch):
         """When a valid policy JSON file exists, load_policy returns a RoutingPolicy."""
         import external_llm.agent.routing_policy as rp
-        monkeypatch.setattr(rp, "_last_check", 0.0)
+        _expire_cache(monkeypatch, rp)
         monkeypatch.setattr(rp, "_cached_policy", None)
         monkeypatch.setattr(rp, "_cached_mtime", 0.0)
         monkeypatch.setattr("os.path.exists", lambda _: True)
@@ -287,7 +313,7 @@ class TestLoadPolicy:
     def test_invalid_json_returns_none(self, monkeypatch):
         """When the JSON file is malformed, load_policy returns None."""
         import external_llm.agent.routing_policy as rp
-        monkeypatch.setattr(rp, "_last_check", 0.0)
+        _expire_cache(monkeypatch, rp)
         monkeypatch.setattr(rp, "_cached_policy", None)
         monkeypatch.setattr(rp, "_cached_mtime", 0.0)
         monkeypatch.setattr("os.path.exists", lambda _: True)
@@ -304,7 +330,7 @@ class TestLoadPolicy:
     def test_cached_stale_mtime_reloads(self, monkeypatch):
         """When mtime changed, cached policy is refreshed."""
         import external_llm.agent.routing_policy as rp
-        monkeypatch.setattr(rp, "_last_check", 0.0)
+        _expire_cache(monkeypatch, rp)
         monkeypatch.setattr(rp, "_cached_policy", RoutingPolicy([{
             "conditions": {"action_hint": "old"},
             "recommended_mode": "replace_symbol_body",
@@ -352,3 +378,65 @@ class TestLoadPolicy:
         policy = rp.load_policy()
         assert policy is cached  # same object, not re-parsed
         assert not json_called  # JSON not re-read
+
+
+class TestFreshlyBootedHost:
+    """The TTL check must not depend on how long the machine has been up.
+
+    ``load_policy`` compares ``time.monotonic() - _last_check`` against
+    ``_CACHE_TTL``. ``monotonic()`` counts from an arbitrary origin — on Linux,
+    system boot — so a test that pins ``_last_check`` to a literal ``0.0`` is
+    really asserting "this host has been up longer than the TTL". True on any
+    developer machine and, as it turns out, inside Docker Desktop's Linux VM
+    (measured 547798 s of uptime, which is why a container could not reproduce
+    this). False on a CI runner that booted seconds ago.
+
+    v0.2.16's release gate failed exactly here. Two tests returned a cached
+    ``None`` instead of re-reading, and two more passed for the wrong reason —
+    they assert ``None`` and got the cached ``None`` without ever reaching the
+    code they exist to exercise. The clock is simulated below so the property
+    is pinned rather than left to the host's uptime.
+    """
+
+    @pytest.fixture
+    def fresh_boot(self, monkeypatch):
+        """``time.monotonic()`` == 30.0 — a runner 30 seconds after boot."""
+        import external_llm.agent.routing_policy as rp
+        monkeypatch.setattr(rp.time, "monotonic", lambda: 30.0)
+
+    @staticmethod
+    def _stub_a_valid_policy_file(monkeypatch):
+        monkeypatch.setattr("os.path.exists", lambda _: True)
+        monkeypatch.setattr("os.path.getmtime", lambda _: 100.0)
+        valid = (
+            '{"rules": [{"conditions": {"action_hint": "bugfix"}, '
+            '"recommended_mode": "surgical_edit", "success_rate": 0.8, "n": 10}]}'
+        )
+        monkeypatch.setattr("json.load", lambda _: __import__("json").loads(valid))
+        monkeypatch.setattr("builtins.open", mock_open(read_data="{}"))
+
+    def test_expiry_helper_works_seconds_after_boot(self, fresh_boot, monkeypatch):
+        import external_llm.agent.routing_policy as rp
+        monkeypatch.setattr(rp, "_cached_policy", None)
+        monkeypatch.setattr(rp, "_cached_mtime", 0.0)
+        _expire_cache(monkeypatch, rp)
+        self._stub_a_valid_policy_file(monkeypatch)
+
+        policy = rp.load_policy()
+        assert policy is not None, "cache read as fresh on a just-booted host"
+        assert policy.predict("bugfix") == "surgical_edit"
+
+    def test_the_literal_zero_idiom_really_is_broken_here(self, fresh_boot, monkeypatch):
+        """Control. Without it the test above could pass for an unrelated reason,
+        and the helper it guards would look like cargo cult."""
+        import external_llm.agent.routing_policy as rp
+        monkeypatch.setattr(rp, "_cached_policy", None)
+        monkeypatch.setattr(rp, "_cached_mtime", 0.0)
+        monkeypatch.setattr(rp, "_last_check", 0.0)  # the pre-fix idiom
+        self._stub_a_valid_policy_file(monkeypatch)
+
+        assert rp.load_policy() is None, (
+            "expected `_last_check = 0.0` to short-circuit seconds after boot; "
+            "if it no longer does, the TTL logic changed and _expire_cache "
+            "should be re-derived rather than trusted"
+        )
