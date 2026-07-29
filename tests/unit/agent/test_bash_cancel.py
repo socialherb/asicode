@@ -109,7 +109,7 @@ def test_output_spanning_many_poll_slices_is_complete(cancel_reg):
     [b"a\rb\r\nc\n", "\uac00\ub098\ub2e4\r\n".encode(), b"plain\n"],
     ids=["cr-and-crlf", "multibyte-crlf", "plain"],
 )
-def test_the_pump_decodes_exactly_as_text_mode_did(raw):
+def test_the_pump_decodes_exactly_as_text_mode_did(raw, tmp_path):
     """Reading the pipes ourselves must not change what a command's output IS.
 
     `communicate(text=True)` performs universal-newline translation: both `\r`
@@ -125,12 +125,21 @@ def test_the_pump_decodes_exactly_as_text_mode_did(raw):
     import codecs
     import io
 
+    # The bytes come from a FILE rather than through a text-mode stdin pipe.
+    # Writing them to `proc.stdin.buffer` and closing it leaves communicate() to
+    # flush an already-closed TextIOWrapper, which raises ValueError — it catches
+    # only BrokenPipeError. CPython 3.14 tolerates that; 3.12 does not, and
+    # requires-python is >=3.10, so the pipe made this test pass on exactly one
+    # interpreter (it was green locally and red on CI's 3.12 — measured both).
+    # A file also keeps the write side out of it entirely: feeding a str through
+    # the wrapper would newline-translate on the way IN, destroying the very
+    # `\r` under test. Only the READ side is what this test is about.
+    src = tmp_path / "raw.bin"
+    src.write_bytes(raw)
     proc = subprocess.Popen(
-        ["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        ["cat", str(src)], stdout=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace",
     )
-    proc.stdin.buffer.write(raw)
-    proc.stdin.close()
     expected, _ = proc.communicate()
 
     for cut in range(len(raw) + 1):
