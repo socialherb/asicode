@@ -325,7 +325,9 @@ class _CFamilySyntaxProvider(SyntaxProvider):
         """
         cc = self._resolve_compilers(compilers)
         if cc is None:
-            return SyntaxValidationResult(ok=True, language=lang)
+            return SyntaxValidationResult.unchecked(
+                lang, f"no C compiler found (tried {', '.join(compilers)})",
+            )
 
         _cmd = [cc, "-fsyntax-only", "-Wall"]
         _cmd.extend(include_flags)
@@ -334,20 +336,21 @@ class _CFamilySyntaxProvider(SyntaxProvider):
         try:
             proc = subprocess.run(
                 _cmd,
-                capture_output=True, text=True, timeout=120, cwd=cwd,
+                capture_output=True, text=True, timeout=30, cwd=cwd,
                 env=_compile_env(),
             )
         except FileNotFoundError:
             logger.debug("%s not installed; skipping semantic validation", cc)
-            return SyntaxValidationResult(ok=True, language=lang)
+            return SyntaxValidationResult.unchecked(lang, f"{cc} is not installed")
         except subprocess.TimeoutExpired:
             logger.debug("%s timed out for %s; skipping", cc, file_path)
-            return SyntaxValidationResult(ok=True, language=lang)
+            return SyntaxValidationResult.unchecked(lang, f"{cc} timed out")
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("%s semantic check failed: %s", cc, e)
-            return SyntaxValidationResult(ok=True, language=lang)
+            return SyntaxValidationResult.unchecked(lang, f"{cc} could not be run")
 
         if proc.returncode == 0:
+            # The compile SUCCEEDED — a real clean verdict, not a skip.
             return SyntaxValidationResult(ok=True, language=lang)
 
         errors: list[SyntaxError_] = []
@@ -381,7 +384,9 @@ class _CFamilySyntaxProvider(SyntaxProvider):
         default, so the C++ retry parses C++ headers correctly.
         """
         if not file_path or not os.path.exists(file_path):
-            return SyntaxValidationResult(ok=True, language=self._lang)
+            return SyntaxValidationResult.unchecked(
+                self._lang, "the file is not on disk",
+            )
 
         cwd = os.path.dirname(os.path.abspath(file_path)) or "."
         target = os.path.basename(file_path)

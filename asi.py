@@ -4028,7 +4028,7 @@ class _ProgressPrinter:
                     "glob": "pattern",
                     "find_symbol": "name",
                     "find_references": "name",
-                    "find_tests_for_symbol": "name",
+                    "find_tests_for_symbol": "symbol",
                     "find_relevant_files": "query",
                     "search_code": "query",
                 }

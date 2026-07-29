@@ -11,6 +11,31 @@ import signal
 import subprocess
 from typing import Optional
 
+# How often a tool blocked on a subprocess re-checks for cancellation. Small
+# enough that ESC feels immediate, large enough that the wakeups are free next
+# to the command itself (4/s while one runs, none otherwise).
+#
+# Shared rather than per-tool: `bash` and `grep` are the two waits long enough
+# to strand a user (a 300s ceiling and a 120s one), and a cancel that feels
+# instant in one tool and laggy in the next is worse than either.
+CANCEL_POLL_INTERVAL = 0.25
+
+
+def cancel_probe(config) -> "callable":
+    """A zero-arg predicate reading ``config.cancel_event`` FRESH each call.
+
+    Not a captured event: the design-chat REPL swaps ``config.cancel_event``
+    per turn (asi.py), so a value read once before a long wait goes stale and
+    the poll then watches an event nobody will ever set — the same trap the RAG
+    indexers document. Returns a callable so the polling loop stays free of the
+    config object.
+    """
+    def _probe() -> bool:
+        _ev = getattr(config, "cancel_event", None)
+        return _ev is not None and _ev.is_set()
+
+    return _probe
+
 
 def run_bounded_subprocess(
     cmd,

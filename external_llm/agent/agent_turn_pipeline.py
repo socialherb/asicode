@@ -32,6 +32,7 @@ from ._shared_utils import (
     estimate_tokens_from_msgs,
     extract_files_from_patch,
     make_tool_signature,
+    render_file_diagnostics_block,
 )
 from .context_budget import _resolve_context_limit
 from external_llm.agent.message_shapes import (
@@ -219,6 +220,10 @@ class TurnPipelineMixin:
                 # Enforce max_turns cap.
                 if ctx.turn_num > self.config.max_turns:
                     return self._handle_max_turns_reached(ctx)
+
+                # Start coalescing semantic checks for THIS turn; they run once
+                # per written file at turn end, against the final content.
+                self.registry.begin_semantic_turn()
 
                 _prep = self._prepare_turn_messages(ctx)
                 # NOTE: do NOT assign _prep.messages back to ctx.messages.
@@ -419,6 +424,15 @@ class TurnPipelineMixin:
                 rollback_performed=ctx.rollback_performed,
                 rollback_result=ctx.rollback_result,
             )
+        finally:
+            # The turn body can be abandoned mid-flight (uncaught exception /
+            # cancellation) after begin_semantic_turn() opened a turn but before
+            # the normal drain at turn end (_settle_deferred_semantics). Without
+            # this, the registry is left believing a turn is active and every
+            # subsequent out-of-turn dispatch would defer — and silently drop —
+            # its diagnostics into a queue nothing drains. No-op on the normal
+            # path: drain already cleared both fields.
+            self.registry.end_semantic_turn()
 
     @staticmethod
     def _effective_final_content(response) -> str:
@@ -1738,6 +1752,86 @@ class TurnPipelineMixin:
             fail_streak=fail_streak,
         )
 
+    def _settle_deferred_semantics(self, new_messages: list) -> None:
+        """Run this turn's coalesced semantic checks and inject the results.
+
+        ``_run_syntax_check_for_file`` deferred each written file rather than
+        spawning a toolchain process per write (see
+        ``ToolRegistry.begin_semantic_turn``). Now that the turn's writes have
+        all landed, one check per file runs against the final content and its
+        diagnostics are written into the tool-result message of that file's LAST
+        write — the one whose edit produced the state being reported.
+
+        The message content is a JSON payload (``_build_tool_result_message``),
+        so the diagnostics are injected by re-serialising it rather than by
+        appending text, which would corrupt the payload.
+
+        Earlier messages for the same file keep their ``semantic_deferred`` flag
+        and gain no ``semantic_diagnostics`` key: an empty list there would be
+        rendered as "checked, clean" by ``_append_semantic_diagnostics``, which
+        is the exact miscue this design exists to avoid.
+
+        Advisory throughout — any failure leaves the messages untouched.
+        """
+        try:
+            diags = self.registry.drain_pending_semantic_checks()
+        except Exception as exc:  # noqa: BLE001 — never break the turn over a lint
+            # Logged, not silent: if this ever starts failing, the whole
+            # advisory channel goes dark and the agent stops hearing about the
+            # errors its own edits introduce. That must be discoverable.
+            logger.warning("Deferred semantic checks could not be drained: %s", exc)
+            return
+        if not diags:
+            return
+        # Every deferring message is visited, not just enough of them to fill
+        # each path once: the earlier writes still carry the internal
+        # ``semantic_deferred_path`` key, and stopping early would ship it to
+        # the model.
+        _filled: set = set()
+        for _msg in reversed(new_messages):
+            _raw = getattr(_msg, "content", None)
+            if not isinstance(_raw, str) or "semantic_deferred" not in _raw:
+                continue
+            try:
+                _payload = json.loads(_raw)
+                _syn = (_payload.get("metadata") or {}).get("syntax_check")
+                if not isinstance(_syn, dict):
+                    continue
+                _path = _syn.pop("semantic_deferred_path", None)
+                if _path is None or _path not in diags:
+                    continue
+                if _path in _filled:
+                    # An earlier write to the same file: the reported state
+                    # belongs to the later one, so leave this message unfilled.
+                    _msg.content = json.dumps(_payload, ensure_ascii=False)
+                    continue
+                _syn.pop("semantic_deferred", None)
+                _outcome = diags[_path]
+                if not _outcome.checked:
+                    # Nothing examined the file — say so instead of writing an
+                    # empty diagnostics list, which reads as a clean check.
+                    # Still marked filled: the model has been told the truth
+                    # about this file, and the earlier writes must not be
+                    # re-answered with the same notice.
+                    _syn["semantic_check_skipped"] = _outcome.skip_reason
+                    _filled.add(_path)
+                    _msg.content = json.dumps(_payload, ensure_ascii=False)
+                    continue
+                _syn["semantic_diagnostics"] = _outcome.diagnostics
+                # Render the SAME <file_diagnostics> guidance block the inline
+                # path produces, so a coalesced check is as salient to the model
+                # as an inline one — not buried only in the JSON metadata. The
+                # inline path appended it during _build_tool_result_message,
+                # which ran BEFORE this settle, so it must be re-created here.
+                _block = render_file_diagnostics_block(_outcome.diagnostics)
+                if _block:
+                    _payload["content"] = (_payload.get("content") or "") + _block
+                _filled.add(_path)
+                _msg.content = json.dumps(_payload, ensure_ascii=False)
+            except Exception as exc:  # noqa: BLE001 — a single bad payload is not fatal
+                logger.debug("Could not settle semantics into a tool message: %s", exc)
+                continue
+
     # ------------------------------------------------------------------
     # Execute and process tool calls
     # ------------------------------------------------------------------
@@ -1962,6 +2056,12 @@ class TurnPipelineMixin:
             plan_current_index=plan_current_index,
             turns=ctx.turns,
         )
+        # Every write of this turn has landed, so the files are now in their
+        # final state: run the coalesced semantic checks and fill the results
+        # into the tool-result messages that deferred them. Done here rather
+        # than inside _process_tool_results because it must observe the LAST
+        # write, and that is only known once the loop over results is over.
+        self._settle_deferred_semantics(_rpr.new_messages)
         if _rpr.early_return is not None:
             return _ToolTurnOutcome(
                 new_messages=_rpr.new_messages,

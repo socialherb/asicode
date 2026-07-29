@@ -72,6 +72,7 @@ class SymbolAwareTestFinder:
         self._facade = graph_facade
         self._dependency_graph = dependency_graph  # P9-2: pre-computed test dependency graph
         self._test_files_cache: Optional[list[str]] = None
+        self._content_cache: dict[str, str] = {}
 
     def discover_test_targets(
         self,
@@ -294,14 +295,40 @@ class SymbolAwareTestFinder:
     def _is_test_file(self, path: str) -> bool:
         return self._is_test_filename(os.path.basename(path))
 
-    def _file_references_symbol(self, test_file: str, symbol: str) -> bool:
-        """Check if test file contains reference to symbol (lightweight grep)."""
+    def _read_test_file(self, test_file: str) -> str:
+        """Whole contents of *test_file*, memoised for this finder instance.
+
+        Read in full, not to a byte cap. The cap used to be 50 000 characters,
+        which silently made the back half of a large test file invisible to
+        symbol matching: this repo's ``test_shell_danger_policy.py`` is 93 KB,
+        so a symbol exercised in its second half reported "no related tests" —
+        the answer that reads as "none exist" rather than "not looked at".
+
+        Memoised because the caller scans up to 10 symbols against every test
+        file, which re-read each one once per symbol. One read each instead
+        makes the full read cheaper than the capped one was.
+        """
+        cached = self._content_cache.get(test_file)
+        if cached is not None:
+            return cached
         try:
             abs_path = os.path.join(self._repo_root, test_file)
             if not os.path.isfile(abs_path):
+                content = ""
+            else:
+                with open(abs_path, errors='ignore', encoding="utf-8") as f:
+                    content = f.read()
+        except OSError:
+            content = ""
+        self._content_cache[test_file] = content
+        return content
+
+    def _file_references_symbol(self, test_file: str, symbol: str) -> bool:
+        """Check if test file contains reference to symbol (lightweight grep)."""
+        try:
+            content = self._read_test_file(test_file)
+            if not content:
                 return False
-            with open(abs_path, errors='ignore', encoding="utf-8") as f:
-                content = f.read(50000)  # limit read size
             # Look for symbol as whole word
             idx = content.find(symbol)
             while idx != -1:
@@ -317,11 +344,9 @@ class SymbolAwareTestFinder:
     def _file_imports_module(self, test_file: str, module_name: str) -> bool:
         """Check if test file imports the given module."""
         try:
-            abs_path = os.path.join(self._repo_root, test_file)
-            if not os.path.isfile(abs_path):
+            content = self._read_test_file(test_file)
+            if not content:
                 return False
-            with open(abs_path, errors='ignore', encoding="utf-8") as f:
-                content = f.read(50000)
             # Simple import check
             return (
                 f"import {module_name}" in content

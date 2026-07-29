@@ -2313,8 +2313,8 @@ class OrchestratorAgent:
                 # otherwise a dead worker gets reused and the next dispatch burns
                 # the full ipc_timeout_s.
                 from .subagent_ipc import read_worker_idle_heartbeat_state
-                _grace_deadline = time.time() + 2.0
-                while time.time() < _grace_deadline:
+                _grace_deadline = time.monotonic() + 2.0
+                while time.monotonic() < _grace_deadline:
                     try:
                         if read_worker_idle_heartbeat_state(repo_root, _worker_id) == "exited":
                             _worker_confirmed_exited = True

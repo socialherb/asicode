@@ -17,11 +17,17 @@ Pinned here:
   5. a single line wider than the whole budget still advances the resume line
      (otherwise "continue from N" would loop forever),
   6. ``metadata`` is always a dict — a handler returning None crashes the
-     result cache in ToolRegistry._dispatch_impl.
+     result cache in ToolRegistry._dispatch_impl,
+  7. every outline row carries the symbol's END line, not just its start, and
+     the range it prints is one a follow-up read_file accepts verbatim.
 """
 from __future__ import annotations
 
+import re
+
 from external_llm.agent.config.thresholds import config as _cfg
+from external_llm.agent.symbol_search import SymbolSearcher
+from external_llm.agent.tool_handlers.read_tools import _outline_extent
 from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 
 
@@ -79,6 +85,96 @@ class TestLineCap:
         assert str(n) in res.content
         assert "start_line" in res.content
         assert "line 0" not in res.content
+
+
+class TestOutlineExtent:
+    """Outline rows must carry the END line, not just the start.
+
+    The outline exists to make the FOLLOW-UP read_file exact. Printing only a
+    start line left the model to invent ``end_line``, and inventing it is where
+    malformed ranges come from — including inverted ones (``start_line=600,
+    end_line=460``, observed against a symbol that really did start at 460),
+    which fail the call outright and cost a turn.
+    """
+
+    # alpha spans 5–7, Beta spans 9–11, VERSION is one line (3).
+    _HEAD = [
+        "import os",          # 1
+        "",                   # 2
+        "VERSION = 3",        # 3
+        "",                   # 4
+        "def alpha(a, b):",   # 5
+        "    x = a + b",      # 6
+        "    return x",       # 7
+        "",                   # 8
+        "class Beta:",        # 9
+        "    def gamma(self):",  # 10
+        "        return 2",   # 11
+        "",                   # 12
+    ]
+
+    def _big_module(self, tmp_path):
+        body = list(self._HEAD)
+        body += [f"# filler {i}" for i in range(_cfg.lines.READ_FILE_FULL_LINES)]
+        _write(tmp_path, "big.py", "\n".join(body))
+
+    def test_outline_row_carries_the_full_extent(self, tmp_path):
+        self._big_module(tmp_path)
+        res = _reg(tmp_path).dispatch("read_file", {"path": "big.py"})
+        assert res.metadata["over_line_cap"] is True
+        assert "5–7" in res.content, "a multi-line function must show start–end"
+        assert "9–11" in res.content, "a class must show start–end"
+
+    def test_the_printed_range_is_one_read_file_accepts(self, tmp_path):
+        """The round trip that matters: copy a range out of the outline, pass it
+        straight back, and the symbol comes back whole — no arithmetic, no
+        guess, nothing for the model to invert."""
+        self._big_module(tmp_path)
+        reg = _reg(tmp_path)
+        outline = reg.dispatch("read_file", {"path": "big.py"}).content
+
+        m = re.search(r"lines\s+(\d+)–(\d+)\s+\[function\] alpha", outline)
+        assert m, f"no start–end row for alpha in:\n{outline[:400]}"
+        start, end = int(m.group(1)), int(m.group(2))
+
+        res = reg.dispatch("read_file", {"path": "big.py", "start_line": start, "end_line": end})
+        assert res.ok, res.error
+        assert "def alpha(a, b):" in res.content, "range must start at the def"
+        assert "return x" in res.content, "range must reach the last body line"
+        assert "class Beta" not in res.content, "range must stop at the symbol's end"
+
+    def test_one_line_symbol_prints_a_bare_line_number(self, tmp_path):
+        """"3–3" reads like a mistake and says nothing "3" does not."""
+        self._big_module(tmp_path)
+        res = _reg(tmp_path).dispatch("read_file", {"path": "big.py"})
+        assert re.search(r"lines\s+3\s+\[constant\] VERSION", res.content), res.content[:400]
+        assert "3–3" not in res.content
+
+    def test_missing_extent_degrades_instead_of_fabricating_one(self):
+        """``_outline_ripgrep`` matches a declaration by regex and never sets
+        ``end_line``. That path must print the start alone rather than invent an
+        end — a wrong range is worse than a missing one."""
+        class _NoExtent:
+            line = 42
+            end_line = None
+
+        assert _outline_extent(_NoExtent()) == "42"
+
+    def test_both_python_outline_paths_agree_on_the_extent(self, tmp_path, monkeypatch):
+        """tree-sitter and the ast fallback are separate code; the extent they
+        report must not depend on which one ran."""
+        self._big_module(tmp_path)
+        import external_llm.agent.symbol_search as _ss
+
+        def _alpha(searcher):
+            return next(s for s in searcher.get_file_outline("big.py") if s.name == "alpha")
+
+        ts_alpha = _alpha(SymbolSearcher(str(tmp_path)))
+        monkeypatch.setattr(_ss, "_HAS_TS", False)
+        ast_alpha = _alpha(SymbolSearcher(str(tmp_path)))
+
+        assert (ts_alpha.line, ts_alpha.end_line) == (5, 7)
+        assert (ast_alpha.line, ast_alpha.end_line) == (5, 7)
 
 
 class TestCharBudget:

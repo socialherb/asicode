@@ -177,10 +177,35 @@ class SyntaxError_:
 
 @dataclass
 class SyntaxValidationResult:
-    """Result of validating a file's syntax."""
+    """Result of validating a file's syntax.
+
+    ``checked`` separates "the tool ran and found nothing" from "no tool ran".
+    Both used to be ``ok=True, errors=[]``, and downstream that is
+    indistinguishable from a clean verdict — so a user with no pyright
+    installed had every Python edit reported to the model as semantically
+    checked. Semantic validation skips for several ordinary reasons (the
+    toolchain is not installed, it timed out, the project has no config for it),
+    and none of them is evidence about the file.
+
+    Syntax validation always genuinely runs — it is tree-sitter or the
+    language's own parser, always present — so the default is True and only the
+    semantic paths construct the False case, via :meth:`unchecked`.
+    """
     ok: bool
     errors: list[SyntaxError_] = field(default_factory=list)
     language: LanguageId = LanguageId.UNKNOWN
+    checked: bool = True
+    skip_reason: str = ""
+
+    @classmethod
+    def unchecked(cls, language: LanguageId, reason: str) -> "SyntaxValidationResult":
+        """A result meaning "nothing examined this file", with the why.
+
+        *reason* reaches the model verbatim, so it names the missing tool
+        rather than the code path — "pyright is not installed", not
+        "FileNotFoundError".
+        """
+        return cls(ok=True, errors=[], language=language, checked=False, skip_reason=reason)
 
 
 @dataclass

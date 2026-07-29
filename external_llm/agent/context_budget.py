@@ -174,7 +174,7 @@ def _save_override_cache(force: bool = False) -> None:
                Used by ``atexit`` flush to prevent losing the last override write.
     """
     global _last_cache_save
-    _now = time.time()
+    _now = time.monotonic()
     if not force and _now - _last_cache_save < _CACHE_SAVE_INTERVAL:
         return
     _tmp = None
@@ -188,7 +188,7 @@ def _save_override_cache(force: bool = False) -> None:
         # either writes, then both write.
         with _override_lock:
             _snapshot = dict(_override_meta)
-            _last_cache_save = time.time()
+            _last_cache_save = time.monotonic()
         with open(_tmp, "w", encoding="utf-8") as _f:
             json.dump(_snapshot, _f, ensure_ascii=False)
         os.replace(_tmp, _OVERRIDE_CACHE_FILE)  # atomic on POSIX & Windows

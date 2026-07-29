@@ -139,6 +139,31 @@ def detect_project_root(file_path: str, markers: tuple[str, ...] = ()) -> str:
     return start
 
 
+def resolve_tool_path(tool_cwd: str, reported: str) -> str:
+    """Normalise a compiler-reported path against the cwd the tool ran in.
+
+    Semantic validators spawn their toolchain with ``cwd=project_root`` and
+    then filter the diagnostics down to the file they asked about. Compilers
+    that are handed a path echo it back verbatim (javac, kotlinc, pyright), but
+    ones driven by a *project* rather than a file list — ``tsc --project``,
+    ``go build ./pkg`` — print paths relative to their OWN cwd.
+
+    Resolving those with a bare ``os.path.abspath`` uses the *agent process's*
+    cwd instead. Nothing in the shipping code ever calls ``os.chdir``, so that
+    is wherever the user launched from; the moment it differs from
+    *tool_cwd* every diagnostic fails the match and is dropped, and a broken
+    file reports ``ok=True, errors=[]`` — indistinguishable downstream from
+    "checked, clean". This helper is the single place that resolution happens,
+    so a new provider cannot reintroduce the bug by reaching for ``abspath``.
+
+    Absolute *reported* paths are passed through. ``normpath`` collapses the
+    ``./`` prefix that both tsc and go emit.
+    """
+    if os.path.isabs(reported):
+        return os.path.normpath(reported)
+    return os.path.normpath(os.path.join(os.path.abspath(tool_cwd), reported))
+
+
 # ── Resolution-error classification ─────────────────────────────────────
 # Pre-write ``validate_syntax`` compiles an isolated temp file WITHOUT the
 # surrounding project context (go.mod / sourcepath / classpath / node_modules).
@@ -759,6 +784,33 @@ class SyntaxProvider(ABC):
         warnings/info are reported but do not fail the check.
         """
         return SyntaxValidationResult(ok=True, language=self.language_id())
+
+    def validate_semantics_batch(
+        self, file_paths: list[str],
+    ) -> dict[str, SyntaxValidationResult]:
+        """Semantic-check several files, sharing toolchain startup where possible.
+
+        Keyed by the exact string passed in, so callers can match results back
+        to their own paths without re-normalising.
+
+        Semantic validation spawns pyright / tsc / go build / javac / kotlinc,
+        and most of a short check is process startup, not analysis (measured:
+        ~0.42 s for pyright on a two-line file). Checking N files one at a time
+        pays that N times. Every one of these tools accepts many files — or, for
+        Go and tsc project mode, ALREADY analyses the siblings and has its
+        results thrown away — so the per-file loop is close to pure waste.
+        Measured with pyright over 4 files: 2.167 s sequential vs 0.391 s
+        batched, a 5.5x difference.
+
+        This default keeps the old behaviour (one call each) so a provider that
+        has not opted in is unaffected. Overrides must preserve two things:
+        every input path appears in the returned mapping, and each result holds
+        only its own file's diagnostics — a batched tool reports the whole set,
+        so the per-file split is the override's responsibility. Splitting by
+        project root is also the override's job, since the markers that define
+        a root are provider-specific.
+        """
+        return {p: self.validate_semantics(p) for p in file_paths}
 
     @abstractmethod
     def get_symbol_patterns(self, kind: str = "any") -> list[SymbolPattern]:

@@ -180,10 +180,14 @@ class KotlinSyntaxProvider(SyntaxProvider):
           project root.
         - Uses ``-d <TemporaryDirectory>`` so compiled output is sandboxed and
           auto-cleaned, never polluting the source tree.
-        - Skips (``ok=True``) when kotlinc is missing/timed out (non-blocking).
+        - Skips (``checked=False``) when kotlinc is missing/timed out
+          (non-blocking, and never reported as a clean verdict it did not reach).
         """
+        def _skip(reason: str) -> SyntaxValidationResult:
+            return SyntaxValidationResult.unchecked(LanguageId.KOTLIN, reason)
+
         if not file_path or not os.path.exists(file_path):
-            return SyntaxValidationResult(ok=True, language=LanguageId.KOTLIN)
+            return _skip("the file is not on disk")
 
         project_root = detect_project_root(
             file_path,
@@ -193,7 +197,9 @@ class KotlinSyntaxProvider(SyntaxProvider):
         if not any(
             os.path.isfile(os.path.join(project_root, m)) for m in _markers
         ):
-            return SyntaxValidationResult(ok=True, language=LanguageId.KOTLIN)
+            return _skip(
+                "no build.gradle / pom.xml above this file, so kotlinc has no project root"
+            )
 
         target_norm = os.path.normpath(os.path.abspath(file_path))
         out_dir = tempfile.TemporaryDirectory()
@@ -210,19 +216,19 @@ class KotlinSyntaxProvider(SyntaxProvider):
             try:
                 proc = subprocess.run(
                     cmd,
-                    capture_output=True, text=True, timeout=120,
+                    capture_output=True, text=True, timeout=30,
                     cwd=project_root,
                     env=_compile_env(),
                 )
             except FileNotFoundError:
                 logger.debug("kotlinc not installed; skipping semantic validation")
-                return SyntaxValidationResult(ok=True, language=LanguageId.KOTLIN)
+                return _skip("kotlinc is not installed")
             except subprocess.TimeoutExpired:
                 logger.debug("kotlinc timed out for %s; skipping", file_path)
-                return SyntaxValidationResult(ok=True, language=LanguageId.KOTLIN)
+                return _skip("kotlinc timed out")
             except Exception as e:
                 logger.debug("kotlinc semantic check failed: %s", e)
-                return SyntaxValidationResult(ok=True, language=LanguageId.KOTLIN)
+                return _skip("kotlinc could not be run")
 
             if proc.returncode == 0:
                 return SyntaxValidationResult(ok=True, language=LanguageId.KOTLIN)

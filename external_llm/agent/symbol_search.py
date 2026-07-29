@@ -31,6 +31,7 @@ from ..languages import (
 )
 from ._shared_utils import (
     _WALK_CACHE_TTL,
+    _WALK_SKIP_DIRS,
     _capped_put,
 )
 from ._shared_utils import (
@@ -531,9 +532,20 @@ def _rg_list_py_files(root: Path, matcher_args: list[str]) -> Optional[set[str]]
         # mutates it, which would otherwise poison every later hit.
         return set(_hit[1])
     try:
+        # --no-ignore-vcs is deliberate: .gitignore bare-filename patterns
+        # have hidden real source files before, and the prefilter inheriting
+        # their blind spot would be a correctness regression (not a perf one).
+        # The walk that filters the rg output already prunes _WALK_SKIP_DIRS
+        # via _walk_should_skip_dir, so omitting --glob exclusions here costs
+        # only a wasted descent — rg walks vendor trees whose every .py match
+        # is discarded at the intersection.  Deriving --glob rules from the
+        # SAME _WALK_SKIP_DIRS set cuts that waste without touching .gitignore.
+        _skip_globs: list[str] = []
+        for _d in _WALK_SKIP_DIRS:
+            _skip_globs.extend(["--glob", f"!**/{_d}/**"])
         proc = subprocess.run(
             [rg, "--files-with-matches", "--type", "py",
-             "--no-ignore-vcs", *matcher_args, "."],
+             "--no-ignore-vcs", *_skip_globs, *matcher_args, "."],
             cwd=str(root), capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError) as e:
@@ -1287,7 +1299,16 @@ class SymbolSearcher:
             return self._outline_ripgrep(p, rel)
 
     def _outline_python(self, file_path: Path, rel: str) -> list[SymbolDef]:
-        """Tree-sitter-based outline for a single Python file (AST fallback)."""
+        """Tree-sitter-based outline for a single Python file (AST fallback).
+
+        Both paths populate ``end_line`` — the extent is free here (tree-sitter
+        ``end_point`` / ``ast.end_lineno``) and it is what the outline is read
+        FOR: the caller's next move is a ``read_file`` range, and with only a
+        start line the model has to invent ``end_line``. Observed cost of that
+        guesswork: inverted ranges (``start_line=600, end_line=460``) that fail
+        the call and spend a turn. ``_outline_treesitter`` already carried the
+        extent; this closes the gap for Python and TS/JS.
+        """
         results: list[SymbolDef] = []
         try:
             source = file_path.read_text(encoding="utf-8", errors="replace")
@@ -1316,6 +1337,7 @@ class SymbolSearcher:
                                         kind="function", name=fn_name,
                                         signature=sig or None, docstring=doc,
                                         decorators=decs or None,
+                                        end_line=node.end_point.row + 1,
                                     ))
                             return  # stop descent for function bodies
 
@@ -1330,6 +1352,7 @@ class SymbolSearcher:
                                     file=rel, line=node.start_point.row + 1,
                                     kind="class", name=cls_name,
                                     bases=bases, methods=methods, docstring=doc,
+                                    end_line=node.end_point.row + 1,
                                 ))
                             return  # don't descend into class body for outline
 
@@ -1362,6 +1385,7 @@ class SymbolSearcher:
                                             file=rel, line=node.start_point.row + 1,
                                             kind="constant", name=name,
                                             signature=f"{name} = {val}" if val else None,
+                                            end_line=node.end_point.row + 1,
                                         ))
                             return
 
@@ -1391,6 +1415,7 @@ class SymbolSearcher:
                 results.append(SymbolDef(
                     file=rel, line=node.lineno, kind=nk, name=node.name,
                     signature=sig, docstring=doc, decorators=decs,
+                    end_line=node.end_lineno,
                 ))
 
             # ── classes ──
@@ -1404,6 +1429,7 @@ class SymbolSearcher:
                 results.append(SymbolDef(
                     file=rel, line=node.lineno, kind="class", name=node.name,
                     bases=bases, methods=methods or None, docstring=doc,
+                    end_line=node.end_lineno,
                 ))
 
             # ── top-level assignments (constants) ──
@@ -1415,6 +1441,7 @@ class SymbolSearcher:
                             file=rel, line=node.lineno, kind="constant",
                             name=target.id,
                             signature=f"{target.id} = {val}" if val else None,
+                            end_line=node.end_lineno,
                         ))
             elif isinstance(node, ast.AnnAssign):
                 if isinstance(node.target, ast.Name):
@@ -1424,6 +1451,7 @@ class SymbolSearcher:
                     results.append(SymbolDef(
                         file=rel, line=node.lineno, kind="constant",
                         name=node.target.id, signature=sig,
+                        end_line=node.end_lineno,
                     ))
 
         results.sort(key=lambda s: s.line)
@@ -2093,6 +2121,18 @@ class SymbolSearcher:
 
         results: list[SymbolDef] = []
 
+        def _end(node) -> Optional[int]:
+            """Extent of an IR node, or None when it carries no usable one.
+
+            Mirrors the ``meta or bare attribute`` shape the start line already
+            uses, via getattr because not every IR node declares both (IRImport
+            /IRExport carry only ``meta``). ``or None`` normalises the dataclass
+            default of 0, which would otherwise render as a "line N-0" range.
+            """
+            _m = getattr(node, "meta", None)
+            _e = getattr(_m, "end_line", None) if _m else getattr(node, "end_line", None)
+            return _e or None
+
         for fn in module.functions:
             sig = _build_ts_function_signature(fn)
             results.append(SymbolDef(
@@ -2101,6 +2141,7 @@ class SymbolSearcher:
                 kind="async_function" if fn.is_async else "function",
                 name=fn.name,
                 signature=sig,
+                end_line=_end(fn),
             ))
 
         for cls in module.classes:
@@ -2111,6 +2152,7 @@ class SymbolSearcher:
                 kind="class",
                 name=cls.name,
                 methods=methods[:25] or None,
+                end_line=_end(cls),
             ))
 
         for iface in module.interfaces:
@@ -2119,6 +2161,7 @@ class SymbolSearcher:
                 line=iface.meta.start_line if iface.meta else iface.start_line,
                 kind="interface",
                 name=iface.name,
+                end_line=_end(iface),
             ))
 
         for ta in module.type_aliases:
@@ -2127,6 +2170,7 @@ class SymbolSearcher:
                 line=ta.meta.start_line if ta.meta else ta.start_line,
                 kind="type",
                 name=ta.name,
+                end_line=_end(ta),
             ))
 
         for en in module.enums:
@@ -2135,6 +2179,7 @@ class SymbolSearcher:
                 line=en.meta.start_line if en.meta else en.start_line,
                 kind="enum",
                 name=en.name,
+                end_line=_end(en),
             ))
 
         for var in module.variables:
@@ -2143,6 +2188,7 @@ class SymbolSearcher:
                 line=var.meta.start_line if var.meta else var.start_line,
                 kind="variable",
                 name=var.name,
+                end_line=_end(var),
             ))
 
         results.sort(key=lambda s: s.line)

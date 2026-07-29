@@ -4687,6 +4687,12 @@ class WriteToolsMixin:
         field is populated with type/undefined-name/import diagnostics collected
         by running the backing tool (pyright/tsc/go build) against the real
         project. These are **non-blocking** — surfaced for LLM self-healing.
+
+        If the backing tool never ran — not installed, timed out, no project
+        config — the result carries ``semantic_check_skipped`` with the reason
+        INSTEAD of ``semantic_diagnostics``. The two must not be conflated: an
+        empty diagnostics list is a clean verdict, and reporting one for a check
+        that never happened tells the model the file was verified.
         """
         try:
             import os
@@ -4720,21 +4726,49 @@ class WriteToolsMixin:
             # Only run semantic check on syntactically-valid files to avoid
             # cascading-error noise from the backing tool.
             if result.ok and provider.capabilities().has_semantic_validator:
-                try:
-                    sem = provider.validate_semantics(abs_path)
-                    out["semantic_diagnostics"] = [
-                        {
-                            "file_path": abs_path,
-                            "line": e.line, "col": e.col,
-                            "message": e.message,
-                            "severity": getattr(e, "severity", "error"),
-                            "code": getattr(e, "code", ""),
-                        }
-                        for e in (sem.errors or [])
-                    ]
-                except Exception as sem_exc:
-                    logger.debug("Semantic check failed for %s: %s", abs_path, sem_exc)
-                    out["semantic_diagnostics"] = []
+                # Inside an agent turn the check is coalesced to once per
+                # (turn, file) and run at turn end against the FINAL content —
+                # see ToolRegistry.begin_semantic_turn for the cost measurement
+                # and for why it must be the last write, not the first.
+                #
+                # Deferring writes NO ``semantic_diagnostics`` key. That matters:
+                # an empty list here is rendered by
+                # ``agent_loop._append_semantic_diagnostics`` as "nothing to
+                # report", so a deferred check would read as a clean one. The
+                # marker below is what the turn pipeline matches on to fill in
+                # the real result before the message reaches the model.
+                _sem_key = os.path.normpath(os.path.abspath(abs_path))
+                if self.defer_semantic_check(_sem_key, rel_or_abs_path):
+                    out["semantic_deferred"] = True
+                    out["semantic_deferred_path"] = _sem_key
+                else:
+                    try:
+                        sem = provider.validate_semantics(abs_path)
+                        if not getattr(sem, "checked", True):
+                            # Nothing examined the file (toolchain missing,
+                            # timed out, no project config). Reporting an empty
+                            # diagnostics list here would read as "checked,
+                            # clean" — see ToolRegistry.SemanticOutcome.
+                            out["semantic_check_skipped"] = (
+                                getattr(sem, "skip_reason", "")
+                                or "the checker did not run"
+                            )
+                        else:
+                            out["semantic_diagnostics"] = [
+                                {
+                                    "file_path": abs_path,
+                                    "line": e.line, "col": e.col,
+                                    "message": e.message,
+                                    "severity": getattr(e, "severity", "error"),
+                                    "code": getattr(e, "code", ""),
+                                }
+                                for e in (sem.errors or [])
+                            ]
+                    except Exception as sem_exc:
+                        logger.debug("Semantic check failed for %s: %s", abs_path, sem_exc)
+                        out["semantic_check_skipped"] = (
+                            "the semantic checker raised before reporting"
+                        )
             return out
         except Exception as exc:
             logger.debug("Post-apply syntax check failed: %s", exc)

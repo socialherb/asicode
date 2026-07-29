@@ -1,21 +1,28 @@
 """Shell tool handlers for ToolRegistry."""
 from __future__ import annotations
 
+import ast as _ast
+import codecs as _codecs
+import io as _io
 import logging
+import os
 import re as _re
+import selectors as _selectors
+import time as _time
 import shlex
 import shutil as _shutil
 import subprocess
 import uuid
+from collections import deque as _deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..background_job_manager import (
     BackgroundJobManager,
     get_global_background_job_manager,
-    recover_communicate_partial,
     strip_malloc_noise,
 )
+from ...common.subprocess_utils import CANCEL_POLL_INTERVAL as _CANCEL_POLL_INTERVAL
 from ...common.subprocess_utils import run_bounded_subprocess as _run_bounded_subprocess
 
 if TYPE_CHECKING:
@@ -25,20 +32,44 @@ logger = logging.getLogger(__name__)
 
 from .shell_policy import ARG_COMMAND_INTRODUCERS as _ARG_COMMAND_INTRODUCERS
 from .shell_policy import COMMAND_INTRODUCING_KEYWORDS as _COMMAND_INTRODUCING_KEYWORDS
+from .shell_policy import COMMAND_STRING_BUILTINS as _COMMAND_STRING_BUILTINS
 from .shell_policy import COMMAND_WRAPPERS as _COMMAND_WRAPPERS
 from .shell_policy import DANGEROUS_EXECUTABLE_PREFIXES as _DANGEROUS_EXECUTABLE_PREFIXES
 from .shell_policy import DANGEROUS_FLAG_COMBOS as _DANGEROUS_FLAG_COMBOS
 from .shell_policy import DANGEROUS_SHELL_COMMANDS as _DANGEROUS_SHELL_COMMANDS
 from .shell_policy import EVAL_BUILTINS as _EVAL_BUILTINS
+from .shell_policy import PYTHON_DESTRUCTIVE_CALLS as _PY_DESTRUCTIVE_CALLS
+from .shell_policy import PYTHON_INTERPRETERS as _PYTHON_INTERPRETERS
+from .shell_policy import PYTHON_SHELL_ESCAPES as _PY_SHELL_ESCAPES
 from .shell_policy import FORBIDDEN_FLAGS as _FORBIDDEN_FLAGS
 from .shell_policy import SHELL_INTERPRETERS as _SHELL_INTERPRETERS
+from .shell_policy import STDIN_INTERPRETERS as _STDIN_INTERPRETERS
 from .shell_policy import WRAPPER_POSITIONAL_ARGS as _WRAPPER_POSITIONAL_ARGS
+from .shell_policy import WRAPPER_SHELL_C_PAYLOAD as _WRAPPER_SHELL_C_PAYLOAD
 from .shell_policy import WRAPPER_VALUE_FLAGS as _WRAPPER_VALUE_FLAGS
 from .shell_policy import SHELL_TIMEOUT_DEFAULT as _SHELL_TIMEOUT_DEFAULT
 from .shell_policy import SHELL_TIMEOUT_MAX as _SHELL_TIMEOUT_MAX
 
+# _CANCEL_POLL_INTERVAL is imported above: the cadence is shared with the search
+# path, since a cancel that feels instant in `bash` and laggy in `grep` is worse
+# than either. See common.subprocess_utils.CANCEL_POLL_INTERVAL.
+#
+# Bytes taken from a pipe per ready-read. Large enough that a chatty command
+# costs few syscalls, small enough that one read cannot outrun the poll.
+_PIPE_READ_CHUNK = 64 * 1024
+# Floor on how long a command may take to EXIT once both its pipes are at EOF.
+# Without it a command that finishes exactly as its budget runs out is pushed to
+# the background with its complete result already captured.
+_EXIT_GRACE = 2.0
+
 # `FOO=bar cmd` — an assignment prefix, not the command itself.
 _ENV_ASSIGN_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# `$RM` / `${RM}` / `${VENV}/bin/python` in the EXECUTABLE slot. Anchored at the
+# start because only a token that BEGINS with the expansion can have the
+# expansion decide which program runs (`x$RM` is a word, not a command name).
+_EXEC_SLOT_VAR_RE = _re.compile(
+    r"^\$(?:\{(?P<brace>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
+)
 # `timeout 5 cmd` / `timeout 5s cmd` / `nice 10 cmd` — a wrapper's numeric arg.
 _WRAPPER_NUM_ARG_RE = _re.compile(r"^[0-9]+(?:\.[0-9]+)?[smhd]?$")
 
@@ -80,18 +111,36 @@ _SORT_V_RE = _re.compile(r"\bsort\s+-V(\s+[^|&;<>]+)?")
 # complete no-op on Linux / GNU-coreutils hosts: the function is defined only
 # when the real binary is absent. The bash tool's own timeout→background
 # transition at communicate() remains the outer safety net.
+#
+# `timeout` decides "did we time out?" from a MARKER the watchdog writes, not
+# from whether the watchdog is still alive. The liveness test was a race: the
+# watchdog subshell has nothing to do after `kill -TERM`, so it normally exits
+# before `wait` resumes the caller — but only normally. Resume the parent
+# first and `kill -0 $wpid` still succeeds, so the timeout is read as "the
+# command finished on its own" and the caller gets 143 (128+SIGTERM) instead of
+# 124. Seen once in a 11,918-test suite run and reproduced deterministically by
+# leaving the watchdog alive one extra millisecond past its kill (5/5 wrong).
+# The marker is written BEFORE the signal, so a child that died from our TERM
+# always finds it already on disk — no ordering left to lose. Hosts without
+# mktemp keep the old heuristic rather than losing the feature.
 _SHELL_SHIM_PRELUDE = """# --- timeout: run a command with a wall-clock kill (GNU exit 124 on timeout)
 if ! command -v timeout >/dev/null 2>&1; then
 timeout() {
     local dur="$1"; shift
     [ $# -gt 0 ] || { echo "timeout: missing command" >&2; return 1; }
+    local mark
+    mark="$(mktemp -t asi_timeout.XXXXXX 2>/dev/null)" || mark=""
     "$@" &
     local pid=$!
-    ( sleep "$dur" 2>/dev/null; kill -TERM "$pid" 2>/dev/null ) &
+    ( sleep "$dur" 2>/dev/null; [ -n "$mark" ] && printf t >"$mark"; kill -TERM "$pid" 2>/dev/null ) &
     local wpid=$!
     wait "$pid" 2>/dev/null
     local rc=$?
-    if kill -0 "$wpid" 2>/dev/null; then
+    if [ -n "$mark" ]; then
+        kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+        [ -s "$mark" ] && rc=124
+        rm -f "$mark" 2>/dev/null
+    elif kill -0 "$wpid" 2>/dev/null; then
         kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
     else
         rc=124
@@ -295,16 +344,26 @@ def _heredoc_body_intervals(command: str) -> list:
     return spans
 
 
-def _blank_heredoc_bodies(command: str) -> str:
-    """Return *command* with every heredoc BODY replaced by spaces.
+def _blank_heredoc_bodies(command: str, *, interpreter_names: frozenset | None = None) -> str:
+    """Return *command* with heredoc BODIES replaced by spaces — except those
+    whose receiver is a shell interpreter.
 
     Length-preserving, because :func:`_split_shell_separators` locates
     separators by byte position in the string the tokens came from — a
     substitution that changed length would misalign every position after it.
 
-    The danger scan needs "the command, minus heredoc bodies": body text is
-    data written to a file, not commands to run, so ``rm`` inside one must not
-    prompt. It previously got that by truncating at the first ``<<`` and
+    The danger scan needs "the command, minus data-only heredoc bodies": body
+    text written to a file (``cat <<EOF > f.txt``) is data, not commands to
+    run, so ``rm`` inside one must not prompt. But a shell interpreter reading
+    a heredoc (``bash <<EOF``) IS executing that body as shell code, so
+    blanking it hides the commands entirely: measured, ``bash <<EOF ; rm -rf x
+    ; EOF`` ran unprompted because the body was blanked before the scan. The
+    *interpreter_names* parameter selects which receivers keep their bodies
+    visible, and only ``SHELL_INTERPRETERS`` is passed — ``python3`` etc. are
+    deliberately excluded (their body is not shell code, same known-limit as
+    ``python -c``).
+
+    It previously got that by truncating at the first ``<<`` and
     scanning only what came before, which also discarded every command AFTER
     the body:
 
@@ -328,8 +387,54 @@ def _blank_heredoc_bodies(command: str) -> str:
     spans = _heredoc_body_intervals(command)
     if not spans:
         return command
+    preserve: set = set()
+    if interpreter_names is not None:
+        # For each heredoc body, decide whether its RECEIVER is a shell
+        # interpreter. If so the body IS shell code and must be scanned, not
+        # blanked.
+        #
+        # The receiver is the executable of the command segment the `<<` sits
+        # in, so it is resolved by :func:`_segment_executable` — the shared
+        # implementation of the danger scan's own executable-slot rules —
+        # applied to the opener line's prefix. Taking the prefix is exact rather
+        # than approximate: a heredoc operator cannot be in a different segment
+        # from the command it feeds, so the last segment of the text before `<<`
+        # IS that command (`cat x; bash <<EOF` resolves to `bash`).
+        #
+        # Two string heuristics preceded this and both shipped bypasses. Reading
+        # the last word before `<<` resolved `bash -s <<EOF` — the canonical
+        # spelling for feeding bash a script — to `-s`, and equally missed
+        # `bash -x`, `bash -euo pipefail`, `bash 2>/dev/null` and `/bin/bash -s`;
+        # `sudo bash <<EOF` passed only because the wrapper happened to leave
+        # `bash` last, never because wrappers were handled. Scanning every word
+        # instead fixed those but charged `echo bash <<EOF` a false prompt and
+        # still knew nothing of `sudo -u me bash` or `chroot /mnt bash`. Both
+        # were re-derivations of slot rules that already existed twenty lines
+        # away in the scan loop, which is exactly why they drifted.
+        #
+        # `-c` suppresses preservation — the interpreter then runs THAT string
+        # and ignores stdin, so the body is dead code. Scoped to the receiver's
+        # OWN segment tokens (not the whole line), so `cat -c f; bash <<EOF`
+        # keeps its prompt: the `-c` there belongs to `cat`, not to `bash`.
+        pos, idx = 0, 0
+        while pos < len(command) and idx < len(spans):
+            m = _HEREDOC_OPENER_RE.search(command, pos)
+            if not m:
+                break
+            line_start = command.rfind("\n", 0, m.start()) + 1
+            prefix = command[line_start:m.start()]
+            _recv, _seg = _segment_executable(prefix)
+            if (
+                _recv in interpreter_names
+                and not any(_SHELL_C_FLAG_RE.match(_t) for _t in _seg)
+            ):
+                preserve.add(idx)
+            idx += 1
+            pos = spans[idx - 1][1]
     out = list(command)
-    for start, end in spans:
+    for idx, (start, end) in enumerate(spans):
+        if idx in preserve:
+            continue  # interpreter-targeted: body IS shell code, scan it
         for i in range(start, min(end, len(out))):
             # Newlines are separators to _normalize_for_scan; blank them too so
             # a body cannot re-arm the executable slot for its own text.
@@ -352,7 +457,208 @@ def _match_in_quotes(pos: int, intervals: list) -> bool:
     return any(start <= pos < end for start, end in intervals)
 
 
-def _truncate_bash_output(content: str, max_chars: int) -> str:
+def _python_payload_effects(code: str) -> tuple:
+    """``(destructive dotted names, shell command strings, opaque_escape)``.
+
+    Reads a ``python -c`` payload with the parser for the language it is written
+    in. The shell scan next door cannot: a Python one-liner is not shell code,
+    and the gate treated "not shell" as "not checkable" — which is how
+    ``python3 -c "import shutil; shutil.rmtree('/tmp/x')"`` ran unprompted while
+    the ``rm -rf`` it is equivalent to did not.
+
+    Names are RESOLVED, not matched textually, so aliasing does not evade it:
+    ``import shutil as sh``, ``from shutil import rmtree as rt`` and
+    ``__import__('shutil').rmtree`` all reduce to ``shutil.rmtree``, and a
+    ``Path('x').unlink()`` reduces to ``pathlib.Path.unlink`` through the
+    receiver call.
+
+    Shell strings are returned rather than judged, so the caller can splice them
+    into the token scan and let every existing rule apply — the same treatment
+    ``bash -c`` gets. ``opaque_escape`` is True when a shell escape is handed
+    something this cannot read (an f-string, a variable): the doctrine for an
+    unreadable payload reaching a shell is already "ask", not "allow" — see the
+    pipe rule.
+
+    A payload that does not parse yields nothing. It also will not run.
+    """
+    try:
+        _tree = _ast.parse(code)
+    except (SyntaxError, ValueError):
+        return set(), [], False
+
+    _alias: dict = {}
+    for _node in _ast.walk(_tree):
+        if isinstance(_node, _ast.Import):
+            for _a in _node.names:
+                if _a.asname:
+                    _alias[_a.asname] = _a.name
+                else:
+                    _alias[_a.name.split(".")[0]] = _a.name.split(".")[0]
+        elif isinstance(_node, _ast.ImportFrom) and _node.module:
+            for _a in _node.names:
+                _alias[_a.asname or _a.name] = f"{_node.module}.{_a.name}"
+
+    def _dotted(_n):
+        if isinstance(_n, _ast.Name):
+            return _alias.get(_n.id, _n.id)
+        if isinstance(_n, _ast.Attribute):
+            _base = _dotted(_n.value)
+            return f"{_base}.{_n.attr}" if _base else None
+        if isinstance(_n, _ast.Call):
+            # `__import__('os').system` — the import is the expression, so the
+            # module name is an argument rather than a binding.
+            if (
+                isinstance(_n.func, _ast.Name)
+                and _n.func.id == "__import__"
+                and _n.args
+                and isinstance(_n.args[0], _ast.Constant)
+                and isinstance(_n.args[0].value, str)
+            ):
+                return _n.args[0].value
+            # `Path('x').unlink()` — the receiver's own call carries the type.
+            return _dotted(_n.func)
+        return None
+
+    # `f = shutil.rmtree; f('/tmp/x')` — one more binding, resolved the same way
+    # the shell scan resolves `RM=rm; $RM -f x`. Not a general dataflow
+    # analysis: a name reached through a container, a getattr or a callback
+    # stays unresolved, so this narrows the gap rather than closing it. That is
+    # the right ambition for an advisory gate aimed at accidents.
+    for _node in _ast.walk(_tree):
+        if not isinstance(_node, _ast.Assign):
+            continue
+        _origin = _dotted(_node.value)
+        if _origin is None:
+            continue
+        for _tgt in _node.targets:
+            if isinstance(_tgt, _ast.Name):
+                _alias.setdefault(_tgt.id, _origin)
+
+    _destructive: set = set()
+    _shell_strings: list = []
+    _opaque = False
+    for _node in _ast.walk(_tree):
+        if not isinstance(_node, _ast.Call):
+            continue
+        _name = _dotted(_node.func)
+        if _name is None:
+            continue
+        if _name in _PY_DESTRUCTIVE_CALLS:
+            _destructive.add(_name)
+            continue
+        if _name not in _PY_SHELL_ESCAPES:
+            continue
+        _arg = _node.args[0] if _node.args else None
+        if isinstance(_arg, _ast.Constant) and isinstance(_arg.value, str):
+            _shell_strings.append(_arg.value)
+        elif isinstance(_arg, (_ast.List, _ast.Tuple)) and _arg.elts and all(
+            isinstance(_e, _ast.Constant) and isinstance(_e.value, str)
+            for _e in _arg.elts
+        ):
+            # The argv form is not shell, but its executable slot is the thing
+            # the scan reads, and joining is enough to expose it.
+            _shell_strings.append(" ".join(_e.value for _e in _arg.elts))
+        else:
+            _opaque = True
+    return _destructive, _shell_strings, _opaque
+
+
+def _close_pipes(proc) -> None:
+    """Release a finished command's pipe fds.
+
+    ``communicate()`` used to do this, so nothing did after it was replaced —
+    and a leaked read end per bash call is a file-descriptor leak in the
+    longest-lived process there is. NOT called on the timeout path: there the
+    BackgroundJobManager takes the pipes over and keeps draining them.
+    """
+    for _stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+        if _stream is None:
+            continue
+        try:
+            _stream.close()
+        except (OSError, ValueError) as exc:
+            logger.debug("bash: pipe close failed: %s", exc)
+
+
+class _BoundedCapture:
+    """Accumulate one stream's text, keeping only its head and its tail.
+
+    ``communicate()`` materialises everything a command prints before any budget
+    can apply, and the budget is ``BASH_OUTPUT_MAX_CHARS`` — ~130 KB. Measured on
+    ``cat`` of a 108 MB log: +360.6 MB of peak RSS, 0.24 s, to produce that 130 KB.
+    Reading into a bounded head plus a tail ring instead costs +0.4 MB and 0.03 s
+    for a byte-identical answer, because the decode and the million allocations
+    behind it never happen.
+
+    Head AND tail, not just a tail, because ``_truncate_bash_output`` needs both:
+    pytest puts its summary at the end and the failing command at the start. Each
+    side retains the FULL ``max_chars``, so anything that truncation would have
+    kept is still present and the rendered result is unchanged — a stream is only
+    ever elided past 2x the cap, where truncation was certain anyway.
+
+    ``total`` counts every character the command produced, so the truncation
+    notice can name the real number rather than what survived.
+    """
+
+    __slots__ = ("_cap", "_head", "_head_len", "_tail", "_tail_len", "total")
+
+    def __init__(self, cap: int) -> None:
+        self._cap = max(1, cap)
+        self._head: list[str] = []
+        self._head_len = 0
+        self._tail: _deque = _deque()
+        self._tail_len = 0
+        self.total = 0
+
+    def feed(self, text: str) -> None:
+        if not text:
+            return
+        self.total += len(text)
+        _room = self._cap - self._head_len
+        if _room > 0:
+            self._head.append(text[:_room])
+            self._head_len += min(_room, len(text))
+            text = text[_room:]
+            if not text:
+                return
+        if len(text) >= self._cap:
+            # One feed already covers the whole tail window, so everything
+            # before it is outside it. Sliced rather than kept whole: the pump
+            # reads at most _PIPE_READ_CHUNK at a time so this is unreachable
+            # from there, but a class whose bound depends on how its caller
+            # happens to chunk is a bound in name only.
+            self._tail.clear()
+            self._tail_len = 0
+            text = text[-self._cap:]
+        self._tail.append(text)
+        self._tail_len += len(text)
+        # Drop whole chunks from the front while the rest still covers the cap,
+        # so the retained tail is never shorter than what truncation will slice.
+        while self._tail and self._tail_len - len(self._tail[0]) >= self._cap:
+            self._tail_len -= len(self._tail.popleft())
+
+    @property
+    def dropped(self) -> int:
+        return self.total - self._head_len - self._tail_len
+
+    def text(self) -> str:
+        """The retained text, with the gap named where one exists.
+
+        The marker matters only on the background-transition path, which hands
+        this string straight to the job's buffer. On the normal path the content
+        is always longer than the cap when anything was dropped, so
+        ``_truncate_bash_output`` cuts the middle out — marker included — and
+        the reader sees exactly one truncation notice.
+        """
+        _head = "".join(self._head)
+        _tail = "".join(self._tail)
+        _gap = self.dropped
+        if not _gap:
+            return _head + _tail
+        return f"{_head}\n... [{_gap:,} chars dropped (middle)] ...\n{_tail}"
+
+
+def _truncate_bash_output(content: str, max_chars: int, true_len: int = 0) -> str:
     """Truncate bash output to fit the token budget while preserving head+tail.
 
     pytest/traceback core diagnostics (``short test summary info``, ``N failed``,
@@ -363,6 +669,12 @@ def _truncate_bash_output(content: str, max_chars: int) -> str:
 
     When non-ASCII (CJK/JSON) content is prevalent, the per-character token cost is
     higher, so the character cap is proportionally reduced.
+
+    ``true_len`` is how many characters the command actually produced, which is no
+    longer ``len(content)`` now that the capture is bounded while it reads. Only
+    the reported figure uses it — the slicing still operates on what is here.
+    Without it a command that printed 108 MB would be described as having lost the
+    ~130 KB the capture happened to be holding.
     """
     if not content or len(content) <= max_chars:
         return content
@@ -373,7 +685,7 @@ def _truncate_bash_output(content: str, max_chars: int) -> str:
     _cap = max_chars if _ascii_ratio > 0.7 else int(max_chars * 0.5)
     if len(content) <= _cap:
         return content
-    _truncated = len(content) - _cap
+    _truncated = max(true_len, len(content)) - _cap
     _half = _cap // 2
     return (
         content[:_half]
@@ -563,27 +875,47 @@ def _normalize_for_scan(command: str) -> str:
         #   `rm${IFS}-f`   → one opaque token → basename is not "rm"
         # The ANSI-C body is decoded to one literal word (bash semantics) and
         # emitted shlex-safe; unquoted ${IFS}/$IFS becomes a split boundary.
-        # Only in the top-level unquoted region: inside quotes ${IFS} does not
-        # word-split, and $'...' is not ANSI-C quoting there.
+        #
+        # ANSI-C `$'...'` fires in EVERY unquoted context, which includes the
+        # body of a double-quoted `$(...)` / backtick substitution: those bodies
+        # are unquoted command lines even though we reached them from inside
+        # double quotes, so `$'rm'` there is ANSI-C quoting, not literal text.
+        # Without the body inclusion, `"$( $'rm' x )"` ran unprompted — the
+        # `$'rm'` was emitted literally and shlex tokenised it as `$rm`. Normal
+        # double-quoted text (cmdsub_depth == 0, no backtick) keeps `$'...'`
+        # literal, because there it is genuinely not ANSI-C quoting. ${IFS}/$IFS
+        # stays top-level-only: it never word-splits inside any double-quoted
+        # region, substitution bodies included (the body is unquoted, but IFS
+        # splitting happens at WORD-split time on the body's OWN words, which the
+        # scan already separates — decoding it here would only mis-space them).
+        _unquoted_ctx = (
+            not in_single
+            and (not in_double or cmdsub_depth > 0 or in_dq_backtick)
+        )
+        if (
+            _unquoted_ctx
+            and ch == "$"
+            and i + 1 < len(command)
+            and command[i + 1] == "'"
+        ):
+            j = i + 2
+            body = []
+            while j < len(command):
+                c = command[j]
+                if c == "\\" and j + 1 < len(command):
+                    body.append(c)
+                    body.append(command[j + 1])
+                    j += 2
+                    continue
+                if c == "'":
+                    break
+                body.append(c)
+                j += 1
+            out.append(_shlex_safe_literal(_decode_ansi_c("".join(body))))
+            i = j + 1  # consume the closing quote
+            continue
         if (ch == "$" and not in_single and not in_double
                 and cmdsub_depth == 0 and not in_dq_backtick):
-            if i + 1 < len(command) and command[i + 1] == "'":
-                j = i + 2
-                body = []
-                while j < len(command):
-                    c = command[j]
-                    if c == "\\" and j + 1 < len(command):
-                        body.append(c)
-                        body.append(command[j + 1])
-                        j += 2
-                        continue
-                    if c == "'":
-                        break
-                    body.append(c)
-                    j += 1
-                out.append(_shlex_safe_literal(_decode_ansi_c("".join(body))))
-                i = j + 1  # consume the closing quote
-                continue
             if command[i:i + 6] == "${IFS}":
                 out.append(" ")
                 i += 6
@@ -775,6 +1107,25 @@ def _split_shell_separators(tokens, original_command: Optional[str] = None) -> l
     _cursor = 0
     for token in tokens:
         if any(ch in token for ch in ";&|"):
+            # A `>|` is a noclobber redirect operator, not a pipe — splitting it
+            # would leave `>` as a bare redirect with `|` as its target (and the
+            # real filename as an ordinary argument).  `>>&` and `&>` also contain
+            # a shell-separator character without being a segment boundary.
+            #
+            # The TARGET must still be checked, because _REDIRECT_RE's tail group
+            # is `.*` and therefore swallows any separator glued to the filename.
+            # shlex emits `echo hi >out.txt;rm -rf /` as the single token
+            # `>out.txt;rm`, which matches the operator rule while hiding a whole
+            # command: skipping the split there left `rm` out of the executable
+            # slot entirely, so the danger gate never saw it (measured — the
+            # `;`, `&&` and `|` spellings all ran unprompted). Only a target with
+            # no separator of its own is exempt; anything else falls through to
+            # the normal split, which at worst over-splits a `>|` (losing the
+            # truncation target while still surfacing the command — fail-safe).
+            _redir_tok = _REDIRECT_RE.match(token)
+            if _redir_tok and not any(ch in _redir_tok.group(2) for ch in ";&|"):
+                out.append(token)
+                continue
             idx = -1
             if original_command:
                 idx = original_command.find(token, _cursor)
@@ -817,8 +1168,21 @@ def _split_shell_separators(tokens, original_command: Optional[str] = None) -> l
 # leading-single-dash anchor; so is a negative number (`-5`).
 _SHORT_FLAG_BUNDLE_RE = _re.compile(r"^-[A-Za-z]{2,}$")
 
-# `>`, `>>`, `2>`, `&>`, `<`, and their glued-target forms (`>out.txt`).
-_REDIRECT_RE = _re.compile(r"^(?:\d+|&)?(>>|>|<)(.*)$")
+# `--flag=value` → two tokens so `--size=0` reaches the `{"--size","0"}` combo.
+# Restricted to `--[A-Za-z]` so `git commit -m 'x=--hard'` (prose inside an
+# assignment) is not mis-split.
+_LONG_FLAG_EQ_RE = _re.compile(r"^(--[A-Za-z][A-Za-z0-9_-]*)=(.*)$")
+# `-s0` / `-s0K` → `-s` + `0`/`0K` so glued short-flag values reach combos too.
+_SHORT_FLAG_VALUE_RE = _re.compile(r"^(-[A-Za-z])(\d.*)$")
+# Truncation to zero bytes with an explicit SI suffix (`-s 0K`, `-s 0M`, …).
+# Canonicalised to "0" in the combo vocabulary so the single `{"-s","0"}` rule
+# covers every zero-equivalent spelling.
+_ZERO_SIZE_RE = _re.compile(r"^0[KkMmGgTtPp]?$")
+
+# `>`, `>>`, `2>`, `&>`, `>|` (noclobber override), `<`, and their
+# glued-target forms (`>out.txt`). `>|` is a truncating redirect just like
+# bare `>` — bash's noclobber override is still a destructive write.
+_REDIRECT_RE = _re.compile(r"^(?:\d+|&)?(>>|>\|?|<)(.*)$")
 
 
 # A `-c` payload can itself be `bash -c "..."`. Bounded by DEPTH, not by a total
@@ -835,6 +1199,102 @@ _SHELL_C_MAX_DEPTH = 8
 # The bundle is short flags only, so `--color` is excluded by the anchor.
 _SHELL_C_FLAG_RE = _re.compile(r"^-[A-Za-z]*c$")
 
+# Words that occupy the executable slot syntactically without being a command.
+# Module-level so the main danger scan and _segment_executable share ONE
+# definition — the heredoc receiver check used to reimplement the slot rules
+# with a string heuristic, and the two drifted (see _segment_executable).
+_SHELL_SYNTAX: frozenset = frozenset({
+    "for", "in", "do", "done", "if", "then", "else", "fi", "while", "until",
+    "echo",
+})
+
+
+def _segment_executable(text: str) -> tuple:
+    """Resolve the executable of the LAST command segment in *text*.
+
+    Returns ``(exe, segment_tokens)`` — ``exe`` is the basename-reduced
+    executable name (``None`` if the segment has none), ``segment_tokens`` are
+    that segment's own tokens (so callers can inspect its flags).
+
+    This exists so a caller that needs "what command is this text running?"
+    gets the SAME answer the danger scan's own executable-slot state machine
+    would give, instead of re-deriving it. The heredoc receiver check is the
+    first such caller: it previously took "the last whitespace-delimited word
+    before ``<<``", which is not the executable whenever a flag, a redirect or
+    a wrapper flag-value sits in between — ``bash -s <<EOF`` (the canonical
+    spelling) resolved to ``-s`` and the body was blanked, shipping a bypass.
+
+    The rules mirrored here are the slot-consuming ones: command wrappers and
+    their positional operands (``chroot /mnt cmd``) and value flags
+    (``sudo -u me cmd``), env assignments (``FOO=bar cmd``), numeric wrapper
+    args (``timeout 5s cmd``), flags, substitution/assignment tokens, basename
+    reduction, and _SHELL_SYNTAX words. Effects the scan performs while walking
+    tokens — forbidden-flag rejection, ``-c`` / ``eval`` splicing, danger-name
+    accumulation — are deliberately NOT reproduced: this is a pure query.
+    """
+    try:
+        _norm = _normalize_for_scan(text)
+    except Exception:
+        return (None, [])
+    try:
+        _parts = shlex.split(_norm)
+    except Exception:
+        _parts = _norm.split()  # tolerant: unbalanced quotes in prose
+    _toks = _split_shell_separators(_parts, _norm)
+
+    # Track the most recently RESOLVED segment. Normalisation rewrites
+    # `<(cmd)` into `< ; cmd ;`, so a trailing process substitution leaves the
+    # final segment empty; falling back to the nearest resolved one keeps
+    # `bash <(echo hi) <<EOF` pointing at `bash` rather than at nothing.
+    _last: tuple = (None, [])
+    exe: Optional[str] = None
+    seg: list = []
+    expect_executable = True
+    wrapper_ctx: Optional[str] = None
+    positional_skip = 0
+    skip_flag_value = False
+
+    for token in _toks:
+        if _SEPARATOR_ONLY_RE.fullmatch(token):
+            if exe is not None:
+                _last = (exe, seg)
+            exe, seg = None, []
+            expect_executable = True
+            wrapper_ctx, positional_skip, skip_flag_value = None, 0, False
+            continue
+        seg.append(token)
+        if skip_flag_value:
+            skip_flag_value = False
+            continue
+        if token.startswith("-"):
+            if (expect_executable and wrapper_ctx
+                    and token in _WRAPPER_VALUE_FLAGS.get(wrapper_ctx, frozenset())):
+                skip_flag_value = True
+            continue
+        if expect_executable and token in _COMMAND_WRAPPERS:
+            wrapper_ctx = Path(token).name
+            positional_skip = _WRAPPER_POSITIONAL_ARGS.get(wrapper_ctx, 0)
+            continue
+        if expect_executable and positional_skip > 0:
+            positional_skip -= 1
+            continue
+        if expect_executable and (
+            _WRAPPER_NUM_ARG_RE.match(token) or _ENV_ASSIGN_RE.match(token)
+        ):
+            continue
+        if token.startswith("$") or "=" in token:
+            expect_executable = False
+            continue
+        if expect_executable:
+            name = Path(token).name or token
+            expect_executable = False
+            if name in _SHELL_SYNTAX:
+                continue
+            exe = name
+    if exe is not None:
+        _last = (exe, seg)
+    return _last
+
 
 def _shell_c_payload_index(tokens: list, start: int) -> Optional[int]:
     """Index of the command string of a ``<shell> -c <payload>``, or None.
@@ -850,6 +1310,83 @@ def _shell_c_payload_index(tokens: list, start: int) -> Optional[int]:
         if _SHELL_C_FLAG_RE.match(tok):
             return i + 1 if i + 1 < len(tokens) else None
     return None
+
+
+def _trap_payload_index(tokens: list, start: int) -> Optional[int]:
+    """Index of ``trap``'s command-string operand, or None.
+
+    *start* is the position just past ``trap`` itself. Scans that segment only,
+    like :func:`_shell_c_payload_index` — ``trap 'x' EXIT; rm -rf y`` must not
+    swallow the ``rm``.
+
+    Only the FIRST non-flag operand is the action; everything after it is a
+    signal name (``EXIT``, ``INT``, ``2``). Two operands are not commands and
+    must not be spliced:
+
+    * ``-`` resets the handler to its default,
+    * ``''`` ignores the signal.
+
+    Both would otherwise be handed to ``_expand_shell_c_payload``, which returns
+    [] for them anyway — they are rejected here so the intent is stated rather
+    than relied upon.
+    """
+    end = _segment_end_index(tokens, start)
+    i = start
+    while i < end:
+        tok = tokens[i]
+        # `trap -p`, `trap --` — options precede the action.
+        if tok == "--" or (tok.startswith("-") and len(tok) > 1):
+            i += 1
+            continue
+        if tok in ("-", ""):
+            return None
+        return i
+    return None
+
+
+def _expand_exec_slot_var(token: str, assigned: dict) -> Optional[str]:
+    """Expand a leading ``$NAME`` / ``${NAME}`` in an executable-slot *token*.
+
+    Returns the expanded token, or None when nothing is known about the name —
+    in which case the caller leaves the token alone and the segment keeps its
+    old "executable unknown" behaviour.
+
+    Two sources, in order:
+
+    1. *assigned* — ``NAME=value`` seen EARLIER IN THIS COMMAND. ``RM=rm; $RM -f
+       x`` parks the command in a variable one statement before using it, which
+       is the `eval` shape again: the command is in the string being scanned.
+    2. ``os.environ`` — the command is about to run in this process's
+       environment, so a name we can read is a name the shell will resolve the
+       same way. This is what makes `$SHELL -c 'rm -rf x'` scannable, and with
+       it the whole ``-c`` payload is re-entered rather than dropped.
+
+    Only the executable slot is expanded. Arguments are deliberately left alone:
+    a value that happens to read like a dangerous name (``MSG=rm; echo $MSG``)
+    must not invent a prompt, and the flag-combo vocabulary is built from
+    literal tokens on purpose (see DANGEROUS_FLAG_COMBOS).
+
+    Suffixes survive the expansion — ``${VENV}/bin/python`` becomes a real path
+    whose basename the caller reduces to ``python``. Previously the whole token
+    was discarded, so the interpreter behind it was never identified.
+    """
+    _m = _EXEC_SLOT_VAR_RE.match(token)
+    if _m is None:
+        return None
+    name = _m.group("brace") or _m.group("bare")
+    value = assigned.get(name)
+    if value is None:
+        value = os.environ.get(name)
+    if not value:
+        return None
+    expanded = value + token[_m.end():]
+    # A value carrying shell metacharacters would change the token's structure
+    # (a second command, a redirect), and re-tokenising mid-scan is not this
+    # function's job. Refuse rather than feed the scan a token that no longer
+    # means what its shape says.
+    if any(c in expanded for c in ";|&<>()`$\n"):
+        return None
+    return expanded
 
 
 def _segment_end_index(tokens: list, start: int) -> int:
@@ -882,8 +1419,7 @@ def _is_dangerous_executable(name: str) -> bool:
         for _pref in _DANGEROUS_EXECUTABLE_PREFIXES
     )
 
-
-def _expand_shell_c_payload(payload: str) -> list:
+def _expand_shell_c_payload(payload: str, *, interpreter_names: frozenset | None = None) -> list:
     """Tokenise a ``-c`` payload the same way the top-level command was.
 
     Returns [] when the payload cannot be read as a command line, which leaves
@@ -894,7 +1430,7 @@ def _expand_shell_c_payload(payload: str) -> list:
     """
     if not payload or not payload.strip():
         return []
-    _scan = _normalize_for_scan(_blank_heredoc_bodies(payload))
+    _scan = _normalize_for_scan(_blank_heredoc_bodies(payload, interpreter_names=interpreter_names))
     try:
         _parts = shlex.split(_scan)
     except ValueError:
@@ -908,14 +1444,41 @@ def _segment_flag_combo_hit(exe: Optional[str], tokens: list) -> bool:
     Whole-token membership only — see the matching contract in
     ``shell_policy.DANGEROUS_FLAG_COMBOS``. Bundled short flags are expanded so
     ``-fdx``, ``-fd -x`` and ``-f -d -x`` are one rule rather than three.
+
+    Flag=value glue is split before building the vocabulary:
+    ``--size=0`` → ``--size`` + ``0``, ``-s0K`` → ``-s`` + ``0K``.
+    Zero-size suffix tokens (``0K``, ``0M``, …) are canonicalised to ``"0"`` so
+    the single ``{"-s","0"}`` rule covers every zero-equivalent spelling.
     """
     combos = _DANGEROUS_FLAG_COMBOS.get(exe or "")
     if not combos:
         return False
-    vocab = set(tokens)
+    # Start with every original token so bundle-targeting combos like
+    # {"-delete"} still match (the original token is preserved alongside any
+    # expansions from the normalisation loop below).
+    vocab: set = set(tokens)
     for tok in tokens:
         if _SHORT_FLAG_BUNDLE_RE.fullmatch(tok):
             vocab.update("-" + ch for ch in tok[1:])
+            continue  # bundle expanded; the original tok is already in vocab
+        m = _LONG_FLAG_EQ_RE.match(tok)
+        if m:
+            vocab.add(m.group(1))
+            val = m.group(2)
+            vocab.add(val)
+            if _ZERO_SIZE_RE.match(val):
+                vocab.add("0")
+            continue
+        m = _SHORT_FLAG_VALUE_RE.match(tok)
+        if m:
+            vocab.add(m.group(1))
+            val = m.group(2)
+            vocab.add(val)
+            if _ZERO_SIZE_RE.match(val):
+                vocab.add("0")
+            continue
+        if _ZERO_SIZE_RE.match(tok):
+            vocab.add("0")  # canonicalise 0K/0M/… so {"-s","0"} matches
     return any(combo <= vocab for combo in combos)
 
 
@@ -977,6 +1540,159 @@ def _format_command_for_approval(command: str, limit: int = 1200) -> str:
 
 class ShellToolsMixin:
     """Mixin providing shell tool implementations for ToolRegistry."""
+
+    def _capture_bounded(self, proc, timeout: float, cap: int):
+        """Drain a command's pipes to EOF, keeping only ``cap`` head + tail chars.
+
+        Returns ``(stdout_capture, stderr_capture, status)`` where status is
+        ``"done"``, ``"cancelled"`` or ``"timeout"``.
+
+        Replaces ``communicate()``, which had no way to bound what it holds: the
+        whole output existed in memory before the ~130 KB budget could apply, so
+        ``cat`` of a 108 MB log cost +360.6 MB of peak RSS (measured) — the same
+        defect the foreground search path was just fixed for, on the tool that
+        can run anything.
+
+        Both pipes are polled in one loop for the reason ``communicate`` exists:
+        draining stdout to exhaustion while the child fills the stderr pipe
+        deadlocks. Waking every ``_CANCEL_POLL_INTERVAL`` keeps ESC responsive
+        without a second mechanism — the poll IS the cancel check.
+
+        Decoding is ours now, so it has to match what ``text=True`` did or every
+        command emitting ``\\r`` (progress bars) changes shape:
+        ``IncrementalNewlineDecoder`` gives the same universal-newline
+        translation, statefully, so a ``\\r\\n`` split across two reads still
+        collapses to one ``\\n``. Verified against ``communicate(text=True)`` at
+        every split point of a mixed ``\\r``/``\\r\\n``/multibyte sample.
+
+        Owning the buffers also retires ``recover_communicate_partial``: partial
+        output no longer has to be dug out of CPython's private
+        ``_fileobj2output`` after a timeout, because it is already here.
+        """
+        _out = _BoundedCapture(cap)
+        _err = _BoundedCapture(cap)
+        _pending: dict = {}
+        _decoders: dict = {}
+        _sel = _selectors.DefaultSelector()
+        try:
+            for _stream, _capture in ((proc.stdout, _out), (proc.stderr, _err)):
+                if _stream is None:
+                    continue
+                _sel.register(_stream, _selectors.EVENT_READ)
+                _pending[_stream] = _capture
+                _decoders[_stream] = _io.IncrementalNewlineDecoder(
+                    _codecs.getincrementaldecoder("utf-8")("replace"), True,
+                )
+
+            _deadline = _time.monotonic() + timeout
+            while _pending:
+                _remaining = _deadline - _time.monotonic()
+                if _remaining <= 0:
+                    return _out, _err, "timeout"
+                for _key, _ in _sel.select(
+                    timeout=min(_CANCEL_POLL_INTERVAL, _remaining)
+                ):
+                    _stream = _key.fileobj
+                    try:
+                        _chunk = os.read(_stream.fileno(), _PIPE_READ_CHUNK)
+                    except (OSError, ValueError) as exc:
+                        logger.debug("bash: pipe read ended early: %s", exc)
+                        _chunk = b""
+                    _dec = _decoders[_stream]
+                    if _chunk:
+                        _pending[_stream].feed(_dec.decode(_chunk))
+                        continue
+                    # EOF. Flush the decoder so a truncated multibyte sequence
+                    # becomes a replacement char rather than vanishing.
+                    _pending[_stream].feed(_dec.decode(b"", True))
+                    _sel.unregister(_stream)
+                    del _pending[_stream]
+                # Read off the LIVE config every poll — the design-chat REPL
+                # swaps config.cancel_event per turn, so a value captured before
+                # the loop goes stale.
+                _cancel = getattr(self.config, "cancel_event", None)
+                if _cancel is not None and _cancel.is_set():
+                    _close_pipes(proc)
+                    return _out, _err, "cancelled"
+        finally:
+            _sel.close()
+
+        # Both pipes are at EOF, so the command has said everything it is going
+        # to. Exiting still gets whatever is left of the budget — a command that
+        # closes its streams early and keeps working must still reach the
+        # background transition at the same moment it used to — plus a floor, so
+        # a process that finishes as the budget expires is not backgrounded with
+        # its result already in hand.
+        try:
+            proc.wait(timeout=max(_EXIT_GRACE, _deadline - _time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return _out, _err, "timeout"
+        _close_pipes(proc)
+        return _out, _err, "done"
+
+    def _cancel_running_command(
+        self, proc, command: str, out_cap=None, err_cap=None,
+    ) -> "ToolResult":
+        """Tear down a command the user cancelled mid-run, and report it.
+
+        The process is in its own session (``start_new_session=True``), so it is
+        not reaped by anything on this side: without an explicit kill it keeps
+        running to completion, keeps its side effects, and outlives the agent
+        entirely if the CLI is killed. Signals the whole group — SIGTERM, then
+        SIGKILL after a short grace — the same escalation ``BackgroundJob.kill``
+        uses, so a shell's children go with it rather than reparenting to init.
+
+        Whatever the command printed before the cancel is returned rather than
+        dropped: the user stopped the command, which is not a reason to hide what
+        it had already said. It arrives as the captures the pump was filling —
+        no longer excavated from a CPython-private buffer after the fact.
+        """
+        import signal as _signal
+
+        _partial = out_cap.text() if out_cap is not None else ""
+        _partial_err = err_cap.text() if err_cap is not None else ""
+        _true_len = (
+            (out_cap.total if out_cap is not None else 0)
+            + (err_cap.total if err_cap is not None else 0)
+        )
+        try:
+            _pgid = os.getpgid(proc.pid)
+            os.killpg(_pgid, _signal.SIGTERM)
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(_pgid, _signal.SIGKILL)
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    logger.warning("cancel: process %s survived SIGKILL", proc.pid)
+        except (ProcessLookupError, PermissionError, OSError) as exc:
+            # Already gone, or not ours to signal — nothing left to tear down.
+            logger.debug("cancel: could not signal process group: %s", exc)
+        logger.info("bash: cancelled by user, cmd=%.200s", command)
+
+        _parts = []
+        if _partial.strip():
+            _parts.append(_partial)
+        if _partial_err.strip():
+            _parts.append(f"[stderr]\n{_partial_err}")
+        if _parts:
+            from ..config.thresholds import config as _thresholds
+            _joined = "\n".join(_parts)
+            _content = _truncate_bash_output(
+                _joined,
+                _thresholds.tokens.BASH_OUTPUT_MAX_CHARS,
+                true_len=max(_true_len, len(_joined)),
+            )
+        else:
+            _content = ""
+        return self._make_result(
+            ok=False,
+            content=_content,
+            error="Operation cancelled",
+            retryable=False,
+            metadata={"cancelled": True, "partial_output": bool(_parts)},
+        )
 
     def _request_shell_danger_approval(self, dangerous_names: str, command: str) -> bool:
         """Request user approval for dangerous shell commands.
@@ -1328,7 +2044,6 @@ class ShellToolsMixin:
                 logger.info("bash: auto-corrected sort -V -> python3: %.200s", fixed_cmd)
                 command = fixed_cmd
 
-        _SHELL_SYNTAX = {"for", "in", "do", "done", "if", "then", "else", "fi", "while", "until", "echo"}
 
         # Scan a copy with heredoc BODIES blanked and newlines / subshell parens
         # turned into explicit separators; the string that EXECUTES stays
@@ -1338,7 +2053,7 @@ class ShellToolsMixin:
         # _re as a function-local name across the WHOLE body, so the earlier
         # _re.search() calls (find -o grouping, ~L175) raise UnboundLocalError
         # before this line ever runs.
-        _scan_command = _normalize_for_scan(_blank_heredoc_bodies(command))
+        _scan_command = _normalize_for_scan(_blank_heredoc_bodies(command, interpreter_names=_SHELL_INTERPRETERS))
         # A heredoc body is script text, not shell syntax, so an apostrophe in
         # its prose ("don't") leaves shlex with an unbalanced quote. Blanking
         # the bodies removes that, but an opener whose body never starts (the
@@ -1366,7 +2081,18 @@ class ShellToolsMixin:
         # `git reset --hard` from `echo "--hard"` or from a commit message that
         # merely says "--hard". See _segment_flag_combo_hit.
         segment_tokens: list = []
+        # `NAME=value` bindings seen so far in THIS command, used to resolve a
+        # later `$NAME` sitting in an executable slot. Command-wide rather than
+        # per-segment: `RM=rm; $RM -f x` binds in one segment and uses it in the
+        # next, which is the whole shape being closed. A prefix assignment
+        # (`RM=rm cmd`) is scoped to one command in real shell semantics, so
+        # carrying it forward can only make the scan look at MORE candidates,
+        # never fewer — the safe direction for an advisory gate.
+        _var_assignments: dict = {}
         flag_combo_exes: set = set()
+        # `python -c` payload findings — see _python_payload_effects.
+        python_destructive: set = set()
+        python_opaque_escape = False
         redirect_targets: list = []
         expect_redirect_target = False
         # Wrapper state, all scoped to the segment being scanned: which wrapper
@@ -1376,11 +2102,49 @@ class ShellToolsMixin:
         wrapper_ctx: Optional[str] = None
         positional_skip = 0
         skip_flag_value = False
+        segment_is_piped_into = False
+        piped_interpreters: set = set()
+        # Process substitution (`bash <(echo rm)`) feeds the left-hand command
+        # via a FIFO — the same "unreadable payload" shape as `curl | sh`.
+        # Detected per-segment from the normalised token stream (NOT from the raw
+        # command string): after normalisation `<(cmd)` becomes `< ; cmd ;`,
+        # so a bare `<` whose next token is a separator `;` is a procsub.
+        segment_has_procsub = False
+        procsub_interpreters: set = set()
 
         def _close_segment() -> None:
-            """Evaluate the finished segment's flag combos (call before reset)."""
+            """Evaluate the finished segment's flag combos and procsub (call before reset)."""
             if _segment_flag_combo_hit(segment_exe, segment_tokens):
                 flag_combo_exes.add(segment_exe)
+            # Process substitution is detected mid-segment (the `<` redirect
+            # appears AFTER the executable), so the check runs here at segment
+            # close, not at the executable-assignment point.
+            #
+            # The `-c` suppression reads THIS segment's own accumulated tokens,
+            # not a forward scan from _ti. By the time this runs _ti has already
+            # advanced past the separator, so it points at the NEXT segment —
+            # which, for `<shell> <(body)`, is the substitution BODY. A forward
+            # scan therefore asked "does the body contain -c?", and any body
+            # carrying an ordinary `-c` flag silenced the prompt: measured,
+            # `bash <(curl -c jar http://x)`, `bash <(grep -c foo f)` and
+            # `bash <(echo sh -c ls)` all ran unprompted. `curl -c`, `grep -c`,
+            # `wc -c`, `sort -c` and `tar -c` are all common spellings, so this
+            # was reachable without contriving anything.
+            #
+            # segment_tokens is the right source: it is the same per-segment
+            # accumulator _segment_flag_combo_hit consults, and it holds the
+            # interpreter's OWN flags — `bash -c 'echo hi' <(echo rm)` keeps its
+            # suppression (bash runs the string, the FIFO is a mere argument)
+            # while the body's flags no longer leak into the decision.
+            if (
+                segment_has_procsub
+                and segment_exe is not None
+                and (segment_exe in _SHELL_INTERPRETERS
+                     or segment_exe in _STDIN_INTERPRETERS
+                     or segment_exe in ("source", "."))
+                and not any(_SHELL_C_FLAG_RE.match(t) for t in segment_tokens)
+            ):
+                procsub_interpreters.add(segment_exe)
 
         # _scan_command, not command: the splitter locates separators by byte
         # position in the string its tokens came from, so feeding it the raw
@@ -1409,6 +2173,12 @@ class ShellToolsMixin:
                 wrapper_ctx = None
                 positional_skip = 0
                 skip_flag_value = False
+                # A `|` makes the NEXT segment read this one's stdout. That
+                # matters for interpreters: `curl url | sh` executes bytes this
+                # scan will never see. Tracked here because the separator is the
+                # only place the relationship is visible.
+                segment_is_piped_into = "|" in token
+                segment_has_procsub = False
                 continue
             if expect_redirect_target:
                 # Detached target of the `>` seen on the previous token.
@@ -1418,7 +2188,62 @@ class ShellToolsMixin:
             _redir = _REDIRECT_RE.match(token)
             if _redir is not None:
                 _op, _glued = _redir.group(1), _redir.group(2)
-                if _op == ">":  # `>>` appends and `<` reads — neither truncates
+                # ── here-string `<<<` ─────────────────────────────────────────
+                # Detected as a `<` redirect whose glued tail starts with `<<`
+                # (`<<<` matches group(1)='<', group(2)='<<'; a bare `<` or heredoc
+                # `<<` does not). The word a SHELL interpreter is fed on stdin via
+                # `<<<` it reads as a command line, so the word is shell code —
+                # exactly the `-c` shape — and is re-entered through the same
+                # splice path. A non-shell (`cat <<< …`) just prints the string, so
+                # only SHELL_INTERPRETERS qualify. Was a documented closable gap:
+                # `bash <<< 'rm -rf x'` ran unprompted because `<<<` was read as a
+                # plain `<` redirect and the quoted word landed in argument slot.
+                if (
+                    _op == "<"
+                    and _glued.startswith("<<")
+                    and _token_depth < _SHELL_C_MAX_DEPTH
+                    and (
+                        segment_exe in _SHELL_INTERPRETERS
+                        or segment_exe in _STDIN_INTERPRETERS
+                    )
+                ):
+                    if len(_glued) > 2:
+                        # Glued form `<<<word`. The payload is glued onto the
+                        # operator, so there is no separate word to consume:
+                        # INSERT the re-entered tokens after the current one
+                        # (the `<<<word` token is at _ti-1, already processed by
+                        # this redirect block and never revisited). The leading
+                        # `;` therefore lands at _ti, where the loop picks it up
+                        # next iteration and resets expect_executable — without
+                        # that, `rm` was read as an argument of the interpreter
+                        # and the glued spelling `bash <<<'rm x'` ran unprompted.
+                        _nested = _expand_shell_c_payload(_glued[2:], interpreter_names=_SHELL_INTERPRETERS)
+                        if _nested:
+                            _repl = [";", *_nested, ";"]
+                            _tokens[_ti:_ti] = _repl
+                            _depths[_ti:_ti] = [_token_depth + 1] * len(_repl)
+                    elif _ti < len(_tokens):
+                        # Separated form `<<< word` — replace the payload word in place.
+                        _nested = _expand_shell_c_payload(_tokens[_ti], interpreter_names=_SHELL_INTERPRETERS)
+                        if _nested:
+                            _repl = [";", *_nested, ";"]
+                            _tokens[_ti:_ti + 1] = _repl
+                            _depths[_ti:_ti + 1] = [_token_depth + 1] * len(_repl)
+                    continue
+                # ── process substitution `<(` — per-segment ──────────────────
+                # After normalisation `<(cmd)` becomes `< ; cmd ;` — the `(`
+                # is rewritten to `;`, so a bare `<` whose next token is a
+                # separator `;` is a procsub (as opposed to `< file`, where the
+                # next token is the filename).  Only `<` with no glued target
+                # and no here-string prefix is checked.
+                if (
+                    _op == "<"
+                    and not _glued  # not here-string (`<<<`) and not glued file
+                    and _ti < len(_tokens)
+                    and _SEPARATOR_ONLY_RE.fullmatch(_tokens[_ti])
+                ):
+                    segment_has_procsub = True
+                if _op in (">", ">|"):  # `>>` appends and `<` reads — neither truncates
                     if _glued:
                         redirect_targets.append(_glued)
                     else:
@@ -1431,6 +2256,15 @@ class ShellToolsMixin:
                 # like `--hard` into the combo vocabulary would invent a prompt.
                 skip_flag_value = False
                 continue
+            if expect_executable and token.startswith("$"):
+                # `RM=rm; $RM -f x` / `$SHELL -c '…'` — expand BEFORE any other
+                # rule sees the token, so the resolved name gets every one of
+                # them (wrapper table, EVAL_BUILTINS, the interpreter `-c`
+                # splice) instead of a second, poorer copy. Unresolvable names
+                # fall through unchanged and keep the old behaviour.
+                _expanded = _expand_exec_slot_var(token, _var_assignments)
+                if _expanded is not None:
+                    token = _expanded
             segment_tokens.append(token)
             # ── Tokens that PRECEDE a command without being one ──────────────
             # Each of these used to consume the executable slot, so the real
@@ -1494,6 +2328,22 @@ class ShellToolsMixin:
                 # `/usr/bin/sudo -u me rm` is the same rule as `sudo -u me rm`.
                 wrapper_ctx = Path(token).name
                 positional_skip = _WRAPPER_POSITIONAL_ARGS.get(wrapper_ctx, 0)
+                if (wrapper_ctx in _WRAPPER_SHELL_C_PAYLOAD
+                        and _token_depth < _SHELL_C_MAX_DEPTH):
+                    # `runuser -c "rm -rf x"` / `script -c ...` / `flock f -c ...`
+                    # hand their payload to a shell, exactly like `bash -c`. They
+                    # cannot live in _SHELL_INTERPRETERS because a COMMAND_WRAPPERS
+                    # hit is consumed right here and never reaches that check, so
+                    # the same splice is applied from inside this branch.
+                    _payload_at = _shell_c_payload_index(_tokens, _ti)
+                    if _payload_at is not None:
+                        _nested = _expand_shell_c_payload(_tokens[_payload_at], interpreter_names=_SHELL_INTERPRETERS)
+                        if _nested:
+                            _repl = [";", *_nested, ";"]
+                            _tokens[_payload_at:_payload_at + 1] = _repl
+                            _depths[_payload_at:_payload_at + 1] = (
+                                [_token_depth + 1] * len(_repl)
+                            )
                 continue
             if expect_executable and positional_skip > 0:
                 # `chroot /mnt rm -rf x` — the operand before the command is not
@@ -1504,6 +2354,15 @@ class ShellToolsMixin:
                 _WRAPPER_NUM_ARG_RE.match(token)      # wrapper arg: `timeout 5s rm`
                 or _ENV_ASSIGN_RE.match(token)        # `FOO=bar rm ...`
             ):
+                if _ENV_ASSIGN_RE.match(token):
+                    # Remember the value so a later `$NAME` in an executable
+                    # slot resolves (see _expand_exec_slot_var). Recorded ONLY
+                    # here, where the token really is a shell assignment: the
+                    # `=` in `make CFLAGS=-O2` is an argument, and treating it
+                    # as an assignment would seed the table with words the shell
+                    # never binds.
+                    _name, _, _value = token.partition("=")
+                    _var_assignments[_name] = _value
                 continue
             if token.startswith("$") or "=" in token:
                 if expect_executable:
@@ -1516,7 +2375,7 @@ class ShellToolsMixin:
                 # scan skipped every token containing "/" outright, which made
                 # this Path(...).name reduction dead code for the one case it
                 # exists for — an absolute path bypassed the gate entirely.
-                name = Path(token).name
+                name = Path(token).name or token
                 expect_executable = False
                 if name in _SHELL_SYNTAX:
                     continue
@@ -1532,15 +2391,73 @@ class ShellToolsMixin:
                     # `bash -c`, so the payload gets every rule this scan
                     # implements rather than a second, poorer copy of them.
                     _eval_end = _segment_end_index(_tokens, _ti)
-                    _nested = _expand_shell_c_payload(" ".join(_tokens[_ti:_eval_end]))
+                    _nested = _expand_shell_c_payload(" ".join(_tokens[_ti:_eval_end]), interpreter_names=_SHELL_INTERPRETERS)
                     if _nested:
                         _repl = [";", *_nested, ";"]
                         _tokens[_ti:_eval_end] = _repl
                         _depths[_ti:_eval_end] = [_token_depth + 1] * len(_repl)
+                if name in _COMMAND_STRING_BUILTINS and _token_depth < _SHELL_C_MAX_DEPTH:
+                    # `trap 'rm -rf x' EXIT` — one operand is a command string
+                    # the shell runs later, the rest are signal names. Spliced
+                    # through the same fence-and-re-enter path as `bash -c` and
+                    # `eval`, so the payload gets every rule this scan
+                    # implements. Only that ONE operand is replaced: joining the
+                    # segment the way `eval` does would append `EXIT` to the
+                    # command line and turn `trap - EXIT` into a command.
+                    _trap_at = _trap_payload_index(_tokens, _ti)
+                    if _trap_at is not None:
+                        _nested = _expand_shell_c_payload(
+                            _tokens[_trap_at], interpreter_names=_SHELL_INTERPRETERS,
+                        )
+                        if _nested:
+                            _repl = [";", *_nested, ";"]
+                            _tokens[_trap_at:_trap_at + 1] = _repl
+                            _depths[_trap_at:_trap_at + 1] = (
+                                [_token_depth + 1] * len(_repl)
+                            )
+                if (
+                    name in _SHELL_INTERPRETERS or name in _STDIN_INTERPRETERS
+                ) and segment_is_piped_into:
+                    # `curl -s url | sh` — the interpreter runs whatever the
+                    # upstream produced, which is not in this string and cannot
+                    # be recovered by any amount of parsing. Unlike the other
+                    # known-open shapes, though, the SHAPE alone is enough: an
+                    # unreadable payload handed to a shell is exactly the case
+                    # where "we cannot tell" should mean "ask", not "allow".
+                    # Excluded when a `-c` payload is present — then the code IS
+                    # visible, was spliced above, and stdin is ignored, so the
+                    # prompt would be noise.
+                    if _shell_c_payload_index(_tokens, _ti) is None:
+                        piped_interpreters.add(name)
+                if name in _PYTHON_INTERPRETERS and _token_depth < _SHELL_C_MAX_DEPTH:
+                    # A `python -c` payload is not shell, so it is not spliced —
+                    # but it IS readable, with Python's own parser. What comes
+                    # back is either an effect this gate already asks about
+                    # under another spelling (`shutil.rmtree` is `rm -rf`) or a
+                    # command handed back to the shell, and the latter is
+                    # spliced so every rule in this scan applies to it.
+                    _py_at = _shell_c_payload_index(_tokens, _ti)
+                    if _py_at is not None:
+                        _py_calls, _py_shell, _py_opaque = _python_payload_effects(
+                            _tokens[_py_at],
+                        )
+                        python_destructive.update(_py_calls)
+                        if _py_opaque:
+                            python_opaque_escape = True
+                        for _cmd in _py_shell:
+                            _nested_py = _expand_shell_c_payload(
+                                _cmd, interpreter_names=_SHELL_INTERPRETERS,
+                            )
+                            if _nested_py:
+                                _repl = [";", *_nested_py, ";"]
+                                _tokens[_py_at:_py_at] = _repl
+                                _depths[_py_at:_py_at] = (
+                                    [_token_depth + 1] * len(_repl)
+                                )
                 if name in _SHELL_INTERPRETERS and _token_depth < _SHELL_C_MAX_DEPTH:
                     _payload_at = _shell_c_payload_index(_tokens, _ti)
                     if _payload_at is not None:
-                        _nested = _expand_shell_c_payload(_tokens[_payload_at])
+                        _nested = _expand_shell_c_payload(_tokens[_payload_at], interpreter_names=_SHELL_INTERPRETERS)
                         if _nested:
                             # Fenced by separators so the payload cannot inherit
                             # this segment's executable slot, nor leak its own
@@ -1576,6 +2493,26 @@ class ShellToolsMixin:
         if flag_combo_exes:
             _effect_reasons.append(
                 ", ".join(sorted(e for e in flag_combo_exes if e)) + " (dangerous flags)"
+            )
+        if piped_interpreters:
+            _effect_reasons.append(
+                "pipes into " + ", ".join(sorted(piped_interpreters))
+                + " (the piped code is not visible to this check)"
+            )
+        if procsub_interpreters:
+            _effect_reasons.append(
+                "process substitution feeds " + ", ".join(sorted(procsub_interpreters))
+                + " (the substitution output is not visible to this check)"
+            )
+        if python_destructive:
+            _effect_reasons.append(
+                "python -c calls " + ", ".join(sorted(python_destructive))
+                + " (deletes files, same as rm)"
+            )
+        if python_opaque_escape:
+            _effect_reasons.append(
+                "python -c hands a command it builds at runtime to the shell "
+                "(the command is not visible to this check)"
             )
         _truncated = _truncating_redirect_targets(redirect_targets, self.repo_root)
         if _truncated:
@@ -1621,21 +2558,38 @@ class ShellToolsMixin:
                 env=_env,
             )
 
-            # Use communicate() for correct pipe I/O handling (prevents deadlock
-            # when child process fills the pipe buffer while we wait).
-            # On timeout: process remains running → background transition.
-            # On success: stdout/stderr are fully captured strings.
-            try:
-                stdout_data, stderr_data = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
+            # Both pipes are drained in one poll loop — the deadlock
+            # `communicate()` exists to prevent — but into a BOUNDED capture, so
+            # the output the tool is about to cut to ~130 KB never has to exist
+            # in full first (`cat` of a 108 MB log: +360.6 MB peak RSS and 0.24 s
+            # before, +0.4 MB and 0.03 s after, same answer).
+            #
+            # The poll is also the cancel check, so ESC reaches a command that is
+            # ALREADY RUNNING. That check used to happen only at dispatch entry,
+            # so a `cancel_event` set one second into a `bash sleep 12` was not
+            # observed until second twelve (measured); with the CLI's default
+            # 120 s budget and 300 s ceiling the command kept running — side
+            # effects included — long after the user asked it to stop. The CLI's
+            # own ESC path abandons the agent thread and returns the prompt,
+            # which hid this: the user gets their prompt back while the
+            # subprocess keeps going, unowned.
+            from ..config.thresholds import config as _thresholds
+            _out_cap, _err_cap, _status = self._capture_bounded(
+                proc, timeout, _thresholds.tokens.BASH_OUTPUT_MAX_CHARS,
+            )
+            if _status == "cancelled":
+                return self._cancel_running_command(proc, command, _out_cap, _err_cap)
+            if _status == "timeout":
                 # ── Timeout → background transition ──────────────────────────
                 # Instead of returning a timeout error (which wastes the work done),
                 # transition the process to background management.
                 #
-                # Salvage the output communicate() already consumed from the
-                # pipes before timing out (lives in a CPython-private buffer,
-                # unreadable via the raw fd) — see recover_communicate_partial.
-                recover_communicate_partial(proc)
+                # What the command printed so far comes straight off the captures
+                # and rides the existing `_recovered_*` contract into the job's
+                # first drain. No excavation of CPython's private
+                # `_fileobj2output` any more — we own the buffer.
+                proc._recovered_stdout = _out_cap.text()
+                proc._recovered_stderr = _err_cap.text()
 
                 job_id = _bg_mgr.start(command, proc)
                 logger.info("bash: timed out, bg job=%s cmd=%.200s", job_id, command)
@@ -1645,8 +2599,8 @@ class ShellToolsMixin:
                     metadata={"background_job_id": job_id},
                 )
 
-            stdout = stdout_data or ""
-            stderr = strip_malloc_noise(stderr_data or "").strip()
+            stdout = _out_cap.text()
+            stderr = strip_malloc_noise(_err_cap.text()).strip()
 
             parts_out = []
             if stdout:
@@ -1654,14 +2608,19 @@ class ShellToolsMixin:
             if stderr:
                 parts_out.append(f"[stderr]\n{stderr}")
             content = "\n".join(parts_out) or "(no output)"
+            # What the command actually printed, which `len(content)` no longer
+            # is. Only the truncation NOTICE uses it, so a 108 MB run is
+            # described by its real size instead of by the slice we kept.
+            _true_len = len(content) + _out_cap.dropped + _err_cap.dropped
 
             #── bash output size restriction ─────────────────────────────────────
             # Prevent context token explosion from large output (git diff, find, rg -r, etc.).
             # Limit managed as a single BASH_OUTPUT_MAX_CHARS threshold
             # (NO hardcoding — mismatch between threshold and actual cap would defeat tuning).
             # Head+tail preservation logic is encapsulated in _truncate_bash_output and tested.
-            from ..config.thresholds import config as _thresholds
-            content = _truncate_bash_output(content, _thresholds.tokens.BASH_OUTPUT_MAX_CHARS)
+            content = _truncate_bash_output(
+                content, _thresholds.tokens.BASH_OUTPUT_MAX_CHARS, true_len=_true_len,
+            )
 
             # rg/grep etc. return exit code 1 for "no match" (exit code 2 is the real error).
             # exit code 1 + no stderr = normal execution but no result → not an error.

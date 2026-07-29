@@ -286,11 +286,11 @@ class FailurePatternStore:
             raw = self._path.read_text(encoding="utf-8")
             obj = json.loads(raw)
             if isinstance(obj, dict) and isinstance(obj.get("patterns"), dict):
-                self._last_read_ts = time.time()
+                self._last_read_ts = time.monotonic()
                 return obj["patterns"]
         except (OSError, json.JSONDecodeError, ValueError):
             pass
-        self._last_read_ts = time.time()
+        self._last_read_ts = time.monotonic()
         return {}
 
     # ── public API ───────────────────────────────────────────────────────────
@@ -412,7 +412,7 @@ class FailurePatternStore:
             # Read-only refresh with TTL: avoid re-reading the JSON file on every
             # recall call during a failure flood.  Within _READ_REFRESH_TTL seconds
             # of the last disk read, use the in-memory cache as-is.
-            if time.time() - self._last_read_ts > _READ_REFRESH_TTL:
+            if time.monotonic() - self._last_read_ts > _READ_REFRESH_TTL:
                 disk_data = self._read_from_disk_unsafe()
                 if disk_data:
                     cache = self._cache or {}

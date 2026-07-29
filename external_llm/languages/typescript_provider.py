@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import subprocess
+import uuid
 
 from .base import (
     SyntaxProvider,
@@ -19,6 +20,7 @@ from .base import (
     detect_project_root,
     find_brace_block_end,
     find_brace_block_end_offset,
+    resolve_tool_path,
     tree_sitter_syntax_fallback,
 )
 from .models import (
@@ -202,60 +204,129 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
           ambient declarations that surface sibling diagnostics.
         - Errors (``error TS2xxx``) make ``ok=False``; warnings surfaced.
         """
-        return self._run_tsc_semantic(
-            file_path,
+        return self.validate_semantics_batch([file_path])[file_path]
+
+    def validate_semantics_batch(
+        self, file_paths: list[str],
+    ) -> dict[str, SyntaxValidationResult]:
+        """Semantic-check *file_paths* with one tsc run per project root.
+
+        Each file otherwise paid its own ``npx tsc`` startup, which is the bulk
+        of a short check. tsc already type-checks everything in ``include``
+        together and tags each diagnostic with its file, so widening ``include``
+        to the whole group costs about one startup instead of N.
+
+        Grouped by :func:`detect_project_root` because that is tsc's cwd and
+        selects which ``tsconfig.json`` applies — a monorepo has one per
+        package, and merging them would check files against the wrong config.
+        """
+        return self._batch_by_root(
+            file_paths,
             language=LanguageId.TYPESCRIPT,
             config_markers=("tsconfig.json",),
-            config_filename="tsconfig.json",
+            config_for=lambda _root: "tsconfig.json",
             allow_js=False,
         )
 
-    def _run_tsc_semantic(
+    def _batch_by_root(
         self,
-        file_path: str,
+        file_paths: list[str],
         *,
         language: LanguageId,
         config_markers: tuple[str, ...],
+        config_for,
+        allow_js: bool,
+    ) -> dict[str, SyntaxValidationResult]:
+        """Group *file_paths* by (project root, config) and run tsc once each.
+
+        *config_for* maps a project root to the config filename to extend; JS
+        needs it because a JS project may carry either ``jsconfig.json`` or
+        ``tsconfig.json``, and the two cannot share one temp config.
+        """
+        # A fresh result per file, never one shared instance: the dataclass is
+        # mutable and carries a list, so sharing would let one consumer's
+        # append surface on every other skipped file.
+        def _skip(reason: str) -> SyntaxValidationResult:
+            return SyntaxValidationResult.unchecked(language, reason)
+
+        out: dict[str, SyntaxValidationResult] = {}
+        groups: dict[tuple[str, str], list[str]] = {}
+        for p in file_paths:
+            if not p or not os.path.exists(p):
+                out[p] = _skip("the file is not on disk")
+                continue
+            root = detect_project_root(p, markers=config_markers)
+            cfg = config_for(root)
+            if cfg is None or not os.path.isfile(os.path.join(root, cfg)):
+                # No config → tsc would emit config/environment noise. Skip.
+                out[p] = _skip(
+                    f"no {' or '.join(config_markers)} above this file, "
+                    "so tsc has no project to check it against",
+                )
+                continue
+            groups.setdefault((root, cfg), []).append(p)
+        for (root, cfg), paths in groups.items():
+            out.update(self._run_tsc_semantic(
+                paths,
+                language=language,
+                project_root=root,
+                config_filename=cfg,
+                allow_js=allow_js,
+            ))
+        return out
+
+    def _run_tsc_semantic(
+        self,
+        file_paths: list[str],
+        *,
+        language: LanguageId,
+        project_root: str,
         config_filename: str,
         allow_js: bool,
-    ) -> SyntaxValidationResult:
-        """Shared tsc project-mode semantic check for TS and JS providers.
+    ) -> dict[str, SyntaxValidationResult]:
+        """One tsc project-mode run over *file_paths*, split back out per file.
 
-        Writes a temporary ``tsconfig.<pid>.json`` that ``extends`` the real
-        config (``tsconfig.json`` or ``jsconfig.json``) with ``include`` pinned
-        to *file_path*, then runs ``tsc --noEmit --project <temp>``.
+        Writes a temporary ``.tsconfig.semcheck.*.json`` that ``extends`` the
+        real config (``tsconfig.json`` or ``jsconfig.json``) with ``include``
+        pinned to *file_paths*, then runs ``tsc --noEmit --project <temp>``.
 
         Args:
-            file_path: on-disk file to check (TS or JS).
-            language: which ``LanguageId`` to tag the result with.
-            config_markers: markers passed to :func:`detect_project_root`.
-            config_filename: the real config file found at the project root
-                (``tsconfig.json`` for TS, ``tsconfig.json`` or ``jsconfig.json``
-                for JS).
-            allow_js: whether to force ``--allowJs --checkJs`` for JS files
+            file_paths: on-disk files to check (TS or JS), all under
+                *project_root* and sharing *config_filename*.
+            language: which ``LanguageId`` to tag the results with.
+            project_root: tsc's cwd; also where the temp config is written.
+            config_filename: the real config file at *project_root*.
+            allow_js: whether to force ``allowJs``/``checkJs`` for JS files
                 whose config may not enable them.
         """
-        if not file_path or not os.path.exists(file_path):
-            return SyntaxValidationResult(ok=True, language=language)
+        def _skip(reason: str) -> dict[str, SyntaxValidationResult]:
+            return {
+                p: SyntaxValidationResult.unchecked(language, reason)
+                for p in file_paths
+            }
 
-        project_root = detect_project_root(file_path, markers=config_markers)
-        real_config = os.path.join(project_root, config_filename)
-        if not os.path.isfile(real_config):
-            # No config → tsc would emit config/environment noise. Skip.
-            return SyntaxValidationResult(ok=True, language=language)
-
-        # Pin the check to exactly the target file via a temp tsconfig that
-        # extends the real one. Relative path is required by tsc `include`.
-        rel_target = os.path.relpath(file_path, project_root)
-        # Name the temp config tsconfig.*.json so tsc treats it as a project
-        # root config; random suffix avoids collisions across parallel checks.
+        # Pin the check to exactly the target files via a temp tsconfig that
+        # extends the real one. Relative paths are required by tsc `include`.
+        rel_targets = [os.path.relpath(p, project_root) for p in file_paths]
+        # The temp config sits in project_root next to the real one; pid + a
+        # random token keep concurrent checks from colliding. (``id()`` is NOT
+        # usable here: CPython reuses addresses after GC, so it is unique only
+        # among simultaneously-live objects.)
         tmp_config = os.path.join(
-            project_root, f".tsconfig.semcheck.{os.getpid()}.{id(file_path)}.json",
+            project_root,
+            f".tsconfig.semcheck.{os.getpid()}.{uuid.uuid4().hex}.json",
         )
         import json as _json
         temp_body: dict = {
-            "extends": config_filename,
-            "include": [rel_target],
+            # MUST be "./name", not a bare "name": tsc resolves a bare extends
+            # as a *node module* specifier, so the real config is never loaded
+            # and the check silently runs on tsc defaults — losing the
+            # project's strict/paths/jsx/lib settings. The resulting
+            # "TS6053: File 'tsconfig.json' not found" lands in the 6xxx band
+            # that the diagnostic filter below drops, so the failure is
+            # invisible. Verified: bare -> TS6053, "./" -> clean.
+            "extends": f"./{config_filename}",
+            "include": rel_targets,
         }
         if allow_js:
             # JS configs may omit allowJs/checkJs — force them so the JS file
@@ -266,7 +337,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 _json.dump(temp_body, fh)
         except OSError as e:
             logger.debug("could not write temp tsconfig: %s", e)
-            return SyntaxValidationResult(ok=True, language=language)
+            return _skip("the temporary tsconfig could not be written")
 
         cmd = [
             "npx", "tsc", "--noEmit", "--pretty", "false",
@@ -276,34 +347,59 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
             try:
                 proc = subprocess.run(
                     cmd,
-                    capture_output=True, text=True, timeout=120,
+                    capture_output=True, text=True,
+                    # Scaled by batch size; startup dominates, so the base
+                    # budget still covers the common small batch.
+                    timeout=30 + 5 * len(file_paths),
                     cwd=project_root,
                 )
             except FileNotFoundError:
                 logger.debug("tsc not installed; skipping semantic validation")
-                return SyntaxValidationResult(ok=True, language=language)
+                return _skip("tsc is not installed (npx could not resolve it)")
             except subprocess.TimeoutExpired:
-                logger.debug("tsc timed out for %s; skipping", file_path)
-                return SyntaxValidationResult(ok=True, language=language)
+                logger.debug("tsc timed out for %s; skipping", file_paths)
+                return _skip("tsc timed out")
             except Exception as e:
                 logger.debug("tsc semantic check failed: %s", e)
-                return SyntaxValidationResult(ok=True, language=language)
+                return _skip("tsc could not be run")
 
             if proc.returncode == 0:
-                return SyntaxValidationResult(ok=True, language=language)
+                # tsc exited clean — a real verdict, not a skip. Sharing the
+                # skip constructor here would report a genuinely checked file as
+                # unchecked, the same conflation in the other direction.
+                return {
+                    p: SyntaxValidationResult(ok=True, language=language)
+                    for p in file_paths
+                }
 
             # Parse: file.ts(10,5): error TS2304: Cannot find name 'foo'.
-            target_norm = os.path.normpath(os.path.abspath(file_path))
-            errors: list[SyntaxError_] = []
-            has_error = False
+            by_norm = {os.path.normpath(os.path.abspath(p)): p for p in file_paths}
+            collected: dict[str, list[SyntaxError_]] = {p: [] for p in file_paths}
+            failed: set[str] = set()
             for line in (proc.stdout + proc.stderr).splitlines():
                 m = _TSC_ERROR_RE.match(line)
                 if not m:
                     continue
                 _file, _line, _col, _code, _msg = m.groups()
-                # Only report the file we asked about (defensive: project mode
-                # pins include, but extends may pull ambient siblings).
-                if _file and os.path.normpath(os.path.abspath(_file)) != target_norm:
+                # Only report the files we asked about (project mode pins
+                # include, but extends may pull ambient siblings, and a batched
+                # run legitimately reports every file in the group).
+                #
+                # tsc prints paths relative to ITS cwd (= project_root), so a
+                # bare abspath() would resolve them against the agent process's
+                # cwd instead — and this process never chdirs, so that is
+                # wherever the user launched from. Whenever it differs from
+                # project_root (monorepo package, launch from a subdirectory)
+                # EVERY diagnostic missed the target and was dropped, making a
+                # broken file report ok=True/errors=[] — indistinguishable from
+                # "checked, clean". Resolve against the tool's cwd, as
+                # go_provider already does. normpath collapses the "./" prefix
+                # tsc sometimes emits.
+                owner = (
+                    by_norm.get(resolve_tool_path(project_root, _file))
+                    if _file else None
+                )
+                if owner is None:
                     continue
                 # Only semantic (2xxx) band: syntax (1xxx) is handled by
                 # validate_syntax, config (5xxx) and implicit-any (7xxx) are noise.
@@ -313,19 +409,22 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                     continue
                 if not (2000 <= num <= 2999):
                     continue
-                errors.append(SyntaxError_(
-                    file=file_path,
+                collected[owner].append(SyntaxError_(
+                    file=owner,
                     line=int(_line), col=int(_col),
                     message=f"{_code}: {_msg}",
                     severity="error",
                     code=_code,
                 ))
-                has_error = True
-            return SyntaxValidationResult(
-                ok=not has_error,
-                errors=errors,
-                language=language,
-            )
+                failed.add(owner)
+            return {
+                p: SyntaxValidationResult(
+                    ok=p not in failed,
+                    errors=collected[p],
+                    language=language,
+                )
+                for p in file_paths
+            }
         finally:
             try:
                 os.unlink(tmp_config)

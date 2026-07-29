@@ -966,7 +966,6 @@ class ExternalLLMService:
                 llm_out: str,
                 *,
                 force_file_block: bool = False,
-                allow_salvage: bool = True,
             ) -> tuple[bool, str, str, Optional[str], str]:
                 """
                 Returns:
@@ -1238,13 +1237,11 @@ class ExternalLLMService:
 
             if progress_callback:
                 progress_callback("parsing_response", "Parsing LLM response...", 3, 4)
-            # For full_file mode, force FILE block only parsing, disable salvage
+            # For full_file mode, force FILE block only parsing
             force_file = (mode == "full_file")
-            allow_salvage = (mode != "full_file")
             ok1, patch, explanation, synth_reason, fail_reason = _evaluate_llm_text(
                 llm_text,
                 force_file_block=force_file,
-                allow_salvage=allow_salvage
             )
             context_meta = dict(context_meta or {})
             # Expose LLM_CONTEXT meta for debugging (token policy / git identity / snippet sizes)
@@ -1316,7 +1313,6 @@ class ExternalLLMService:
                 ok2, patch2, explanation2, synth2, fail2 = _evaluate_llm_text(
                     llm_text2,
                     force_file_block=True,
-                    allow_salvage=False,
                 )
                 if ok2:
                     patch = patch2

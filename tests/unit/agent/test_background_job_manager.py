@@ -197,20 +197,20 @@ def test_output_survives_intermediate_reads():
         mgr.shutdown()
 
 
-def test_recover_communicate_partial_after_timeout():
-    """Regression (Bug #2): output consumed by communicate() before
-    TimeoutExpired must be salvaged into the job's accumulated buffer.
-    _fileobj2output holds a LIST of bytes chunks — the original fix treated it
-    as bytes and silently no-opped via AttributeError."""
-    import subprocess
+def test_pre_timeout_output_rides_the_handover_into_the_job_buffer():
+    """Regression (Bug #2): what the command printed before the timeout must
+    reach the job's accumulated buffer.
+
+    The bash tool now reads the pipes itself into a bounded capture, so the
+    hand-over is a plain assignment rather than an excavation of CPython's
+    private ``_fileobj2output`` — but the contract the CONSUMER implements is
+    unchanged, and it is the consumer that had the defect. Set here the way
+    ``_tool_shell_exec`` sets it."""
     proc = _real_proc("echo EARLY_OUT; echo EARLY_ERR >&2; sleep 30")
     mgr = BackgroundJobManager(max_jobs=5, reap_interval=9999.0)
     try:
-        with pytest.raises(subprocess.TimeoutExpired):
-            proc.communicate(timeout=1)
-        bjm.recover_communicate_partial(proc)
-        assert getattr(proc, "_recovered_stdout", "") == "EARLY_OUT\n"
-        assert getattr(proc, "_recovered_stderr", "") == "EARLY_ERR\n"
+        proc._recovered_stdout = "EARLY_OUT\n"
+        proc._recovered_stderr = "EARLY_ERR\n"
 
         jid = mgr.start("timed-out", proc)
         info = mgr.get_info(jid)
@@ -400,4 +400,94 @@ def test_short_output_is_preserved_verbatim():
         assert info.stdout == "hello\n"
         assert not info.stdout.startswith(bjm._TRUNCATION_MARKER)
     finally:
+        mgr.shutdown()
+
+
+# ── the salvage was inert for a stdout-only command ────────────────────────
+# The test above passes and always did, because its script writes to BOTH
+# streams. That is the one shape in which the defect cannot fire: the producer
+# set each attribute only when its stream was non-empty, and `read_output`
+# fetched the pair with plain attribute access, stderr second — so an absent
+# `_recovered_stderr` raised AttributeError and discarded the already-fetched
+# stdout. A command that writes to stdout and not to stderr is the common case,
+# so the feature was inert in normal use while its own test stayed green. Both
+# ends are fixed, and both are still pinned: the producer always writes the
+# pair, and the consumer below survives one of them being missing outright.
+
+
+@pytest.mark.parametrize(
+    "script,marker,stream",
+    [
+        ("echo ONLY_OUT; sleep 30", "ONLY_OUT", "stdout"),
+        ("echo ONLY_ERR >&2; sleep 30", "ONLY_ERR", "stderr"),
+    ],
+    ids=["stdout-only", "stderr-only"],
+)
+def test_partial_output_survives_when_one_stream_is_silent(script, marker, stream):
+    proc = _real_proc(script)
+    mgr = BackgroundJobManager(max_jobs=5, reap_interval=9999.0)
+    try:
+        proc._recovered_stdout = marker + "\n" if stream == "stdout" else ""
+        proc._recovered_stderr = marker + "\n" if stream == "stderr" else ""
+
+        jid = mgr.start("timed-out", proc)
+        info = mgr.get_info(jid)
+        assert marker in getattr(info, stream), (
+            f"pre-timeout {stream} was salvaged and then dropped: "
+            f"stdout={info.stdout!r} stderr={info.stderr!r}"
+        )
+    finally:
+        proc.kill()
+        proc.wait()
+        mgr.shutdown()
+
+
+def test_a_missing_recovery_attribute_does_not_discard_the_other():
+    """The consumer must tolerate one name being absent entirely.
+
+    The asymmetry was the whole bug — a reader that fetched the pair with plain
+    attribute access had no way to tell "nothing on this stream" from "attribute
+    missing", and threw away the stdout it had already fetched. Asserted against
+    the reader rather than any one producer, so it holds for whatever sets it.
+    """
+    proc = _real_proc("sleep 30")
+    mgr = BackgroundJobManager(max_jobs=5, reap_interval=9999.0)
+    try:
+        proc._recovered_stdout = "ONLY_OUT\n"
+        assert not hasattr(proc, "_recovered_stderr")
+
+        jid = mgr.start("half-recovered", proc)
+        info = mgr.get_info(jid)
+        assert "ONLY_OUT" in info.stdout, (
+            f"a missing _recovered_stderr discarded the recovered stdout: "
+            f"{info.stdout!r}"
+        )
+    finally:
+        proc.kill()
+        proc.wait()
+        mgr.shutdown()
+
+
+def test_read_output_tolerates_a_missing_recovery_attribute():
+    """The reader is defensive on its own, not only because the producer is.
+
+    Either end alone would let the other reintroduce the coupling, so the
+    contract is pinned from both sides. Simulated directly rather than through
+    a timeout, because the producer no longer creates this state.
+    """
+    proc = _real_proc("sleep 30")
+    mgr = BackgroundJobManager(max_jobs=5, reap_interval=9999.0)
+    try:
+        jid = mgr.start("half-recovered", proc)
+        job = mgr._jobs[jid]
+        job.proc._recovered_stdout = "SALVAGED\n"
+        # _recovered_stderr deliberately absent — the old shape.
+        if hasattr(job.proc, "_recovered_stderr"):
+            del job.proc._recovered_stderr
+        out, _err = job.read_output()
+        assert "SALVAGED" in out, "a missing stderr attribute discarded stdout"
+        assert "SALVAGED" in job._stdout_buf
+    finally:
+        proc.kill()
+        proc.wait()
         mgr.shutdown()

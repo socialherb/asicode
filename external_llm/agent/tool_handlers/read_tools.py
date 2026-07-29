@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...common.indent_utils import INDENT_GUTTER_BAR, format_numbered_line
+from ...common.subprocess_utils import CANCEL_POLL_INTERVAL as _CANCEL_POLL_INTERVAL
+from ...common.subprocess_utils import cancel_probe as _cancel_probe
 from ..config.thresholds import config as _cfg
 from ..rag_configs import CodeTokenizer
 from ..rag_searcher import _bm25_score as _bm25
@@ -40,6 +42,25 @@ _format_numbered_line = format_numbered_line
 # Method names listed per class in read_file's over-cap outline. Matches the
 # get_file_outline tool's own cap so the two views of a file agree.
 _METHODS_PER_CLASS = 15
+
+
+def _outline_extent(sym: Any) -> str:
+    """Render a symbol's line extent for an outline row.
+
+    ``"120–450"`` when the end line is known, a bare ``"120"`` when it is not.
+    Both forms occur: every AST-backed outline (Python, TS/JS, tree-sitter for
+    the rest) carries ``end_line``, but ``_outline_ripgrep`` — the fallback for
+    a language with no installed grammar — matches a declaration by regex and
+    has no extent to report. Degrading to the start alone keeps that path
+    exactly as useful as it was rather than printing a fabricated range.
+
+    ``end_line > line`` rather than ``!= None``: a one-line symbol renders as a
+    bare line number, since "300–300" reads like a mistake and says no more.
+    """
+    end = getattr(sym, "end_line", None)
+    if end and end > sym.line:
+        return f"{sym.line}–{end}"
+    return str(sym.line)
 
 
 # ── File-extension → language-label map (shared by read_file / read_symbol) ──
@@ -98,6 +119,120 @@ _BOM_ENCODINGS: tuple[tuple[bytes, str], ...] = (
 _IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff"})
 
 _BINARY = "binary"
+
+# How long a search process may take to EXIT after it has closed stdout. Kept
+# apart from the search timeout because they bound different things: the search
+# budget bounds how long the tool may look, this bounds teardown after it has
+# already answered. See _run_search_bounded.
+_EXIT_GRACE = 5.0
+
+
+# Above this size read_file streams instead of materialising. Below it the whole
+# file is read and split in one go, which is what read_file has always done and
+# is measurably the faster of the two at that scale — the streaming path exists
+# for the case where materialising costs hundreds of megabytes, not to replace a
+# working fast path. See _stream_split_window.
+_STREAM_ABOVE_BYTES = 1 << 20
+# Bytes per read while streaming.
+_STREAM_CHUNK = 1 << 16
+# Stands in for "to the end of the file" when the caller gave a start_line
+# but no end_line — the retained window still has to be an integer bound.
+_MAX_LINE_INDEX = 1 << 62
+
+
+class SearchCancelled(Exception):
+    """The user cancelled a running search. Distinct from a timeout.
+
+    They mean different things to the caller and must not share a type: a
+    timeout is the tool giving up and is reported as a (successful) empty
+    answer, while a cancel is the user withdrawing the request and has to come
+    back as `ok=False` — reported as success it reads as "asked and answered"
+    and the model moves on as if the search had found nothing.
+    """
+
+
+def _stream_split_window(fh, prefix: bytes, first: int, last: int, retain_chars: int):
+    """``(total_lines, lines[first-1:last])`` without holding the whole file.
+
+    read_file materialised every byte of a file to answer questions that need
+    almost none of it. Measured on a 108 MB log: +509 MB of peak RSS to produce
+    a "too long, use start_line" refusal, and the same again for the ranged read
+    the refusal invites. The bytes, the decoded string and a list of two million
+    line objects all existed at once.
+
+    The split has to stay ``str.splitlines()``, exactly — read_file's line
+    numbers are its own, and anchor_edit's ``anchor_ast_lineno`` mode builds a
+    matching array, so the semantics are load-bearing across tools. That rules
+    out splitting on ``\\n``: ``splitlines`` also breaks on ``\\v \\f \\x1c \\x1d
+    \\x1e \\x85 \\u2028 \\u2029``, and a file containing any of them would
+    silently renumber.
+
+    So the chunk boundary is the whole problem, and there are three of them:
+    a line straddling two reads, a multibyte sequence straddling two reads, and
+    ``\\r\\n`` straddling two reads — the last being the only ambiguous one,
+    since a trailing ``\\r`` is a complete break until an ``\\n`` arrives and
+    makes it half of one. A part is therefore carried forward when it is
+    unterminated OR ends with a lone ``\\r``.
+
+    Verified rather than argued: 20,000 random texts built from every break
+    character, multibyte codepoints and invalid UTF-8, at five chunk sizes,
+    against ``raw.decode("utf-8", errors="replace").splitlines()``.
+
+    ``retain_chars`` bounds the window itself, because "give me lines 1 to
+    2000000" is a request the caller can make and the char budget downstream
+    will cut long before that. The count keeps going after retention stops, so
+    the total is still exact.
+    """
+    import codecs as _codecs
+
+    _dec = _codecs.getincrementaldecoder("utf-8")("replace")
+    _carry = ""
+    _total = 0
+    _window: list[str] = []
+    _kept = 0
+    _full = False
+
+    def _emit(part: str) -> None:
+        nonlocal _total, _kept, _full
+        _total += 1
+        if _full or not (first <= _total <= last):
+            return
+        _stripped = part.splitlines()
+        _line = _stripped[0] if _stripped else ""
+        if _kept + len(_line) > retain_chars:
+            _full = True
+            return
+        _window.append(_line)
+        _kept += len(_line)
+
+    _raw = prefix
+    while True:
+        if _raw:
+            _buf = _carry + _dec.decode(_raw)
+            _parts = _buf.splitlines(keepends=True)
+            _carry = ""
+            if _parts:
+                _tail = _parts[-1]
+                if _tail.splitlines()[0] == _tail or _tail.endswith("\r"):
+                    _carry = _parts.pop()
+            if _full or _total >= last or _total + len(_parts) < first:
+                # Nothing in this chunk can be retained — it is entirely before
+                # the window, or past it, or retention is already full. Only the
+                # count is still owed, and a per-line Python call to produce it
+                # is the whole cost at scale: a 108 MB file is 2M calls, ~0.9 s
+                # against a 0.13 s bulk split. (Counting break characters
+                # instead of splitting was measured and is 3x SLOWER — ten
+                # passes with str.count lose to one optimised split.)
+                _total += len(_parts)
+            else:
+                for _part in _parts:
+                    _emit(_part)
+        _raw = fh.read(_STREAM_CHUNK)
+        if not _raw:
+            break
+    for _part in (_carry + _dec.decode(b"", True)).splitlines(keepends=True):
+        _emit(_part)
+    return _total, _window
 
 
 def _classify_binary(head: bytes) -> str | None:
@@ -399,41 +534,69 @@ class ReadToolsMixin:
         if not abs_path.is_file():
             return self._make_result(ok=False, content="", error=f"Not a file: {path!r}")
 
+        start_line = args.get("start_line")
+        end_line = args.get("end_line")
+
+        # The window worth keeping, decided BEFORE the file is read. Without a
+        # range that is the line cap — anything past it is refused, so reading it
+        # is pure cost. With one it is the range asked for, bounded by twice the
+        # char budget that will cut it downstream (numbered lines are longer than
+        # raw ones, so the budget always binds first and `truncated_at` stays
+        # exact).
+        _first = max(1, int(start_line or 1)) if (start_line or end_line) else 1
+        if start_line is None and end_line is None:
+            _last = _cfg.lines.READ_FILE_FULL_LINES
+        elif end_line is not None:
+            _last = int(end_line)
+        else:
+            _last = _MAX_LINE_INDEX
+        _retain = _cfg.lines.READ_FILE_MAX_CHARS * 2
+
         # Sniff a prefix before committing to the whole file, so a binary is
         # rejected without ever being read past its header. The body is read
         # from the same handle, so the text path pays for one open, not two.
         try:
+            _size = abs_path.stat().st_size
             with abs_path.open("rb") as fh:
                 head = fh.read(_BINARY_SNIFF_BYTES)
                 verdict = _classify_binary(head)
                 if verdict is not None:
-                    size = abs_path.stat().st_size
                     return self._make_result(
                         ok=True,
-                        content=_binary_guidance(path, size, verdict),
-                        metadata={"binary": True, "reason": verdict, "byte_size": size},
+                        content=_binary_guidance(path, _size, verdict),
+                        metadata={"binary": True, "reason": verdict, "byte_size": _size},
                     )
-                raw = head + fh.read()
+                if _size > _STREAM_ABOVE_BYTES:
+                    # Streaming answers the same questions off a bounded window.
+                    # Measured on a 108 MB log, one cold process per row:
+                    #   refusal   511.4 MB / 0.25 s  ->  0.8 MB / 0.18 s
+                    #   lines 100-120   511.4 MB / 0.16 s  ->  0.2 MB / 0.12 s
+                    # Identical output, and no slower — the file is read once
+                    # either way, and the decoded copy is what cost the time.
+                    _total, lines = _stream_split_window(
+                        fh, head, _first, _last, _retain,
+                    )
+                else:
+                    lines = (head + fh.read()).decode(
+                        "utf-8", errors="replace",
+                    ).splitlines()
+                    _total = len(lines)
+                    lines = lines[_first - 1:_last]
         except Exception as e:
             return self._make_result(ok=False, content="", error=f"Failed to read {path!r}: {e}")
 
-        lines = raw.decode("utf-8", errors="replace").splitlines()
-
-        start_line = args.get("start_line")
-        end_line = args.get("end_line")
-
         if start_line is None and end_line is None:
-            if len(lines) > _cfg.lines.READ_FILE_FULL_LINES:
+            if _total > _cfg.lines.READ_FILE_FULL_LINES:
                 return self._make_result(
                     ok=True,
-                    content=self._over_cap_guidance(path, len(lines)),
-                    metadata={"over_line_cap": True, "line_count": len(lines)},
+                    content=self._over_cap_guidance(path, _total),
+                    metadata={"over_line_cap": True, "line_count": _total},
                 )
-            s, e = 1, len(lines)
+            s, e = 1, _total
         else:
-            s = max(1, int(start_line or 1))
-            _requested_end = int(end_line) if end_line is not None else len(lines)
-            e = min(len(lines), _requested_end)
+            s = _first
+            _requested_end = int(end_line) if end_line is not None else _total
+            e = min(_total, _requested_end)
             # Two different mistakes, which the single "out of range" message
             # conflated — and it named the CLAMPED end, so asking for 9999-10005
             # of a 200-line file was reported as "range 9999-200", a range the
@@ -454,7 +617,7 @@ class ReadToolsMixin:
                     error=(
                         f"end_line must be 1 or greater (got {_requested_end}); "
                         f"line numbers are 1-based. Omit end_line to read to the "
-                        f"end of {path!r} ({len(lines)} lines)."
+                        f"end of {path!r} ({_total} lines)."
                     ),
                 )
             # Guarded on end_line being SUPPLIED: with it omitted the default is
@@ -467,19 +630,19 @@ class ReadToolsMixin:
                     ok=False, content="",
                     error=(
                         f"start_line {s} is after end_line {_requested_end} "
-                        f"in {path!r} ({len(lines)} lines). Swap them."
+                        f"in {path!r} ({_total} lines). Swap them."
                     ),
                 )
-            if s > len(lines):
+            if s > _total:
                 return self._make_result(
                     ok=False, content="",
                     error=(
                         f"start_line {s} is past the end of {path!r}, which has "
-                        f"{len(lines)} lines."
+                        f"{_total} lines."
                     ),
                 )
 
-        numbered_lines = [_format_numbered_line(i, ln) for i, ln in enumerate(lines[s - 1 : e], start=s)]
+        numbered_lines = [_format_numbered_line(i, ln) for i, ln in enumerate(lines[: e - s + 1], start=s)]
         # Char budget. Applied here rather than only on the no-range path
         # because an explicit range is the documented way around the line cap,
         # so it is the path most able to overrun the context window.  Truncate
@@ -498,7 +661,7 @@ class ReadToolsMixin:
         lang = path.split(".")[-1] if "." in path else ""
         lang_label = _EXT_LANG_MAP.get(lang, "")
 
-        result_content = f"`{path}` ({len(lines)} lines) — `│N│` = leading-indent column count"
+        result_content = f"`{path}` ({_total} lines) — `│N│` = leading-indent column count"
         if start_line is not None or end_line is not None:
             result_content += f" lines {s}–{e}"
         if lang_label:
@@ -518,13 +681,13 @@ class ReadToolsMixin:
             else:
                 result_content += (
                     f"\n\n[Truncated at the {budget:,}-char output budget. "
-                    f"Lines {truncated_at}–{len(lines)} were not returned — "
+                    f"Lines {truncated_at}–{_total} were not returned — "
                     f"call read_file again with start_line={truncated_at}.]"
                 )
 
         meta: dict[str, Any] = {}
         if truncated_at is not None:
-            meta = {"truncated": True, "resume_line": truncated_at, "line_count": len(lines)}
+            meta = {"truncated": True, "resume_line": truncated_at, "line_count": _total}
             if partial_line is not None:
                 meta["partial_line"] = partial_line
         return self._make_result(ok=True, content=result_content, metadata=meta)
@@ -552,9 +715,22 @@ class ReadToolsMixin:
             return head + " Call read_file again with start_line and end_line."
 
         cap = _cfg.lines.READ_FILE_OUTLINE_MAX_SYMBOLS
+        shown_symbols = symbols[:cap]
+        # The END line is the half that was missing. This outline exists to make
+        # the follow-up read_file exact, but printing only a start left the model
+        # to invent end_line — and inventing it is where malformed ranges come
+        # from, including inverted ones (start_line=600, end_line=460) that fail
+        # the call outright and cost a turn. The extent is already computed by
+        # every AST-backed outline, so surfacing it is free.
+        extents = [_outline_extent(s) for s in shown_symbols]
+        width = max((len(x) for x in extents), default=1)
+        # Methods hang under the symbol they belong to, so the continuation
+        # indent has to track the (now variable-width) range column.
+        method_indent = " " * (len("  lines ") + width + 2)
+
         rows: list[str] = []
-        for s in symbols[:cap]:
-            rows.append(f"  line {s.line:>5}  [{s.kind}] {s.name}")
+        for s, extent in zip(shown_symbols, extents):
+            rows.append(f"  lines {extent:>{width}}  [{s.kind}] {s.name}")
             # Methods carry no line of their own in the outline, so listing the
             # NAMES is what makes them reachable: read_symbol takes a name, and
             # a file that is one 2000-line class would otherwise offer nothing
@@ -563,17 +739,152 @@ class ReadToolsMixin:
             if methods:
                 shown = ", ".join(methods[:_METHODS_PER_CLASS])
                 more = f" (+{len(methods) - _METHODS_PER_CLASS} more)" if len(methods) > _METHODS_PER_CLASS else ""
-                rows.append(f"           methods: {shown}{more}")
+                rows.append(f"{method_indent}methods: {shown}{more}")
         if len(symbols) > cap:
             rows.append(f"  … {len(symbols) - cap} more symbols (get_file_outline for the full map)")
 
         return (
             head
-            + "\n\nOutline:\n"
+            + "\n\nOutline — each range is exact; pass it as start_line/end_line:\n"
             + "\n".join(rows)
             + "\n\nNext: read_symbol with a name above (exact, no range needed), "
               "or read_file with start_line/end_line."
         )
+
+    @staticmethod
+    def _run_search_bounded(cmd, cwd, timeout, retain_lines, cancelled=None):
+        """Run a line-oriented search, keeping at most *retain_lines* of stdout.
+
+        Returns ``(returncode, lines, total_lines, stderr)`` where *lines* is a
+        prefix of the output and *total_lines* is the true count.
+
+        ``capture_output=True`` materialises everything the tool prints before
+        any cap can be applied, and the cap here is ~24 KB of content: ripgrep
+        over a 108 MB log with a match on every line cost 522 MB of peak RSS to
+        produce it (measured). The tool's own budget was already applied twice —
+        ``max_results`` and a char cap — but both ran on a list that had to
+        exist first. Nothing about a search needs the whole output resident, so
+        it is streamed and only the retained prefix is kept.
+
+        The count is still exact. That matters: reporting the DISPLAYED count as
+        the match count was a real bug once (50 reported for 29,871), and the
+        model reads it as "I have seen everything".
+
+        stderr is drained on its own thread — reading stdout to exhaustion while
+        the child fills the stderr pipe is the classic deadlock ``communicate``
+        exists to avoid — and bounded, since a permission-denied storm is
+        exactly the run that also produces the most stdout.
+
+        stdout gets a thread of its own for a different reason: *timeout*.
+        Iterating the pipe on this thread blocks in ``read()`` until a line
+        arrives, so a deadline checked between lines is only ever checked when
+        the search is PRODUCING — and the slow search this budget exists to
+        bound is the silent one (a rare pattern over a huge tree emits nothing
+        for minutes). Measured against a 1.0 s budget: ``sleep 5`` returned at
+        5.01 s and ``echo hi; sleep 5`` at 5.03 s, i.e. no timeout at all.
+        Waiting on an Event instead makes the deadline independent of whether
+        any output ever shows up.
+
+        *cancelled* is a zero-arg predicate polled on the same wait. ESC reached
+        `bash` and stopped at the tool next door: a search is the other call
+        that can hold a turn for two minutes, and until now nothing observed a
+        cancel while it ran. Raises :class:`SearchCancelled` after tearing the
+        process group down — an abandoned search must not outlive the request
+        that asked for it.
+        """
+        import os
+        import signal
+        import subprocess
+        import threading
+        import time
+
+        _STDERR_CAP = 64 * 1024
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                start_new_session=True,
+            )
+        except OSError as exc:
+            # A missing binary is an OSError, not a SubprocessError. Named here
+            # rather than left to the caller's generic handler, which would
+            # report "grep failed: [Errno 2]" without saying what was missing.
+            raise RuntimeError(f"could not start {cmd[0]!r}: {exc}") from exc
+        err_chunks: list[str] = []
+
+        def _drain_err():
+            try:
+                for chunk in iter(lambda: proc.stderr.read(8192), ""):
+                    if sum(map(len, err_chunks)) < _STDERR_CAP:
+                        err_chunks.append(chunk)
+            except (OSError, ValueError) as exc:
+                # The pipe closed under us (kill path) — stdout is the result
+                # that matters, so this degrades to "no stderr", never fails.
+                logger.debug("search stderr drain ended early: %s", exc)
+
+        err_thread = threading.Thread(target=_drain_err, daemon=True)
+        err_thread.start()
+
+        lines: list[str] = []
+        counted = [0]
+        read_done = threading.Event()
+
+        def _drain_out():
+            try:
+                for line in proc.stdout:
+                    counted[0] += 1
+                    if len(lines) < retain_lines:
+                        lines.append(line.rstrip("\n"))
+            except (OSError, ValueError) as exc:
+                # Same degradation as stderr: the pipe closed under us on the
+                # kill path, and the prefix read so far is still the answer.
+                logger.debug("search stdout drain ended early: %s", exc)
+            finally:
+                read_done.set()
+
+        out_thread = threading.Thread(target=_drain_out, daemon=True)
+        out_thread.start()
+
+        deadline = time.monotonic() + timeout
+        try:
+            while not read_done.is_set():
+                _remaining = deadline - time.monotonic()
+                if _remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                if read_done.wait(timeout=min(_CANCEL_POLL_INTERVAL, _remaining)):
+                    break
+                if cancelled is not None and cancelled():
+                    raise SearchCancelled(cmd)
+            # EOF on stdout means the search is done producing, so exiting is
+            # not part of the search budget and gets its own grace. Charging it
+            # the deadline's remainder meant a search that used its budget had
+            # 0.1 s to exit — and a process killed at 0.1 s after delivering
+            # every match was reported as "grep timed out", discarding a
+            # complete result.
+            proc.wait(timeout=_EXIT_GRACE)
+        except (subprocess.TimeoutExpired, SearchCancelled):
+            # The process GROUP, not the process: rg is spawned in its own
+            # session, so nothing on this side reaps it and a search abandoned
+            # by ESC would otherwise keep walking the tree unowned — the same
+            # shape the bash cancel path exists to prevent.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError) as exc:
+                logger.debug("search process group already gone: %s", exc)
+            proc.wait(timeout=5)
+            raise
+        finally:
+            # Joined before the pipes close: the drain threads are reading these
+            # very handles, and closing under them turns an orderly EOF into the
+            # ValueError the drains only tolerate as a degradation.
+            out_thread.join(timeout=2)
+            err_thread.join(timeout=2)
+            for _stream in (proc.stdout, proc.stderr):
+                try:
+                    _stream.close()
+                except (OSError, ValueError) as exc:
+                    logger.debug("search pipe close failed: %s", exc)
+        return proc.returncode, lines, counted[0], "".join(err_chunks)
 
     def _tool_grep(self, args: dict[str, Any]) -> "ToolResult":
         """Search for a pattern across files using grep (or ripgrep if available)."""
@@ -651,24 +962,35 @@ class ReadToolsMixin:
                 cmd.append(pattern)
                 cmd.append(search_path)
 
+            # Retained prefix: what ranking and display can possibly need. The
+            # BM25 pass below used to do this cut itself, AFTER the whole output
+            # was already a list in memory; doing it while reading bounds the
+            # memory too, and the exact match count still comes back separately.
+            _retain = max(max_results * 20, 5000)
             try:
-                proc = subprocess.run(
-                    cmd,
-                    cwd=self.repo_root,
-                    capture_output=True, text=True, timeout=120,
+                _rc, _lines, _total, _stderr = self._run_search_bounded(
+                    cmd, self.repo_root, 120, _retain,
+                    cancelled=_cancel_probe(self.config),
+                )
+            except SearchCancelled:
+                # ok=False, mirroring the bash cancel: the user withdrew the
+                # request, so this is not an answer.
+                return self._make_result(
+                    ok=False, content="", error="Operation cancelled",
+                    retryable=False, metadata={"cancelled": True},
                 )
             except subprocess.TimeoutExpired:
                 return self._make_result(ok=True, content=f"grep timed out (pattern={pattern!r})")
             except Exception as e:
                 return self._make_result(ok=False, content="", error=f"grep failed: {e}")
 
-            if proc.returncode != 2 or use_fixed:
+            if _rc != 2 or use_fixed:
                 break  # success or non-regex error — done
             # Exit code 2 = regex syntax error → retry as fixed string
             use_fixed = True
 
-        if proc.returncode == 0 or (proc.returncode == 1 and proc.stdout.strip()):
-            lines = proc.stdout.splitlines()
+        if _rc == 0 or (_rc == 1 and _lines):
+            lines = _lines
             # Captured BEFORE the ranking block, which SELECTS the top
             # ``max_results`` and discards the rest — after it, ``len(lines)`` is
             # the displayed count, not the match count. Deriving the header and
@@ -677,7 +999,7 @@ class ReadToolsMixin:
             # your pattern" hint entirely, so the agent believed it had seen
             # every hit and stopped searching. Only stop-word patterns
             # (tokenize("import") == []) escaped, because they skip ranking.
-            total = len(lines)
+            total = _total
 
             # BM25 ranking: re-rank FLAT match-lines (context==0) by relevance to
             # the search pattern. Each match line is treated as a pseudo-document
@@ -701,9 +1023,8 @@ class ReadToolsMixin:
                     # BM25 on 50k+ lines is O(n*q) CPU — pre-cutting to a sensible
                     # cap keeps ranking quality (top N out of shuffled filesystem
                     # order ≅ top N out of K*N) while bounding worst-case time.
-                    _bm25_cap = max(max_results * 20, 5000)
-                    if len(lines) > _bm25_cap:
-                        lines = lines[:_bm25_cap]
+                    # (The pre-cut this comment describes now happens while
+                    # the output is read — see _run_search_bounded's `retain`.)
                     _tokenized = [_tok.tokenize(_item_) for _item_ in lines]
                     _doc_tc: list[dict[str, int]] = [dict(Counter(t)) for t in _tokenized]
                     _doc_lens = [len(t) for t in _tokenized]
@@ -752,17 +1073,17 @@ class ReadToolsMixin:
                 result += f"\n... (truncated to {max_results} of {total} matches — refine your pattern)"
 
             return self._make_result(ok=True, content=result)
-        elif proc.returncode == 1:
+        elif _rc == 1:
             tool_name = "rg" if use_rg else "grep"
             return self._make_result(
                 ok=True,
                 content=f"{tool_name}: {pattern!r} in {search_path} — no matches.",
             )
         else:
-            stderr = (proc.stderr or "").strip()[:500]
+            stderr = (_stderr or "").strip()[:500]
             return self._make_result(
                 ok=False, content="",
-                error=f"grep failed (exit={proc.returncode}): {stderr}",
+                error=f"grep failed (exit={_rc}): {stderr}",
             )
 
     def _tool_read_symbol(self, args: dict[str, Any]) -> "ToolResult":
@@ -979,7 +1300,11 @@ class ReadToolsMixin:
         lines: list[str] = [f"File outline: {path} ({len(symbols)} symbols)\n"]
         for s in symbols:
             prefix = f"  [{s.kind}] {s.name}"
-            loc = f"(line {s.line})"
+            # Same reasoning as read_file's over-cap outline (_outline_extent):
+            # this tool's own closing line sends the caller to read_file with a
+            # range, so withholding the end line makes it guess one.
+            _extent = _outline_extent(s)
+            loc = f"(lines {_extent})" if "–" in _extent else f"(line {_extent})"
             if s.kind == "class":
                 detail = ""
                 if s.bases:

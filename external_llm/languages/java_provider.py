@@ -199,10 +199,14 @@ class JavaSyntaxProvider(SyntaxProvider):
           / ``build.gradle.kts`` / ``settings.gradle``) — no stable source root.
         - Uses ``-d <TemporaryDirectory>`` so ``.class`` output is sandboxed and
           auto-cleaned, never polluting the source tree.
-        - Skips (``ok=True``) when javac is missing/timed out (non-blocking).
+        - Skips (``checked=False``) when javac is missing/timed out
+          (non-blocking, and never reported as a clean verdict it did not reach).
         """
+        def _skip(reason: str) -> SyntaxValidationResult:
+            return SyntaxValidationResult.unchecked(LanguageId.JAVA, reason)
+
         if not file_path or not os.path.exists(file_path):
-            return SyntaxValidationResult(ok=True, language=LanguageId.JAVA)
+            return _skip("the file is not on disk")
 
         project_root = detect_project_root(
             file_path,
@@ -214,7 +218,9 @@ class JavaSyntaxProvider(SyntaxProvider):
             os.path.isfile(os.path.join(project_root, m))
             for m in ("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle")
         ):
-            return SyntaxValidationResult(ok=True, language=LanguageId.JAVA)
+            return _skip(
+                "no pom.xml / build.gradle above this file, so javac has no source root"
+            )
 
         target_norm = os.path.normpath(os.path.abspath(file_path))
         # -sourcepath must be the source root (top of the package hierarchy),
@@ -232,19 +238,19 @@ class JavaSyntaxProvider(SyntaxProvider):
             try:
                 proc = subprocess.run(
                     cmd,
-                    capture_output=True, text=True, timeout=120,
+                    capture_output=True, text=True, timeout=30,
                     cwd=project_root,
                     env=_compile_env(),
                 )
             except FileNotFoundError:
                 logger.debug("javac not installed; skipping semantic validation")
-                return SyntaxValidationResult(ok=True, language=LanguageId.JAVA)
+                return _skip("javac is not installed")
             except subprocess.TimeoutExpired:
                 logger.debug("javac timed out for %s; skipping", file_path)
-                return SyntaxValidationResult(ok=True, language=LanguageId.JAVA)
+                return _skip("javac timed out")
             except Exception as e:
                 logger.debug("javac semantic check failed: %s", e)
-                return SyntaxValidationResult(ok=True, language=LanguageId.JAVA)
+                return _skip("javac could not be run")
 
             if proc.returncode == 0:
                 return SyntaxValidationResult(ok=True, language=LanguageId.JAVA)

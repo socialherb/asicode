@@ -72,39 +72,12 @@ def strip_malloc_noise(text: str) -> str:
     )
 
 
-def recover_communicate_partial(proc) -> None:
-    """Salvage output ``communicate(timeout=...)`` consumed before TimeoutExpired.
-
-    ``communicate()`` reads from the pipes into an internal buffer and raises
-    ``TimeoutExpired`` when the deadline passes — the data read so far lives in
-    ``proc._fileobj2output`` and is NOT recoverable from the raw pipe fd (those
-    bytes were already consumed). Stash it on ``proc._recovered_stdout`` /
-    ``_recovered_stderr`` so :meth:`BackgroundJob.read_output` prepends it on
-    the first drain after a timeout→background transition.
-
-    ``_fileobj2output`` maps file object → LIST of raw bytes chunks (CPython
-    appends each selector read; verified on 3.14). Treating the value as bytes
-    silently no-ops via AttributeError — join the chunks instead, isinstance-
-    guarding each so a future CPython switch to str chunks stays correct.
-    Best-effort: relies on a CPython private attribute, so any failure
-    degrades to the pre-recovery behavior (partial output lost).
-    """
-    def _join_chunks(chunks) -> str:
-        return "".join(
-            c.decode("utf-8", errors="replace") if isinstance(c, bytes) else c
-            for c in (chunks or [])
-            if isinstance(c, (bytes, str))
-        )
-
-    try:
-        partial_out = _join_chunks(proc._fileobj2output.get(proc.stdout))
-        partial_err = _join_chunks(proc._fileobj2output.get(proc.stderr))
-        if partial_out:
-            proc._recovered_stdout = partial_out
-        if partial_err:
-            proc._recovered_stderr = partial_err
-    except (AttributeError, TypeError, ValueError):
-        pass
+# NOTE: the partial-output hand-over used to be excavated from CPython's private
+# `_fileobj2output` after `communicate(timeout=...)` raised — the only place the
+# bytes it had already consumed still existed. The bash tool now reads the pipes
+# itself into a bounded capture (`_BoundedCapture`), so the data is in hand and
+# the hand-over is a plain assignment to `_recovered_stdout` / `_recovered_stderr`.
+# `read_output` below is unchanged and still the consumer of that pair.
 
 
 class BackgroundJobInfo:
@@ -170,17 +143,21 @@ class BackgroundJob:
             # buffer after a TimeoutExpired (Bug #2).  This data lives in ad-hoc
             # attributes on the proc object and is consumed exactly once (first
             # drain after background transition loses communicate's read-ahead).
-            try:
-                recovered_stdout = self.proc._recovered_stdout
-                recovered_stderr = self.proc._recovered_stderr
-                if recovered_stdout:
-                    stdout += recovered_stdout
-                    self.proc._recovered_stdout = ""
-                if recovered_stderr:
-                    stderr += recovered_stderr
-                    self.proc._recovered_stderr = ""
-            except AttributeError:
-                pass
+            #
+            # getattr with a default, per stream, NOT attribute access on both
+            # inside one try: the two streams are independent, and fetching them
+            # as a pair meant an absent `_recovered_stderr` (set only when
+            # non-empty) threw away an already-fetched `_recovered_stdout`.
+            # Measured: the attribute held "PRE-1\nPRE-2\nPRE-3\n" while this
+            # method returned "" and the model saw only post-transition output.
+            recovered_stdout = getattr(self.proc, "_recovered_stdout", "")
+            recovered_stderr = getattr(self.proc, "_recovered_stderr", "")
+            if recovered_stdout:
+                stdout += recovered_stdout
+                self.proc._recovered_stdout = ""
+            if recovered_stderr:
+                stderr += recovered_stderr
+                self.proc._recovered_stderr = ""
 
             if self.proc.stdout:
                 try:

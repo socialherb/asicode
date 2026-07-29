@@ -1228,9 +1228,13 @@ def _enter_debounce_window(monkeypatch):
     never entered and the debounce was never actually exercised. Proven by
     mutation: with ``force`` ignored outright,
     ``test_force_save_skips_debounce`` still passed.
+
+    Uses ``time.monotonic()`` (not ``time.time()``) to match the source: the
+    debounce clock domain is monotonic, so the test must set ``_last_cache_save``
+    in the same domain or the diff sign flips.
     """
     import external_llm.agent.context_budget as cb
-    monkeypatch.setattr(cb, "_last_cache_save", time.time())
+    monkeypatch.setattr(cb, "_last_cache_save", time.monotonic())
 
 
 class TestOverrideCacheForceSave:
@@ -1266,10 +1270,33 @@ class TestOverrideCacheForceSave:
         test above would also pass against a save that never writes at all."""
         import external_llm.agent.context_budget as cb
         monkeypatch.setattr(
-            cb, "_last_cache_save", time.time() - cb._CACHE_SAVE_INTERVAL - 1
+            cb, "_last_cache_save", time.monotonic() - cb._CACHE_SAVE_INTERVAL - 1
         )
         cb._save_override_cache(force=False)
         assert cache_file.exists()
+
+    def test_debounce_ignores_wallclock_backward_jump(self, cache_file, monkeypatch):
+        """Regression: debounce must key off ``time.monotonic()``, never ``time.time()``.
+
+        Before the fix, ``_save_override_cache`` read ``time.time()``; an NTP
+        backward step made ``_now - _last_cache_save`` negative, so the ``< interval``
+        guard was always true and EVERY force=False save was suppressed until the
+        wall clock caught back up.  We simulate the jump by pinning ``time.time`` to
+        the distant past while keeping monotonic in its own domain; the save must
+        still fire because the debounce elapsed in the monotonic domain.
+        """
+        import external_llm.agent.context_budget as cb
+        # Pin wall-clock to the distant past (simulated NTP backward step).
+        monkeypatch.setattr(cb.time, "time", lambda: 0.0)
+        # Place _last_cache_save one interval ago in the MONOTONIC domain.
+        monkeypatch.setattr(
+            cb, "_last_cache_save", time.monotonic() - cb._CACHE_SAVE_INTERVAL - 1
+        )
+        cb._save_override_cache(force=False)
+        assert cache_file.exists(), (
+            "wall-clock backward jump suppressed a force=False save; "
+            "debounce must use time.monotonic()"
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 13. P2: Override cache snapshot under lock (thread safety)

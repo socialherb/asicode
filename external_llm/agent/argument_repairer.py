@@ -49,7 +49,7 @@ _ARG_ALIASES: dict[str, dict[str, str]] = {
     "modify_symbol": {"path": "file_path"},
     "anchor_edit": {"path": "file_path"},
     "edit_ast": {"path": "file_path"},
-    "edit_text": {"path": "file_path"},
+    "edit_text": {"path": "file_path", "old_text": "old_string", "new_text": "new_string"},
     "read_symbol": {"path": "file_path"},
     "analyze_change_impact": {"path": "file_path"},
     # Schema uses "path"; accept the "file_path" family.

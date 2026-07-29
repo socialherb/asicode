@@ -97,3 +97,53 @@ def test_python_only_and_design_chat_filters_compose(tool_registry):
     assert not (python_only & ts_design)
     assert not (DESIGN_CHAT_ONLY_TOOL_NAMES & ts_agent)
     assert DESIGN_CHAT_ONLY_TOOL_NAMES <= ts_design
+
+
+# ── the other direction: a handler nothing advertises ───────────────────────
+# `find_tests_for_symbol` had a working handler, a working backend
+# (SymbolAwareTestFinder), an entry in work_state_digest's tool taxonomy and
+# render support in asi.py — and no schema and no _TOOL_HANDLER_MAP entry, so no
+# model could ever call it. That drift is invisible from the model's side (the
+# tool simply does not exist) and invisible from the code's side (every piece
+# looks wired to the piece next to it), which is why it needs a gate of its own.
+
+# Handlers that are dispatched by something other than a model tool call.
+# Adding a handler without a schema is a decision, so it must be made HERE.
+INTERNAL_ONLY_HANDLERS = frozenset({
+    # Reached through delegate_to_helper, not chosen by the model.
+    "delegate_to_helper",
+    "delegate_to_local_model",
+    "edit_file",
+    # Removed from the schemas because bash is equivalent and more flexible;
+    # kept dispatchable for internal callers and backward compatibility.
+    "run_tests",
+    "run_lint",
+    # Internal bookkeeping invoked by the loop, never advertised.
+    "update_memory",
+    "query_experience",
+})
+
+
+def test_every_handler_is_reachable_or_declared_internal():
+    """A dispatchable tool the model is never told about is dead weight."""
+    advertised = _names(AGENT_TOOL_SCHEMAS)
+    orphaned = sorted(
+        n for n in ToolRegistry._TOOL_HANDLER_MAP
+        if n not in advertised and n not in INTERNAL_ONLY_HANDLERS
+    )
+    assert not orphaned, (
+        f"handler exists but nothing advertises it: {orphaned}. "
+        "Either add a schema to AGENT_TOOL_SCHEMAS or list it in "
+        "INTERNAL_ONLY_HANDLERS with the reason."
+    )
+
+
+def test_internal_only_list_has_no_stale_entries():
+    """The allowlist must not outlive the handlers it excuses."""
+    stale = sorted(INTERNAL_ONLY_HANDLERS - set(ToolRegistry._TOOL_HANDLER_MAP))
+    assert not stale, f"listed as internal-only but no longer a handler: {stale}"
+    advertised = _names(AGENT_TOOL_SCHEMAS)
+    now_public = sorted(INTERNAL_ONLY_HANDLERS & advertised)
+    assert not now_public, (
+        f"advertised to models but still listed as internal-only: {now_public}"
+    )

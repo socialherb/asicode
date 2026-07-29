@@ -33,6 +33,7 @@ from ._shared_utils import (
     estimate_tokens_from_msgs,
     make_tool_signature,
     preemptive_trim,
+    render_file_diagnostics_block,
 )
 from .agent_context_manager import (
     ContextManagerMixin,
@@ -2766,7 +2767,6 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         # Tool schemas are serialised into the prompt, so build them before the
         # token guard below so it can account for their size.
         tool_schemas = self.registry.get_tool_schemas(
-            read_only_request=read_only_request,
             lang_filter=self.registry.repo_language,
         )
 
@@ -3372,8 +3372,14 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         Only *errors* and *warnings* are surfaced; info-level diagnostics are
         dropped to keep the LLM context focused. Returns *content* unchanged if
         there are no diagnostics to report.
+
+        The rendering itself lives in the shared
+        :func:`render_file_diagnostics_block` so the turn-end deferred path
+        (``_settle_deferred_semantics``) produces the identical block for a
+        coalesced check, rather than leaving the model to find raw diagnostics
+        buried only in the JSON metadata.
         """
-        diags = []
+        diags: list = []
         # Path 1: lightweight tools (apply_patch, edit_text, edit_file, ...)
         _syn = (result.metadata or {}).get("syntax_check")
         if isinstance(_syn, dict):
@@ -3386,66 +3392,10 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
             _sd2 = _sem.get("diagnostics")
             if isinstance(_sd2, list):
                 diags.extend(_sd2)
-
-        # De-duplicate by (file, line, message) and keep error/warning only.
-        seen = set()
-        filtered = []
-        _total_count = 0
-        _n_err_total = 0
-        _n_warn_total = 0
-        for d in diags:
-            if not isinstance(d, dict):
-                continue
-            _sev = (d.get("severity") or "error").lower()
-            if _sev not in ("error", "warning"):
-                continue
-            _key = (d.get("file_path", ""), d.get("line"), d.get("message", ""))
-            if _key in seen:
-                continue
-            seen.add(_key)
-            _total_count += 1
-            if _sev == "error":
-                _n_err_total += 1
-            else:
-                _n_warn_total += 1
-            if len(filtered) >= 15:  # cap to avoid context bloat
-                continue  # still count, but don't add to filtered
-            filtered.append(d)
-
-        if not filtered:
+        _block = render_file_diagnostics_block(diags)
+        if not _block:
             return content
-
-        _n_err = _n_err_total
-        _n_warn = _n_warn_total
-        _suppressed = _total_count - len(filtered)
-        lines = ["\n\n<file_diagnostics>"]
-        lines.append(
-            f"Semantic check found {_total_count} unique issue(s) "
-            f"({_n_err} error, {_n_warn} warning), showing {len(filtered)} below. "
-            f"The edit was applied, but these may cause runtime failures — "
-            f"consider fixing them next."
-        )
-        if _suppressed > 0:
-            lines.append(
-                f"... {_suppressed} more {'issues' if _suppressed > 1 else 'issue'} "
-                f"suppressed (run the validator directly for full output)"
-            )
-        for d in filtered:
-            _sev = (d.get("severity") or "error").lower()
-            _tag = "Error" if _sev == "error" else "Warn"
-            _loc = ""
-            if d.get("line") is not None:
-                _col = d.get("column") or d.get("col")
-                _loc = f":{d.get('line')}" + (f":{_col}" if _col else "")
-            _file = d.get("file_path", "") or ""
-            _file_short = _file.rsplit("/", 1)[-1] if _file else ""
-            _code = d.get("code")
-            _code_str = f" [{_code}]" if _code else ""
-            lines.append(
-                f"{_tag}: {_file_short}{_loc}{_code_str} {d.get('message', '').strip()}"
-            )
-        lines.append("</file_diagnostics>")
-        return (content or "") + "\n".join(lines)
+        return (content or "") + _block
 
     def _append_patch_retry_guidance(self, content: str, tool_name: str, result: ToolResult) -> str:
         """Append apply_patch retry guidance from result metadata."""

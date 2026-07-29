@@ -216,13 +216,58 @@ class TestToolsMixin:
         return self._make_result(ok=True, content=result.summary)
 
     def _tool_find_tests_for_symbol(self, args: dict[str, Any]) -> "ToolResult":
-        """Find test files related to a symbol or file path. Supports Python (pytest), TS/JS (jest/vitest), and Go."""
-        symbol = args.get("symbol")
-        file_path = args.get("file_path")
+        """Find test files covering a symbol or file. Python, TS/JS, and Go.
+
+        Reports each hit with WHY it matched, not just its path. The finder
+        ranks by match type — a test that references the symbol by name
+        (``direct_symbol``) is evidence of a different order than one that
+        merely imports the module (``module_import``) or happens to sit in the
+        matching directory (``same_module``) — and every candidate below the
+        top tier is a guess the model should be able to see as one. Collapsing
+        that to a bare path list, as this used to, made a 0.2-score filename
+        guess indistinguishable from a direct hit.
+        """
+        symbol = args.get("symbol") or args.get("name")
+        file_path = args.get("file_path") or args.get("path")
+        if not symbol and not file_path:
+            return self._make_result(
+                ok=False,
+                content="",
+                error=(
+                    "find_tests_for_symbol needs `symbol` (a function/class name) "
+                    "or `file_path` (a file whose tests you want). "
+                    "Both empty matches nothing."
+                ),
+                retryable=True,
+            )
         finder = SymbolAwareTestFinder(self.repo_root)
-        test_files = finder.find_tests_for_symbol(symbol=symbol, file_path=file_path)
-        if test_files:
-            content = f"Found {len(test_files)} related test file(s):\n" + "\n".join(test_files)
-        else:
-            content = "No related tests found."
-        return self._make_result(ok=True, content=content)
+        targets = finder.discover_test_targets(
+            target_symbols=[symbol] if symbol else None,
+            target_files=[file_path] if file_path else None,
+        )
+        if not targets:
+            _asked = symbol or file_path
+            return self._make_result(
+                ok=True,
+                content=(
+                    f"No test file references {_asked!r}. "
+                    "This means no match was found, NOT that the symbol is "
+                    "untested by some other name — check a caller, or the "
+                    "module's own test file, before concluding it has no cover."
+                ),
+                metadata={"match_count": 0},
+            )
+        lines = [f"{len(targets)} test file(s), strongest match first:"]
+        for t in targets:
+            _why = t.match_type
+            if t.matched_symbols:
+                _why += f" ({', '.join(t.matched_symbols[:3])})"
+            lines.append(f"  {t.test_path}  [{_why}]")
+        return self._make_result(
+            ok=True,
+            content="\n".join(lines),
+            metadata={
+                "match_count": len(targets),
+                "top_match_type": targets[0].match_type,
+            },
+        )

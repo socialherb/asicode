@@ -308,6 +308,31 @@ class AgentConfig:
 # Model-name-based restrictions have been removed. All models are treated equally.
 
 
+@dataclass(frozen=True)
+class SemanticOutcome:
+    """One file's turn-end semantic verdict — or the reason there isn't one.
+
+    ``diagnostics == []`` and "nothing checked this file" are different answers
+    with opposite meanings for the model, and they used to share a
+    representation: every skip path in every provider returned ``ok=True,
+    errors=[]``, which downstream is exactly what a clean check produces. A user
+    with no pyright installed therefore had every Python edit reported as
+    semantically verified. Semantic checking skips for ordinary reasons — the
+    toolchain is not installed, it timed out, the project has no config for that
+    language — and none of them is evidence about the file.
+
+    ``skip_reason`` non-empty means no verdict was reached, and it reaches the
+    model verbatim so it can act on the difference (re-check another way, or
+    say the check was unavailable) instead of trusting a check that never ran.
+    """
+    diagnostics: list[dict] = field(default_factory=list)
+    skip_reason: str = ""
+
+    @property
+    def checked(self) -> bool:
+        return not self.skip_reason
+
+
 @dataclass
 class ToolResult:
     ok: bool
@@ -416,6 +441,7 @@ class ToolRegistry(
         "read_file": "_tool_read_file",
         "read_symbol": "_tool_read_symbol",
         "find_references": "_tool_find_references",
+        "find_tests_for_symbol": "_tool_find_tests_for_symbol",
         "find_relevant_files": "_tool_find_relevant_files",
         # internal only — not exposed to LLM via AGENT_TOOL_SCHEMAS
         "update_memory": "_tool_update_memory",
@@ -567,6 +593,13 @@ class ToolRegistry(
         self._write_success_callbacks: list = []
         # Scoped write filter (None = unrestricted); set via clone_with_filter()
         self._write_filter: Optional[ScopedToolFilter] = None
+        # Semantic-lint coalescing (see begin_semantic_turn). Files written
+        # during the current turn, awaiting ONE validate_semantics run at turn
+        # end. Empty + inactive means "run inline", which is what every caller
+        # outside the agent turn loop (MCP server, design chat, direct dispatch)
+        # gets.
+        self._semantic_pending: dict[str, str] = {}
+        self._semantic_turn_active: bool = False
         # Tool result cache for read-only tools (TTL + LRU). Built via the shared
         # helper so __init__ and BOTH clone paths construct identical, ISOLATED
         # caches (never shared — concurrent in-process subagents would race on
@@ -589,6 +622,178 @@ class ToolRegistry(
     def add_write_success_callback(self, cb) -> None:
         """Register a callback to be invoked after any successful write tool."""
         self._write_success_callbacks.append(cb)
+
+    def begin_semantic_turn(self) -> None:
+        """Start coalescing per-file semantic checks for one agent turn.
+
+        Within a single turn the same file is often written several times
+        (``edit_text`` + ``apply_patch``, or several ``modify_symbol`` calls on
+        one class). Semantic validation spawns a heavy toolchain process —
+        pyright / tsc / go build / javac / kotlinc / gcc -fsyntax-only — and
+        350-400 ms of that is pure Node/JVM cold start rather than analysis
+        (measured: 0.35 s for pyright on a two-line file with no imports). Five
+        edits to one file cost 1.84 s of pyright against 1.94 s of total wall.
+
+        So the run is coalesced to once per (turn, file). It must coalesce to
+        the LAST write, not the first: the diagnostics describe the file on
+        disk, and the agent needs to know about the error its most recent edit
+        introduced. A first-write-wins cache reports the state before the later
+        edits and then reports ``[]`` for each of them, which is indistinguishable
+        from "checked, clean" downstream — a broken edit reads as a passing one.
+        Hence deferral plus :meth:`drain_pending_semantic_checks` at turn end,
+        rather than a seen-set.
+
+        Outside a turn (MCP server, design chat, a direct ``dispatch`` call)
+        nothing would ever drain the queue, so no turn is active there and
+        ``_run_syntax_check_for_file`` keeps running the check inline.
+        """
+        self._semantic_pending.clear()
+        self._semantic_turn_active = True
+
+    def end_semantic_turn(self) -> None:
+        """Discard any pending checks and mark no turn active, WITHOUT running them.
+
+        ``drain_pending_semantic_checks`` runs the coalesced checks; this is the
+        counterpart for paths that leave the turn body early — an uncaught
+        exception or cancellation aborts the loop before the normal drain at
+        turn end. It restores the "no active turn" invariant so a later
+        out-of-turn dispatch (MCP server, design chat, direct ``dispatch``)
+        keeps running its check inline instead of deferring into a queue
+        nothing will ever drain, which would silently drop that dispatch's
+        diagnostics. A no-op when the turn already ended normally, since drain
+        already cleared both fields.
+        """
+        self._semantic_pending = {}
+        self._semantic_turn_active = False
+
+    def defer_semantic_check(self, abs_path: str, rel_path: str = "") -> bool:
+        """Queue *abs_path* for the turn-end semantic run; False if not coalescing.
+
+        Returning False is the signal to run the check inline right now.
+        """
+        if not self._semantic_turn_active:
+            return False
+        self._semantic_pending[abs_path] = rel_path or abs_path
+        return True
+
+    def drain_pending_semantic_checks(self) -> dict[str, "SemanticOutcome"]:
+        """Run one semantic check per file written this turn; end the turn.
+
+        Returns ``{abs_path: SemanticOutcome}``. The diagnostics inside use the
+        same shape ``_run_syntax_check_for_file`` produces inline, so the two
+        paths are interchangeable downstream.
+
+        Every pending path appears in the mapping — including the ones nothing
+        examined. "No diagnostics" and "no check ran" are different answers and
+        must not share a representation: a provider whose toolchain is missing
+        (no pyright, no tsc, no go) returns the second, and reporting it as an
+        empty diagnostic list tells the model the file was verified. See
+        :class:`SemanticOutcome`.
+        """
+        pending, self._semantic_pending = self._semantic_pending, {}
+        self._semantic_turn_active = False
+        if not pending:
+            return {}
+        from ..languages.registry import LanguageRegistry
+
+        # Group by provider so each toolchain starts ONCE for the whole turn
+        # rather than once per file. Coalescing already collapsed repeat writes
+        # to one check per file; without this, a turn touching N files still
+        # paid N cold starts, and startup is most of a short check (pyright
+        # over 4 files: 2.167 s one-at-a-time vs 0.391 s batched). Providers
+        # that have not overridden validate_semantics_batch fall back to the
+        # same per-file loop as before. Grouping stops at the provider —
+        # splitting a batch across project roots needs provider-specific
+        # markers, so each override does its own.
+        out: dict[str, SemanticOutcome] = {
+            abs_path: SemanticOutcome(skip_reason="no semantic checker for this file type")
+            for abs_path in pending
+        }
+        by_provider: dict[int, tuple[Any, list[str]]] = {}
+        for abs_path in pending:
+            try:
+                provider = LanguageRegistry.instance().get(abs_path)
+                if provider is None or not provider.capabilities().has_semantic_validator:
+                    continue
+                by_provider.setdefault(id(provider), (provider, []))[1].append(abs_path)
+            except Exception as exc:  # noqa: BLE001 — advisory, never blocks
+                logger.debug("Provider lookup failed for %s: %s", abs_path, exc)
+                out[abs_path] = SemanticOutcome(
+                    skip_reason="the language provider could not be loaded",
+                )
+
+        # Each group is a separate toolchain process (pyright, npx tsc, go
+        # build), so a turn touching two languages used to pay their SUM.
+        # Measured on one .py + one .ts: 0.424 s + 0.804 s = 1.228 s serial
+        # against a 0.804 s parallel bound — the second toolchain becomes free
+        # up to the cost of the slowest one. They share nothing: distinct
+        # processes, distinct working directories, and the one provider that
+        # writes a temp file (typescript) already names it by pid + uuid.
+        #
+        # The FIRST group always runs inline on this thread, so the common
+        # single-language turn never touches the pool at all, and a saturated
+        # pool can still only delay the extra groups rather than the whole
+        # drain. Order of results does not matter — everything lands in `out`
+        # keyed by path.
+        _groups = list(by_provider.values())
+        _pending_futures: list = []
+        for _provider, _paths in _groups[1:]:
+            try:
+                _pending_futures.append(
+                    (_provider, _paths, shared_pool.submit(
+                        _provider.validate_semantics_batch, _paths,
+                    )),
+                )
+            except RuntimeError as exc:
+                # Pool already shut down (interpreter teardown). Fall back to
+                # running it inline rather than losing the diagnostics.
+                logger.debug("Semantic batch could not be scheduled: %s", exc)
+                _pending_futures.append((_provider, _paths, None))
+        _first = [(p, paths, None) for p, paths in _groups[:1]]
+
+        for provider, paths, future in [*_first, *_pending_futures]:
+            try:
+                results = (
+                    provider.validate_semantics_batch(paths)
+                    if future is None
+                    else future.result()
+                )
+            except Exception as exc:  # noqa: BLE001 — advisory, never blocks
+                # One provider's failure must not cost the others their
+                # diagnostics, so this is caught per group, not per drain.
+                logger.debug("Deferred semantic checks failed for %s: %s", paths, exc)
+                for abs_path in paths:
+                    out[abs_path] = SemanticOutcome(
+                        skip_reason="the semantic checker raised before reporting",
+                    )
+                continue
+            for abs_path in paths:
+                sem = results.get(abs_path)
+                if sem is None:
+                    continue
+                if not getattr(sem, "checked", True):
+                    # No tool examined this file (not installed, timed out, no
+                    # project config). An empty diagnostic list here would be
+                    # rendered as "checked, clean" — the miscue this whole
+                    # design exists to avoid — so the skip travels as a skip.
+                    out[abs_path] = SemanticOutcome(
+                        skip_reason=(
+                            getattr(sem, "skip_reason", "")
+                            or "the checker did not run"
+                        ),
+                    )
+                    continue
+                out[abs_path] = SemanticOutcome(diagnostics=[
+                    {
+                        "file_path": abs_path,
+                        "line": e.line, "col": e.col,
+                        "message": e.message,
+                        "severity": getattr(e, "severity", "error"),
+                        "code": getattr(e, "code", ""),
+                    }
+                    for e in (sem.errors or [])
+                ])
+        return out
 
     @property
     def repo_language(self) -> Optional[LanguageId]:
@@ -690,6 +895,10 @@ class ToolRegistry(
         # not the parent's object).
         clone._text_edited_files = set()
         clone._agent_profile = getattr(self, "_agent_profile", None)
+        # Semantic-lint coalescing — FRESH per clone (never shared — concurrent
+        # subagent writes must NOT co-accumulate into the parent's batch).
+        clone._semantic_pending = {}
+        clone._semantic_turn_active = False
 
         return clone
 
@@ -714,6 +923,11 @@ class ToolRegistry(
         clone._repo_root_override = getattr(self, "_repo_root_override", None)
         # Agent profile — shared read-only
         clone._agent_profile = getattr(self, "_agent_profile", None)
+        # Repo language (needed by get_tool_schemas/get_tool_names)
+        clone._repo_language = getattr(self, "_repo_language", None)
+        # Fresh semantic-lint coalescing state — ISOLATED per clone.
+        clone._semantic_pending = {}
+        clone._semantic_turn_active = False
         # Parallel execution graph not used in filtered clones
         clone.dependency_graph = None
         # Fresh mutable state — not shared with original
@@ -924,6 +1138,7 @@ class ToolRegistry(
     _READ_ONLY_TOOLS: ClassVar[set[str]] = {
         "get_project_info",
         "find_symbol", "find_references",
+        "find_tests_for_symbol",
         "find_relevant_files",
         "get_file_outline",
         "analyze_change_impact",
@@ -2372,17 +2587,12 @@ class ToolRegistry(
 
     def get_tool_schemas(
         self,
-        read_only_request: bool = False,
-        role: str = "agent",
         lang_filter: Optional[LanguageId] = None,
         design_chat: bool = False,
     ) -> list[dict[str, Any]]:
         """Return tool schemas for the LLM API.
 
         Args:
-            read_only_request: Kept for backward compatibility — no longer filters
-                write tools.
-            role: Kept for backward compatibility — no longer filters tools.
             lang_filter: When set to a non-Python LanguageId, schemas with
                 ``"x_python_only": True`` are excluded.  Pass ``None`` (default)
                 to include all tools (Python or mixed-language repos).

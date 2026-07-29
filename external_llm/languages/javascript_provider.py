@@ -17,7 +17,6 @@ from .base import (
     SyntaxProvider,
     _replace_last_cmd_path,
     _tempfile_for_content,
-    detect_project_root,
     tree_sitter_syntax_fallback,
 )
 from .models import (
@@ -170,32 +169,34 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
 
         JS projects configure tsc via ``jsconfig.json``; TS projects use
         ``tsconfig.json`` (whose ``allowJs``/``checkJs`` may also cover ``.js``
-        files). Either config is accepted — see :meth:`_resolve_js_config` for
-        the selection logic. Without any config the check is skipped to avoid
-        tsc's environment/config noise.
+        files). Either config is accepted — see :meth:`_config_at_root` for the
+        selection logic. Without any config the check is skipped to avoid tsc's
+        environment/config noise.
         """
-        config_filename = self._resolve_js_config(file_path)
-        if config_filename is None:
-            return SyntaxValidationResult(ok=True, language=LanguageId.JAVASCRIPT)
-        return self._ts._run_tsc_semantic(
-            file_path,
+        return self.validate_semantics_batch([file_path])[file_path]
+
+    def validate_semantics_batch(
+        self, file_paths: list[str],
+    ) -> dict[str, SyntaxValidationResult]:
+        """Semantic-check *file_paths* with one tsc run per (project, config).
+
+        Same batching as the TS provider — see
+        :meth:`TypeScriptSyntaxProvider.validate_semantics_batch` — with the
+        extra split on which config a root carries: a JS project may use
+        ``jsconfig.json`` or ``tsconfig.json``, and the temp config can only
+        extend one of them, so the two cannot share a run.
+        """
+        return self._ts._batch_by_root(
+            file_paths,
             language=LanguageId.JAVASCRIPT,
             config_markers=("jsconfig.json", "tsconfig.json"),
-            config_filename=config_filename,
+            config_for=self._config_at_root,
             allow_js=True,
         )
 
-    def _resolve_js_config(self, file_path: str) -> Optional[str]:
-        """Return the config filename (``jsconfig.json`` or ``tsconfig.json``)
-        nearest to *file_path*.
-
-        Prefers ``jsconfig.json`` (JS-native) but accepts ``tsconfig.json``
-        when a JS project reuses the TS config. Returns ``None`` if neither is
-        found in any ancestor — callers skip the check in that case.
-        """
-        project_root = detect_project_root(
-            file_path, markers=("jsconfig.json", "tsconfig.json"),
-        )
+    @staticmethod
+    def _config_at_root(project_root: str) -> Optional[str]:
+        """Which config filename *project_root* carries, preferring jsconfig."""
         for name in ("jsconfig.json", "tsconfig.json"):
             if os.path.isfile(os.path.join(project_root, name)):
                 return name

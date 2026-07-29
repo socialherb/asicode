@@ -58,7 +58,20 @@ def _nesting_bucket(depth: int) -> str:
 _CACHE_TTL = _cfg.counts.ROUTING_POLICY_CACHE_TTL_S
 _cached_policy: Optional["RoutingPolicy"] = None
 _cached_mtime: float = 0.0
-_last_check: float = 0.0
+
+# NOT 0.0. ``load_policy`` expires the cache with
+# ``time.monotonic() - _last_check < _CACHE_TTL``, and ``monotonic()`` counts
+# from an arbitrary origin — on Linux, system boot. Seeding 0.0 therefore means
+# "last checked at boot", so on a host whose uptime is under the 300 s TTL the
+# FIRST call short-circuits and returns the still-empty ``_cached_policy``: the
+# policy file is never read, and routing silently runs unpolicied, for the
+# first five minutes after a reboot. Measured with monotonic() stubbed to 30.0:
+# ``30.0 - 0.0 < 300`` -> True.
+#
+# -inf is expired by construction whatever the origin, which is the property
+# the seed actually needs ("never checked"), rather than a timestamp that only
+# looks old on a long-running machine.
+_last_check: float = float("-inf")
 
 
 class RoutingPolicy:

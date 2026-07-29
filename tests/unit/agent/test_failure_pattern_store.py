@@ -611,6 +611,46 @@ def test_count_not_inflated_by_repeated_recall(tmp_path):
     assert c <= 2, f"count inflated to {c} by repeated recall_for"
 
 
+def test_recall_ttl_ignores_wallclock_backward_jump(tmp_path, monkeypatch):
+    """Regression: recall_for TTL must compare in time.monotonic(), not time.time().
+
+    Before the fix, ``_read_from_disk`` set ``_last_read_ts = time.time()`` and
+    ``recall_for`` checked ``time.time() - _last_read_ts > TTL``. A backward NTP
+    step made that diff negative, so ``'> TTL'`` was False and ``recall_for``
+    skipped the disk refresh — serving the stale in-memory snapshot until the
+    wall clock caught back up. Monotonic never goes backward, so pinning
+    wall-clock to the past must NOT block the refresh.
+
+    Bidirectional guard: if the source reverts to ``time.time()`` at the TTL
+    check, the patched clock makes the diff negative, the refresh is skipped, the
+    stale EMPTY snapshot yields no entry → ``""``, and the assertion fails.
+
+    (``_decay_weight`` clamps negative age to 0, so pinning ``time.time`` to the
+    past does not perturb the count math — it only zeroes decay.)
+    """
+    import external_llm.agent.failure_pattern_store as fps
+
+    # B reads disk while it is EMPTY → B's in-memory snapshot stays empty.
+    b = FailurePatternStore(tmp_path)
+    assert b.recall_for("tool", "reason", min_count=1) == ""  # disk empty → no recall
+    assert b._last_read_ts > 0.0, "initial read must stamp _last_read_ts"
+
+    # Another process seeds disk with observations B has not seen.
+    seed = FailurePatternStore(tmp_path)
+    for _ in range(3):
+        seed.record("tool", "reason")
+    seed.flush()
+
+    # Simulate an NTP backward step (wall-clock → distant past) while placing
+    # _last_read_ts one TTL ago in the MONOTONIC domain.
+    monkeypatch.setattr(fps.time, "time", lambda: 0.0)
+    b._last_read_ts = time.monotonic() - fps._READ_REFRESH_TTL - 1
+
+    # With the monotonic fix: refresh fires → sees the seeded count → recalls.
+    hint = b.recall_for("tool", "reason", min_count=1)
+    assert "RECALL" in hint, "wall-clock backward jump suppressed the TTL refresh"
+
+
 def test_decay_not_lost_by_delta_merge(tmp_path):
     """Regression: decay must survive _merge_max delta merge.
 

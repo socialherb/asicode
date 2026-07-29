@@ -440,3 +440,30 @@ class TestFreshlyBootedHost:
             "if it no longer does, the TTL logic changed and _expire_cache "
             "should be re-derived rather than trusted"
         )
+
+    def test_a_process_started_right_after_boot_still_loads_the_policy(
+        self, fresh_boot, monkeypatch,
+    ):
+        """The MODULE SEED must be expired too, not just the per-test override.
+
+        This is the shipping half of the same bug: `_last_check` seeded to 0.0
+        reads as "last checked at boot", so on a host with less than _CACHE_TTL
+        of uptime the very first `load_policy()` short-circuits and returns the
+        still-empty cache. Routing then runs unpolicied for the first five
+        minutes after a reboot — no error, just the learned policy silently not
+        applied. Reproduced with monotonic() stubbed to 30.0.
+
+        Deliberately does NOT touch `_last_check`: the seed is the thing under
+        test, so overriding it here would test nothing.
+        """
+        import external_llm.agent.routing_policy as rp
+        monkeypatch.setattr(rp, "_cached_policy", None)
+        monkeypatch.setattr(rp, "_cached_mtime", 0.0)
+        self._stub_a_valid_policy_file(monkeypatch)
+
+        policy = rp.load_policy()
+        assert policy is not None, (
+            "first call after boot short-circuited on the module seed — "
+            "_last_check must be expired by construction, not 0.0"
+        )
+        assert policy.predict("bugfix") == "surgical_edit"

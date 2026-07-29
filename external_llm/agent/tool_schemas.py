@@ -631,6 +631,39 @@ SCHEMA_FIND_REFERENCES = {
     }
 
 
+SCHEMA_FIND_TESTS_FOR_SYMBOL = {
+        "name": "find_tests_for_symbol",
+        "description": (
+            "Find the test files that cover a symbol or a source file. "
+            "Ranks by why each one matched — a test naming the symbol outranks "
+            "one that only imports its module — and labels every hit with that "
+            "reason, so a weak match is visible as a weak match. "
+            "Use before changing a signature (to know what will break) and after "
+            "an edit (to know what to run). "
+            "Beats grepping for the name: it understands test-file naming across "
+            "Python (pytest), TS/JS (jest/vitest) and Go, and it reads imports, "
+            "not just occurrences."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Function/class/method name to find tests for",
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": (
+                        "Repo-relative source file whose tests you want. "
+                        "May be given instead of, or together with, `symbol`."
+                    ),
+                },
+            },
+            "anyOf": [{"required": ["symbol"]}, {"required": ["file_path"]}],
+        },
+    }
+
+
 SCHEMA_FIND_RELEVANT_FILES = {
         "name": "find_relevant_files",
         "description": (
@@ -1226,6 +1259,7 @@ AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     SCHEMA_JOB,       # ★ Background job management (list/output/kill for long-running bash commands)
     SCHEMA_FIND_SYMBOL,
     SCHEMA_FIND_REFERENCES,
+    SCHEMA_FIND_TESTS_FOR_SYMBOL,  # which tests cover this — pairs with scoped_verification
     SCHEMA_FIND_RELEVANT_FILES,
     SCHEMA_QUERY_DEPENDENCY_GRAPH,
     SCHEMA_ANALYZE_CHANGE_IMPACT,

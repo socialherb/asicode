@@ -36,17 +36,27 @@ DANGEROUS_FLAG_COMBOS: dict[str, list[frozenset[str]]] = {
     "git": [
         frozenset({"--hard"}),          # git reset --hard — discards the worktree
         frozenset({"--force"}),         # git push --force — rewrites remote history
-        frozenset({"-f", "-d"}),        # git clean -fd/-fdx — removes untracked files
-        frozenset({"checkout", "--"}),  # git checkout -- . — discards uncommitted edits
-        frozenset({"restore", "--"}),   # git restore -- . — the modern equivalent
+        frozenset({"push", "-f"}),      # git push -f — the short form of --force
+        frozenset({"clean", "-f"}),     # git clean -f — removes untracked files (short form alone)
+        frozenset({"-f", "-d"}),        # git clean -fd/-fdx — removes untracked files+dirs
+        frozenset({"checkout", "--"}),  # git checkout -- . — discards uncommitted edits (long form)
+        frozenset({"checkout", "."}),   # git checkout . — discards uncommitted edits
+        frozenset({"checkout", "-f"}),  # git checkout -f — force-switch discarding changes
+        frozenset({"restore", "--"}),   # git restore -- . — the modern equivalent (long form)
+        frozenset({"restore", "."}),    # git restore . — discards uncommitted edits
+        frozenset({"restore", "-W"}),   # git restore -W . — discards worktree changes (BSD compat)
+        frozenset({"branch", "-f"}),    # git branch -f — force-reassign a branch ref
     ],
     # ``find -delete`` removes every match, with no confirmation of its own.
     "find": [
         frozenset({"-delete"}),
     ],
-    # ``truncate -s 0`` empties a file in place.
+    # ``truncate -s 0`` empties a file in place.  The zero-size check in
+    # ``_segment_flag_combo_hit`` also matches 0K/0M/0G/etc. and glued
+    # forms ``-s0``/``--size=0`` after flag=value normalisation.
     "truncate": [
         frozenset({"-s", "0"}),
+        frozenset({"--size", "0"}),
     ],
     # NOTE: `dd` is deliberately absent — it is already in
     # DANGEROUS_SHELL_COMMANDS, so it prompts on the executable name alone and
@@ -83,6 +93,14 @@ DANGEROUS_SHELL_COMMANDS: frozenset = frozenset({
     # needs these, so the prompt costs nothing and the mistake is unrecoverable.
     "mkfs",
     "dd",
+    # Secure / unrecoverable FILE erasure. `shred` overwrites in place (and
+    # `-u` deletes afterwards) so the original bytes are gone; `srm` is the
+    # secure-delete equivalent. The same "unrecoverable, agent never needs it"
+    # argument as dd/mkfs applies — the survey at the bottom of this file
+    # previously listed these as a deliberate omission; promoted because the
+    # mistake is just as permanent and the false-positive cost is nil.
+    "shred",
+    "srm",
     # Machine-level state changes. These normally need sudo and would fail, but
     # passwordless sudo exists and the confirmation is free.
     "shutdown",
@@ -135,6 +153,29 @@ EVAL_BUILTINS: frozenset = frozenset({
     "eval",
 })
 
+# Builtins whose *first operand* is a command string the shell runs later.
+#
+# `trap 'rm -rf "$tmp"' EXIT` is the `eval "rm -rf x"` shape wearing a different
+# hat: the command is right there in the string being scanned, parked in an
+# argument slot, and the scan read it as one opaque word. All three spellings
+# ran with no prompt (measured 2026-07-29, dispatched through the real
+# ToolRegistry):
+#
+#     trap 'rm -f X' EXIT      trap -- 'rm -f X' EXIT      trap 'rm -f X' INT EXIT
+#
+# It differs from EVAL_BUILTINS in WHICH operands are the payload. `eval` joins
+# all of them; `trap` runs only the first, and the rest are signal names — so
+# space-joining would hand the scan `rm -f X EXIT` and, worse, would make a
+# reset (`trap - EXIT`) look like a command. git_tools._trap_payload_index
+# therefore locates that single operand and splices it alone.
+#
+# A cleanup trap is the reason this matters in practice rather than in theory:
+# `trap 'rm -rf "$workdir"' EXIT` is the idiomatic way to write one, so the
+# model reaches for it without any intent to evade a gate.
+COMMAND_STRING_BUILTINS: frozenset = frozenset({
+    "trap",
+})
+
 # ─── Executable-position tracking (danger-gate support) ───────────────────
 # The gate identifies the *executable* of each command segment, so anything that
 # occupies that slot without being the command hides the real one behind it.
@@ -146,6 +187,37 @@ COMMAND_WRAPPERS: frozenset = frozenset({
     "sudo", "doas", "env", "nohup", "setsid", "stdbuf", "nice", "ionice",
     "time", "timeout", "gtimeout", "xargs", "command", "exec", "builtin",
     "chroot",
+    # Same slot-swallowing shape as the above, measured running unprompted
+    # before they were listed (`flock /tmp/l rm -rf x`, `parallel rm -rf ::: x`,
+    # `unbuffer rm -rf x`, `watch rm -rf x`, `runuser -u nobody rm -rf x`).
+    # `flock` also takes a positional lock file first — see
+    # WRAPPER_POSITIONAL_ARGS.
+    "flock", "parallel", "unbuffer", "watch", "runuser",
+    # `script` covers BOTH of its divergent spellings once it carries a
+    # positional arity of 1 (see WRAPPER_POSITIONAL_ARGS): BSD's
+    # `script <file> <command>` puts the command in the slot after the operand
+    # is consumed, and GNU's `script -c <command> [file]` is caught by the
+    # payload re-entry below. A GNU user writing `script out.log` simply has
+    # the log name consumed as the operand, which is harmless.
+    "script",
+})
+
+# Wrappers whose ``-c`` argument is a SHELL command line, exactly like
+# SHELL_INTERPRETERS' — but which also occupy the executable slot, so they are
+# listed above rather than there (a COMMAND_WRAPPERS hit is consumed before the
+# interpreter check is ever reached). The token scan re-enters the payload for
+# these too.
+#
+#   runuser -c "rm -rf x"     ("pass a single command to the shell with -c")
+#   script  -c "rm -rf x"     ("run command rather than interactive shell")
+#   flock /tmp/l -c "rm -rf x"
+#
+# `script` is here and NOT in COMMAND_WRAPPERS on purpose: its positional form
+# is platform-divergent (GNU takes a typescript FILE, BSD takes file + command),
+# so the operand count cannot be stated once. The `-c` form is unambiguous on
+# both, and the positional form stays a known gap rather than a guess.
+WRAPPER_SHELL_C_PAYLOAD: frozenset = frozenset({
+    "runuser", "script", "flock",
 })
 
 # Shell keywords after which a command begins (handled separately from
@@ -165,6 +237,71 @@ ARG_COMMAND_INTRODUCERS: frozenset = frozenset({
 # reaches the same checks the un-nested spelling does. Only shells belong here:
 # `python -c` and `perl -e` also take code, but it is not SHELL code, and
 # scanning it with shell rules would classify its contents wrongly.
+# Interpreters that execute stdin when run without arguments (or with a script
+# file argument). These are gated by the PIPE rule (`curl url | python3`) and the
+# here-string rule (`python3 <<< 'code'`), but NOT by the `-c` splice — their
+# `-c`/`-e` payload is not shell code, so re-entering it as a shell command line
+# would classify its contents wrongly. Kept separate from SHELL_INTERPRETERS for
+# that reason: the two sets differ in which rules apply.
+STDIN_INTERPRETERS: frozenset = frozenset({
+    "python3", "python", "python2",
+    "perl", "ruby", "lua",
+    "node",
+})
+# ── `python -c` — the one non-shell payload that CAN be read ────────────────
+# The comment above is still true (a Python payload is not shell code and must
+# not be scanned with shell rules), but "not shell" was being read as "not
+# checkable", and it is not the same thing. Measured 2026-07-30 by dispatching
+# 41 real command shapes at the gate: it prompted on 36 — backticks, $(), xargs,
+# find -exec, eval, procsub, here-strings, trap, wrappers, loops, nested
+# `bash -c` — and the survivors were exactly these two:
+#
+#     python3 -c "import shutil; shutil.rmtree('/tmp/x')"     ran unprompted
+#     perl -e 'unlink "/tmp/x"'                               ran unprompted
+#
+# Python is checkable with the parser for the language it is actually written
+# in, which is also this repo's stated preference over pattern matching. `perl
+# -e` / `ruby -e` / `node -e` stay a documented limit: there is no parser here
+# for them, and prompting on the FLAG alone would train exactly the reflexive
+# approval the `kill` note above argues against.
+PYTHON_INTERPRETERS: frozenset = frozenset({"python", "python3", "python2"})
+
+# Calls whose blast radius is the same as an executable in
+# DANGEROUS_SHELL_COMMANDS, so the same answer applies: ask. Matched on the
+# RESOLVED dotted name, so every spelling is one entry — `import shutil as sh`,
+# `from shutil import rmtree as rt` and `__import__('shutil').rmtree` all land
+# on `shutil.rmtree`.
+#
+# Deliberately narrow. Writing, creating and reading are what the agent is for;
+# only deletion and in-place truncation are here, mirroring `rm` / `truncate -s 0`.
+PYTHON_DESTRUCTIVE_CALLS: frozenset = frozenset({
+    "shutil.rmtree",
+    "os.remove",
+    "os.unlink",
+    "os.rmdir",
+    "os.removedirs",
+    "os.truncate",
+    "pathlib.Path.unlink",
+    "pathlib.Path.rmdir",
+})
+
+# Calls that hand a command back to the shell. Their argument is re-entered
+# through the SAME token scan as a `bash -c` payload, so `python3 -c
+# "os.system('rm -rf x')"` reaches every rule the un-nested spelling does
+# instead of getting a second, poorer copy of them.
+PYTHON_SHELL_ESCAPES: frozenset = frozenset({
+    "os.system",
+    "os.popen",
+    "os.execv", "os.execve", "os.execvp", "os.execvpe", "os.spawnv",
+    "subprocess.run",
+    "subprocess.call",
+    "subprocess.check_call",
+    "subprocess.check_output",
+    "subprocess.Popen",
+    "subprocess.getoutput",
+    "subprocess.getstatusoutput",
+})
+
 SHELL_INTERPRETERS: frozenset = frozenset({
     "sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "busybox",
     # `su -c "rm -rf x"` hands its payload to the target user's shell, so the
@@ -203,6 +340,16 @@ WRAPPER_VALUE_FLAGS: dict = {
         "--max-lines", "--max-chars", "--arg-file",
     }),
     "time": frozenset({"-o", "-f", "--output", "--format"}),
+    # Separated-spelling flag values for the wrappers added above; without
+    # these the value lands in the executable slot and the real command behind
+    # it reads as an argument (the `sudo -u me rm` shape).
+    "flock": frozenset({"-w", "-E", "--wait", "--timeout", "--conflict-exit-code"}),
+    "watch": frozenset({"-n", "--interval"}),
+    "parallel": frozenset({
+        "-j", "-N", "-n", "-L", "-S", "-d", "-a",
+        "--jobs", "--delimiter", "--max-lines", "--arg-file",
+    }),
+    "runuser": frozenset({"-u", "-g", "-s", "--user", "--group", "--shell"}),
 }
 
 # Wrappers that consume POSITIONAL operands before the command. `chroot /mnt rm
@@ -210,45 +357,107 @@ WRAPPER_VALUE_FLAGS: dict = {
 # how many operands precede the command.
 WRAPPER_POSITIONAL_ARGS: dict = {
     "chroot": 1,
+    # `flock <file>|<dir> <command> ...` — the lock target precedes the command
+    # (`flock [options] <file> <command>` per its own usage line).
+    "flock": 1,
+    # `script <file> <command>` (BSD) / `script [options] [file]` (GNU). One
+    # operand either way; see the note in COMMAND_WRAPPERS.
+    "script": 1,
 }
 
 # Known limits of this scan — it is an advisory prompt, not a sandbox (bash is
 # unrestricted by design). Indirection defeats any static reading of the command
 # string, so these still reach the shell unprompted:
-#   • variable/substitution indirection — `$CMD -rf x`, `$(echo rm) -rf x`
+#   • variable indirection whose value is NOT set in the same command and is not
+#     in the environment — `$CMD -rf x` with CMD exported by a parent shell.
+#     The resolvable half no longer belongs here: `RM=rm; $RM -f x` assigns in
+#     the very string being scanned, and `$SHELL -c '…'` reads a variable this
+#     process also has, so both are now expanded in the executable slot (see
+#     git_tools._expand_exec_slot_var).
+#   • substitution OUTPUT used as the executable — `$(echo rm) -rf x`. The body
+#     is scanned as its own command line (`echo` — safe), but what the body
+#     PRINTS becomes the command, and that is not in the string.
 #   • a payload interpreted by a NON-shell — `python -c "os.system('rm -rf x')"`
 #   • a payload interpreted on another HOST — `ssh host rm -rf x`
 #   • a wrapper flag this file does not know takes a value — the table above is
 #     enumerated per wrapper, so an unlisted one puts its value in the executable
 #     slot. Bounded by WRAPPER_VALUE_FLAGS being the only thing to extend.
 #
-# Four entries have LEFT this list, each with the mechanism that replaced it:
+# Six entries have LEFT this list, each with the mechanism that replaced it:
 #   • `bash -c "rm -rf x"` → SHELL_INTERPRETERS, re-entered as a command line
 #   • `eval "rm -rf x"` → EVAL_BUILTINS, re-entered the same way
+#   • `trap 'rm -rf x' EXIT` → COMMAND_STRING_BUILTINS, re-entered the same way
 #   • `"$(rm x)"`, backticks, and their nested forms →
 #     git_tools._normalize_for_scan
+#   • `RM=rm; $RM -f x` → git_tools._expand_exec_slot_var
 #   • `sudo -u me rm -rf x` → WRAPPER_VALUE_FLAGS / WRAPPER_POSITIONAL_ARGS
 # What remains ABOVE is genuine indirection: the command is not IN the string
 # being scanned, so no amount of parsing recovers it.
 # Treat the gate as a guardrail against plausible mistakes, not as containment.
 #
 # Separately, these are shapes where the command IS recoverable (or the shape
-# alone is enough) and the gate simply does not look yet. All measured running
+# alone is enough) and the gate simply does not look yet. Measured running
 # unprompted on 2026-07-29; listed so they are known gaps rather than decisions:
-#   • a shell payload delivered other than by `-c` — `bash <<< 'rm -rf x'`,
-#     `echo 'rm -rf x' | bash`, `curl -s url | sh`. The herestring form is
-#     recoverable (the payload is in the string); the pipe forms are not, so
-#     closing those means gating the SHAPE "pipes into a shell interpreter"
-#     rather than reading the payload.
-#   • command wrappers absent from COMMAND_WRAPPERS — `flock`, `parallel`,
-#     `script`, `unbuffer`, `watch`, `runuser`, `proot` each still swallow the
-#     executable slot the way `sudo`/`nohup` did before they were listed.
+#   • `proot <cmd>` — a wrapper, but obscure enough that adding it buys little
+#     next to the ones now listed. Left out deliberately rather than missed.
+#   • `script <file> <command>` on BSD when the file operand is itself absent
+#     or doubled: the arity is stated once (1) and cannot cover both platforms'
+#     edge spellings.
 #   • executables that fit DANGEROUS_SHELL_COMMANDS' own criterion but are not
-#     in it — `shred`, `srm` (unrecoverable erasure, the `dd`/`mkfs` category).
-#     A policy call, not a parsing gap.
-# `source evil.sh` / `. evil.sh` is NOT in that list: its payload lives in a
-# FILE, which makes it the same genuine indirection as `$CMD` unless the gate
-# starts reading files, which it deliberately does not.
+#     in it — `shred` and `srm` WERE listed here; both are now in the set (see
+#     the block above). Any remaining name is a deliberate policy call, not a
+#     parsing gap.
+#
+# Closed since that survey, each verified against the pre-fix tree:
+#   • the seven unlisted command wrappers → COMMAND_WRAPPERS (+
+#     WRAPPER_POSITIONAL_ARGS for `flock`/`script`, + WRAPPER_VALUE_FLAGS)
+#   • `runuser -c` / `script -c` / `flock … -c` → WRAPPER_SHELL_C_PAYLOAD,
+#     re-entered like `bash -c`
+#   • `curl url | sh` and friends → gated on the SHAPE. The piped bytes are
+#     genuinely unreadable, which is precisely why an unreadable payload handed
+#     to a shell should ask rather than allow. Suppressed when a `-c` payload
+#     is present, since then the code IS visible and stdin is ignored.
+#   • `bash <<< 'rm -rf x'` (here-string) → the `<<<` word a SHELL interpreter
+#     is fed on stdin is re-entered as a command line, the same splice path as
+#     `-c`. A non-shell (`cat <<< …`) just prints the word and is left alone.
+#   • `shred` / `srm` → promoted into DANGEROUS_SHELL_COMMANDS (unrecoverable
+#     erasure, the dd/mkfs category).
+#   • `"$( $'rm' x )"` (ANSI-C `$'...'` inside a double-quoted command
+#     substitution) → the substitution body is an unquoted command line, so the
+#     ANSI-C decoder now fires there too (git_tools._normalize_for_scan). Normal
+#     double-quoted text keeps `$'...'` literal.
+#   • `bash <<EOF ; rm -rf x ; EOF` (heredoc body fed to a shell interpreter)
+#     → the blanking is now receiver-aware: when the heredoc's receiver is in
+#     SHELL_INTERPRETERS the body IS shell code and is NOT blanked, so the scan
+#     sees it. Non-shell receivers (`cat`, `tee`) and non-shell interpreters
+#     (`python3` — same known-limit as `python -c`) keep their bodies blanked.
+#     The receiver is searched across every word of the opener-line prefix,
+#     basename-reduced — reading only the word next to `<<` left `bash -s <<EOF`
+#     (the canonical spelling), `bash -x`, `bash 2>/dev/null` and `/bin/bash -s`
+#     all bypassing, and made `sudo bash <<EOF` pass by luck rather than by
+#     wrapper handling. `-c` on the opener line suppresses it: stdin is ignored.
+#   • `source <(curl url)` / `. <(curl url)` (procsub feeding source/dot) →
+#     process substitution produces an anonymous FIFO, not a real file, so the
+#     "payload lives in a FILE" exclusion does not apply. The procsub gate now
+#     includes `source` and `.` alongside SHELL_INTERPRETERS. The dot-source
+#     basename reduction (`Path(".").name == ""`) is also fixed so `.` survives
+#     as an executable name (git_tools, token scan line ~1654).
+#
+# `source evil.sh` / `. evil.sh` with a REAL FILE is STILL genuine indirection
+# (the payload lives on disk, not in this string) and is deliberately left
+# unprompted.
+#
+# `eval "$(curl url)"` is left unprompted too, but for a WEAKER reason, and the
+# distinction matters because it decides whether the entry is ever revisited.
+# Its payload is unrecoverable — produced at runtime, never in the scanned
+# string — which is the `$CMD` property. But unrecoverability alone stopped
+# being this gate's test for silence: `curl url | sh` and `bash <(curl url)`
+# have equally unrecoverable payloads and BOTH prompt, on the ground that the
+# SHAPE — an opaque payload entering an interpreter through a visible channel —
+# is itself statically readable. `eval "$(…)"` has that same readable shape.
+# So this is a POLICY call about false positives (`eval "$(cat cfg)"` and
+# `eval "$(ssh-agent -s)"` are ordinary and would start prompting), not a
+# parsing limit. Revisit it as a policy question; do not file it under `$CMD`.
 
 # Bounds for the `bash` tool's own timeout argument. Advertised verbatim in the
 # tool schema and enforced in git_tools._tool_shell_exec; the MCP ceiling is

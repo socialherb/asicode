@@ -20,6 +20,7 @@ from .base import (
     _tempfile_for_content,
     detect_project_root,
     find_brace_block_end,
+    resolve_tool_path,
     tree_sitter_syntax_fallback,
 )
 from .models import (
@@ -178,16 +179,61 @@ class GoSyntaxProvider(SyntaxProvider):
         - Only reports diagnostics whose file path matches *file_path* (a
           package build surfaces errors from sibling files too).
         - Errors make ``ok=False``; build warnings are surfaced.
+
+        Checking several files goes through :meth:`validate_semantics_batch`,
+        which builds each package once instead of once per file.
         """
-        if not file_path or not os.path.exists(file_path):
-            return SyntaxValidationResult(ok=True, language=LanguageId.GO)
+        return self.validate_semantics_batch([file_path])[file_path]
 
-        module_root = detect_project_root(file_path, markers=("go.mod",))
-        if not os.path.isfile(os.path.join(module_root, "go.mod")):
-            return SyntaxValidationResult(ok=True, language=LanguageId.GO)
+    def validate_semantics_batch(
+        self, file_paths: list[str],
+    ) -> dict[str, SyntaxValidationResult]:
+        """Semantic-check *file_paths* with one ``go build`` per package.
 
+        Go compiles a whole package at a time, so a single build ALREADY
+        produces the diagnostics for every file in that package — the
+        single-file path then discarded all but one file's worth. Two files
+        edited in the same package meant running the identical command twice
+        and throwing away half of each result. Grouping by package directory
+        removes that duplication outright; distinct packages still need their
+        own build.
+
+        Grouped by ``(module_root, package_dir)``: a repo can contain several
+        modules, and package paths are only meaningful relative to their own
+        ``go.mod``.
+        """
+        # A fresh result per file, never one shared instance: the dataclass is
+        # mutable and carries a list, so sharing would let one consumer's
+        # append surface on every other skipped file.
+        def _skip(reason: str) -> SyntaxValidationResult:
+            return SyntaxValidationResult.unchecked(LanguageId.GO, reason)
+
+        out: dict[str, SyntaxValidationResult] = {}
+        groups: dict[tuple[str, str], list[str]] = {}
+        for p in file_paths:
+            if not p or not os.path.exists(p):
+                out[p] = _skip("the file is not on disk")
+                continue
+            module_root = detect_project_root(p, markers=("go.mod",))
+            if not os.path.isfile(os.path.join(module_root, "go.mod")):
+                out[p] = _skip("no go.mod above this file, so `go build` has no package")
+                continue
+            pkg_dir = os.path.dirname(os.path.abspath(p))
+            groups.setdefault((module_root, pkg_dir), []).append(p)
+        for (module_root, pkg_dir), paths in groups.items():
+            out.update(self._build_package(module_root, pkg_dir, paths))
+        return out
+
+    def _build_package(
+        self, module_root: str, pkg_dir_abs: str, file_paths: list[str],
+    ) -> dict[str, SyntaxValidationResult]:
+        """One ``go build`` of the package, split back out per file in *file_paths*."""
+        def _skip(reason: str) -> dict[str, SyntaxValidationResult]:
+            return {
+                p: SyntaxValidationResult.unchecked(LanguageId.GO, reason)
+                for p in file_paths
+            }
         # Package dir relative to module root
-        pkg_dir_abs = os.path.dirname(os.path.abspath(file_path))
         try:
             pkg_rel = os.path.relpath(pkg_dir_abs, module_root)
         except ValueError:
@@ -198,52 +244,68 @@ class GoSyntaxProvider(SyntaxProvider):
         try:
             proc = subprocess.run(
                 cmd,
-                capture_output=True, text=True, timeout=120,
+                capture_output=True, text=True,
+                # One build covers the whole package regardless of how many of
+                # its files were edited, so the budget only needs a little head
+                # room over the single-file case.
+                timeout=30 + 5 * len(file_paths),
                 cwd=module_root,
                 env=_compile_env(),
             )
         except FileNotFoundError:
             logger.debug("go not installed; skipping semantic validation")
-            return SyntaxValidationResult(ok=True, language=LanguageId.GO)
+            return _skip("the go toolchain is not installed")
         except subprocess.TimeoutExpired:
-            logger.debug("go build timed out for %s; skipping", file_path)
-            return SyntaxValidationResult(ok=True, language=LanguageId.GO)
+            logger.debug("go build timed out for %s; skipping", pkg_target)
+            return _skip("`go build` timed out")
         except Exception as e:
             logger.debug("go build semantic check failed: %s", e)
-            return SyntaxValidationResult(ok=True, language=LanguageId.GO)
+            return _skip("`go build` could not be run")
 
         if proc.returncode == 0:
-            return SyntaxValidationResult(ok=True, language=LanguageId.GO)
+            # The build SUCCEEDED — a real clean verdict, not a skip. Sharing
+            # the skip constructor here would report a genuinely checked file
+            # as unchecked, which is the same conflation in the other
+            # direction.
+            return {
+                p: SyntaxValidationResult(ok=True, language=LanguageId.GO)
+                for p in file_paths
+            }
 
         # Parse: ./pkg/file.go:10:5: undefined: foo
-        target_norm = os.path.normpath(os.path.abspath(file_path))
-        errors: list[SyntaxError_] = []
-        has_error = False
+        by_norm = {os.path.normpath(os.path.abspath(p)): p for p in file_paths}
+        collected: dict[str, list[SyntaxError_]] = {p: [] for p in file_paths}
+        failed: set[str] = set()
         for line in (proc.stdout + proc.stderr).splitlines():
             m = _GO_ERROR_RE.match(line)
             if not m:
                 continue
             _file, _line, _col, _msg = m.groups()
-            # Only report the file we asked about (package build surfaces siblings)
-            # removeprefix (Python 3.9+) is safe: lstrip("./") strips ANY
-            # leading '/' or '.' characters, e.g. "..hidden" → "hidden".
-            _normalized = _file.removeprefix("./") if _file.startswith("./") else _file
-            _candidate = os.path.normpath(os.path.abspath(os.path.join(module_root, _normalized)))
-            if _file and os.path.normpath(_file) != target_norm and _candidate != target_norm:
+            # Only report the files we asked about. A package build surfaces
+            # siblings we were not asked to check, and go build prints paths
+            # relative to its own cwd (module_root), so resolution goes through
+            # the shared resolve_tool_path rather than a bare abspath — see its
+            # docstring for the silent-drop failure that helper exists to
+            # prevent.
+            owner = by_norm.get(resolve_tool_path(module_root, _file)) if _file else None
+            if owner is None:
                 continue
-            errors.append(SyntaxError_(
-                file=file_path,
+            collected[owner].append(SyntaxError_(
+                file=owner,
                 line=int(_line), col=int(_col),
                 message=_msg,
                 severity="error",
                 code="",
             ))
-            has_error = True
-        return SyntaxValidationResult(
-            ok=not has_error,
-            errors=errors,
-            language=LanguageId.GO,
-        )
+            failed.add(owner)
+        return {
+            p: SyntaxValidationResult(
+                ok=p not in failed,
+                errors=collected[p],
+                language=LanguageId.GO,
+            )
+            for p in file_paths
+        }
 
     # ── Symbol patterns ───────────────────────────────────────────────────
 

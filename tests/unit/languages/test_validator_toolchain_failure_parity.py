@@ -117,3 +117,91 @@ def test_absence_and_failure_agree(lang, path, broken, valid):
     assert absent == failed, (
         f"{lang.value}: tool-absent {absent} diverges from tool-failed {failed}"
     )
+
+
+# ── the semantic half: a check that did not run must not answer "clean" ────
+# validate_syntax always genuinely runs (tree-sitter is always there), so the
+# tests above are about a WEAKER verdict. validate_semantics has the opposite
+# failure: it depends on a toolchain the user may simply not have installed —
+# pyright, tsc, go, javac, kotlinc — and every skip path answered ok=True with
+# an empty error list, which downstream is exactly what a clean check produces.
+# A `pip install asicode` with no node on the machine therefore had every Python
+# edit reported to the model as semantically verified.
+
+
+SEMANTIC_CASES = [
+    (LanguageId.PYTHON, "x.py"),
+    (LanguageId.TYPESCRIPT, "x.ts"),
+    (LanguageId.GO, "x.go"),
+    (LanguageId.JAVA, "X.java"),
+    (LanguageId.KOTLIN, "X.kt"),
+]
+
+SEMANTIC_FAILURES = [
+    pytest.param(FileNotFoundError("gone"), id="not-installed"),
+    pytest.param(subprocess.TimeoutExpired("tool", 10), id="timeout"),
+    pytest.param(OSError("boom"), id="oserror"),
+]
+
+
+@pytest.mark.parametrize("lang,name", SEMANTIC_CASES)
+@pytest.mark.parametrize("exc", SEMANTIC_FAILURES)
+def test_semantic_skip_is_not_reported_as_checked(lang, name, exc, tmp_path):
+    """A toolchain that never ran must say so, not return a clean verdict."""
+    cls, mod = _provider_and_module(lang)
+    # python_provider imports subprocess INSIDE _run_pyright, so it has no
+    # module-level attribute to patch — patch the stdlib module it will import,
+    # which is the same object. Skipping instead (as the syntax helper above
+    # does) would silently drop Python, the language most users run this on.
+    holder = mod.subprocess if hasattr(mod, "subprocess") else subprocess
+    # A real file, and the project markers each provider requires, so the run
+    # reaches the subprocess call rather than skipping earlier for its own
+    # reasons — those paths are unchecked too, but this test is about the
+    # toolchain itself failing.
+    src = tmp_path / name
+    src.write_text("x = 1\n", encoding="utf-8")
+    for marker in ("go.mod", "tsconfig.json", "pom.xml"):
+        (tmp_path / marker).write_text("{}\n", encoding="utf-8")
+
+    real = holder.run
+
+    def boom(*a, **k):
+        raise exc
+
+    holder.run = boom
+    try:
+        result = cls().validate_semantics(str(src))
+    finally:
+        holder.run = real
+
+    assert result.checked is False, (
+        f"{lang.value}: a semantic checker that never ran reported checked=True, "
+        "which is indistinguishable from a clean verdict"
+    )
+    assert result.skip_reason, f"{lang.value}: skip carries no reason for the model"
+    assert result.ok is True, (
+        f"{lang.value}: an unavailable semantic checker must stay non-blocking"
+    )
+    assert result.errors == []
+
+
+def test_a_real_clean_semantic_verdict_is_still_marked_checked(tmp_path):
+    """The opposite direction: a tool that RAN and found nothing is `checked`.
+
+    Reusing the skip constructor for a successful run would make every healthy
+    check look unavailable — the same conflation, mirrored.
+    """
+    pytest.importorskip("shutil")
+    import shutil
+
+    if shutil.which("pyright") is None:
+        pytest.skip("pyright not installed")
+    src = tmp_path / "clean.py"
+    src.write_text("x: int = 1\n", encoding="utf-8")
+
+    cls, _ = _provider_and_module(LanguageId.PYTHON)
+    result = cls().validate_semantics(str(src))
+
+    assert result.checked is True, "a completed pyright run reported as unchecked"
+    assert result.skip_reason == ""
+    assert result.ok is True

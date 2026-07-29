@@ -2531,3 +2531,74 @@ def preemptive_trim(
         len(messages), len(_fallback),
     )
     return _fallback
+
+
+def render_file_diagnostics_block(diags: Any) -> str:
+    """Render a ``<file_diagnostics>`` guidance block from raw diagnostic dicts.
+
+    Shared by the inline path (``AgentLoop._append_semantic_diagnostics``) and
+    the turn-end deferred-settlement path
+    (``TurnPipelineMixin._settle_deferred_semantics``) so a check that was
+    coalesced to turn end reaches the model through the SAME formatted channel
+    as an inline one, instead of only as raw JSON in ``metadata``. The block is
+    the channel the surrounding code documents as "which the LLM parses
+    reliably"; without this, every in-turn write (all deferred) would lose it.
+
+    Keeps error/warning severities only, de-duplicates by
+    ``(file_path, line, message)`` and caps the shown list at 15 (the running
+    totals are still reported). Returns ``""`` when nothing remains, so callers
+    can treat a falsy result as "append nothing" — identical to the prior
+    inline behaviour where an empty filtered list left ``content`` untouched.
+    """
+    seen: set = set()
+    filtered: list = []
+    total = 0
+    n_err = 0
+    n_warn = 0
+    for d in diags or []:
+        if not isinstance(d, dict):
+            continue
+        sev = (d.get("severity") or "error").lower()
+        if sev not in ("error", "warning"):
+            continue
+        key = (d.get("file_path", ""), d.get("line"), d.get("message", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        total += 1
+        if sev == "error":
+            n_err += 1
+        else:
+            n_warn += 1
+        if len(filtered) >= 15:
+            continue
+        filtered.append(d)
+    if not filtered:
+        return ""
+    suppressed = total - len(filtered)
+    lines = ["\n\n<file_diagnostics>"]
+    lines.append(
+        f"Semantic check found {total} unique issue(s) "
+        f"({n_err} error, {n_warn} warning), showing {len(filtered)} below. "
+        f"The edit was applied, but these may cause runtime failures — "
+        f"consider fixing them next."
+    )
+    if suppressed > 0:
+        lines.append(
+            f"... {suppressed} more {'issues' if suppressed > 1 else 'issue'} "
+            f"suppressed (run the validator directly for full output)"
+        )
+    for d in filtered:
+        sev = (d.get("severity") or "error").lower()
+        tag = "Error" if sev == "error" else "Warn"
+        loc = ""
+        if d.get("line") is not None:
+            col = d.get("column") or d.get("col")
+            loc = f":{d.get('line')}" + (f":{col}" if col else "")
+        file_ = d.get("file_path", "") or ""
+        file_short = file_.rsplit("/", 1)[-1] if file_ else ""
+        code = d.get("code")
+        code_str = f" [{code}]" if code else ""
+        lines.append(f"{tag}: {file_short}{loc}{code_str} {d.get('message', '').strip()}")
+    lines.append("</file_diagnostics>")
+    return "\n".join(lines)

@@ -583,12 +583,12 @@ external_llm/languages/libcst_utils.py::<module>::splice_modified_functions::3
 external_llm/languages/libcst_utils.py::<module>::splice_modified_functions::_BodyReplacer::leave_Module::0
 external_llm/languages/libcst_utils.py::<module>::splice_modified_functions::_extract_body::0
 external_llm/languages/libcst_utils.py::<module>::splice_modified_functions::_extract_full_node::0
+external_llm/languages/python_provider.py::<module>::PythonSyntaxProvider::_run_pyright::4
 external_llm/languages/python_provider.py::<module>::PythonSyntaxProvider::_validate_syntax_impl::3
 external_llm/languages/python_provider.py::<module>::PythonSyntaxProvider::find_symbol_body_range::0
 external_llm/languages/python_provider.py::<module>::PythonSyntaxProvider::find_symbol_in_file::0
 external_llm/languages/python_provider.py::<module>::PythonSyntaxProvider::find_symbol_in_file::1
 external_llm/languages/python_provider.py::<module>::PythonSyntaxProvider::find_symbol_in_file::2
-external_llm/languages/python_provider.py::<module>::PythonSyntaxProvider::validate_semantics::4
 external_llm/languages/syntax_validator.py::<module>::SyntaxValidator::find_symbol_in_file::0
 external_llm/languages/tree_sitter_utils.py::<module>::0
 external_llm/languages/tree_sitter_utils.py::<module>::_parse_to_tree_uncached::0

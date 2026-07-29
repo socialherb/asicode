@@ -188,3 +188,61 @@ def test_all_shims_guarded_by_command_v():
     prelude is inert wherever the real binary lives on PATH."""
     for name in ("timeout", "gtimeout", "tac", "nproc", "shuf", "realpath", "gsed", "gstat"):
         assert f"command -v {name}" in _SHELL_SHIM_PRELUDE, f"{name} missing no-op guard"
+
+
+# ── timeout's verdict must not depend on a race ─────────────────────────────
+# `timeout` used to decide "did we time out?" by asking whether the watchdog
+# subshell was still alive. The watchdog has nothing to do after `kill -TERM`,
+# so it normally exits before `wait` resumes the caller — but only normally.
+# Lose that race and a timed-out command reports 143 (128+SIGTERM) instead of
+# 124, so every caller keying on 124 sees a generic signal death. It surfaced
+# once in an 11,918-test suite run: rare enough to look like noise, real enough
+# to matter on a loaded machine.
+#
+# Asserted deterministically instead of by repetition: keeping the watchdog
+# alive one extra beat past its kill is exactly the state the old code
+# mis-read, and it is reproducible on demand. A correct implementation cannot
+# care how long the watchdog lives.
+
+
+def _widened_prelude() -> str:
+    """The shipped shim, with the watchdog left alive past its own kill."""
+    from external_llm.agent.tool_handlers.git_tools import _SHELL_SHIM_PRELUDE
+
+    widened = _SHELL_SHIM_PRELUDE.replace(
+        'kill -TERM "$pid" 2>/dev/null ) &',
+        'kill -TERM "$pid" 2>/dev/null; sleep 0.3 ) &',
+    )
+    assert widened != _SHELL_SHIM_PRELUDE, (
+        "the watchdog line moved — update this test's widening patch, do not "
+        "delete it: without the widening the assertion below passes vacuously"
+    )
+    return widened
+
+
+@pytest.mark.parametrize("name", ["timeout", "gtimeout"])
+def test_timeout_reports_124_even_when_the_watchdog_outlives_its_kill(name):
+    rc = subprocess.run(
+        _widened_prelude() + f"\n{name} 1 sleep 5",
+        shell=True, executable=_BASH, capture_output=True, text=True,
+    ).returncode
+    assert rc == 124, (
+        f"{name} returned {rc} (143 = SIGTERM leaked through) — the timeout "
+        "verdict is racing the watchdog's exit instead of reading a fact"
+    )
+
+
+def test_timeout_still_reports_the_command_status_when_it_finishes_first():
+    """The other direction: no timeout means the command's own exit code."""
+    for script, expected in (("gtimeout 5 true", 0), ("gtimeout 5 sh -c 'exit 7'", 7)):
+        rc, _, _ = _run(script)
+        assert rc == expected, f"{script!r} -> {rc}, expected {expected}"
+
+
+def test_timeout_marker_files_are_not_left_behind(tmp_path):
+    """The marker is an implementation detail; it must not accumulate in TMPDIR."""
+    env = dict(os.environ, TMPDIR=str(tmp_path))
+    rc, _, _ = _run("gtimeout 1 sleep 5", env=env)
+    assert rc == 124
+    leftovers = list(tmp_path.glob("asi_timeout.*"))
+    assert not leftovers, f"marker files left behind: {leftovers}"
