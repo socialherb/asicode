@@ -90,7 +90,6 @@ class AgentConfig:
     #RAG: related file automatic provide
     rag_enabled: bool = True           # Auto-inject related file Top-K at session start
     rag_top_k: int = 5                 # Number of files to auto-provide
-    rag_force_injection: bool = False  # Always force-inject RAG context (default False for Cursor/Windsurf-style lazy loading)
     # Human-in-the-Loop approval gate
     # Callable: (tool_name, args, preview_text) -> bool (True=proceed)
     approval_callback: Optional[Callable[["str", "dict[str,Any]", "str"], bool]] = None
@@ -134,8 +133,6 @@ class AgentConfig:
     helper_max_calls: int = 5        # Max delegation calls per session
     helper_ollama_url: str = "http://127.0.0.1:11434"  # Used when helper_model is Ollama
 
-    # Task Router configuration
-    task_router_enabled: bool = True
     route_decision: Optional[Any] = None
 
     # ── Bench / Experiment ────────────────────────────────────────────────────
@@ -146,9 +143,6 @@ class AgentConfig:
     # Exploration rate for online bandit learning (0.0 = pure exploit, 1.0 = pure random).
     # When triggered, a random strategy is tried instead of the policy-recommended one.
     patch_exploration_rate: float = 0.0
-
-    # Learning system for tool recommendation
-    learning_enabled: bool = False
 
     # Vector cache for semantic search
     vector_cache_enabled: bool = True
@@ -161,8 +155,6 @@ class AgentConfig:
     # Turn reduction optimizations
     dynamic_turn_budget_enabled: bool = True  # Dynamically adjust turn budget based on progress
 
-    prefer_fused_tools: bool = True  # Prefer fused tools over sequential tool calls
-
     # Tool result cache: reuse results of read-only tools (safe invalidation on writes)
     tool_result_cache_enabled: bool = True
     tool_result_cache_ttl: int = 120  # seconds
@@ -174,19 +166,6 @@ class AgentConfig:
     debug_messages: bool = False
     debug_route: bool = False
     debug_retries: bool = False
-
-    # Action memory: prevent duplicate tool calls
-    action_memory_enabled: bool = False
-    action_memory_max_entries: int = 64
-
-    # Planning progress tracking
-    plan_tracking_enabled: bool = False
-
-    # State-aware tool result delta context
-    delta_observation_enabled: bool = False
-
-    # Workspace state memory for recent context
-    workspace_state_enabled: bool = False
 
     # Tolerant patch mode: relaxed patch application for small/local models
     # When True: try whitespace-insensitive apply, fuzzy context re-anchoring,
@@ -846,7 +825,7 @@ class ToolRegistry(
         """Create a lightweight clone sharing expensive resources.
 
         Shared (immutable/thread-safe): SymbolSearcher, RAGSearcher,
-        CallGraphIndexer, file_cache, LintRunner.
+        CallGraphIndexer, LintRunner.
         Fresh (per-subagent mutable state): _applied_patches,
         _search_cache, config, tool_chain/async/watcher (disabled for subagents).
         """

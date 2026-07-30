@@ -170,7 +170,6 @@ class DelegationResult:
     validation: dict[str, Any] = field(default_factory=dict)
     # validation keys: syntax_ok, pattern_match, issues (list), overall_ok
     accepted: bool = False
-    rejection_reason: str = ""
     execution_time: float = 0.0
 
 
@@ -686,7 +685,6 @@ class LocalAssistant:
                 spec=spec,
                 validation={"overall_ok": False, "issues": ["OllamaClient not available"]},
                 accepted=False,
-                rejection_reason="OllamaClient not available",
                 execution_time=time.monotonic() - t0,
             )
 
@@ -726,7 +724,6 @@ class LocalAssistant:
                 cleaned_output="",
                 validation={"overall_ok": False, "issues": [str(exc)]},
                 accepted=False,
-                rejection_reason=str(exc),
                 execution_time=elapsed,
             )
 

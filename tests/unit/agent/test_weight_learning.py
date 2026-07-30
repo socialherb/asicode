@@ -377,6 +377,25 @@ class TestApplyWeightDelta:
         assert abs(sum(result.values()) - 1.0) < 1e-6
         assert result["success"] >= _W_MIN
 
+    def test_apply_multi_axis_residual_stays_on_simplex(self):
+        """Residual from clamping MANY pinned axes must still sum to 1.0.
+
+        Regression: the old re-balancer dumped the entire deficit onto ONE axis
+        and broke on the first fit. With 3 axes pushed high and 2 pushed low
+        (all clamping), no single axis had room for the whole residual, so the
+        simplex invariant drifted (sum ≈ 1.386). The fix distributes the
+        residual across every axis that still has room.
+        """
+        weights = {k: 0.2 for k in _AXES}
+        delta = {
+            "success": 0.4, "repair": 0.4, "contract": 0.4,
+            "complexity": -0.4, "cost": -0.4,
+        }
+        result = _apply_weight_delta(weights, delta)
+        assert abs(sum(result.values()) - 1.0) < 1e-6
+        for v in result.values():
+            assert _W_MIN - 1e-9 <= v <= _W_MAX + 1e-9
+
     def test_apply_preserves_all_axes(self):
         weights = {"success": 0.35, "repair": 0.30, "contract": 0.20, "complexity": 0.10, "cost": 0.05}
         delta = {"success": 0.01, "repair": 0.0, "contract": 0.02, "complexity": 0.0, "cost": 0.0}

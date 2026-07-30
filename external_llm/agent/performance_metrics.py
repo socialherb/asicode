@@ -69,8 +69,6 @@ class CacheHitRateMetrics:
     """
 
     def __init__(self):
-        self._file_hits = 0
-        self._file_misses = 0
         self._rag_hits = 0
         self._rag_misses = 0
         self._vector_hits = 0
@@ -96,9 +94,7 @@ class CacheHitRateMetrics:
     def get_stats(self, cache_type: str) -> dict[str, Any]:
         """Get comprehensive statistics for a cache type"""
         with self._lock:
-            if cache_type == "file":
-                hits, misses = self._file_hits, self._file_misses
-            elif cache_type == "rag":
+            if cache_type == "rag":
                 hits, misses = self._rag_hits, self._rag_misses
             elif cache_type == "vector":
                 hits, misses = self._vector_hits, self._vector_misses
@@ -119,7 +115,6 @@ class CacheHitRateMetrics:
     def get_all_stats(self) -> dict[str, dict[str, Any]]:
         """Get statistics for all cache types"""
         return {
-            "file": self.get_stats("file"),
             "rag": self.get_stats("rag"),
             "vector": self.get_stats("vector")
         }
@@ -127,8 +122,6 @@ class CacheHitRateMetrics:
     def reset(self):
         """Reset all counters"""
         with self._lock:
-            self._file_hits = 0
-            self._file_misses = 0
             self._rag_hits = 0
             self._rag_misses = 0
             self._vector_hits = 0
@@ -508,14 +501,11 @@ class PerformanceCollector:
         cache_misses`` below; the authoritative aggregate lives in the
         ``tool_result_cache`` summary channel (WeakSet over registered caches).
 
-        It is deliberately NOT forwarded to any file-cache channel: doing so
-        mislabeled every tool call (including non-cacheable write tools, which
-        always counted as file-cache misses) as file-cache activity, duplicating
-        the per-tool counters above AND the dedicated ``tool_result_cache``
-        channel, and distorting ``overall_hit_rate``. ``record_file_cache`` was
-        removed entirely; the ``file`` cache type remains in :meth:`get_stats` /
-        :meth:`get_summary` for backward-compat (always zeros — no real file
-        cache feeds it).
+        It is deliberately NOT forwarded to the ``rag``/``vector`` cache
+        channels: doing so would mislabel every tool call (including
+        non-cacheable write tools) as rag/vector activity, duplicating the
+        per-tool counters above AND the dedicated ``tool_result_cache``
+        channel, and distorting ``overall_hit_rate``.
         """
         with self._lock:
             if tool_name not in self.tool_metrics:
@@ -797,18 +787,18 @@ class PerformanceCollector:
 
         # Overall cache hit-rate across ALL live cache channels. tool_result_cache is
         # the largest by volume (every cacheable tool call flows through it), so it
-        # MUST be in the sum — excluding it made the headline reflect only rag+vector
-        # (file is always 0: legacy shape with no feeder). tool_result_cache_stats may
-        # be None when no cache is registered; treat as a zero contribution.
+        # MUST be in the sum — excluding it made the headline reflect only rag+vector.
+        # tool_result_cache_stats may be None when no cache is registered; treat as a
+        # zero contribution.
         _trc = tool_result_cache_stats
         _trc_hits = _trc["hits"] if _trc else 0
         _trc_total = (_trc["hits"] + _trc["misses"]) if _trc else 0
         _all_hits = (
-            cache_stats['file']['hits'] + cache_stats['rag']['hits']
+            cache_stats['rag']['hits']
             + cache_stats['vector']['hits'] + _trc_hits
         )
         _all_total = (
-            cache_stats['file']['total'] + cache_stats['rag']['total']
+            cache_stats['rag']['total']
             + cache_stats['vector']['total'] + _trc_total
         )
         overall_hit_rate = _all_hits / _all_total if _all_total > 0 else 0
@@ -895,7 +885,6 @@ class PerformanceCollector:
             'slow_llm': slow_llm,
 
             'cache_metrics': {
-                'file_cache': cache_stats['file'],
                 'rag_cache': cache_stats['rag'],
                 'vector_cache': cache_stats['vector'],
                 'tool_result_cache': tool_result_cache_stats,

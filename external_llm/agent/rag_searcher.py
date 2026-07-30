@@ -30,17 +30,23 @@ from .rag_configs import CodeTokenizer
 # Deterministic, source-prioritized descent order shared with the symbol /
 # call-graph walkers — keeps the RAG corpus reproducible and source-first.
 from ._shared_utils import _walk_dir_sort_key
+# Language extension SSOT — keeps the RAG corpus in lock-step with the rest of
+# the language layer (see the "6 SSOT dimensions" invariant in test_tree_sitter
+# _utils.py).  Importing _EXT_MAP here closes the last open drift the invariant
+# documents: _INDEXED_EXTS was a hardcoded subset that silently dropped
+# half-wired languages (.lua/.scala/.css/.html/.json/.pyi/.mjs/.cc/.kts/…).
+from ..languages.models import _EXT_MAP
 
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_INDEXED_EXTS = {
-    ".py", ".js", ".ts", ".jsx", ".tsx",
-    ".java", ".go", ".rs", ".rb", ".php",
-    ".cs", ".swift", ".kt", ".cpp", ".c", ".h",
-    ".md", ".toml", ".yaml", ".yml",
-}
+# Single source of truth: every extension the language layer recognises
+# (_EXT_MAP) plus doc/config extras that carry no language semantics but are
+# still worth searching (README, pyproject/Cargo manifests, CI configs).
+# Derived at import time so adding a language to _EXT_MAP makes it
+# RAG-indexable automatically — no manual sync, no silent omission.
+_INDEXED_EXTS = set(_EXT_MAP) | {".md", ".toml", ".yaml", ".yml"}
 
 _SKIP_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache",
@@ -254,9 +260,11 @@ class RAGSearcher:
                 else:
                     del self._search_cache[cache_key]  # expired
         if _cached is not None:
-            # Cache hit
+            # Cache hit. Return a shallow copy so a caller mutating the returned
+            # list (sort/append/clear/slice-assign) cannot poison the shared cache
+            # entry for the 5-min TTL — the cached list object must stay private.
             get_global_collector().record_rag_cache(True)
-            return _cached
+            return list(_cached)
         # Cache miss
         get_global_collector().record_rag_cache(False)
 
@@ -700,9 +708,9 @@ class RAGSearcher:
         Accumulates into *local* lists/dicts and only commits to ``self._*`` at
         the very end, so a mid-build cancel leaves instance state pristine —
         ``_built`` stays False and the next query re-runs this method from
-        scratch.  ``vector_cache_manager.add_document`` is the one side-effect
-        inside the loop; on cancel it may be partially written, but it is
-        incremental/idempotent and decoupled from the BM25 path.  Hold
+        scratch.  Vector-cache additions are staged during the loop and flushed
+        in a single batched ``add_documents`` call only on success; on cancel
+        the staged list is discarded (next rebuild re-adds everything).  Hold
         ``_index_lock`` for the whole build (the caller does) so no reader
         races the final commit.
         """
@@ -712,6 +720,10 @@ class RAGSearcher:
         doc_texts: list[str] = []
         df: dict[str, int] = {}
         total_len = 0
+        # Staged vector-cache additions — flushed as one batched encode() after
+        # the loop (see add_documents). Left empty on cancel, so nothing is
+        # written to the vector cache for a partial build.
+        vc_updates: list[tuple[str, str]] = []
 
         for fpath in self._walk_files():
             # Cooperative cancel: the per-file read+tokenize loop is the
@@ -743,12 +755,13 @@ class RAGSearcher:
                 for t in set(tc):
                     df[t] = df.get(t, 0) + 1
 
-                # Add to vector cache if enabled
+                # Stage vector-cache additions for a single batched flush after
+                # the loop (one encode() over all docs — 1.6x-2.2x faster than
+                # per-file add_document on a cold-start build). On cancel the
+                # staged list is discarded; the next successful rebuild re-adds
+                # everything, so no data is lost in steady state.
                 if self.vector_cache_enabled and self.vector_cache_manager is not None:
-                    try:
-                        self.vector_cache_manager.add_document(rel, text)
-                    except Exception as e:
-                        logger.debug(f"Failed to add document {rel} to vector cache: {e}")
+                    vc_updates.append((rel, text))
             except (AttributeError, TypeError):
                 continue
 
@@ -762,6 +775,13 @@ class RAGSearcher:
         self._total_doc_len = total_len
         self._avgdl = total_len / max(n, 1)
         self._rel_path_to_idx = {p: i for i, p in enumerate(rel_paths)}
+
+        # Flush staged vector-cache additions in one batched encode pass.
+        if vc_updates and self.vector_cache_enabled and self.vector_cache_manager is not None:
+            try:
+                self.vector_cache_manager.add_documents(vc_updates)
+            except Exception as e:
+                logger.debug(f"Failed to batch-add {len(vc_updates)} documents to vector cache: {e}")
         return True
 
     def _walk_files(self) -> list[Path]:

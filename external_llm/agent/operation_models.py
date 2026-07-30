@@ -577,7 +577,6 @@ class OperationKindPolicy:
     creates_files: bool = False        # creates new files (not pre-existing)
     deletes_files: bool = False        # removes files from disk
     deletes_symbols: bool = False    # removes symbols from file (e.g. DELETE_SYMBOL_RANGE)
-    requires_preflight: bool = False   # needs _preflight_check_file_issues (currently equivalent to modifies_files; reserved for future ops that modify files but skip preflight)
     allows_directory_target: bool = False  # path may be a dir, not a single file
     read_only: bool = False            # never produces a write op
     already_sat_eligible: bool = False # already_satisfied verdict is meaningful
@@ -605,68 +604,68 @@ OP_KIND_POLICY: dict[OperationKind, OperationKindPolicy] = {
         category=OpCategory.ANALYTICAL,
     ),
     OperationKind.MODIFY_SYMBOL: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
         already_sat_eligible=True,
         symbol_edit=True, precheck_eligible=True,
         inplace=True,
     ),
     OperationKind.INSERT_AFTER_SYMBOL: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
         already_sat_eligible=True,
         symbol_edit=True, inplace=True,
     ),
     OperationKind.INSERT_AFTER_LINE: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
         already_sat_eligible=True, inplace=True,
     ),
     OperationKind.ANCHOR_EDIT: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
         already_sat_eligible=True, symbol_edit=True,
         precheck_eligible=True, inplace=True,
     ),
     OperationKind.CREATE_FILE: OperationKindPolicy(
-        creates_files=True, requires_preflight=True,
+        creates_files=True,
     ),
     OperationKind.REPLACE_FILE: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True, inplace=True,
+        modifies_files=True, inplace=True,
     ),
     OperationKind.OVERWRITE_FILE: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True, inplace=True,
+        modifies_files=True, inplace=True,
     ),
     OperationKind.DELETE_FILE: OperationKindPolicy(
-        deletes_files=True, requires_preflight=True,
+        deletes_files=True,
     ),
     OperationKind.MOVE_SYMBOL: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
         convergence_excluded=True,
     ),
     OperationKind.UPDATE_CALLERS: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
         allows_directory_target=True, propagation_op=True,
     ),
     OperationKind.UPDATE_TESTS: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
         allows_directory_target=True, propagation_op=True,
     ),
     OperationKind.EXTRACT_FUNCTION: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
         convergence_excluded=True,
     ),
     OperationKind.INSERT_IMPORT: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
     ),
     OperationKind.REMOVE_IMPORT: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
     ),
     OperationKind.REMOVE_IMPORT_NAME: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
     ),
     OperationKind.ADD_ASSIGN: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
         inplace=True,
     ),
     OperationKind.DELETE_SYMBOL_RANGE: OperationKindPolicy(
-        modifies_files=True, requires_preflight=True,
+        modifies_files=True,
         # symbol_edit=False so the symbol-edit invariants (selector ladder,
         # semantic-verifier "symbol must remain") don't fire.
         already_sat_eligible=True,
@@ -724,11 +723,9 @@ class ExecutionPhase(str, enum.Enum):
     SINGLE_PHASE   — normal one-shot plan (no deferred writes).
     PHASE1_ANALYSIS — first phase: read/analyze only; requires_phase2=True means
                      a second execution phase will be generated from Phase 1 outputs.
-    PHASE2_EXECUTION — second phase: modification ops generated from Phase 1 outputs.
     """
     SINGLE_PHASE = "single_phase"
     PHASE1_ANALYSIS = "phase1_analysis"
-    PHASE2_EXECUTION = "phase2_execution"
 
 
 class DeferredWriteMode(str, enum.Enum):
@@ -736,12 +733,10 @@ class DeferredWriteMode(str, enum.Enum):
 
     ANALYZE_THEN_MODIFY  — plan has SUMMARIZE_ANALYSIS that produces a FixSpec;
                            Phase 2 regenerates modify ops from FixSpec.
-    UPSTREAM_UNVERIFIED  — upstream symbol was not yet read; inject upstream READ first.
     READ_THEN_FIXSPEC    — semantic-fit judge flagged presupposition mismatch;
                            read symbol body first to reconcile or abstain.
     """
     ANALYZE_THEN_MODIFY = "analyze_then_modify"
-    UPSTREAM_UNVERIFIED = "upstream_unverified"
     READ_THEN_FIXSPEC = "read_then_fixspec"
 
 

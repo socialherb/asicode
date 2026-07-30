@@ -6,10 +6,6 @@ Manages dependencies between tools for optimal chaining and parallel execution a
 
 from __future__ import annotations
 
-import logging
-
-logger = logging.getLogger(__name__)
-
 
 class ToolDependencyGraph:
     """Manages tool dependency graph for optimal chaining and parallel execution."""

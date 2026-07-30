@@ -49,7 +49,6 @@ class ImportInfo:
     module: str
     names: list[str] = field(default_factory=list)
     alias: Optional[str] = None
-    is_from_import: bool = False
 
 
 @dataclass
@@ -116,7 +115,6 @@ class CodeAnalyzer:
                     analysis.imports.append(ImportInfo(
                         module=alias.name,
                         alias=alias.asname,
-                        is_from_import=False
                     ))
 
             elif isinstance(node, ast.ImportFrom):
@@ -125,7 +123,6 @@ class CodeAnalyzer:
                 analysis.imports.append(ImportInfo(
                     module=module,
                     names=names,
-                    is_from_import=True
                 ))
 
             # Function calls

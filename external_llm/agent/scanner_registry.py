@@ -36,9 +36,6 @@ class ScannerSpec:
     input_schema: dict[str, str] = field(default_factory=dict)
     """Parameter name → type hint string, e.g. ``{"max_per_file": "int"}``."""
 
-    output_type_name: str = ""
-    """Human-readable output type, e.g. ``"DeadBlockCandidate"``."""
-
     produces_workset_kinds: list[str] = field(default_factory=list)
     """Workset kind strings, e.g. ``["dead_block_cluster"]``."""
 
@@ -371,7 +368,6 @@ def _auto_register() -> None:
                     "cluster_gap_tolerance": "Optional[int]",
                     "cross_file_referenced_names": "Optional[set]",
                 },
-                output_type_name="DeadBlockCandidate",
                 produces_workset_kinds=["dead_block_cluster"],
                     file_filter=".py",
                     supported_languages=set(_PYTHON_ONLY),
@@ -392,7 +388,6 @@ def _auto_register() -> None:
                 name="duplicate_definition_scanner",
                 description="Find top-level duplicate definitions (same name, same kind)",
                 input_schema={"max_per_file": "int"},
-                output_type_name="DuplicateDefinitionCandidate",
                 produces_workset_kinds=["duplicate_definition"],
                     file_filter="",
                     supported_languages=set(_TS_LANGUAGES),
@@ -412,7 +407,6 @@ def _auto_register() -> None:
                 name="unused_import_scanner",
                 description="Find unused import statements via AST reference analysis",
                 input_schema={"max_per_file": "int"},
-                output_type_name="UnusedImportCandidate",
                 produces_workset_kinds=["unused_import"],
                     file_filter=".py",
                     supported_languages=set(_PYTHON_ONLY),
@@ -436,7 +430,6 @@ def _auto_register() -> None:
                     "cluster_gap_tolerance": "Optional[int]",
                     "cross_file_referenced_names": "Optional[set]",
                 },
-                output_type_name="DeadBlockCandidate",
                 produces_workset_kinds=["public_dead_block_cluster"],
                     file_filter=".py",
                     supported_languages=set(_PYTHON_ONLY),
@@ -456,7 +449,6 @@ def _auto_register() -> None:
                 name="contradictory_logic_scanner",
                 description="Find contradictory conditions, unreachable branches, always-false assertions",
                 input_schema={"max_per_file": "int"},
-                output_type_name="ContradictoryCandidate",
                 produces_workset_kinds=["contradictory_logic"],
                 file_filter=".py",
                 supported_languages=set(_PYTHON_ONLY),
@@ -480,7 +472,6 @@ def _auto_register() -> None:
                     "min_similarity": "float",
                     "symbol_filter": "Optional[list]",
                 },
-                output_type_name="SimilarityCandidate",
                 produces_workset_kinds=["shared_scaffold", "paired_local_patch", "structural_pair"],
                 file_filter=".py",
                 supported_languages=set(_PYTHON_ONLY),
@@ -510,7 +501,6 @@ def _auto_register() -> None:
                     "exclude_patterns": "Optional[list]",
                     "exclude_kinds": "Optional[Iterable[str]]",
                 },
-                output_type_name="VultureCandidate",
                 produces_workset_kinds=["vulture_dead_code"],
                 file_filter=".py",
                 supported_languages=set(_PYTHON_ONLY),
@@ -541,7 +531,6 @@ def _auto_register() -> None:
                     "min_unreachable_keys": "int",
                     "cross_file_referenced_names": "Optional[set]",
                 },
-                output_type_name="ContainerReachabilityCandidate",
                 produces_workset_kinds=["container_dead_keys"],
                 file_filter=".py",
                 supported_languages=set(_PYTHON_ONLY),
@@ -564,7 +553,6 @@ def _auto_register() -> None:
                     "live while the other is unreachable (orphan reader/writer)"
                 ),
                 input_schema={"max_per_file": "int"},
-                output_type_name="BrokenContractCandidate",
                 produces_workset_kinds=["broken_contract"],
                 file_filter=".py",
                 supported_languages=set(_PYTHON_ONLY),

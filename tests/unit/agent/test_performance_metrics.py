@@ -1,6 +1,6 @@
 """Unit tests for performance_metrics.py — ToolMetrics aggregation (#2),
-file_cache decoupling (#3), tool failure recording (#4), and thread-safety
-of get_summary / reset (#5)."""
+rag/vector cache-channel decoupling (#3), tool failure recording (#4), and
+thread-safety of get_summary / reset (#5)."""
 
 import threading
 import time
@@ -71,20 +71,22 @@ class TestToolMetricsAggregation:
         assert abs(ts["avg_execution_time_ms"] - 15.0) < 1e-9
 
 
-# -- #3: record_tool_call must NOT pollute the file_cache channel --------------
+# -- #3: record_tool_call must NOT pollute the rag/vector cache channels ---------
 
 
 class TestFileCacheDecoupling:
-    def test_record_tool_call_does_not_feed_file_cache(self):
+    def test_record_tool_call_does_not_feed_cache_channels(self):
         # cache_hit passed to record_tool_call is the ToolResultCache hit flag,
-        # NOT a file-cache hit. Feeding it into cache_metrics.file_cache
-        # duplicated the per-tool counters and the tool_result_cache channel and
-        # distorted overall_hit_rate.
+        # NOT a rag/vector cache hit. Feeding it into cache_metrics would
+        # duplicate the per-tool counters and the tool_result_cache channel and
+        # distort overall_hit_rate.
         c = PerformanceCollector()
         c.record_tool_call("read_file", 0.01, cache_hit=True)
         c.record_tool_call("edit_text", 0.02, cache_hit=False)
-        fc = c.cache_metrics.get_stats("file")
-        assert fc["hits"] == 0 and fc["misses"] == 0 and fc["total"] == 0
+        rag = c.cache_metrics.get_stats("rag")
+        assert rag["hits"] == 0 and rag["misses"] == 0 and rag["total"] == 0
+        vec = c.cache_metrics.get_stats("vector")
+        assert vec["hits"] == 0 and vec["misses"] == 0 and vec["total"] == 0
 
     def test_per_tool_cache_granularity_preserved(self):
         # Removing the file_cache feed must not lose per-tool cache stats.

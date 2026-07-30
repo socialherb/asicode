@@ -1343,13 +1343,31 @@ class ReadToolsMixin:
         file_glob = args.get("file_glob") or None
 
         results = self._rag_searcher.find_relevant_files(query, top_k=top_k, file_glob=file_glob)
+        # The corpus walk caps at RAG_MAX_FILES; when the cap is hit the index is
+        # incomplete, so "no results" does NOT mean "absent in repo". Surface the
+        # truncation flag in content + metadata so the agent can fall back to
+        # grep/glob (a full-repo scan the cap does not bind). getattr guards
+        # against test doubles that lack the property.
+        index_truncated = bool(getattr(self._rag_searcher, "index_truncated", False))
         logger.debug(
-            "RAG search invoked: query=%s results=%d",
+            "RAG search invoked: query=%s results=%d truncated=%s",
             query,
-            len(results)
+            len(results),
+            index_truncated,
         )
         if not results:
-            return self._make_result(ok=True, content="No relevant files found for the given query.")
+            if index_truncated:
+                content = (
+                    "No relevant files found in the indexed corpus, but the RAG index "
+                    "hit its file cap and is incomplete — a match may exist in files "
+                    "beyond the cap. Retry with grep or glob, which scan the full repo."
+                )
+            else:
+                content = "No relevant files found for the given query."
+            return self._make_result(
+                ok=True, content=content,
+                metadata={"files_found": [], "result_count": 0, "index_truncated": index_truncated},
+            )
 
         lines: list[str] = [f"Top {len(results)} relevant file(s) for: '{query}'\n"]
         for i, r in enumerate(results, 1):
@@ -1357,9 +1375,19 @@ class ReadToolsMixin:
             if r.snippet.strip():
                 lines.append(f"     {r.snippet[:110]}")
         lines.append("\nUse read_file to inspect these, or get_file_outline first if a file is large.")
+        if index_truncated:
+            lines.append(
+                "\nNote: the RAG index hit its file cap and is incomplete — a more "
+                "relevant file may exist beyond the cap. Use grep or glob to scan "
+                "the full repository."
+            )
         return self._make_result(
             ok=True, content="\n".join(lines),
-            metadata={"files_found": [r.file for r in results], "result_count": len(results)},
+            metadata={
+                "files_found": [r.file for r in results],
+                "result_count": len(results),
+                "index_truncated": index_truncated,
+            },
         )
 
     def _tool_read_image(self, args: dict[str, Any]) -> "ToolResult":

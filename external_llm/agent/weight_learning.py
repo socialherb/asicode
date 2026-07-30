@@ -471,21 +471,36 @@ def _apply_weight_delta(
     1. Add delta.
     2. Normalise (scale to sum=1.0).
     3. Clamp each axis to [_W_MIN, _W_MAX].
-    4. Re-balance: any sum residual from step 3 is absorbed by the axis
-       farthest from both bounds, keeping all axes within bounds.
+    4. Re-balance: distribute the sum residual from step 3 across every axis
+       that still has room in the needed direction (water-filling). Each pass
+       spreads the residual evenly over the unpinned axes; an axis that hits a
+       bound drops out and the remainder carries to the next pass. Because 1.0
+       always lies within [_AXES·_W_MIN, _AXES·_W_MAX], total room always covers
+       the residual, so this converges in at most len(_AXES) passes.
     """
     updated = {k: weights.get(k, 0.0) + delta.get(k, 0.0) for k in _AXES}
     normed  = _normalize_weights(updated)
     clamped = _clamp_weights(normed)
 
-    # Re-distribute sum residual onto the most flexible axis
     deficit = round(1.0 - sum(clamped.values()), 9)
-    if abs(deficit) > 1e-9:
-        for k in sorted(_AXES, key=lambda x: -clamped[x]):
-            candidate = clamped[k] + deficit
-            if _W_MIN - 1e-9 <= candidate <= _W_MAX + 1e-9:
-                clamped[k] = max(_W_MIN, min(_W_MAX, candidate))
-                break
+    for _ in range(len(_AXES)):
+        if abs(deficit) <= 1e-9:
+            break
+        if deficit > 0:
+            # Need to ADD weight: axes with upward room below _W_MAX.
+            flexible = [k for k in _AXES if clamped[k] < _W_MAX - 1e-12]
+        else:
+            # Need to REMOVE weight: axes with downward room above _W_MIN.
+            flexible = [k for k in _AXES if clamped[k] > _W_MIN + 1e-12]
+        if not flexible:
+            break  # defensive: every axis pinned (infeasible bounds)
+        share = deficit / len(flexible)
+        absorbed = 0.0
+        for k in flexible:
+            new_val = max(_W_MIN, min(_W_MAX, clamped[k] + share))
+            absorbed += new_val - clamped[k]
+            clamped[k] = round(new_val, 9)
+        deficit = round(deficit - absorbed, 9)
 
     return clamped
 

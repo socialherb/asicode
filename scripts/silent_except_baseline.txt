@@ -278,7 +278,7 @@ external_llm/agent/placement_contract.py::<module>::_verify_inside_block::1
 external_llm/agent/placement_contract.py::<module>::_verify_inside_block::_collect_stmts::0
 external_llm/agent/placement_contract.py::<module>::find_pre_return_lineno::0
 external_llm/agent/placement_contract.py::<module>::resolve_after_anchor_insertion::0
-external_llm/agent/rag_searcher.py::<module>::RAGSearcher::_build_index::1
+external_llm/agent/rag_searcher.py::<module>::RAGSearcher::_build_index::0
 external_llm/agent/rag_searcher.py::<module>::RAGSearcher::invalidate_files::0
 external_llm/agent/rag_searcher.py::<module>::RAGSearcher::invalidate_files::2
 external_llm/agent/repair_helpers.py::<module>::_restore_missing_docstring::0

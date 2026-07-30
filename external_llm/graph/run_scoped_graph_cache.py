@@ -116,9 +116,8 @@ class RunScopedGraphCache:
                 ttl=effective_ttl,
             )
             # Move to end AFTER assignment so both new and updated keys land at
-            # the MRU end (mirrors ToolResultCache.set / FileContentCache.set;
-            # fixes the old code that moved-then-overwrote, making the move a
-            # no-op for existing keys).
+            # the MRU end (mirrors ToolResultCache.set; fixes the old code that
+            # moved-then-overwrote, making the move a no-op for existing keys).
             self._cache.move_to_end(key)
             # Evict AFTER inserting: _evict_if_needed() uses a strict-greater
             # (`> max_entries`) guard, so it can only trip once the new entry

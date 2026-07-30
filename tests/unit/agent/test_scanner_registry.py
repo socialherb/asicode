@@ -23,7 +23,6 @@ def registry() -> ScannerRegistry:
             name="test_scanner",
             description="A test scanner",
             input_schema={"limit": "int"},
-            output_type_name="TestCandidate",
             produces_workset_kinds=["test_cluster"],
             file_filter=".py",
         ),

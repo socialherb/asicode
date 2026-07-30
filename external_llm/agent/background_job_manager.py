@@ -442,6 +442,7 @@ class BackgroundJobManager:
             if remaining <= 0:
                 return info  # timeout — return current snapshot
             time.sleep(min(poll_interval, remaining))
+
     def list_jobs(self, include_completed: bool = True) -> list[BackgroundJobInfo]:
         """List all tracked jobs, lazily reaping old completed ones first.
 

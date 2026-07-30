@@ -289,6 +289,32 @@ def test_stale_result_not_recached_after_invalidate_race(tmp_path: Path) -> None
         )
 
 
+def test_cache_hit_returns_copy_not_shared_list(tmp_path: Path) -> None:
+    """A cache hit must return a fresh list, not the cached object.
+
+    Callers may sort/append/clear the returned list; if the cached entry were
+    handed out by reference, that mutation would poison the entry for the 5-min
+    TTL (e.g. an in-place ``clear()`` would make every subsequent hit return []).
+    """
+    _seed_repo(tmp_path)
+    searcher = _build_searcher(tmp_path)
+    # First call populates the cache (miss); second is a guaranteed hit.
+    query = "unique_token_doc1"
+    r1 = searcher.find_relevant_files(query, top_k=5)
+    assert r1, "seed query must match"
+    r2 = searcher.find_relevant_files(query, top_k=5)
+    assert len(r2) == len(r1)
+
+    # Mutate the returned list as a buggy caller might.
+    r2.clear()
+    r2.append("NOT_A_SEARCH_RESULT")
+
+    # The cached entry (and thus a fresh hit) must be unaffected.
+    r3 = searcher.find_relevant_files(query, top_k=5)
+    assert len(r3) == len(r1), "caller mutated the cached list — cache poisoned"
+    assert all(hasattr(x, "file") for x in r3), "poisoned entry leaked into fresh hit"
+
+
 def test_generation_compare_holds_cache_lock(tmp_path: Path) -> None:
     """The generation re-check at the cache-WRITE site must run UNDER
     ``_search_cache_lock`` (not before it), else a micro-window lets an

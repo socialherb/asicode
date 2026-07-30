@@ -68,12 +68,6 @@ class SymbolFlowFacts:
     e.g. {"get_user": [["1"], ["2"]], "fetch": [['"admin"']]}
     """
 
-    mutating_calls: set[str] = field(default_factory=set)
-    """Callee names where is_mutating=True in the call graph.
-    Populated from graph edge data (not re-derived from AST here).
-    Signals "this function writes to external state via these callees."
-    """
-
     alias_chains: dict[str, str] = field(default_factory=dict)
     """Single-hop alias map: alias_name -> original_name for x = y assignments.
     Enables object identity: u2 = u1 → alias_chains["u2"] = "u1"

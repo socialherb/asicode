@@ -9500,7 +9500,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
     # main poll loop below (single-threaded), read by this daemon thread. Not
     # lock-protected — advisory display data, not a correctness signal, and
     # simple int/str assignment is atomic enough under the GIL.
-    _worker_start_ts = time.time()
+    _worker_start_ts = time.monotonic()
     _worker_stats = {"tasks_served": 0, "last_task_id": ""}
 
     def _write_idle_hb() -> None:
@@ -9508,7 +9508,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
             repo_root, agent_id, pid=os.getpid(),
             tasks_served=_worker_stats["tasks_served"],
             last_task_id=_worker_stats["last_task_id"],
-            uptime_s=time.time() - _worker_start_ts,
+            uptime_s=time.monotonic() - _worker_start_ts,
         )
 
     def _idle_heartbeat_writer() -> None:
