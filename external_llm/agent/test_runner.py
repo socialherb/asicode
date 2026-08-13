@@ -203,7 +203,14 @@ class TestRunner:
         # Without this, pytest reads the terminal width (often 80-120 cols)
         # and breaks node IDs like "...::TestFoo\n  ::test_bar", which makes
         # the structured output hard to parse and the LLM result confusing.
-        env.setdefault("COLUMNS", "200")
+        #
+        # Assigned, not setdefault: an inherited narrow COLUMNS is exactly the
+        # case this guards against, and setdefault yielded to it — a parent
+        # that exports COLUMNS=80 (CI runners do) passed 80 straight through
+        # and the wrapping happened anyway. An explicit env_overrides entry is
+        # a deliberate caller choice and still wins.
+        if "COLUMNS" not in self.env_overrides:
+            env["COLUMNS"] = "200"
 
         from .config.thresholds import config as _thresholds
         _CAP = _thresholds.tokens.BASH_OUTPUT_MAX_CHARS

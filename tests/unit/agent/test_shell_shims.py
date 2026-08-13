@@ -139,6 +139,19 @@ def test_option_forms_still_time_out():
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(
+    shutil.which("timeout") is not None,
+    reason=(
+        "same reason as test_missing_command: where coreutils provides a real "
+        "timeout the shim function is never defined, so this asserts GNU's "
+        "escalation semantics rather than ours. The exit codes diverge only "
+        "once the child TRAPS TERM and the KILL escalation is forced — the "
+        "plain-timeout cases above stay 124 on both platforms, which is why "
+        "only this one needs the guard. Measured on ubuntu-latest / coreutils: "
+        "rc=-9, i.e. the KILL reaches the invoking bash itself rather than "
+        "surfacing as 124. Pinning that buys no coverage of our shim."
+    ),
+)
 def test_kill_after_escalates_to_sigkill():
     """`-k` is honoured, not merely parsed and dropped.
 
