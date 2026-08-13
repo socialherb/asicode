@@ -3,7 +3,10 @@ Tests for ClaudeSession event handling and SessionEvent/SessionResult.
 """
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
+
+import pytest
 
 from external_llm.repl.collaborate import CollaborationVerdict
 from external_llm.repl.collaborate.claude_session import (
@@ -188,3 +191,75 @@ class TestStreamEventHandling:
         ))
         assert len(s._events) == 1
         assert s._events[0].content == "x"
+
+
+class TestQueryTimeout:
+    """ClaudeSession.query() timeout + interrupt wiring (R11-1)."""
+
+    def test_timeout_returns_failure_and_interrupts_agent(self):
+        """A hung receive_response() must time out, interrupt the SDK agent
+        subprocess, and return a failure verdict instead of hanging forever.
+
+        Drives query(), which reaches _process_response_stream's SDK import —
+        requires claude_agent_sdk (optional dependency), skipped when absent.
+        Without the skip this fails as "Session error" (the ImportError path)
+        rather than the timeout it means to assert.
+        """
+        pytest.importorskip("claude_agent_sdk")
+        interrupted = {"called": False}
+
+        class _HungClient:
+            async def query(self, prompt):
+                pass
+
+            async def receive_response(self):
+                # SDK hang: stream never completes
+                while True:
+                    await asyncio.sleep(0.1)
+                    yield SimpleNamespace()
+
+            async def interrupt(self):
+                interrupted["called"] = True
+
+        s = ClaudeSession(query_timeout=0.05)
+        s._client = _HungClient()
+
+        result = asyncio.run(s.query("hello"))
+
+        assert result.verdict.status == "failure"
+        assert result.verdict.summary == "Query timed out"
+        assert "timed out" in (result.error or "").lower()
+        assert interrupted["called"] is True
+        # interrupt() emits a status event into the failure result
+        assert any(e.type == "status" and e.content == "INTERRUPTED"
+                   for e in result.events)
+
+    def test_completes_normally_with_timeout_set(self):
+        """A fast stream must complete normally even with a timeout configured.
+
+        Requires claude_agent_sdk (optional dependency) — skipped when absent,
+        for the same reason as the timeout test above.
+        """
+        pytest.importorskip("claude_agent_sdk")
+
+        class _FastClient:
+            async def query(self, prompt):
+                pass
+
+            async def receive_response(self):
+                # empty stream — generator completes immediately
+                return
+                yield  # pragma: no cover — unreachable, keeps it a generator
+
+        s = ClaudeSession(query_timeout=5.0)
+        s._client = _FastClient()
+
+        result = asyncio.run(s.query("hello"))
+
+        assert result.verdict.status == "insufficient_info"  # fallback verdict
+        assert result.error is None
+
+    def test_no_timeout_by_default(self):
+        """query_timeout defaults to None → wait_for not applied."""
+        s = ClaudeSession()
+        assert s._query_timeout is None

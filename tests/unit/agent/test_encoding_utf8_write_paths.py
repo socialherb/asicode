@@ -105,8 +105,11 @@ class TestEncodingSourceGuard:
         )
 
     def test_from_full_file_uses_utf8_read(self):
-        src = inspect.getsource(PatchSynthesizer._from_full_file)
+        # P23-1 moved the target read out of _from_full_file/_from_asicode_block/
+        # _from_targeted_block into the _read_target_text helper — the guard
+        # follows the single chokepoint.
+        src = inspect.getsource(PatchSynthesizer._read_target_text)
         assert 'encoding="utf-8"' in src, (
-            "_from_full_file lost encoding=\"utf-8\" — non-ASCII source will "
-            "raise UnicodeDecodeError under ASCII locale (CI/Docker)"
+            "PatchSynthesizer target reads lost encoding=\"utf-8\" — non-ASCII "
+            "source will raise UnicodeDecodeError under ASCII locale (CI/Docker)"
         )

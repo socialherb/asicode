@@ -80,10 +80,104 @@ def test_grep_results_are_unchanged_for_an_ordinary_search(tool_registry, temp_r
     assert "(2 matches)" in result.content
 
 
+@pytest.fixture
+def wide_line_repo(temp_repo_root):
+    """One match inside a line no human wrote — a minified bundle."""
+    with open(f"{temp_repo_root}/bundle.min.js", "w", encoding="utf-8") as fh:
+        fh.write("var a=1;" * 400_000 + "NEEDLE_TOKEN;\n")  # ~3.2 MB, ONE line
+    return temp_repo_root
+
+
+class TestWideLines:
+    """The budgets bounded rows; nothing bounded columns.
+
+    `retain_lines`, `max_results` and the char cap all count LINES. A single
+    match inside a minified bundle, a .map or one-line JSON therefore returned
+    the whole line: measured 34,000,257 chars of tool content against a
+    60,000-char "hard limit" (566x), and +215 MB of peak RSS. The char guard
+    admitted it deliberately — "include this line but stop" — which makes the
+    cap a limit plus one line of unbounded width.
+
+    `bash` next door has a real cap (_truncate_bash_output slices), and the
+    webapp's own rg fallback already passes --max-columns. grep was the outlier.
+    """
+
+    @staticmethod
+    def _cap() -> int:
+        from external_llm.agent.config.thresholds import config as _thresholds
+        return _thresholds.tokens.BASH_OUTPUT_MAX_CHARS
+
+    @pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
+    def test_a_wide_match_line_cannot_blow_the_char_cap(self, tool_registry, wide_line_repo):
+        result = tool_registry.dispatch("grep", {"pattern": "NEEDLE_TOKEN"})
+        assert result.ok
+        assert len(result.content) <= self._cap(), (
+            f"grep returned {len(result.content):,} chars against a "
+            f"{self._cap():,}-char cap — the cap bounds lines, not their width"
+        )
+
+    @pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
+    def test_the_match_is_still_found_and_counted(self, tool_registry, wide_line_repo):
+        """Clamping the width must not cost the match or the count."""
+        result = tool_registry.dispatch("grep", {"pattern": "NEEDLE_TOKEN"})
+        assert result.ok
+        assert "(1 match)" in result.content
+        assert "bundle.min.js" in result.content
+
+    def test_the_system_grep_fallback_is_clamped_too(
+        self, tool_registry, wide_line_repo, monkeypatch,
+    ):
+        """rg is OPTIONAL (pyproject [search]).
+
+        --max-columns does the clamping in the child for the rg path, and there
+        is no equivalent flag for system grep — so on the fallback the Python
+        clamp in _drain_out is the only thing standing between a minified line
+        and the conversation history.
+        """
+        # _tool_grep imports shutil inside the function, so the module
+        # attribute is what it resolves against.
+        monkeypatch.setattr(shutil, "which", lambda _name: None)
+        result = tool_registry.dispatch("grep", {"pattern": "NEEDLE_TOKEN"})
+        assert result.ok
+        assert len(result.content) <= self._cap(), (
+            f"the system-grep fallback returned {len(result.content):,} chars"
+        )
+
+    def test_the_clamp_leaves_ordinary_lines_untouched(self, tool_registry, temp_repo_root):
+        """A clamp that trims real source would be worse than the bug."""
+        body = "def alpha():\n    return 1  # " + "y" * 200 + "\n"
+        with open(f"{temp_repo_root}/a.py", "w", encoding="utf-8") as fh:
+            fh.write(body)
+        result = tool_registry.dispatch("grep", {"pattern": "return 1"})
+        assert result.ok
+        assert "y" * 200 in result.content, "a 230-char line must survive intact"
+
+
 def test_grep_reports_no_matches_distinctly(tool_registry, temp_repo_root):
     result = tool_registry.dispatch("grep", {"pattern": "zzz_no_such_token_zzz"})
     assert result.ok
     assert "no matches" in result.content
+
+
+def test_grep_floors_max_results_at_one(tool_registry, temp_repo_root):
+    """max_results=0 is a malformed request, not "show me nothing".
+
+    grep's siblings floor at 1 (glob, find_relevant_files); without the floor
+    grep selected a top-0 BM25 slice and rendered "truncated to 0 of N matches"
+    — a useless answer that reads as "searched, found nothing to show". A
+    correct-type 0 is left intact by the argument-repair layer (only null is
+    dropped, see TestNullIsAbsence), so it reaches the handler.
+    """
+    with open(f"{temp_repo_root}/m.py", "w", encoding="utf-8") as fh:
+        fh.write("needle = 1\nneedle = 2\nneedle = 3\n")
+    result = tool_registry.dispatch("grep", {"pattern": "needle", "max_results": 0})
+    assert result.ok
+    # At least one match line is shown, never zero.
+    assert "m.py" in result.content, (
+        f"max_results=0 showed no matches at all: {result.content!r}"
+    )
+    # The true total is still reported.
+    assert "(3 matches)" in result.content
 
 
 class TestSearchDeadline:
@@ -144,6 +238,7 @@ class TestSearchDeadline:
             )
         survivors = subprocess.run(
             ["pgrep", "-f", marker], capture_output=True, text=True, timeout=10,
+            check=False,
         )
         assert not survivors.stdout.strip(), (
             f"processes survived the search kill: {survivors.stdout!r}"
@@ -200,6 +295,7 @@ class TestSearchCancel:
             )
         survivors = subprocess.run(
             ["pgrep", "-f", marker], capture_output=True, text=True, timeout=10,
+            check=False,
         )
         assert not survivors.stdout.strip(), (
             f"the search survived its cancel: {survivors.stdout!r}"
@@ -209,7 +305,7 @@ class TestSearchCancel:
         """Not as an empty answer — that reads as 'searched, found nothing'."""
         import external_llm.agent.tool_handlers.read_tools as rt
 
-        def _cancel(cmd, cwd, timeout, retain_lines, cancelled=None):
+        def _cancel(cmd, cwd, timeout, retain_lines, cancelled=None, **_kw):
             raise rt.SearchCancelled(cmd)
 
         monkeypatch.setattr(
@@ -230,7 +326,7 @@ class TestSearchCancel:
 
         seen: list = []
 
-        def _capture(cmd, cwd, timeout, retain_lines, cancelled=None):
+        def _capture(cmd, cwd, timeout, retain_lines, cancelled=None, **_kw):
             seen.append(cancelled)
             return 1, [], 0, ""
 
@@ -256,7 +352,7 @@ def test_grep_surfaces_a_tool_failure(tool_registry, temp_repo_root, monkeypatch
     """A non-search failure must still reach the caller with its stderr."""
     import external_llm.agent.tool_handlers.read_tools as rt
 
-    def _boom(cmd, cwd, timeout, retain_lines, cancelled=None):
+    def _boom(cmd, cwd, timeout, retain_lines, cancelled=None, **_kw):
         return 2, [], 0, "rg: unrecognized flag"
 
     monkeypatch.setattr(

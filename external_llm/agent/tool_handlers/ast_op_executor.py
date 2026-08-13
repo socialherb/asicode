@@ -16,10 +16,15 @@ from __future__ import annotations
 
 import ast
 import builtins as _builtins
+import logging
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from external_llm.code_structure_utils import is_module_level_import_present, iter_module_scope_nodes
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_unparse_iter(loop_node: ast.For) -> str:
@@ -30,7 +35,10 @@ def _safe_unparse_iter(loop_node: ast.For) -> str:
         return ""
 
 
-def _guard_already_present(source: str, stmt: str, symbol: str) -> bool:
+def _guard_already_present(
+    source: str, stmt: str, symbol: str, parent_class: str = "",
+    *, _src_tree: Optional[ast.AST] = None,
+) -> bool:
     """AST-based guard idempotency check.
 
     Returns True when the function ``symbol`` already contains an ``if``
@@ -38,10 +46,14 @@ def _guard_already_present(source: str, stmt: str, symbol: str) -> bool:
     condition, AND whose body contains a terminal action (raise/return/
     continue/break).
 
+    Resolution is class-scoped: a qualified ``symbol`` ("Class.method") or
+    ``parent_class`` restricts the search to that class's method, so a
+    same-named method in a different class must NOT satisfy the check.
+
     Scans both the function body entry (first 5 stmts) AND first stmts of
     every for/while loop body, covering all insert_scope variants.
     """
-    try:
+    with suppress(SyntaxError, ValueError):  # malformed guard statement
         # Parse the guard statement to extract its condition.
         guard_tree = ast.parse(stmt, mode="exec")
         guard_if: ast.If | None = None
@@ -53,14 +65,14 @@ def _guard_already_present(source: str, stmt: str, symbol: str) -> bool:
             return False
         guard_cond_dump = ast.dump(guard_if.test)
 
-        # Parse the source and find the target function.
-        src_tree = ast.parse(source)
-        func_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None
-        bare = symbol.split(".")[-1] if "." in symbol else symbol
-        for node in ast.walk(src_tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == bare:
-                func_node = node
-                break
+        # Parse the source and find the target function (class-scoped).
+        # A pre-parsed tree from the caller (_add_guard) is reused — the same
+        # source is otherwise parsed up to 3x per add_guard call.
+        src_tree = _src_tree if _src_tree is not None else ast.parse(source)
+        _parts = symbol.split(".") if symbol else []
+        _bare = _parts[-1] if _parts else symbol
+        _parent = _parts[-2] if len(_parts) >= 2 else parent_class
+        func_node = ASTOpExecutor._find_func_node(src_tree, _bare, _parent)
         if func_node is None:
             return False
 
@@ -87,12 +99,8 @@ def _guard_already_present(source: str, stmt: str, symbol: str) -> bool:
 
         # Scan entry of every loop body inside the function (for_loop / while_loop).
         for node in ast.walk(func_node):
-            if isinstance(node, (ast.For, ast.While)) and node.body:
-                if _has_terminal_if(node.body):
-                    return True
-
-    except Exception:
-        pass
+            if isinstance(node, (ast.For, ast.While)) and node.body and _has_terminal_if(node.body):
+                return True
     return False
 
 
@@ -277,10 +285,7 @@ class ASTOpExecutor:
                 # the last line's terminator, but if old had none, swallowing it
                 # would merge the replacement with the following line.
                 if span.endswith("\n") and not old.endswith(("\n", "\r")):
-                    if span.endswith("\r\n"):
-                        span = span[:-2]
-                    else:
-                        span = span[:-1]
+                    span = span[:-2] if span.endswith("\r\n") else span[:-1]
                 matches.append(span)
         if len(matches) == 1:
             return matches[0]
@@ -291,9 +296,11 @@ class ASTOpExecutor:
     ) -> tuple[str, bool]:
         """Replace first occurrence of ``old`` with ``new``.
 
-        When ``symbol`` is given, the replacement is scoped to that function's
-        line range.  Falls back to file-level replace if the function is not
-        found or the pattern is absent inside it.
+        When ``symbol`` is given, the replacement is strictly scoped to that
+        function's line range.  If the symbol cannot be resolved the operation
+        fails loudly (returns False + sets op["_error"]) instead of silently
+        falling back to a file-wide replace, which would mutate a different
+        function (mirrors delete_stmt's loud-failure contract).
 
         Matching is exact first; on miss, a whitespace-tolerant fallback retries
         ignoring per-line trailing whitespace / line endings (the common reason
@@ -309,20 +316,34 @@ class ASTOpExecutor:
                 tree = ast.parse(source)
                 lines = source.splitlines(keepends=True)
                 node = self._find_func_node(tree, symbol, parent_class)
-                if node is not None:
-                    s = node.lineno - 1        # 0-based inclusive start
-                    e = node.end_lineno        # 0-based exclusive end
-                    func_text = "".join(lines[s:e])
-                    _match = old if old in func_text else self._ws_tolerant_span(func_text, old)
-                    if not _match:
-                        return source, False
-                    if func_text.count(_match) > 1:
-                        return source, False
-                    new_func = func_text.replace(_match, new, 1)
-                    result = "".join(lines[:s]) + new_func + "".join(lines[e:])
-                    return result, True
+                if node is None:
+                    # Symbol not found — fail loudly instead of falling back to
+                    # a file-wide replace, which would silently mutate a
+                    # different function (mirrors delete_stmt).
+                    op["_error"] = (
+                        f"replace_expr: symbol '{symbol}' not found in file; "
+                        "operation aborted to prevent file-wide replacement."
+                    )
+                    return source, False
+                s = node.lineno - 1        # 0-based inclusive start
+                e = node.end_lineno        # 0-based exclusive end
+                func_text = "".join(lines[s:e])
+                _match = old if old in func_text else self._ws_tolerant_span(func_text, old)
+                if not _match:
+                    return source, False
+                if func_text.count(_match) > 1:
+                    return source, False
+                new_func = func_text.replace(_match, new, 1)
+                result = "".join(lines[:s]) + new_func + "".join(lines[e:])
             except Exception:
-                pass  # fall through to file-level
+                # AST parse error — fail loudly instead of silent file-wide fallback.
+                op["_error"] = (
+                    "replace_expr: AST parse failed; "
+                    "operation aborted to prevent file-wide replacement."
+                )
+                return source, False
+            else:
+                return result, True
 
         _match = old if old in source else self._ws_tolerant_span(source, old)
         if not _match:
@@ -388,7 +409,14 @@ class ASTOpExecutor:
                         _existing_names = [a.name for a in _scope_node.names]
                         # Skip ``from X import *`` — cannot merge with star imports
                         if "*" not in _existing_names and "*" not in _merge_new_names:
-                            _merged = sorted(set(_existing_names + _merge_new_names))
+                            # Preserve ``as`` aliases of the existing line: rendering
+                            # names only would silently drop ``A as B`` → B (and the
+                            # re-bound A) break at runtime.
+                            _existing_rendered = [
+                                f"{a.name} as {a.asname}" if a.asname else a.name
+                                for a in _scope_node.names
+                            ]
+                            _merged = sorted(set(_existing_rendered + _merge_new_names))
                             _merge_lines = source.splitlines(keepends=True)
                             _start = _scope_node.lineno - 1  # AST 1-based → 0-based
                             _end = getattr(_scope_node, "end_lineno", _scope_node.lineno)
@@ -458,7 +486,8 @@ class ASTOpExecutor:
         return "".join(lines), True
 
     def _add_guard(
-        self, source: str, op: dict[str, Any], symbol: str, parent_class: str = ""
+        self, source: str, op: dict[str, Any], symbol: str, parent_class: str = "",
+        *, _src_tree: Optional[ast.AST] = None,
     ) -> tuple[str, bool]:
         """Insert a guard statement into a specific scope of ``symbol``.
 
@@ -491,32 +520,41 @@ class ASTOpExecutor:
         if not stmt or not symbol:
             return source, False
 
-        # Idempotent: guard already present — check verbatim first (fast path),
-        # then fall back to AST-based condition equivalence (handles format/quote
-        # differences, e.g. one-liner vs multi-line, single vs double quotes).
-        if stmt in source:
-            return source, True
-        if _guard_already_present(source, stmt, symbol):
-            return source, True
-
         try:
-            tree = ast.parse(source)
+            # Single source parse for the whole add_guard path: the tree is
+            # threaded through _guard_already_present / _insert_at_* helpers.
+            # _src_tree=None (standalone calls) falls back to a self-parse.
+            if _src_tree is None:
+                _src_tree = ast.parse(source)
+            tree = _src_tree
             lines = source.splitlines(keepends=True)
             func_node = self._find_func_node(tree, symbol, parent_class)
             if func_node is None:
                 return source, False
 
+            # Idempotent — scoped to the TARGET function, not the whole file:
+            # a verbatim match inside a different function (e.g. a single-line
+            # guard in another function) or a same-named method of a different
+            # class must NOT report success without inserting.
+            func_text = "".join(lines[func_node.lineno - 1:func_node.end_lineno])
+            if stmt in func_text:
+                return source, True
+            if _guard_already_present(source, stmt, symbol, parent_class, _src_tree=_src_tree):
+                return source, True
+
             if insert_scope == "function_body":
-                return self._insert_at_function_body(lines, func_node, stmt)
+                return self._insert_at_function_body(lines, func_node, stmt, _src_tree=_src_tree, op=op)
 
             if insert_scope in ("for_loop", "while_loop"):
                 return self._insert_at_loop_body(
                     lines, func_node, stmt, insert_scope, loop_variable,
                     loop_iterable_src=loop_iterable_src,
+                    _src_tree=_src_tree,
+                    op=op,
                 )
 
-        except Exception:
-            pass
+        except Exception as exc:
+            op["_error"] = f"add_guard: {exc}"
         return source, False
 
     def _insert_at_function_body(
@@ -524,6 +562,9 @@ class ASTOpExecutor:
         lines: list[str],
         func_node: ast.AST,
         stmt: str,
+        *,
+        _src_tree: Optional[ast.AST] = None,
+        op: dict[str, Any] | None = None,
     ) -> tuple[str, bool]:
         """Insert guard after the function docstring (or after def line).
 
@@ -532,12 +573,19 @@ class ASTOpExecutor:
         """
         body = func_node.body  # type: ignore[attr-defined]
         if not body:
+            if op is not None:
+                op["_error"] = "add_guard: target function has an empty body"
             return "".join(lines), False
 
         source = "".join(lines)
-        safe_line = self._find_safe_insertion_point(stmt, func_node, source)
+        safe_line = self._find_safe_insertion_point(stmt, func_node, source, _src_tree=_src_tree)
 
         if safe_line == -1:
+            if op is not None:
+                op["_error"] = (
+                    "add_guard: no safe insertion point — the guard references "
+                    "name(s) not defined at any usable point in the function"
+                )
             return "".join(lines), False
 
         if safe_line == func_node.lineno:  # type: ignore[attr-defined]
@@ -569,6 +617,8 @@ class ASTOpExecutor:
         loop_variable: str,
         *,
         loop_iterable_src: str = "",
+        _src_tree: Optional[ast.AST] = None,
+        op: dict[str, Any] | None = None,
     ) -> tuple[str, bool]:
         """Insert guard as first statement of a loop body inside ``func_node``.
 
@@ -611,16 +661,37 @@ class ASTOpExecutor:
 
         if len(candidates) != 1:
             # 0 → loop not found; ≥2 → ambiguous.  Executor must not choose.
+            # Surface the precise reason so the LLM can recover (supply
+            # loop_variable/loop_iterable_src) instead of a blind fallback.
+            if op is not None:
+                _kind = "for" if insert_scope == "for_loop" else "while"
+                _var = f" (loop_variable={loop_variable!r})" if loop_variable else ""
+                if not candidates:
+                    op["_error"] = (
+                        f"add_guard: no {_kind}-loop found{_var} in the target function"
+                    )
+                else:
+                    op["_error"] = (
+                        f"add_guard: {len(candidates)} {_kind}-loops match{_var} — "
+                        "provide loop_variable/loop_iterable_src to disambiguate"
+                    )
             return "".join(lines), False
 
         loop_node = candidates[0]
         body = loop_node.body  # type: ignore[attr-defined]
         if not body:
+            if op is not None:
+                op["_error"] = "add_guard: matched loop has an empty body"
             return "".join(lines), False
 
         # Name-safety: check guard references are all available before this loop.
         source = "".join(lines)
-        if not self._is_safe_for_loop_body(stmt, func_node, source, loop_node):
+        if not self._is_safe_for_loop_body(stmt, func_node, source, loop_node, _src_tree=_src_tree):
+            if op is not None:
+                op["_error"] = (
+                    "add_guard: name-safety violation — the guard references "
+                    "name(s) defined after the loop (forward reference)"
+                )
             return "".join(lines), False
 
         # Insert before the first statement of the loop body.
@@ -639,6 +710,7 @@ class ASTOpExecutor:
         source: str,
         *,
         extra_always_avail: set[str] | None = None,
+        _src_tree: Optional[ast.AST] = None,
     ) -> tuple[set[str], dict[str, int], set[str]]:
         """Extract name-safety data for a guard statement.
 
@@ -675,10 +747,12 @@ class ASTOpExecutor:
         })
 
         # Module-level names
-        try:
-            _ft = ast.parse(source)
-        except SyntaxError:
-            _ft = None
+        _ft: Optional[ast.AST] = _src_tree
+        if _ft is None:
+            try:
+                _ft = ast.parse(source)
+            except SyntaxError:
+                _ft = None
 
         if _ft is not None:
             for _n in ast.walk(_ft):
@@ -728,9 +802,9 @@ class ASTOpExecutor:
                 for _t in _n.targets:
                     if isinstance(_t, ast.Name):
                         _record(_t.id, _n.lineno)
-            elif isinstance(_n, ast.AnnAssign) and isinstance(_n.target, ast.Name):
-                _record(_n.target.id, _n.lineno)
-            elif isinstance(_n, (ast.For, ast.AsyncFor)) and isinstance(_n.target, ast.Name):
+            elif (isinstance(_n, ast.AnnAssign) and isinstance(_n.target, ast.Name)) or (
+                isinstance(_n, (ast.For, ast.AsyncFor)) and isinstance(_n.target, ast.Name)
+            ):
                 _record(_n.target.id, _n.lineno)
             elif isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef)) and _n is not func_node:
                 _record(_n.name, _n.lineno)
@@ -748,6 +822,8 @@ class ASTOpExecutor:
         guard_stmt: str,
         func_node: ast.AST,
         source: str,
+        *,
+        _src_tree: Optional[ast.AST] = None,
     ) -> int:
         """Find the first safe line (1-based) to insert guard_stmt after.
 
@@ -758,7 +834,7 @@ class ASTOpExecutor:
         index into the lines list).  Returns -1 if no safe point exists.
         """
         guard_names, first_def, always_avail = self._compute_name_safety_info(
-            guard_stmt, func_node, source,
+            guard_stmt, func_node, source, _src_tree=_src_tree,
         )
         if not guard_names:
             return func_node.lineno
@@ -792,6 +868,8 @@ class ASTOpExecutor:
         func_node: ast.AST,
         source: str,
         loop_node: ast.AST,
+        *,
+        _src_tree: Optional[ast.AST] = None,
     ) -> bool:
         """Check if guard_stmt can be safely inserted at the start of loop body.
 
@@ -804,7 +882,7 @@ class ASTOpExecutor:
             extra.add(loop_node.target.id)
 
         guard_names, first_def, always_avail = ASTOpExecutor._compute_name_safety_info(
-            stmt, func_node, source, extra_always_avail=extra,
+            stmt, func_node, source, extra_always_avail=extra, _src_tree=_src_tree,
         )
         if not guard_names:
             return True
@@ -1021,9 +1099,12 @@ class ASTOpExecutor:
 
             # Idempotent: check if field already defined in this class
             for stmt in cls_node.body:
-                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-                    if stmt.target.id == field_name:
-                        return source, True  # already present
+                if (
+                    isinstance(stmt, ast.AnnAssign)
+                    and isinstance(stmt.target, ast.Name)
+                    and stmt.target.id == field_name
+                ):
+                    return source, True  # already present
 
             # Find insertion point: after last AnnAssign/Assign in class body
             last_field_lineno = None  # 0-based
@@ -1062,9 +1143,87 @@ class ASTOpExecutor:
 
             # Validate — roll back on syntax error
             ast.parse(new_source)
-            return new_source, True
         except (SyntaxError, TypeError, AttributeError):
             return source, False
+        else:
+            return new_source, True
+
+    def _resolve_module_level_list(
+            self, source: str, list_name: str,
+        ) -> tuple[list[str], ast.Assign] | None:
+            """Locate the module-level ``list_name = [...]`` / ``list_name = (...)`` assignment.
+
+            Shared front-end of ``_list_append``/``_list_remove``: parses the source
+            and finds the module-level list/tuple assignment, returning
+            ``(lines, target_node)`` for the caller to rewrite and re-validate.
+
+            Module-level contract: scans ``tree.body`` only — ``ast.walk`` would
+            descend into function/class scopes, where a nested same-named list
+            would be wrongly mutated.  Returns ``None`` when the source is
+            unparsable or no such module-level assignment exists.
+            """
+            try:
+                tree = ast.parse(source)
+            except (SyntaxError, TypeError, AttributeError):
+                logger.debug("module-level list source unparsable", exc_info=True)
+                return None
+            lines = source.splitlines(keepends=True)
+
+            for node in tree.body:
+                if not isinstance(node, ast.Assign):
+                    continue
+                if len(node.targets) != 1:
+                    continue
+                t = node.targets[0]
+                if not (isinstance(t, ast.Name) and t.id == list_name):
+                    continue
+                if isinstance(node.value, (ast.List, ast.Tuple)):
+                    return lines, node
+            return None
+
+    def _rewrite_module_level_list(
+                self, source: str, op: dict[str, Any],
+                rewrite: Callable[[list[str], ast.Assign, str], tuple[list[str], bool] | None],
+            ) -> tuple[str, bool]:
+            """Shared skeleton of ``_list_append``/``_list_remove``.
+
+            Validates the common op keys (``list_name``/``value``), resolves the
+            module-level list assignment via ``_resolve_module_level_list``, then
+            delegates the actual edit to *rewrite* and validates the result with
+            ``ast.parse``.  *rewrite* receives ``(lines, target_node, value)`` and
+            returns:
+
+              - ``None``                → the edit is impossible → ``(source, False)``
+              - ``(lines, False)``      → idempotent no-op (value already present /
+                                          already absent) → ``(source, True)``
+              - ``(new_lines, True)``   → rewritten lines → validated and returned
+
+            Any ``SyntaxError``/``TypeError``/``AttributeError`` raised by *rewrite*
+            or a failed ``ast.parse`` validation rolls back to ``(source, False)``.
+            """
+            list_name: str = (op.get("list_name") or "").strip()
+            value: str = (op.get("value") or "").strip()
+            if not list_name or not value:
+                return source, False
+
+            resolved = self._resolve_module_level_list(source, list_name)
+            if resolved is None:
+                return source, False
+            lines, target_node = resolved
+
+            try:
+                result = rewrite(lines, target_node, value)
+                if result is None:
+                    return source, False
+                new_lines, changed = result
+                if not changed:
+                    return source, True  # idempotent no-op success
+                new_source = "".join(new_lines)
+                ast.parse(new_source)  # validate
+            except (SyntaxError, TypeError, AttributeError):
+                return source, False
+            else:
+                return new_source, True
 
     def _list_append(self, source: str, op: dict[str, Any]) -> tuple[str, bool]:
         """Append a string value to a module-level list variable (idempotent).
@@ -1077,38 +1236,16 @@ class ASTOpExecutor:
         appends the quoted value if not already present.  Preserves surrounding
         formatting — does NOT use ast.unparse.
         """
-        list_name: str = (op.get("list_name") or "").strip()
-        value: str = (op.get("value") or "").strip()
-        if not list_name or not value:
-            return source, False
 
-        quoted = f'"{value}"'
-
-        try:
-            tree = ast.parse(source)
-            lines = source.splitlines(keepends=True)
-
-            # Find the module-level assignment: list_name = [...]
-            target_node = None
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Assign):
-                    continue
-                if len(node.targets) != 1:
-                    continue
-                t = node.targets[0]
-                if not (isinstance(t, ast.Name) and t.id == list_name):
-                    continue
-                if isinstance(node.value, (ast.List, ast.Tuple)):
-                    target_node = node
-                    break
-
-            if target_node is None:
-                return source, False
+        def rewrite(
+                lines: list[str], target_node: ast.Assign, value: str,
+            ) -> tuple[list[str], bool] | None:
+            quoted = f'"{value}"'
 
             # Idempotent: check if value is already in the list
             for elt in target_node.value.elts:
                 if isinstance(elt, ast.Constant) and str(elt.value) == value:
-                    return source, True  # already present
+                    return lines, False  # already present
 
             # Find the closing bracket/paren line
             end_lineno = target_node.end_lineno - 1  # 0-based
@@ -1118,7 +1255,7 @@ class ASTOpExecutor:
             bracket_close = "]" if isinstance(target_node.value, ast.List) else ")"
             close_idx = end_line.rfind(bracket_close)
             if close_idx == -1:
-                return source, False
+                return None
 
             # Detect indentation from existing elements or use list indent + 4
             existing_elts = target_node.value.elts
@@ -1141,23 +1278,38 @@ class ASTOpExecutor:
             is_multiline = target_node.value.lineno != target_node.value.end_lineno
 
             if is_multiline:
-                # Insert new element line before the closing bracket
-                new_element_line = f"{indent_str}{quoted},{trailing_comma}\n"
+                # New element always gets a trailing comma (multiline convention).
+                new_element_line = f"{indent_str}{quoted},\n"
                 new_lines = [*lines[:end_lineno], new_element_line, *lines[end_lineno:]]
+                # If the previous last element lacked a trailing comma, add one so
+                # the elements stay separate (avoids implicit string concatenation).
+                if existing_elts and not trailing_comma:
+                    last_elt = existing_elts[-1]
+                    last_lineno = last_elt.end_lineno - 1  # always < end_lineno
+                    line = new_lines[last_lineno]
+                    col = last_elt.end_col_offset
+                    new_lines[last_lineno] = line[:col] + "," + line[col:]
             else:
-                # Inline: insert before closing bracket
-                # e.g. ["a", "b"] → ["a", "b", "c"]
+                # Inline: insert before closing bracket.
+                # e.g. ["a", "b"] → ["a", "b", "c"]; [] → ["z"].
+                # Separator is decided by element count, not by the truthiness of
+                # the prefix string (which always contains the assignment LHS).
                 prefix = end_line[:close_idx]
                 suffix = end_line[close_idx:]
-                sep = ", " if prefix.rstrip().rstrip(",").strip() else ""
-                new_end_line = prefix.rstrip().rstrip(",") + f'{sep}{quoted}' + suffix
+                is_tuple = isinstance(target_node.value, ast.Tuple)
+                if existing_elts:
+                    new_end_line = prefix.rstrip().rstrip(",") + f", {quoted}" + suffix
+                else:
+                    # Empty container. A single-element tuple needs a trailing
+                    # comma to remain a tuple (() → ("z",)); a list is
+                    # unambiguous without one ([] → ["z"]).
+                    trailing = "," if is_tuple else ""
+                    new_end_line = prefix.rstrip() + f"{quoted}{trailing}" + suffix
                 new_lines = [*lines[:end_lineno], new_end_line, *lines[end_lineno + 1:]]
 
-            new_source = "".join(new_lines)
-            ast.parse(new_source)  # validate
-            return new_source, True
-        except (SyntaxError, TypeError, AttributeError):
-            return source, False
+            return new_lines, True
+
+        return self._rewrite_module_level_list(source, op, rewrite)
 
     def _list_remove(self, source: str, op: dict[str, Any]) -> tuple[str, bool]:
         """Remove a string value from a module-level list variable (idempotent).
@@ -1166,31 +1318,10 @@ class ASTOpExecutor:
           list_name  (str, required): name of the list variable (e.g. "__all__")
           value      (str, required): string literal to remove (e.g. "old_func")
         """
-        list_name: str = (op.get("list_name") or "").strip()
-        value: str = (op.get("value") or "").strip()
-        if not list_name or not value:
-            return source, False
 
-        try:
-            tree = ast.parse(source)
-            lines = source.splitlines(keepends=True)
-
-            target_node = None
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Assign):
-                    continue
-                if len(node.targets) != 1:
-                    continue
-                t = node.targets[0]
-                if not (isinstance(t, ast.Name) and t.id == list_name):
-                    continue
-                if isinstance(node.value, (ast.List, ast.Tuple)):
-                    target_node = node
-                    break
-
-            if target_node is None:
-                return source, False
-
+        def rewrite(
+                lines: list[str], target_node: ast.Assign, value: str,
+            ) -> tuple[list[str], bool] | None:
             # Find the element to remove
             elt_to_remove = None
             for elt in target_node.value.elts:
@@ -1199,7 +1330,7 @@ class ASTOpExecutor:
                     break
 
             if elt_to_remove is None:
-                return source, True  # not present → idempotent success
+                return lines, False  # not present → idempotent success
 
             # Remove the element's line (handles both inline and multi-line lists)
             elt_lineno = elt_to_remove.lineno - 1  # 0-based
@@ -1212,22 +1343,41 @@ class ASTOpExecutor:
                 # Remove entire line
                 new_lines = lines[:elt_lineno] + lines[elt_lineno + 1:]
             else:
-                # Inline: remove just the element and its comma
+                # Inline: remove the element and its adjacent comma.
+                is_tuple = isinstance(target_node.value, ast.Tuple)
+                remaining = len(target_node.value.elts) - 1  # count after removal
+                new_line = None
                 for q in quoted_variants:
                     for pattern in (f", {q}", f",{q}", f"{q}, ", f"{q},"):
                         if pattern in elt_line:
                             new_line = elt_line.replace(pattern, "", 1)
-                            new_lines = [*lines[:elt_lineno], new_line, *lines[elt_lineno + 1:]]
                             break
-                    else:
-                        continue
-                    break
-                else:
-                    return source, False
+                    if new_line is not None:
+                        break
+                if new_line is None:
+                    # No comma adjoins the element → it is the sole inline
+                    # element (e.g. ["a"]). Blank it out to leave an empty
+                    # container, matching the multiline single-element path.
+                    if len(target_node.value.elts) != 1:
+                        return None
+                    for q in quoted_variants:
+                        if q in elt_line:
+                            new_line = elt_line.replace(q, "", 1)
+                            break
+                    if new_line is None:
+                        return None
+                elif is_tuple and remaining == 1:
+                    # An inline tuple reduced to a single element collapses to
+                    # a grouped expression: ("a", "b") -rm "b" → ("a"), which
+                    # parses as the bare string "a", not a 1-tuple. Re-add the
+                    # trailing comma so it stays a tuple: ("a",). Mirrors the
+                    # _list_append empty/single-element tuple handling.
+                    close = new_line.rfind(")")
+                    if close != -1 and not new_line[:close].rstrip().endswith(","):
+                        new_line = new_line[:close] + "," + new_line[close:]
+                new_lines = [*lines[:elt_lineno], new_line, *lines[elt_lineno + 1:]]
 
-            new_source = "".join(new_lines)
-            ast.parse(new_source)
-            return new_source, True
-        except (SyntaxError, TypeError, AttributeError):
-            return source, False
+            return new_lines, True
+
+        return self._rewrite_module_level_list(source, op, rewrite)
 

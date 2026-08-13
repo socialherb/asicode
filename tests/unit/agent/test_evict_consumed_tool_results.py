@@ -270,7 +270,7 @@ def test_below_occupancy_does_not_fire_eviction():
     """
     from external_llm.agent.agent_turn_pipeline import _evict_for_loop
 
-    # A handful of turns on a 200K-window model — nowhere near 0.75 × cap.
+    # A handful of turns on a 200K-window model — nowhere near 0.75 x cap.
     msgs: list[LLMMessage] = []
     for turn in range(15):
         a, t = _pair(turn, f"SMALL LOOP TURN {turn} DATA " * 200)
@@ -304,7 +304,7 @@ def test_above_occupancy_fires_eviction(monkeypatch):
     monkeypatch.setattr(atp, "_EVICTION_ENABLED", True)
     _EVICTION_KEEP_RECENT = atp._EVICTION_KEEP_RECENT
 
-    # Big enough tool payloads to cross 0.75 × cap on a 64K window
+    # Big enough tool payloads to cross 0.75 x cap on a 64K window
     # (deepseek-r1 cap ≈ 59.9K → trigger ≈ 44.9K; this builds ~85K est tokens).
     msgs: list[LLMMessage] = []
     for turn in range(40):
@@ -340,9 +340,9 @@ def test_occupancy_trigger_config():
     a fixed model-independent quality floor (keep_recent), a fractional trigger
     strictly inside (0, 1), and eviction disabled by default."""
     from external_llm.agent.agent_turn_pipeline import (
+        _EVICTION_ENABLED,
         _EVICTION_KEEP_RECENT,
         _EVICTION_OCCUPANCY_TRIGGER,
-        _EVICTION_ENABLED,
     )
     assert _EVICTION_KEEP_RECENT == 6
     assert _EVICTION_ENABLED is False, (
@@ -362,7 +362,7 @@ def test_eviction_disabled_by_default_does_not_fire():
     overflow-only cut) bounds the window, so a routine loop never pays a prefix
     rewrite.
     """
-    from external_llm.agent.agent_turn_pipeline import _evict_for_loop, _EVICTION_ENABLED
+    from external_llm.agent.agent_turn_pipeline import _EVICTION_ENABLED, _evict_for_loop
 
     assert _EVICTION_ENABLED is False
     # Same oversized payload as the enabled-flag regression above.
@@ -401,15 +401,16 @@ def test_production_eviction_paths_cannot_diverge():
     """
     import inspect
 
-    from external_llm.agent import agent_turn_pipeline
-    from external_llm.agent import design_chat_loop
+    from external_llm.agent import agent_turn_pipeline, design_chat_loop
 
     # (1) The wrapper takes only IDENTITY params — never a raw eviction knob.
-    #     Passing ``model``/``tool_schemas`` cannot make two call sites diverge
-    #     (the trigger is derived centrally from those); passing
+    #     Passing ``model``/``base_url``/``tool_schemas`` cannot make two call
+    #     sites diverge (the trigger is derived centrally from those); passing
     #     ``keep_recent``/``batch_evict_threshold``/``occupancy`` could.
+    #     ``base_url`` is server identity (which Ollama instance), not a knob —
+    #     it only routes the /api/show cache lookup to the right entry.
     sig = inspect.signature(agent_turn_pipeline._evict_for_loop)
-    _allowed = {"messages", "model", "tool_schemas"}
+    _allowed = {"messages", "model", "tool_schemas", "base_url"}
     _forbidden = {"keep_recent", "batch_evict_threshold", "occupancy", "trigger"}
     params = set(sig.parameters)
     assert params <= _allowed, (
@@ -571,3 +572,36 @@ def test_gemini_function_response_is_stubbed_in_place():
         "Gemini stub names the tool (from the part's own name)"
     assert "600 chars" in fr["response"]["content"], \
         "per-part size reported"
+
+
+# ── BUG-2a: _evict_for_loop must forward base_url (server identity) ─────────
+# base_url is NOT an eviction knob (threshold) — it is server identity (which
+# Ollama instance). It must thread through to _resolve_context_limit so the
+# /api/show cache key resolves to the right (model, server) entry; without it,
+# multi-server setups cross-pollinate context budgets (server A's num_ctx used
+# for server B's loop). Pins the threading contract added alongside base_url.
+def test_evict_for_loop_forwards_base_url(monkeypatch):
+    from external_llm.agent import agent_turn_pipeline as atp
+
+    captured = {}
+
+    def _spy_resolve(model_name, base_url=None):
+        captured["base_url"] = base_url
+        return 200_000  # large window → below occupancy trigger → no eviction
+
+    monkeypatch.setattr(atp, "_resolve_context_limit", _spy_resolve)
+    saved = atp._EVICTION_ENABLED
+    atp._EVICTION_ENABLED = True  # default-off short-circuits before the resolve
+    try:
+        atp._evict_for_loop(
+            [LLMMessage(role="user", content="hi")],
+            model="llama3:8b",
+            base_url="http://gpu-box:11434",
+        )
+    finally:
+        atp._EVICTION_ENABLED = saved
+
+    assert captured.get("base_url") == "http://gpu-box:11434", (
+        "_evict_for_loop must forward base_url to _resolve_context_limit so the "
+        "/api/show cache key resolves to the correct server."
+    )

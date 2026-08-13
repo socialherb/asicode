@@ -4,6 +4,7 @@ Python syntax provider — wraps existing AST-based logic.
 from __future__ import annotations
 
 import ast
+import contextlib
 import logging
 import os
 from dataclasses import replace
@@ -22,13 +23,18 @@ logger = logging.getLogger(__name__)
 
 
 def _tree_sitter_available() -> bool:
-    """Dynamically check if tree-sitter is available for Python."""
-    try:
-        from .tree_sitter_utils import get_parser, is_available
+    """Dynamically check if tree-sitter is available for Python.
 
-        return is_available() and get_parser("python") is not None
-    except Exception:
-        return False
+    Delegates to :func:`~external_llm.languages.tree_sitter_utils.is_language_available`,
+    which is memoised in the module's ``_LANG_CACHE`` (positive AND negative) and
+    cleared by ``invalidate_caches()`` — the same invalidation contract the rest of
+    the module uses. So a grammar pip-installed mid-process is picked up without a
+    restart, and repeated checks are a cache hit instead of building a per-thread
+    parser (the old ``get_parser`` probe had that side effect).
+    """
+    from .tree_sitter_utils import is_available, is_language_available
+
+    return is_available() and is_language_available("python")
 
 
 
@@ -75,24 +81,23 @@ class PythonSyntaxProvider(SyntaxProvider):
             ))
             return SyntaxValidationResult(ok=False, errors=errors, language=LanguageId.PYTHON)
 
-        # 2. compile() — stricter, catches some issues AST doesn't
-        try:
-            compile(content, file_path, "exec")
-        except SyntaxError as e:
-            errors.append(SyntaxError_(
-                file=file_path,
-                line=e.lineno or 0,
-                col=e.offset or 0,
-                message=f"Compile error: {e.msg}",
-            ))
-        except ValueError as e:
-            errors.append(SyntaxError_(
-                file=file_path, line=0, col=0,
-                message=f"Compile error: {e}",
-            ))
-        except Exception:
-            # Non-syntax errors (e.g. memory) are not validation failures
-            pass
+        # 2. compile() — stricter, catches some issues AST doesn't. Non-syntax
+        # errors (e.g. memory) are not validation failures.
+        with contextlib.suppress(ValueError, RecursionError, MemoryError):  # non-syntax compile failures
+            try:
+                compile(content, file_path, "exec")
+            except SyntaxError as e:
+                errors.append(SyntaxError_(
+                    file=file_path,
+                    line=e.lineno or 0,
+                    col=e.offset or 0,
+                    message=f"Compile error: {e.msg}",
+                ))
+            except ValueError as e:
+                errors.append(SyntaxError_(
+                    file=file_path, line=0, col=0,
+                    message=f"Compile error: {e}",
+                ))
 
         return SyntaxValidationResult(
             ok=len(errors) == 0,
@@ -186,6 +191,7 @@ class PythonSyntaxProvider(SyntaxProvider):
                 # because startup, not per-file analysis, is the bulk of a run.
                 timeout=30 + 5 * len(file_paths),
                 cwd=project_root,
+                check=False,
             )
         except FileNotFoundError:
             logger.debug("pyright not found; skipping semantic validation")
@@ -211,7 +217,7 @@ class PythonSyntaxProvider(SyntaxProvider):
         collected: dict[str, list[SyntaxError_]] = {p: [] for p in file_paths}
         failed: set[str] = set()
         for d in diags:
-            try:
+            with contextlib.suppress(AttributeError, TypeError):  # malformed diagnostic shape
                 sev = (d.get("severity") or "error").lower()
                 rng = d.get("range") or {}
                 start = rng.get("start") or {}
@@ -241,8 +247,6 @@ class PythonSyntaxProvider(SyntaxProvider):
                 ))
                 if sev == "error":
                     failed.add(owner)
-            except Exception:
-                continue
         return {
             p: SyntaxValidationResult(
                 ok=p not in failed,
@@ -306,25 +310,28 @@ class PythonSyntaxProvider(SyntaxProvider):
                 from .tree_sitter_utils import find_symbol_range
 
                 result = find_symbol_range(content, symbol_name, "python")
+            except Exception as _exc:  # parser fallback chain
+                logger.debug("python_provider: tree-sitter find failed (%s) — falling to LibCST", _exc)
+            else:
                 if result is not None:
                     return result
-            except Exception:
-                pass
 
         # Priority 2: LibCST (precise end_lineno, decorator-aware)
         try:
             from .libcst_utils import find_symbol_range as _lc_range
 
             result = _lc_range(content, symbol_name)
+        except Exception as _exc:  # parser fallback chain
+            logger.debug("python_provider: LibCST find failed (%s) — falling to ast", _exc)
+        else:
             if result is not None:
                 return result
-        except Exception:
-            pass
 
         # Priority 3: stdlib ast (fallback)
         try:
             tree = ast.parse(content, filename=file_path)
-        except SyntaxError:
+        except SyntaxError as e:
+            logger.debug("ast.parse failed in find_symbol_in_file: %s", e)
             return None
 
         parts = symbol_name.split(".")
@@ -334,22 +341,20 @@ class PythonSyntaxProvider(SyntaxProvider):
             for cls_node in ast.walk(tree):
                 if isinstance(cls_node, ast.ClassDef) and cls_node.name == class_name:
                     for child in cls_node.body:
-                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                            if child.name == method_name:
-                                end = getattr(child, "end_lineno", None)
-                                if end is None:
-                                    return None
-                                return (child.lineno, end)
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == method_name:
+                            end = getattr(child, "end_lineno", None)
+                            if end is None:
+                                return None
+                            return (child.lineno, end)
                     break
             return None
 
         for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if node.name == symbol_name:
-                    end = getattr(node, "end_lineno", None)
-                    if end is None:
-                        return None
-                    return (node.lineno, end)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == symbol_name:
+                end = getattr(node, "end_lineno", None)
+                if end is None:
+                    return None
+                return (node.lineno, end)
         return None
 
     # ── Definition keywords ───────────────────────────────────────────────
@@ -426,7 +431,8 @@ class PythonSyntaxProvider(SyntaxProvider):
         """
         try:
             tree = ast.parse(content)
-        except SyntaxError:
+        except SyntaxError as e:
+            logger.debug("ast.parse failed in find_symbol_body_range: %s", e)
             return None
 
         parts = symbol_name.split(".")
@@ -437,24 +443,22 @@ class PythonSyntaxProvider(SyntaxProvider):
             for cls_node in ast.walk(tree):
                 if isinstance(cls_node, ast.ClassDef) and cls_node.name == class_name:
                     for child in cls_node.body:
-                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                            if child.name == method_name:
-                                body_start = child.lineno + 1
-                                end = getattr(child, "end_lineno", None)
-                                if end is None:
-                                    return None
-                                return (body_start, end)
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == method_name:
+                            body_start = child.lineno + 1
+                            end = getattr(child, "end_lineno", None)
+                            if end is None:
+                                return None
+                            return (body_start, end)
                     break
             return None
 
         for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if node.name == symbol_name:
-                    body_start = node.lineno + 1  # First line after def
-                    end = getattr(node, "end_lineno", None)
-                    if end is None:
-                        return None
-                    return (body_start, end)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol_name:
+                body_start = node.lineno + 1  # First line after def
+                end = getattr(node, "end_lineno", None)
+                if end is None:
+                    return None
+                return (body_start, end)
         return None
 
 

@@ -9,12 +9,15 @@ Tracks:
 - Call chains
 """
 from __future__ import annotations
+
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from .code_analyzer import CodeAnalysis, CodeAnalyzer
+
+
 @dataclass
 class CallRelation:
     """Represents a function call relationship"""
@@ -112,7 +115,17 @@ class DependencyGraphBuilder:
                 self._build_recursive(imported_file, graph, visited, depth + 1, max_depth)
 
     def _get_analysis(self, file_path: Path) -> Optional[CodeAnalysis]:
-        """Get or cache code analysis"""
+        """Get or cache code analysis.
+
+        Returns a SHARED cached object: every caller for a given file_path
+        receives the same ``CodeAnalysis`` instance by reference. Callers MUST
+        treat it as read-only — mutating its ``.functions``/``.classes``/``.imports``
+        lists would corrupt the cache for every other caller. A defensive
+        deepcopy on every return was considered and rejected: CodeAnalysis carries
+        rich per-file AST metadata whose reuse is the entire point of the cache,
+        so the copy cost would negate the benefit. The read-only contract is
+        enforced by convention (all current callers iterate only).
+        """
         if file_path not in self._analysis_cache:
             self._analysis_cache[file_path] = self.analyzer.analyze_file(file_path)
         return self._analysis_cache[file_path]
@@ -233,10 +246,6 @@ class DependencyGraphBuilder:
 
         return None
 
-    def find_callers(self, graph: DependencyGraph, function: str) -> list[str]:
-        """Find all functions that call the given function"""
-        return graph.called_by.get(function, [])
-
     def format_call_graph(self, graph: DependencyGraph, target_function: str, max_items: int = 10) -> str:
         """
         Format call graph as readable text
@@ -256,8 +265,7 @@ class DependencyGraphBuilder:
             calls = graph.calls[target_function][:max_items]
             if calls:
                 lines.append(f"{target_function} calls:")
-                for callee in calls:
-                    lines.append(f"  ├─ {callee}")
+                lines.extend(f"  ├─ {callee}" for callee in calls)
 
         # What calls this function
         if target_function in graph.called_by:
@@ -266,7 +274,6 @@ class DependencyGraphBuilder:
                 if lines:
                     lines.append("")
                 lines.append("Called by:")
-                for caller in callers:
-                    lines.append(f"  ├─ {caller}")
+                lines.extend(f"  ├─ {caller}" for caller in callers)
 
         return '\n'.join(lines) if lines else "No call information available"

@@ -93,10 +93,11 @@ class SemanticPatchEngine:
                     class_name=node0.name,
                 )
 
-            return None
 
         except Exception as e:
             logger.debug("Semantic patch apply failed for %s: %s", file_path, e)
+            return None
+        else:
             return None
 
     def generate_patch(self, file_path: str, result: SemanticPatchResult) -> str:
@@ -110,7 +111,13 @@ class SemanticPatchEngine:
             lineterm="",
         )
 
-        body = "".join(diff)
+        # difflib emits only the control lines (---/+++/@@) with lineterm;
+        # body lines already carry their newlines via splitlines(True).
+        # Joining with "\n" keeps the header pair on separate lines — a bare
+        # "".join here produced "--- a/x+++ b/x@@ …" (corrupt for git apply).
+        body = "\n".join(diff)
+        if body:
+            body += "\n"
         return f"diff --git a/{rel} b/{rel}\n{body}"
 
     # ---------------------------------------------------------

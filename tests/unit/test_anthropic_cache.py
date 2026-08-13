@@ -12,6 +12,8 @@ Covers two complementary cache contracts:
 """
 
 
+from typing import ClassVar
+
 from external_llm.anthropic_client import AnthropicClient
 from external_llm.client import LLMMessage
 from external_llm.openai_client import OpenAIClient, ZAIClient
@@ -136,7 +138,7 @@ class _FakeOpenAIResponse:
   """Minimal response shape for OpenAIClient.chat/chat_with_tools parsing."""
   status_code = 200
   text = "{}"
-  headers: dict = {}
+  headers: ClassVar[dict] = {}
 
   def json(self):
       return {
@@ -154,8 +156,9 @@ class _FakeOpenAISession:
   def post(self, url, headers=None, json=None, timeout=None, **kw):
       self.captured = json
       resp = _FakeOpenAIResponse()
-      # streaming path reads iter_lines / iter_content
+      # streaming path reads iter_lines / iter_bytes (P28-1 SSE parser)
       resp.iter_lines = lambda: iter([])
+      resp.iter_bytes = lambda: iter([])
       resp.iter_content = lambda *a, **k: iter([])
       resp.close = lambda: None
       return resp

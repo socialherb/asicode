@@ -16,9 +16,14 @@ exercise module-level helpers / monkeypatched ``sync_playwright``.
 """
 from __future__ import annotations
 
+import threading
+import time
+import types
+
 import pytest
 
-import external_llm.agent.tool_handlers.browser_tools as browser_tools
+from external_llm.agent.agent_loop_types import AgentCancelled
+from external_llm.agent.tool_handlers import browser_tools
 from external_llm.agent.tool_handlers.browser_tools import BrowserActionToolsMixin
 
 
@@ -98,6 +103,8 @@ def _real_browser_state(monkeypatch):
     monkeypatch.setattr(BrowserActionToolsMixin, "_browser", None)
     monkeypatch.setattr(BrowserActionToolsMixin, "_page", None)
     monkeypatch.setattr(BrowserActionToolsMixin, "_playwright", None)
+    # Cached per browser, so it must not leak a previous test's probe result.
+    monkeypatch.setattr(BrowserActionToolsMixin, "_user_agent", None)
 
 
 def test_navigate_length_metadata_excludes_marker(_real_browser_state, monkeypatch):
@@ -201,13 +208,25 @@ def test_render_and_eval_uses_isolated_page_and_closes_it(_real_browser_state, m
         def is_closed(self):
             return self.closed
 
+    class _ProbePage(_EvalPage):
+        """Answers the one-off navigator.userAgent probe with a HEADLESS UA."""
+
+        def evaluate(self, js):
+            self.evaluated = js
+            return "Mozilla/5.0 (X11; Linux x86_64) HeadlessChrome/149.0.0.0 Safari/537.36"
+
     shared = _EvalPage()
+    probe = _ProbePage()
     fresh = _EvalPage()
     monkeypatch.setattr(BrowserActionToolsMixin, "_page", shared)
 
+    handed_out = []
+
     class _FakeBrowser:
-        def new_page(self):
-            return fresh
+        def new_page(self, user_agent=None):
+            handed_out.append(user_agent)
+            # First call is the UA probe (raw, no user_agent), then the real page.
+            return probe if len(handed_out) == 1 else fresh
 
     host = _NavHost()
     monkeypatch.setattr(host, "_get_browser", lambda: _FakeBrowser())
@@ -218,6 +237,13 @@ def test_render_and_eval_uses_isolated_page_and_closes_it(_real_browser_state, m
     assert fresh.evaluated == "() => []"                # eval ran on the fresh page
     assert fresh.goto_url == "https://search.naver.com/x"
     assert fresh.closed is True                          # throwaway page closed
+    assert probe.closed is True                          # UA probe page closed too
+    # The render page is created with the de-headlessed UA: leaving
+    # "HeadlessChrome" in the string is by itself enough for some anti-bot
+    # systems to refuse the request (measured on Startpage 2026-08-05).
+    assert handed_out[0] is None                         # probe itself is raw
+    assert "HeadlessChrome" not in handed_out[1]
+    assert "Chrome/149.0.0.0" in handed_out[1]
     assert shared.closed is False                        # shared session untouched
     assert BrowserActionToolsMixin._page is shared       # shared _page not replaced
 
@@ -230,3 +256,97 @@ def test_render_and_eval_raises_when_playwright_unavailable(monkeypatch):
     monkeypatch.setattr(host, "_ensure_playwright_installed", lambda: False)
     with pytest.raises(RuntimeError, match="Playwright"):
         host._render_and_eval("https://x/", "() => []")
+
+
+# ── wait-action cancellation (P0-1) ─────────────────────────────────────────
+
+
+class _WaitHost(_NavHost):
+    """Host with a registry-style ``config.cancel_event`` (ESC wiring)."""
+
+    def __init__(self, cancel_event=None) -> None:
+        self.config = types.SimpleNamespace(cancel_event=cancel_event)
+
+
+def test_wait_no_selector_aborts_immediately_when_cancel_set(_real_browser_state, monkeypatch):
+    """ESC already pressed → a no-selector wait raises AgentCancelled instantly
+    instead of sleeping the full clamped timeout on the browser worker."""
+    ev = threading.Event()
+    ev.set()
+    host = _WaitHost(cancel_event=ev)
+    monkeypatch.setattr(BrowserActionToolsMixin, "_get_page", lambda self: object())
+
+    with pytest.raises(AgentCancelled):
+        host._tool_browser_action({"action": "wait", "timeout": 30000})
+
+
+def test_wait_no_selector_wires_live_cancel_event(_real_browser_state, monkeypatch):
+    """The wait's sleep is interruptible_sleep (client.py SSOT) wired to the
+    registry's LIVE cancel_event — a mid-wait ESC aborts the turn."""
+    ev = threading.Event()
+    host = _WaitHost(cancel_event=ev)
+    monkeypatch.setattr(BrowserActionToolsMixin, "_get_page", lambda self: object())
+    calls: list[tuple] = []
+
+    def _fake_sleep(seconds, cancel_event):
+        calls.append((seconds, cancel_event))
+        return False  # not cancelled → wait completes normally
+
+    monkeypatch.setattr(browser_tools, "interruptible_sleep", _fake_sleep)
+
+    res = host._tool_browser_action({"action": "wait", "timeout": 30000})
+    assert res["ok"], res
+    assert calls == [(30.0, ev)]
+
+
+def test_wait_no_selector_absent_config_sleeps_without_cancel(_real_browser_state, monkeypatch):
+    """Duck-typed hosts without ``config`` fall back to a non-cancelable wait —
+    no AttributeError from the defensive getattr."""
+    host = _NavHost()  # no .config attribute
+    monkeypatch.setattr(BrowserActionToolsMixin, "_get_page", lambda self: object())
+    calls: list[tuple] = []
+
+    def _fake_sleep(seconds, cancel_event):
+        calls.append((seconds, cancel_event))
+        return False
+
+    monkeypatch.setattr(browser_tools, "interruptible_sleep", _fake_sleep)
+
+    res = host._tool_browser_action({"action": "wait", "timeout": 30000})
+    assert res["ok"], res
+    assert calls == [(30.0, None)]
+
+
+def test_wait_no_selector_mid_wait_cancel_aborts_quickly(_real_browser_state, monkeypatch):
+    """ESC pressed DURING the wait → the real interruptible_sleep is interrupted
+    and AgentCancelled propagates through the browser executor (the worker is
+    not left sleeping for the full timeout)."""
+    ev = threading.Event()
+    host = _WaitHost(cancel_event=ev)
+    monkeypatch.setattr(BrowserActionToolsMixin, "_get_page", lambda self: object())
+    threading.Timer(0.05, ev.set).start()
+
+    t0 = time.monotonic()
+    with pytest.raises(AgentCancelled):
+        host._tool_browser_action({"action": "wait", "timeout": 5000})
+    # Aborted in ~50ms; the uncancelled wait would have run the full 5s.
+    assert time.monotonic() - t0 < 2.0
+
+
+def test_wait_with_selector_ignores_cancel_event(_real_browser_state, monkeypatch):
+    """The selector path is unchanged: Playwright's wait_for_selector owns the
+    wait even when the cancel event is already set."""
+    ev = threading.Event()
+    ev.set()
+    host = _WaitHost(cancel_event=ev)
+    waited: list[str] = []
+
+    class _Page:
+        def wait_for_selector(self, selector, timeout=None):
+            waited.append(selector)
+
+    monkeypatch.setattr(BrowserActionToolsMixin, "_get_page", lambda self: _Page())
+
+    res = host._tool_browser_action({"action": "wait", "selector": ".ok", "timeout": 30000})
+    assert res["ok"], res
+    assert waited == [".ok"]

@@ -3,19 +3,24 @@ Pytest fixtures for asicode agent tests.
 """
 from __future__ import annotations
 
+import contextlib
 import shutil
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock
 
 import pytest
 
 # Heavy imports deferred to fixture bodies (saves ~300ms on collection).
-# from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
-# from external_llm.agent.agent_loop import AgentLoop
-# from external_llm.agent.orchestrator import FileLockManager
+# TYPE_CHECKING-only imports keep the annotation names (AgentConfig, ToolRegistry,
+# AgentLoop, FileLockManager) resolvable for ruff's F821 without paying the
+# collection-time import cost -- the block never executes at runtime.
+if TYPE_CHECKING:
+    from external_llm.agent.agent_loop import AgentLoop
+    from external_llm.agent.orchestrator import FileLockManager
+    from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 
 
 @pytest.fixture
@@ -140,35 +145,24 @@ def _isolate_strategy_state(tmp_path_factory):
         pass
 
 
-@pytest.fixture(autouse=True)
-def _isolate_write_tool_failure_log(tmp_path_factory, monkeypatch):
-    """Keep fabricated test failures out of the user's real learning log.
+@pytest.fixture(scope="session")
+def _isolate_session_base(tmp_path_factory) -> Path:
+    """One numbered base dir for the whole session.
 
-    ``tool_failure_log`` already reads ``ASICODE_WRITE_TOOL_FAILURE_LOG`` at call
-    time, and its docstring says the override is "used by tests to redirect to a
-    temp file without touching the real log" — but only ONE test module ever set
-    it, so every other test that tripped a write-tool failure appended to
-    ``~/.asicode/learning/write_tool_failures.jsonl``. The mechanism existed and
-    was never wired for the general case.
-
-    Confirmed from the real log during a suite run: records carrying
-    ``"repo": "/private/var/folders/.../T/e2e-repo-*"`` — pytest tmp dirs. The
-    file is write-only for shipping code (an offline analysis dataset), so the
-    cost is a skewed dataset rather than a wrong decision at runtime, but it grows
-    every run and the noise is indistinguishable from real failures after the fact.
+    pytest's ``make_numbered_dir`` scans the entire basetemp to find the highest
+    existing number, so per-test ``mktemp`` calls are O(dir-count). The two
+    autouse isolation fixtures below used to make ~16.5k of them per suite
+    (8,237 tests x 2), which is O(n²) overall (~30-60s serial at 8k dirs).
+    Per-test subdirs are now uuid-named below this base, which is O(1).
     """
-    monkeypatch.setenv(
-        "ASICODE_WRITE_TOOL_FAILURE_LOG",
-        str(tmp_path_factory.mktemp("write_failures") / "write_tool_failures.jsonl"),
-    )
+    return tmp_path_factory.mktemp("asr_isolate")
 
 
 @pytest.fixture(autouse=True)
-def _isolate_runs_dir(tmp_path_factory, monkeypatch):
-    """Isolate run artifacts to a per-test temp directory.
+def _isolate_runs_dir(_isolate_session_base, monkeypatch):
+    """Isolate run artifacts and write-tool failure logs per test.
 
-    Prevents test runs from leaking into the real .asicode/runs/.
-
+    Run artifacts: prevents test runs from leaking into the real .asicode/runs/.
     config.ASICODE_RUNS_DIR is resolved ONCE at import time, and consumers copy
     it by value via ``from config import ASICODE_RUNS_DIR``. Simply setting the
     env var is therefore insufficient (the value is already frozen). We (1)
@@ -176,11 +170,33 @@ def _isolate_runs_dir(tmp_path_factory, monkeypatch):
     ``config`` and every already-imported module that captured its own copy.
     Modules imported LATER during the test read config's (already-patched)
     value directly, so they are covered transitively.
-    """
-    import sys
 
-    target = str(tmp_path_factory.mktemp("asr_runs"))
+    Write-tool failures: ``tool_failure_log`` reads
+    ``ASICODE_WRITE_TOOL_FAILURE_LOG`` at call time (no module-attribute copy),
+    so the env var alone is enough there. Keeps fabricated test failures out of
+    the user's real ``~/.asicode/learning/write_tool_failures.jsonl`` — before
+    this fixture existed, any test that tripped a write-tool failure appended to
+    the real log; confirmed from the real log during a suite run: records
+    carrying ``"repo": "/private/var/folders/.../T/e2e-repo-*"`` (pytest tmp
+    dirs). The file is write-only for shipping code, so the cost is a skewed
+    dataset rather than a wrong decision at runtime.
+
+    Both env vars point under one uuid-named per-test subdir of the session
+    base (O(1) to create, no basetemp scan).
+    """
+    import os
+    import sys
+    import uuid
+
+    base = _isolate_session_base / f"t{uuid.uuid4().hex[:12]}"
+    runs_dir = base / "runs"
+    os.makedirs(runs_dir, exist_ok=True)
+    target = str(runs_dir)
     monkeypatch.setenv("ASICODE_RUNS_DIR", target)
+    monkeypatch.setenv(
+        "ASICODE_WRITE_TOOL_FAILURE_LOG",
+        str(base / "write_tool_failures.jsonl"),
+    )
     # NOTE: use ``in mod.__dict__`` (membership) instead of ``hasattr``.
     # hasattr() triggers a module's lazy ``__getattr__`` — e.g. the
     # ``transformers`` package routes any ``ASICODE_*`` attribute through an
@@ -189,10 +205,8 @@ def _isolate_runs_dir(tmp_path_factory, monkeypatch):
     # actually defined/imported by the module, with no side effects.
     for mod in list(sys.modules.values()):
         if mod is not None and "ASICODE_RUNS_DIR" in mod.__dict__:
-            try:
+            with contextlib.suppress(AttributeError, TypeError):
                 monkeypatch.setattr(mod, "ASICODE_RUNS_DIR", target)
-            except (AttributeError, TypeError):
-                pass
 
 
 @pytest.fixture
@@ -202,9 +216,9 @@ def temp_repo_root() -> Generator[str, None, None]:
     try:
         # Initialize as a git repo for git operations
         import subprocess
-        subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmpdir, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmpdir, capture_output=True)
+        subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=False)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmpdir, capture_output=True, check=False)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmpdir, capture_output=True, check=False)
 
         # Create a sample Python file for testing
         sample_file = Path(tmpdir) / "sample.py"
@@ -219,8 +233,8 @@ def temp_repo_root() -> Generator[str, None, None]:
         )
 
         # Commit the file
-        subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "initial"], cwd=tmpdir, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=False)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=tmpdir, capture_output=True, check=False)
 
         yield tmpdir
     finally:
@@ -240,15 +254,14 @@ def temp_repo_root_with_memory(temp_repo_root: str) -> Generator[str, None, None
 @pytest.fixture
 def agent_config() -> AgentConfig:
     """Return a basic AgentConfig for testing."""
-    from external_llm.agent.tool_registry import AgentConfig
-    from external_llm.agent.task_router import Lane, RouteDecision, TaskKind
     from external_llm.agent.enums import Complexity, Scope
+    from external_llm.agent.task_router import Lane, RouteDecision, TaskKind
+    from external_llm.agent.tool_registry import AgentConfig
     config = AgentConfig(
         max_turns=5,
         run_tests=False,
         run_lint=False,
         auto_test_on_patch=False,
-        planning_enabled=False,
         self_review_enabled=False,
         rag_enabled=False,
         parallel_tool_execution_enabled=False,
@@ -433,3 +446,4 @@ def sample_multi_file_plan_dict() -> dict[str, Any]:
             }
         ]
     }
+

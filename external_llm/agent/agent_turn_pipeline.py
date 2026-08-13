@@ -16,6 +16,18 @@ import logging
 import time
 from typing import Any, Optional
 
+from external_llm.agent._response_utils import extract_llm_reasoning
+from external_llm.agent.message_shapes import (
+    _is_anthropic_tool_result as _is_anthropic_shape,  # backward compat alias
+)
+from external_llm.agent.message_shapes import (
+    _is_gemini_tool_result as _is_gemini_shape,
+)
+from external_llm.agent.message_shapes import (
+    is_tool_call,
+    is_tool_result,
+)
+
 from ..client import (
     LLMAuthenticationError,
     LLMConnectionError,
@@ -24,8 +36,10 @@ from ..client import (
     LLMRateLimitError,
     LLMServerUnavailableError,
 )
+from ..output_parser import parse_tool_args
 from ._shared_utils import (
     cache_hit_pct,
+    coerce_token_count,
     context_message_cap,
     estimate_cache_adjusted_cost,
     estimate_cost,
@@ -33,13 +47,6 @@ from ._shared_utils import (
     extract_files_from_patch,
     make_tool_signature,
     render_file_diagnostics_block,
-)
-from .context_budget import _resolve_context_limit
-from external_llm.agent.message_shapes import (
-    is_tool_result,
-    is_tool_call,
-    _is_anthropic_tool_result as _is_anthropic_shape,  # backward compat alias
-    _is_gemini_tool_result as _is_gemini_shape,
 )
 from .agent_loop_types import (
     AgentCancelled,
@@ -53,7 +60,9 @@ from .agent_loop_types import (
     _ToolTurnOutcome,
     _TurnPrepResult,
 )
-from .config.thresholds import config, _env_flag
+from .config.thresholds import _env_flag, config
+from .context_budget import _resolve_context_limit
+from .performance_metrics import get_global_collector
 from .tool_registry import ToolResult
 
 logger = logging.getLogger(__name__)
@@ -117,7 +126,7 @@ def _write_touched_test_file(tool_name: str, tool_args: dict) -> bool:
                 elif isinstance(_parsed, list):
                     _write_ops = _parsed
             except (json.JSONDecodeError, TypeError):
-                pass
+                logger.debug("<module>::_write_touched_test_file:0 suppressed (json.JSONDecodeError, TypeError)", exc_info=True)
         elif isinstance(_plan, list):
             # Bare list — write_tools.py wraps as {"ops": plan}.
             _write_ops = _plan
@@ -176,14 +185,14 @@ class TurnPipelineMixin:
         )
         if _continuation and not _is_planner:
             ctx.messages = self._build_continuation_messages(
-                _continuation, ctx.request, ctx.has_native_tools,
+                _continuation, ctx.request,
             )
             logger.info(
                 "Using continuation messages: conversation=%d turns",
                 len(_continuation.get("conversation") or []),
             )
         else:
-            ctx.messages = self._build_initial_messages(ctx.request, ctx.context, ctx.has_native_tools, tier=ctx.tier)
+            ctx.messages = self._build_initial_messages(ctx.request, ctx.context, tier=ctx.tier)
 
         ctx.tdd_fail_count = 0
         ctx.tdd_total_runs = 0
@@ -204,6 +213,11 @@ class TurnPipelineMixin:
         ctx.rollback_result = None
         ctx.budget_warned = False
         ctx.fail_streak = {}
+        # Per-run recall session identity: fresh key each run so [RECALL] dedup
+        # re-arms (id()-based keys reused freed addresses and silenced recall
+        # for the whole process lifetime — see failure_pattern_store note).
+        from .failure_pattern_store import new_session_key
+        ctx.recall_session_key = new_session_key()
         ctx.no_tool_nudge_count = 0
         ctx.any_tool_called = False
         ctx.noop_confirmed = False
@@ -256,7 +270,6 @@ class TurnPipelineMixin:
                 try:
                     response = self._llm_call_with_tools(
                             _prep.messages,
-                            read_only_request=ctx.read_only_request,
                             token_callback=_token_cb,
                         )
                 except (LLMConnectionError, LLMRateLimitError, LLMServerUnavailableError, LLMQuotaExceededError, LLMAuthenticationError) as e:
@@ -281,6 +294,12 @@ class TurnPipelineMixin:
                         "error_type": error_type,
                         "turn": ctx.turn_num,
                     })
+                    # Turn-level outcome channel: this turn terminated with an
+                    # LLM error. The per-provider llm_metrics.failures already
+                    # counts the call; the agent_result channel records the
+                    # TURN-level outcome (same event, different granularity).
+                    self.performance_collector.record_agent_result(failed=True)
+                    get_global_collector().record_agent_result(failed=True)
                     self.performance_collector.end_session()
                     performance_summary = self.performance_collector.get_summary()
 
@@ -293,18 +312,32 @@ class TurnPipelineMixin:
                             "performance": performance_summary,
                         },
                     )
-                def _rget(_key: str, _default=None):
-                    if isinstance(response, dict):
-                        return response.get(_key, _default)
-                    return getattr(response, _key, _default)
+                def _rget(_key: str, _default=None, _response=response):
+                    # B023: bind the per-iteration response at def time. All
+                    # call sites are synchronous within this iteration today,
+                    # but def-time binding keeps the closure correct if it is
+                    # ever deferred past the next `response =` reassignment.
+                    if isinstance(_response, dict):
+                        return _response.get(_key, _default)
+                    return getattr(_response, _key, _default)
 
                 # ── Token tracking ──
                 _pt = _rget("prompt_tokens", 0)
                 if _pt is None:
                     _pt = _rget("tokens_used", 0)  # fallback: total when split unavailable
                 _ct = _rget("completion_tokens", 0)
-                _crt = _rget("cache_read_input_tokens", 0) or 0
-                _cct = _rget("cache_creation_input_tokens", 0) or 0
+                # Coerce None -> 0 AFTER the fallback decision: the fallback
+                # must keep `is None` semantics (a real 0 is a valid value and
+                # must not trigger the tokens_used fallback), while None fields
+                # (Optional[int] = None on provider responses that carry no
+                # usage report) must not TypeError the accumulation below.
+                # coerce_token_count additionally guards non-int truthy values
+                # (Mock auto-attributes, JSON-decoded strings from gateway
+                # shims) that would crash the whole turn loop in +=.
+                _pt = coerce_token_count(_pt)
+                _ct = coerce_token_count(_ct)
+                _crt = coerce_token_count(_rget("cache_read_input_tokens", 0))
+                _cct = coerce_token_count(_rget("cache_creation_input_tokens", 0))
                 ctx.total_prompt_tokens += _pt
                 ctx.total_completion_tokens += _ct
                 ctx.total_cache_read_tokens += _crt
@@ -313,7 +346,10 @@ class TurnPipelineMixin:
                 ctx.last_call_completion_tokens = _ct
                 _llm_elapsed_ms = int((time.monotonic() - _llm_call_start) * 1000)
                 _finish_reason = _rget("finish_reason", "")
-                _tool_calls_count = len(_rget("tool_calls", []))
+                _raw_tool_calls = _rget("tool_calls", [])
+                # Same crash class as the token fields: a Mock auto-attribute
+                # has no len() and would TypeError here.
+                _tool_calls_count = len(_raw_tool_calls) if isinstance(_raw_tool_calls, (list, tuple)) else 0
                 if _pt or _ct:
                     _turn_cost = estimate_cost(ctx.provider_name, _pt, _ct, model=ctx.model_name)
                     _total_cost = estimate_cost(
@@ -343,7 +379,7 @@ class TurnPipelineMixin:
                         "tool_calls_count": _tool_calls_count,
                     })
 
-                tool_calls = _rget("tool_calls", None) or []
+                tool_calls = _raw_tool_calls if isinstance(_raw_tool_calls, (list, tuple)) else []
                 content = _rget("content", "")
 
                 if content and content.strip():
@@ -382,8 +418,6 @@ class TurnPipelineMixin:
                 _tool_out = self._execute_and_process_tool_calls(
                     ctx,
                     tool_calls=tool_calls,
-                    content=content,
-                    response=response,
                 )
                 if _tool_out.early_return is not None:
                     return _tool_out.early_return
@@ -404,7 +438,6 @@ class TurnPipelineMixin:
                     ctx,
                     response=response,
                     new_messages=new_messages,
-                    prepared_calls=_tool_out.prepared_calls,
                 )
                 if _post.early_return is not None:
                     return _post.early_return
@@ -461,13 +494,11 @@ class TurnPipelineMixin:
         raw_resp = getattr(raw_obj, "raw_response", None) if raw_obj is not None else None
         if isinstance(raw_resp, dict):
             try:
-                choices = raw_resp.get("choices") or []
-                msg_obj = (choices[0].get("message", {}) if choices else {}) or {}
-                rc = msg_obj.get("reasoning_content", "") or ""
-                if isinstance(rc, str) and rc.strip():
-                    return rc.strip()
+                rc = extract_llm_reasoning(raw_resp, strip=True)
+                if rc:
+                    return rc
             except (AttributeError, TypeError, IndexError):
-                pass
+                logger.debug("<module>::TurnPipelineMixin::_effective_final_content:0 suppressed (AttributeError, TypeError, IndexError)", exc_info=True)
         return content if isinstance(content, str) else ""
 
     # ------------------------------------------------------------------
@@ -484,7 +515,6 @@ class TurnPipelineMixin:
         try:
             response = self._llm_call_with_tools(
                     ctx.messages,
-                    read_only_request=ctx.read_only_request,
                     token_callback=_token_cb,
                 )
 
@@ -494,18 +524,18 @@ class TurnPipelineMixin:
                     try:
                         return getter(key, default)
                     except (AttributeError, TypeError, KeyError):
-                        pass
+                        logger.debug("<module>::TurnPipelineMixin::_handle_max_turns_reached::_rget:0 suppressed (AttributeError, TypeError, KeyError)", exc_info=True)
                 return getattr(response, key, default)
 
-            _pt = _rget("prompt_tokens", 0) or 0
+            _pt = coerce_token_count(_rget("prompt_tokens", 0))
             if not _pt:
-                _pt = _rget("tokens_used", 0) or 0  # fallback: total when split unavailable
-            _ct = _rget("completion_tokens", 0) or 0
+                _pt = coerce_token_count(_rget("tokens_used", 0))  # fallback: total when split unavailable
+            _ct = coerce_token_count(_rget("completion_tokens", 0))
             # Defense-depth parity with main turn loop (L228-239): accumulate
             # cache tokens here too — the max_turns final call consumes cache
             # budget and must be reflected in the per-bucket counters.
-            _crt = _rget("cache_read_input_tokens", 0) or 0
-            _cct = _rget("cache_creation_input_tokens", 0) or 0
+            _crt = coerce_token_count(_rget("cache_read_input_tokens", 0))
+            _cct = coerce_token_count(_rget("cache_creation_input_tokens", 0))
             ctx.total_prompt_tokens += _pt
             ctx.total_completion_tokens += _ct
             ctx.total_cache_read_tokens += _crt
@@ -523,21 +553,20 @@ class TurnPipelineMixin:
                 ))
                 response = self._llm_call_with_tools(
                     ctx.messages,
-                    read_only_request=ctx.read_only_request,
                     token_callback=_token_cb,
                 )
 
                 # NOTE: _rget closes over `response` *by reference*, so after the
                 # reassignment above it already reads the new response — a second
                 # identical closure (_rget2) was redundant and has been removed.
-                _pt = _rget("prompt_tokens", 0) or 0
+                _pt = coerce_token_count(_rget("prompt_tokens", 0))
                 if not _pt:
-                    _pt = _rget("tokens_used", 0) or 0  # fallback: total when split unavailable
-                _ct = _rget("completion_tokens", 0) or 0
+                    _pt = coerce_token_count(_rget("tokens_used", 0))  # fallback: total when split unavailable
+                _ct = coerce_token_count(_rget("completion_tokens", 0))
                 # Defense-depth parity with main turn loop (L228-239): accumulate
                 # cache tokens for the wrap-up retry call too.
-                _crt = _rget("cache_read_input_tokens", 0) or 0
-                _cct = _rget("cache_creation_input_tokens", 0) or 0
+                _crt = coerce_token_count(_rget("cache_read_input_tokens", 0))
+                _cct = coerce_token_count(_rget("cache_creation_input_tokens", 0))
                 ctx.total_prompt_tokens += _pt
                 ctx.total_completion_tokens += _ct
                 ctx.total_cache_read_tokens += _crt
@@ -560,7 +589,7 @@ class TurnPipelineMixin:
             if should_do_review and self._is_trivial_edit_request(ctx.request):
                 should_do_review = False
             if should_do_review:
-                review_summary = self._run_self_review(ctx.messages, ctx.has_native_tools)
+                review_summary = self._run_self_review()
                 if review_summary and ' lgtm ' not in f' {review_summary.lower()} ':
                     final_msg += f"\n\n---\n**[Self-Review]** {review_summary}"
 
@@ -587,32 +616,7 @@ class TurnPipelineMixin:
                             review_summary and ' lgtm ' not in f' {review_summary.lower()} '
                         ),
                     },
-                    "tokens": {
-                        "prompt": ctx.total_prompt_tokens,
-                        "completion": ctx.total_completion_tokens,
-                        "total": ctx.total_prompt_tokens + ctx.total_completion_tokens,
-                        "cost_usd": round(
-                            estimate_cost(
-                                ctx.provider_name,
-                                ctx.total_prompt_tokens,
-                                ctx.total_completion_tokens, model=ctx.model_name),
-                            6,
-                        ),
-                        "cache_adjusted_cost_usd": round(
-                            estimate_cache_adjusted_cost(
-                                ctx.provider_name,
-                                ctx.total_prompt_tokens,
-                                ctx.total_completion_tokens,
-                                ctx.total_cache_read_tokens, ctx.total_cache_creation_tokens, model=ctx.model_name, base_url=ctx.base_url),
-                            6,
-                        ),
-                        "cache_read_tokens": ctx.total_cache_read_tokens,
-                        "cache_creation_tokens": ctx.total_cache_creation_tokens,
-                        "cache_hit_ratio": _cache_hit_ratio(ctx),
-                        "last_call_prompt": ctx.last_call_prompt_tokens,
-                        "last_call_completion": ctx.last_call_completion_tokens,
-                        "provider": ctx.provider_name,
-                    },
+                    "tokens": _token_metadata(ctx),
                     "performance": performance_summary,
                 },
             )
@@ -625,12 +629,13 @@ class TurnPipelineMixin:
                 ctx.total_cache_read_tokens,
                 ctx.total_cache_creation_tokens,
             )
-            return _final_result
 
         except Exception as e:
             logger.debug("Final LLM call after max_turns failed: %s", e)
             if "without any applied patches" in str(e):
                 logger.warning("Blocking false success at max_turns for write-intent request")
+        else:
+            return _final_result
 
         _max_result = AgentResult(
             status="max_turns",
@@ -645,21 +650,7 @@ class TurnPipelineMixin:
                     "pass": ctx.tdd_total_pass,
                     "fail": ctx.tdd_fail_count,
                 },
-                "tokens": {
-                    "prompt": ctx.total_prompt_tokens,
-                    "completion": ctx.total_completion_tokens,
-                    "total": ctx.total_prompt_tokens + ctx.total_completion_tokens,
-                    "cost_usd": round(estimate_cost(
-                        ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens, model=ctx.model_name), 6),
-                    "cache_adjusted_cost_usd": round(
-                        estimate_cache_adjusted_cost(
-                            ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens,
-                            ctx.total_cache_read_tokens, ctx.total_cache_creation_tokens, model=ctx.model_name, base_url=ctx.base_url), 6,
-                    ),
-                    "cache_read_tokens": ctx.total_cache_read_tokens,
-                    "cache_creation_tokens": ctx.total_cache_creation_tokens,
-                    "cache_hit_ratio": _cache_hit_ratio(ctx),
-                },
+                "tokens": _token_metadata(ctx),
             },
         )
         self._save_session_log(
@@ -707,20 +698,7 @@ class TurnPipelineMixin:
                         "turns_used": ctx.turn_num - 1,
                         "noop": True,
                         "performance": performance_summary,
-                        "tokens": {
-                            "prompt": ctx.total_prompt_tokens,
-                            "completion": ctx.total_completion_tokens,
-                            "total": ctx.total_prompt_tokens + ctx.total_completion_tokens,
-                            "cost_usd": round(estimate_cost(
-                                ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens, model=ctx.model_name), 6),
-                            "cache_adjusted_cost_usd": round(
-                                estimate_cache_adjusted_cost(
-                                    ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens,
-                                    ctx.total_cache_read_tokens, ctx.total_cache_creation_tokens, model=ctx.model_name, base_url=ctx.base_url), 6,
-                            ),
-                            "cache_read_tokens": ctx.total_cache_read_tokens,
-                            "cache_creation_tokens": ctx.total_cache_creation_tokens,
-                        },
+                        "tokens": _token_metadata(ctx),
                     },
                 )
                 self._save_session_log(
@@ -739,21 +717,7 @@ class TurnPipelineMixin:
                     applied_patches=[],
                     metadata={
                         "turns_used": ctx.turn_num - 1,
-                        "tokens": {
-                            "prompt": ctx.total_prompt_tokens,
-                            "completion": ctx.total_completion_tokens,
-                            "total": ctx.total_prompt_tokens + ctx.total_completion_tokens,
-                            "cost_usd": round(estimate_cost(
-                                ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens, model=ctx.model_name), 6),
-                            "cache_adjusted_cost_usd": round(
-                                estimate_cache_adjusted_cost(
-                                    ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens,
-                                    ctx.total_cache_read_tokens, ctx.total_cache_creation_tokens, model=ctx.model_name, base_url=ctx.base_url), 6,
-                            ),
-                            "cache_read_tokens": ctx.total_cache_read_tokens,
-                            "cache_creation_tokens": ctx.total_cache_creation_tokens,
-                            "provider": ctx.provider_name,
-                        },
+                        "tokens": _token_metadata(ctx),
                     },
                 )
                 self._save_session_log(
@@ -811,23 +775,7 @@ class TurnPipelineMixin:
                         "summary": None,
                         "issues_found": False,
                     },
-                    "tokens": {
-                        "prompt": ctx.total_prompt_tokens,
-                        "completion": ctx.total_completion_tokens,
-                        "total": ctx.total_prompt_tokens + ctx.total_completion_tokens,
-                        "cost_usd": round(estimate_cost(
-                            ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens, model=ctx.model_name), 6),
-                        "cache_adjusted_cost_usd": round(
-                            estimate_cache_adjusted_cost(
-                                ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens,
-                                ctx.total_cache_read_tokens, ctx.total_cache_creation_tokens, model=ctx.model_name, base_url=ctx.base_url), 6,
-                        ),
-                        "cache_read_tokens": ctx.total_cache_read_tokens,
-                        "cache_creation_tokens": ctx.total_cache_creation_tokens,
-                        "last_call_prompt": ctx.last_call_prompt_tokens,
-                        "last_call_completion": ctx.last_call_completion_tokens,
-                        "provider": ctx.provider_name,
-                    },
+                    "tokens": _token_metadata(ctx),
                     "performance": performance_summary,
                     "false_success_blocked": True,
                     "nudge_count": ctx.no_tool_nudge_count,
@@ -842,13 +790,12 @@ class TurnPipelineMixin:
         review_summary: Optional[str] = None
 
         should_do_review = self.config.self_review_enabled and self.registry.applied_patches
-        if should_do_review:
-            if self._is_trivial_edit_request(ctx.request):
-                logger.info("Skipping self-review phase for trivial request")
-                should_do_review = False
+        if should_do_review and self._is_trivial_edit_request(ctx.request):
+            logger.info("Skipping self-review phase for trivial request")
+            should_do_review = False
 
         if should_do_review:
-            review_summary = self._run_self_review(ctx.messages, ctx.has_native_tools)
+            review_summary = self._run_self_review()
             if review_summary and ' lgtm ' not in f' {review_summary.lower()} ':
                 final_msg = (
                     final_msg
@@ -883,21 +830,7 @@ class TurnPipelineMixin:
                         and ' lgtm ' not in f' {review_summary.lower()} '
                     ),
                 },
-                "tokens": {
-                    "prompt": ctx.total_prompt_tokens,
-                    "completion": ctx.total_completion_tokens,
-                    "total": ctx.total_prompt_tokens + ctx.total_completion_tokens,
-                    "cost_usd": round(estimate_cost(
-                        ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens, model=ctx.model_name), 6),
-                    "cache_adjusted_cost_usd": round(
-                        estimate_cache_adjusted_cost(
-                            ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens,
-                            ctx.total_cache_read_tokens, ctx.total_cache_creation_tokens, model=ctx.model_name, base_url=ctx.base_url), 6,
-                    ),
-                    "cache_read_tokens": ctx.total_cache_read_tokens,
-                    "cache_creation_tokens": ctx.total_cache_creation_tokens,
-                    "provider": ctx.provider_name,
-                },
+                "tokens": _token_metadata(ctx),
                 "performance": performance_summary,
             },
         )
@@ -916,14 +849,13 @@ class TurnPipelineMixin:
         ctx: TurnContext,
         response: Any,
         new_messages: list,
-        prepared_calls: list,
     ) -> "_PostToolResult":
         """Process results after tool execution: sanitize, update messages, auto-observe, TDD."""
         try:
             if hasattr(response, "content") and isinstance(response.content, str):
                 response.content = self._strip_thinking_text(response.content)
         except (AttributeError, TypeError):
-            pass
+            logger.debug("<module>::TurnPipelineMixin::_process_post_tool_turn:0 suppressed (AttributeError, TypeError)", exc_info=True)
 
         ctx.messages = self._append_native_tool_messages(ctx.messages, response, new_messages)
 
@@ -997,23 +929,7 @@ class TurnPipelineMixin:
                         "summary": None,
                         "issues_found": False,
                     },
-                    "tokens": {
-                        "prompt": ctx.total_prompt_tokens,
-                        "completion": ctx.total_completion_tokens,
-                        "total": ctx.total_prompt_tokens + ctx.total_completion_tokens,
-                        "cost_usd": round(estimate_cost(
-                            ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens, model=ctx.model_name), 6),
-                        "cache_adjusted_cost_usd": round(
-                            estimate_cache_adjusted_cost(
-                                ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens,
-                                ctx.total_cache_read_tokens, ctx.total_cache_creation_tokens, model=ctx.model_name, base_url=ctx.base_url), 6,
-                        ),
-                        "cache_read_tokens": ctx.total_cache_read_tokens,
-                        "cache_creation_tokens": ctx.total_cache_creation_tokens,
-                        "last_call_prompt": ctx.last_call_prompt_tokens,
-                        "last_call_completion": ctx.last_call_completion_tokens,
-                        "provider": ctx.provider_name,
-                    },
+                    "tokens": _token_metadata(ctx),
                     "performance": performance_summary,
                     "early_finish": {
                         "enabled": True,
@@ -1028,68 +944,61 @@ class TurnPipelineMixin:
             return _PostToolResult(messages=ctx.messages, tdd_fail_count=ctx.tdd_fail_count, tdd_total_runs=ctx.tdd_total_runs, tdd_total_pass=ctx.tdd_total_pass, early_return=_final_result)
 
         # TDD auto-test
-        if self.config.auto_test_on_patch:
-            patch_succeeded_this_turn = any(
-                t.tool_name in _PATCH_TOOLS and t.tool_result.ok
-                for t in ctx.turns
-                if t.turn_num == ctx.turn_num
+        if self.config.auto_test_on_patch and patch_ok_this_turn:
+            ctx.tdd_total_runs += 1
+            ctx.messages, ctx.tdd_fail_count = self._auto_test_and_inject(
+                ctx.messages, ctx.turn_num, ctx.tdd_fail_count
             )
-            if patch_succeeded_this_turn:
-                ctx.tdd_total_runs += 1
-                ctx.messages, ctx.tdd_fail_count = self._auto_test_and_inject(
-                    ctx.messages, ctx.turn_num, ctx.tdd_fail_count
-                )
-                if ctx.tdd_fail_count == 0:
-                    ctx.tdd_total_pass += 1
-                    if not self.config.self_review_enabled:
-                        self.performance_collector.end_session()
-                        performance_summary = self.performance_collector.get_summary()
+            if ctx.tdd_fail_count == 0:
+                ctx.tdd_total_pass += 1
+                if not self.config.self_review_enabled:
+                    self.performance_collector.end_session()
+                    performance_summary = self.performance_collector.get_summary()
 
-                        _llm_last_msg2 = self._effective_final_content(response).strip() if response else ""
-                        _final_result = AgentResult(
-                            status="success",
-                            turns=ctx.turns,
-                            final_message=_llm_last_msg2 or "All tests passed. Changes applied.",
-                            applied_patches=self.registry.applied_patches,
-                            metadata={
-                                "turns_used": ctx.turn_num,
-                                "plan": ctx.plan,
-                                "tdd": {
-                                    "runs": ctx.tdd_total_runs,
-                                    "pass": ctx.tdd_total_pass,
-                                    "fail": ctx.tdd_fail_count,
-                                },
-                                "self_review": {
-                                    "enabled": self.config.self_review_enabled,
-                                    "summary": None,
-                                    "issues_found": False,
-                                },
-                                "tokens": {
-                                    "prompt": ctx.total_prompt_tokens,
-                                    "completion": ctx.total_completion_tokens,
-                                    "total": ctx.total_prompt_tokens + ctx.total_completion_tokens,
-                                    "cost_usd": round(estimate_cost(
-                                        ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens, model=ctx.model_name), 6),
-                                    "cache_adjusted_cost_usd": round(
-                                        estimate_cache_adjusted_cost(
-                                            ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens,
-                                            ctx.total_cache_read_tokens, ctx.total_cache_creation_tokens, model=ctx.model_name, base_url=ctx.base_url), 6,
-                                    ),
-                                    "cache_read_tokens": ctx.total_cache_read_tokens,
-                                    "cache_creation_tokens": ctx.total_cache_creation_tokens,
-                                    "cache_hit_ratio": _cache_hit_ratio(ctx),
-                                    "provider": ctx.provider_name,
-                                },
-                                "performance": performance_summary,
+                    _llm_last_msg2 = self._effective_final_content(response).strip() if response else ""
+                    _final_result = AgentResult(
+                        status="success",
+                        turns=ctx.turns,
+                        final_message=_llm_last_msg2 or "All tests passed. Changes applied.",
+                        applied_patches=self.registry.applied_patches,
+                        metadata={
+                            "turns_used": ctx.turn_num,
+                            "plan": ctx.plan,
+                            "tdd": {
+                                "runs": ctx.tdd_total_runs,
+                                "pass": ctx.tdd_total_pass,
+                                "fail": ctx.tdd_fail_count,
                             },
-                        )
-                        self._save_session_log(
-                            ctx.session_id, ctx.request, _final_result,
-                            ctx.total_prompt_tokens, ctx.total_completion_tokens,
-                        )
-                        return _PostToolResult(messages=ctx.messages, tdd_fail_count=ctx.tdd_fail_count, tdd_total_runs=ctx.tdd_total_runs, tdd_total_pass=ctx.tdd_total_pass, early_return=_final_result)
+                            "self_review": {
+                                "enabled": self.config.self_review_enabled,
+                                "summary": None,
+                                "issues_found": False,
+                            },
+                            "tokens": _token_metadata(ctx),
+                            "performance": performance_summary,
+                        },
+                    )
+                    self._save_session_log(
+                        ctx.session_id,
+                        ctx.request,
+                        _final_result,
+                        ctx.total_prompt_tokens,
+                        ctx.total_completion_tokens,
+                    )
+                    return _PostToolResult(
+                        messages=ctx.messages,
+                        tdd_fail_count=ctx.tdd_fail_count,
+                        tdd_total_runs=ctx.tdd_total_runs,
+                        tdd_total_pass=ctx.tdd_total_pass,
+                        early_return=_final_result,
+                    )
 
-        return _PostToolResult(messages=ctx.messages, tdd_fail_count=ctx.tdd_fail_count, tdd_total_runs=ctx.tdd_total_runs, tdd_total_pass=ctx.tdd_total_pass)
+        return _PostToolResult(
+            messages=ctx.messages,
+            tdd_fail_count=ctx.tdd_fail_count,
+            tdd_total_runs=ctx.tdd_total_runs,
+            tdd_total_pass=ctx.tdd_total_pass,
+        )
 
     # ------------------------------------------------------------------
     # Turn message preparation
@@ -1110,7 +1019,15 @@ class TurnPipelineMixin:
         ctx.messages = _evict_for_loop(
             ctx.messages,
             model=getattr(ctx, "model_name", "") or "",
-            tool_schemas=self.registry.get_tool_schemas() if self.registry else None,
+            # Must match the variant sent to the API (agent_loop passes
+            # lang_filter=repo_language) or the budget accounts for masked
+            # python-only tools the request never carries — get_tool_names'
+            # docstring declares this agreement an explicit contract.
+            tool_schemas=(
+                self.registry.get_tool_schemas(lang_filter=self.registry.repo_language)
+                if self.registry else None
+            ),
+            base_url=getattr(ctx, "base_url", None),
         )
 
         if (
@@ -1173,7 +1090,7 @@ class TurnPipelineMixin:
                     LLMMessage(role="system", content=tool_hint)
                 )
         except (AttributeError, TypeError):
-            pass
+            logger.debug("<module>::TurnPipelineMixin::_prepare_turn_messages:0 suppressed (AttributeError, TypeError)", exc_info=True)
 
         # Planner progress hint
         if ctx.plan_subtasks and ctx.plan_current_index < len(ctx.plan_subtasks):
@@ -1189,7 +1106,7 @@ class TurnPipelineMixin:
                     LLMMessage(role="user", content=hint)
                 )
             except (AttributeError, TypeError):
-                pass
+                logger.debug("<module>::TurnPipelineMixin::_prepare_turn_messages:1 suppressed (AttributeError, TypeError)", exc_info=True)
 
         if ctx.read_only_request or ctx.is_local_model:
             try:
@@ -1200,7 +1117,7 @@ class TurnPipelineMixin:
                     )
                 )
             except (AttributeError, TypeError):
-                pass
+                logger.debug("<module>::TurnPipelineMixin::_prepare_turn_messages:2 suppressed (AttributeError, TypeError)", exc_info=True)
 
         if (
             ctx.known_target_file
@@ -1221,7 +1138,7 @@ class TurnPipelineMixin:
                     )
                 )
             except (AttributeError, TypeError):
-                pass
+                logger.debug("<module>::TurnPipelineMixin::_prepare_turn_messages:3 suppressed (AttributeError, TypeError)", exc_info=True)
 
         try:
             if ctx.turn_num > 2:
@@ -1231,7 +1148,7 @@ class TurnPipelineMixin:
                         LLMMessage(role="user", content=traj)
                     )
         except (AttributeError, TypeError):
-            pass
+            logger.debug("<module>::TurnPipelineMixin::_prepare_turn_messages:4 suppressed (AttributeError, TypeError)", exc_info=True)
 
         if self.config.cancel_event and self.config.cancel_event.is_set():
             raise AgentCancelled("cancelled by user")
@@ -1251,6 +1168,7 @@ class TurnPipelineMixin:
                     })
                     logger.info("Mid-task user message injected at turn %d: %s", ctx.turn_num, mid_msg[:80])
                 except _queue_mod.Empty:
+                    logger.debug("<module>::TurnPipelineMixin::_prepare_turn_messages:5 suppressed _queue_mod.Empty", exc_info=True)
                     break
 
         ctx.messages = self._trim_context(ctx.messages)
@@ -1301,7 +1219,7 @@ class TurnPipelineMixin:
                         len(plan_subtasks)
                     )
             except (TypeError, AttributeError):
-                pass
+                logger.debug("<module>::TurnPipelineMixin::_build_and_filter_prepared_calls:0 suppressed (TypeError, AttributeError)", exc_info=True)
 
         prepared_calls = []
         _unknown_tool_notices: list[str] = []
@@ -1353,20 +1271,16 @@ class TurnPipelineMixin:
                     tool_args = raw_args
                 elif isinstance(raw_args, str) and raw_args.strip():
                     try:
-                        tool_args = json.loads(raw_args)
+                        parsed = json.loads(raw_args)
+                        # Only a dict is usable as tool args; a list/scalar JSON
+                        # payload is dropped here (same as the old inline path).
+                        tool_args = parsed if isinstance(parsed, dict) else {}
                     except Exception:
-                        s = raw_args.strip()
-                        try:
-                            _item_ = s.find("{")
-                            r = s.rfind("}")
-                            if _item_ != -1 and r != -1 and r > _item_:
-                                mid = s[_item_ : r + 1]
-                                obj2 = json.loads(mid)
-                                tool_args = obj2 if isinstance(obj2, dict) else {"__raw_arguments": s}
-                            else:
-                                tool_args = {"__raw_arguments": s}
-                        except Exception as e2:
-                            tool_args = {"__raw_arguments": s, "__parse_error": str(e2)}
+                        # Salvage via the shared contract in output_parser —
+                        # single source of truth for the find/rfind JSON recovery.
+                        # (The inline copy previously drifted; its extra
+                        # "__parse_error" key had zero consumers.)
+                        tool_args = parse_tool_args(raw_args)
                 else:
                     tool_args = {}
 
@@ -1437,7 +1351,7 @@ class TurnPipelineMixin:
                         "args": self.registry.normalize_args_for_display(_pc["args"]),
                     })
                 except (AttributeError, TypeError):
-                    pass
+                    logger.debug("<module>::TurnPipelineMixin::_build_and_filter_prepared_calls:4 suppressed (AttributeError, TypeError)", exc_info=True)
 
         if self.config.cancel_event and self.config.cancel_event.is_set():
             raise AgentCancelled("cancelled by user before tool execution")
@@ -1461,16 +1375,13 @@ class TurnPipelineMixin:
         reads_since_last_edit: int,
         fail_streak: dict,
         fail_streak_threshold: int,
-        any_tool_called: bool,
+        session_key: str,
         write_tools: set,
         read_only_request: bool,
-        is_local_model: bool,
-        target_keywords: list[str],
         request: str,
         session_id: str,
         git_state: Any,
         turn_num: int,
-        plan_current_index: int,
         turns: list,
     ) -> "_ResultsProcessingOutcome":
         """Process tool call results: track writes, early-finish, chaining, fail-loop, SSE emit."""
@@ -1529,7 +1440,7 @@ class TurnPipelineMixin:
                                 },
                             })
                         except Exception:
-                            pass
+                            logger.debug("<module>::TurnPipelineMixin::_process_tool_results:0 suppressed Exception", exc_info=True)
                     # `turns` is ctx.turns, which the caller already appended
                     # this tool call to before invoking _process_tool_results.
                     # Building another AgentTurn here would double-count it.
@@ -1571,13 +1482,12 @@ class TurnPipelineMixin:
             # below so the two never tangle.
             try:
                 from .failure_pattern_store import record_recall_outcome
-                record_recall_outcome(ok=result.ok, session_key=str(id(fail_streak)))
-            except Exception:  # noqa: BLE001 — recall bookkeeping must not break the pipeline
-                pass
+                record_recall_outcome(ok=result.ok, session_key=session_key)
+            except Exception:  # recall bookkeeping must not break the pipeline
+                logger.debug("<module>::TurnPipelineMixin::_process_tool_results:1 suppressed Exception", exc_info=True)
             if not result.ok:
                 classification = self._failure_classifier.classify(
                     tool_name,
-                    tool_args,
                     result
                 )
                 try:
@@ -1587,7 +1497,7 @@ class TurnPipelineMixin:
                         "reason": classification.reason
                     }
                 except (AttributeError, TypeError):
-                    pass
+                    logger.debug("<module>::TurnPipelineMixin::_process_tool_results:2 suppressed (AttributeError, TypeError)", exc_info=True)
                 # ── Per-repo persistent failure recall ─────────────────────────
                 # recall_on_failure is the single shared hook (also used by the
                 # CLI design-chat loop): classify → in-session dedup → record →
@@ -1601,18 +1511,18 @@ class TurnPipelineMixin:
                     _recall_hint = recall_on_failure(
                         tool_name, tool_args, result,
                         getattr(self.registry, "repo_root", "") or "",
-                        # fail_streak is a fresh dict per run (ctx.fail_streak={}
-                        # at _run_llm_loop entry) → id() is a stable per-run key,
-                        # so a new run re-records & re-hints (matches the old
-                        # fail_streak==0 gate that reset each run).
-                        session_key=str(id(fail_streak)),
+                        # session_key is a fresh per-run key (new_session_key()
+                        # at _run_llm_loop entry) → a new run re-records &
+                        # re-hints (matches the old fail_streak==0 gate that
+                        # reset each run).
+                        session_key=session_key,
                     )
                     if _recall_hint:
                         new_messages.append(
                             LLMMessage(role="user", content=_recall_hint)
                         )
-                except Exception:  # noqa: BLE001 — recall must never break the pipeline
-                    pass
+                except Exception:  # recall must never break the pipeline
+                    logger.debug("<module>::TurnPipelineMixin::_process_tool_results:3 suppressed Exception", exc_info=True)
                 self._tool_retry_counter[tool_name] += 1
                 if self._tool_retry_counter[tool_name] >= _TOOL_RETRY_LIMIT:
                     _exhaust_warn = LLMMessage(
@@ -1670,7 +1580,6 @@ class TurnPipelineMixin:
                 tool_name,
                 tool_args,
                 result,
-                read_only_request=read_only_request,
             )
 
             if tool_name in {"write_plan", "apply_patch"} and not result.ok:
@@ -1701,7 +1610,7 @@ class TurnPipelineMixin:
                         },
                     })
                 except (AttributeError, TypeError):
-                    pass
+                    logger.debug("<module>::TurnPipelineMixin::_process_tool_results:4 suppressed (AttributeError, TypeError)", exc_info=True)
 
             new_messages.append(
                 self._build_tool_result_message(call_id, tool_name, result, tool_args)
@@ -1741,8 +1650,8 @@ class TurnPipelineMixin:
                                 _rr = getattr(self.registry, "repo_root", None)
                                 if _rr:
                                     invalidate_index(_rr)
-                    except Exception:  # noqa: BLE001 — must never break the pipeline
-                        pass
+                    except Exception:  # must never break the pipeline
+                        logger.debug("<module>::TurnPipelineMixin::_process_tool_results:5 suppressed Exception", exc_info=True)
 
         return _ResultsProcessingOutcome(
             new_messages=new_messages,
@@ -1775,7 +1684,7 @@ class TurnPipelineMixin:
         """
         try:
             diags = self.registry.drain_pending_semantic_checks()
-        except Exception as exc:  # noqa: BLE001 — never break the turn over a lint
+        except Exception as exc:  # never break the turn over a lint
             # Logged, not silent: if this ever starts failing, the whole
             # advisory channel goes dark and the agent stops hearing about the
             # errors its own edits introduce. That must be discoverable.
@@ -1828,7 +1737,7 @@ class TurnPipelineMixin:
                     _payload["content"] = (_payload.get("content") or "") + _block
                 _filled.add(_path)
                 _msg.content = json.dumps(_payload, ensure_ascii=False)
-            except Exception as exc:  # noqa: BLE001 — a single bad payload is not fatal
+            except Exception as exc:  # a single bad payload is not fatal
                 logger.debug("Could not settle semantics into a tool message: %s", exc)
                 continue
 
@@ -1840,8 +1749,6 @@ class TurnPipelineMixin:
         self,
         ctx: TurnContext,
         tool_calls: list,
-        content: str,
-        response: Any,
     ) -> "_ToolTurnOutcome":
         """Prepare, execute, and process tool calls for one LLM turn.
 
@@ -1889,18 +1796,36 @@ class TurnPipelineMixin:
             try:
                 results = self.registry.dispatch_parallel(parallel_calls)
             except StopIteration:
-                logger.error("Tool dispatch_parallel StopIteration (mock side_effect exhausted)")
+                logger.exception("Tool dispatch_parallel StopIteration (mock side_effect exhausted)")
                 results = [
                     ToolResult(ok=False, content="", error="StopIteration", metadata={})
                     for _ in parallel_calls
                 ]
-            _log_parallel_write_failures(results, parallel_calls, self)
+            # Parity with the serial branch: a multi-call turn still counts as
+            # "tools called" for the false-success gate, must feed the
+            # adaptive-routing success/failure memory channels, and failed
+            # apply_patch results climb the same auto-repair / tolerant
+            # edit_blocks recovery ladder (previously skipped entirely when a
+            # turn carried 2+ tool calls).
+            any_tool_called = True
+            for _i, _pc in enumerate(prepared_calls):
+                _r = results[_i]
+                try:
+                    if _r and getattr(_r, "ok", False):
+                        self._record_tool_success(_pc["tool"], _pc["args"])
+                    else:
+                        self._record_tool_failure(_pc["tool"], _pc["args"])
+                except (AttributeError, TypeError):
+                    logger.debug("<module>::TurnPipelineMixin::_execute_and_process_tool_calls:2 suppressed (AttributeError, TypeError)", exc_info=True)
+                results[_i] = self._post_dispatch_patch_recovery(_pc["tool"], _pc["args"], _r)
+            _log_parallel_write_failures(
+                results, parallel_calls, self, session_key=ctx.recall_session_key
+            )
         else:
             results = []
             for pc in prepared_calls:
                 tool_name = pc["tool"]
                 tool_args = pc["args"]
-                already_retried = False
                 try:
                     result = self.registry.dispatch(tool_name, tool_args)
                     any_tool_called = True
@@ -1910,110 +1835,39 @@ class TurnPipelineMixin:
                             self._record_tool_success(tool_name, tool_args)
                         else:
                             self._record_tool_failure(tool_name, tool_args)
-                            # Persist write-tool failures to JSONL for analysis.
-                            if tool_name in self.registry._WRITE_TOOLS:
-                                try:
-                                    from .tool_failure_log import (
-                                        record_write_tool_failure_from_tr,
-                                    )
-                                    record_write_tool_failure_from_tr(
-                                        tool=tool_name, tr=result, args=tool_args,
-                                        model=getattr(self.config, "model", None),
-                                        repo_root=getattr(self.registry, "repo_root", None),
-                                    )
-                                except Exception:
-                                    logger.debug(
-                                        "tool_failure_log: record failed", exc_info=True
-                                    )
+                        # Persist write-tool outcomes to JSONL for analysis and
+                        # settle/fire the suggestion-hit tracker. Called on EVERY
+                        # write-tool result: the record helper no-ops on success,
+                        # but the settle must run on success too so a suggestion
+                        # fired by an earlier failure settles as helped/ignored.
+                        if tool_name in self.registry._WRITE_TOOLS:
+                            try:
+                                from .tool_failure_log import (
+                                    record_write_tool_failure_from_tr,
+                                )
+                                record_write_tool_failure_from_tr(
+                                    tool=tool_name, tr=result, args=tool_args,
+                                    model=getattr(self.config, "model", None),
+                                    repo_root=getattr(self.registry, "repo_root", None),
+                                    session_key=ctx.recall_session_key,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "tool_failure_log: record failed", exc_info=True
+                                )
                     except (AttributeError, TypeError):
-                        pass
+                        logger.debug("<module>::TurnPipelineMixin::_execute_and_process_tool_calls:2 suppressed (AttributeError, TypeError)", exc_info=True)
                 except StopIteration:
-                    logger.error(
+                    logger.exception(
                         "Tool dispatch StopIteration (mock side_effect exhausted): %s",
                         tool_name,
                     )
                     result = ToolResult(ok=False, content="", error="StopIteration", metadata={})
 
-                # Auto-repair for apply_patch failures (max 1 retry)
-                if tool_name == "apply_patch" and not result.ok and not already_retried:
-                    new_args = self._auto_repair_apply_patch_args(tool_args, result)
-                    if new_args:
-                        logger.debug("Auto-repair for apply_patch: attempting repair")
-                        # Capture the failure cause BEFORE retry_result replaces
-                        # `result`; on success result.error becomes None and the
-                        # original error would otherwise be lost from metadata.
-                        _orig_error = result.error
-                        retry_result = self.registry.dispatch(tool_name, new_args)
-                        already_retried = True
-                        if retry_result.ok:
-                            result = retry_result
-                            result.metadata["auto_repair"] = {
-                                "attempted": True,
-                                "kind": "patch_format_fix",
-                                "original_error": _orig_error,
-                                "success": True,
-                            }
-                        else:
-                            result.metadata["auto_repair"] = {
-                                "attempted": True,
-                                "kind": "patch_format_fix",
-                                "original_error": _orig_error,
-                                "success": False,
-                                "retry_error": retry_result.error,
-                            }
-
-                # Tolerant patch: track failures & try edit_blocks auto-conversion
-                if tool_name == "apply_patch":
-                    if result.ok:
-                        self._patch_fail_count = 0
-                    else:
-                        self._patch_fail_count += 1
-                        max_failures = getattr(self.config, "tolerant_patch_max_failures", 2)
-                        if (
-                            getattr(self.config, "tolerant_patch_mode", False)
-                            and self._patch_fail_count >= max_failures
-                        ):
-                            patch_text = tool_args.get("patch", "")
-                            path_hint = tool_args.get("path")
-                            eb_result = None
-                            try:
-                                from ..patch_engine import PatchEngine
-                            except ImportError:
-                                PatchEngine = None
-                            if PatchEngine is not None:
-                                try:
-                                    engine = PatchEngine(self.registry.repo_root)
-                                    converted = engine.convert_patch_to_edit_blocks(patch_text, path_hint)
-                                    if converted:
-                                        plan = {
-                                            "kind": "ASICODE_PLAN_V1",
-                                            "ops": [{"op": "edit_blocks", "path": converted["file_path"], "blocks": converted["blocks"]}],
-                                        }
-                                        plan_str = json.dumps(plan, ensure_ascii=False)
-                                        eb_result = self.registry.dispatch("write_plan", {"plan": plan_str})
-                                        if eb_result.ok:
-                                            eb_result.metadata["auto_converted_from_patch"] = True
-                                            eb_result.metadata["edit_blocks_count"] = len(converted["blocks"])
-                                            eb_result.content = (
-                                                f"Patch auto-converted to edit_blocks and applied successfully "
-                                                f"({len(converted['blocks'])} block(s) in {converted['file_path']}).\n" + (eb_result.content or "")
-                                            )
-                                except Exception as e:
-                                    logger.debug("PatchEngine convert_patch_to_edit_blocks failed: %s", e)
-                                    eb_result = None
-                            if eb_result is not None:
-                                if eb_result.ok:
-                                    logger.info(
-                                        "edit_blocks auto-conversion succeeded after %d patch failures",
-                                        self._patch_fail_count,
-                                    )
-                                    self._patch_fail_count = 0
-                                    result = eb_result
-                                else:
-                                    logger.debug(
-                                        "edit_blocks auto-conversion also failed: %s", eb_result.error
-                                    )
-                                    result.metadata["edit_blocks_fallback_error"] = eb_result.error
+                # Auto-repair + tolerant edit_blocks fallback — the SAME ladder
+                # the parallel branch runs, so a failed apply_patch recovers
+                # identically whether it was batched with other tools or not.
+                result = self._post_dispatch_patch_recovery(tool_name, tool_args, result)
                 results.append(result)
 
         # Record one AgentTurn per executed tool call. Both the parallel and
@@ -2044,16 +1898,13 @@ class TurnPipelineMixin:
             reads_since_last_edit=reads_since_last_edit,
             fail_streak=fail_streak,
             fail_streak_threshold=fail_streak_threshold,
-            any_tool_called=any_tool_called,
+            session_key=ctx.recall_session_key,
             write_tools=ctx.write_tools,
             read_only_request=ctx.read_only_request,
-            is_local_model=ctx.is_local_model,
-            target_keywords=ctx.target_keywords,
             request=ctx.request,
             session_id=ctx.session_id,
             git_state=ctx.git_state,
             turn_num=ctx.turn_num,
-            plan_current_index=plan_current_index,
             turns=ctx.turns,
         )
         # Every write of this turn has landed, so the files are now in their
@@ -2091,6 +1942,100 @@ class TurnPipelineMixin:
         )
 
     # ------------------------------------------------------------------
+    def _post_dispatch_patch_recovery(self, tool_name: str, tool_args: dict, result) -> Any:
+            """Apply the apply_patch recovery ladder to a dispatched result.
+
+            Two stages, both apply_patch-only:
+              1. auto-repair (max 1 retry) via ``_auto_repair_apply_patch_args``;
+              2. tolerant-patch mode: count consecutive failures and, at the
+                 threshold, auto-convert the patch to edit_blocks via PatchEngine
+                 and dispatch it as write_plan.
+
+            Shared by the serial and parallel dispatch branches in
+            ``_execute_and_process_tool_calls`` so a failed apply_patch gets the
+            same recovery whether it ran alone or was batched with other tools in
+            one turn. Returns the (possibly replaced) final result.
+            """
+            if tool_name != "apply_patch":
+                return result
+            if not result.ok:
+                new_args = self._auto_repair_apply_patch_args(tool_args)
+                if new_args:
+                    logger.debug("Auto-repair for apply_patch: attempting repair")
+                    # Capture the failure cause BEFORE retry_result replaces
+                    # `result`; on success result.error becomes None and the
+                    # original error would otherwise be lost from metadata.
+                    _orig_error = result.error
+                    retry_result = self.registry.dispatch(tool_name, new_args)
+                    if retry_result.ok:
+                        result = retry_result
+                        result.metadata["auto_repair"] = {
+                            "attempted": True,
+                            "kind": "patch_format_fix",
+                            "original_error": _orig_error,
+                            "success": True,
+                        }
+                    else:
+                        result.metadata["auto_repair"] = {
+                            "attempted": True,
+                            "kind": "patch_format_fix",
+                            "original_error": _orig_error,
+                            "success": False,
+                            "retry_error": retry_result.error,
+                        }
+            if result.ok:
+                self._patch_fail_count = 0
+            else:
+                self._patch_fail_count += 1
+                max_failures = getattr(self.config, "tolerant_patch_max_failures", 2)
+                if (
+                    getattr(self.config, "tolerant_patch_mode", False)
+                    and self._patch_fail_count >= max_failures
+                ):
+                    patch_text = tool_args.get("patch", "")
+                    path_hint = tool_args.get("path")
+                    eb_result = None
+                    # patch_engine is first-party — import cannot fail.
+                    from ..patch_engine import PatchEngine
+                    if PatchEngine is not None:
+                        try:
+                            engine = PatchEngine(self.registry.repo_root)
+                            converted = engine.convert_patch_to_edit_blocks(patch_text, path_hint)
+                            if converted:
+                                plan = {
+                                    "kind": "ASICODE_PLAN_V1",
+                                    "ops": [{"op": "edit_blocks", "path": converted["file_path"], "blocks": converted["blocks"]}],
+                                }
+                                plan_str = json.dumps(plan, ensure_ascii=False)
+                                eb_result = self.registry.dispatch("write_plan", {"plan": plan_str})
+                                if eb_result.ok:
+                                    eb_result.metadata["auto_converted_from_patch"] = True
+                                    eb_result.metadata["edit_blocks_count"] = len(converted["blocks"])
+                                    eb_result.content = (
+                                        f"Patch auto-converted to edit_blocks and applied successfully "
+                                        f"({len(converted['blocks'])} block(s) in {converted['file_path']}).\n" + (eb_result.content or "")
+                                    )
+                        except Exception as e:
+                            logger.debug("PatchEngine convert_patch_to_edit_blocks failed: %s", e)
+                            eb_result = None
+                    if eb_result is not None:
+                        if eb_result.ok:
+                            logger.info(
+                                "edit_blocks auto-conversion succeeded after %d patch failures",
+                                self._patch_fail_count,
+                            )
+                            self._patch_fail_count = 0
+                            result = eb_result
+                        else:
+                            logger.debug(
+                                "edit_blocks auto-conversion also failed: %s", eb_result.error
+                            )
+                            result.metadata["edit_blocks_fallback_error"] = eb_result.error
+            return result
+
+        # ------------------------------------------------------------------
+        # Loop cancellation handler
+        # ------------------------------------------------------------------
     # Loop cancellation handler
     # ------------------------------------------------------------------
 
@@ -2164,6 +2109,14 @@ class TurnPipelineMixin:
     ) -> "AgentResult":
         """Handle unexpected Exception: rollback patches and return error result."""
         logger.exception("Unexpected error in agent loop")
+
+        # Turn-level outcome channel: this loop dies with status="error".
+        # The typed LLM-error path in the turn body records failed=True for
+        # the 5 known client errors; anything escaping to here (other
+        # LLMClientError subclasses, unexpected exceptions) must not vanish
+        # from failure_rate / the recent-outcome window.
+        self.performance_collector.record_agent_result(failed=True)
+        get_global_collector().record_agent_result(failed=True)
 
         if isinstance(error, LLMConnectionError):
             error_type = "connection"
@@ -2270,13 +2223,15 @@ def _summarize_rollback(rollback_result: Any) -> tuple:
         "affected_files": affected,
     }
     return (msg, meta)
-def _log_parallel_write_failures(results, parallel_calls, pipeline):
-    """Persist write-tool failures produced by ``dispatch_parallel``.
+def _log_parallel_write_failures(results, parallel_calls, pipeline, session_key=""):
+    """Persist write-tool outcomes produced by ``dispatch_parallel``.
 
     ``dispatch_parallel`` bypasses the serial loop where the per-call failure
     logging lives, so parallel write-tool failures would otherwise escape the
     JSONL forensic log. This walks the parallel ``results`` and records every
-    failed write tool. Best-effort — never raises.
+    write tool (the record helper no-ops on success). The suggestion-hit
+    settle must also run on success, hence the unconditional walk. Best-effort
+    — never raises.
     """
     try:
         from .tool_failure_log import record_write_tool_failure_from_tr
@@ -2285,13 +2240,13 @@ def _log_parallel_write_failures(results, parallel_calls, pipeline):
             tool_name = parallel_calls[idx]["tool"] if idx < len(parallel_calls) else ""
             if tool_name not in write_tools:
                 continue
-            if result and not getattr(result, "ok", True):
-                record_write_tool_failure_from_tr(
-                    tool=tool_name, tr=result,
-                    args=parallel_calls[idx].get("args"),
-                    model=getattr(pipeline.config, "model", None),
-                    repo_root=getattr(pipeline.registry, "repo_root", None),
-                )
+            record_write_tool_failure_from_tr(
+                tool=tool_name, tr=result,
+                args=parallel_calls[idx].get("args"),
+                model=getattr(pipeline.config, "model", None),
+                repo_root=getattr(pipeline.registry, "repo_root", None),
+                session_key=session_key,
+            )
     except Exception:
         logger.debug("tool_failure_log: parallel record failed", exc_info=True)
 # Marker prefix stamped onto stubbed tool_result content. Doubles as the
@@ -2352,12 +2307,13 @@ _EVICTION_OCCUPANCY_TRIGGER = 0.75
 _EVICTION_ENABLED = _env_flag("ASICODE_TOOL_RESULT_EVICTION", False)
 
 
-def _evict_for_loop(messages, model: str = "", tool_schemas=None):
+def _evict_for_loop(messages, model: str = "", tool_schemas=None, base_url: Optional[str] = None):
     """Occupancy-gated tool-result eviction for an in-flight agent tool-loop.
 
     Single source of truth for the trigger: callers pass only the model
-    *identity* (``model``) and the ``tool_schemas`` sent alongside the prompt —
-    never a raw threshold — so the firing decision lives in exactly ONE place.
+    *identity* (``model``, ``base_url`` — which Ollama server) and the
+    ``tool_schemas`` sent alongside the prompt — never a raw threshold — so the
+    firing decision lives in exactly ONE place.
     Every production tool-loop (MAIN_AGENT pipeline AND design-chat loop) runs
     the SAME logic, so they can never drift apart.
 
@@ -2367,7 +2323,7 @@ def _evict_for_loop(messages, model: str = "", tool_schemas=None):
     window, as an overflow-only HTTP-400 backstop. When enabled, it fires
     ``_evict_consumed_tool_results`` (stub every tool result beyond the
     most-recent ``_EVICTION_KEEP_RECENT``) ONLY when the estimated prompt exceeds
-    ``_EVICTION_OCCUPANCY_TRIGGER × context_message_cap(model)``. Below that it
+    ``_EVICTION_OCCUPANCY_TRIGGER x context_message_cap(model)``. Below that it
     returns ``messages`` unchanged, so the prefix cache stays warm and no
     proactive cache-miss is minted. Unknown model → 1M default cap → effectively
     off until the prompt is genuinely huge, leaving the hard-cap front-trim as
@@ -2380,7 +2336,7 @@ def _evict_for_loop(messages, model: str = "", tool_schemas=None):
         # hard-cap front-trim remains as the window-overflow backstop.
         return messages
     try:
-        limit = _resolve_context_limit(model or "")
+        limit = _resolve_context_limit(model or "", base_url=base_url)
         cap = context_message_cap(
             limit, config.tokens.CONTEXT_HARD_CAP_SAFETY_MARGIN, tool_schemas
         )
@@ -2417,7 +2373,7 @@ def _stub_tool_result(m, name_map: dict | None = None):
         try:
             size += len(json.dumps(raw_content, ensure_ascii=False))
         except (TypeError, ValueError):
-            pass
+            logger.debug("<module>::_stub_tool_result:0 suppressed (TypeError, ValueError)", exc_info=True)
 
     if _is_stubbed_tool_result(m) or size <= _EVICT_MIN_CONTENT_LEN:
         return m
@@ -2425,10 +2381,7 @@ def _stub_tool_result(m, name_map: dict | None = None):
     name = getattr(m, "name", "") or "tool"
     tid = getattr(m, "tool_call_id", "") or ""
     tid_suffix = f" ({tid})" if tid else ""
-    stub = (
-        f"{_EVICTED_MARKER}: {name}{tid_suffix} — {size} chars "
-        f"evicted to save context; re-read if still needed.]"
-    )
+    stub = _eviction_stub(f"{name}{tid_suffix}", size)
     # Copy-on-write: replace returns a NEW dataclass instance, leaving the
     # original message object (and any shared reference to it) intact.
     # ── Anthropic format: per-block stub using name_map (tool_use_id → name) ─
@@ -2465,6 +2418,33 @@ def _cache_hit_ratio(ctx=None, *, cache_read_tokens=0, prompt_tokens=0,
 
 
 
+def _token_metadata(ctx) -> dict:
+    """Build ``AgentResult.metadata["tokens"]`` — single source for every exit path.
+
+    Keeps the field set uniform across all statuses so consumers (session log,
+    dashboards) never see a path-dependent subset: ``cache_hit_ratio``,
+    ``last_call_*`` and ``provider`` are always present, on every status.
+    """
+    return {
+        "prompt": ctx.total_prompt_tokens,
+        "completion": ctx.total_completion_tokens,
+        "total": ctx.total_prompt_tokens + ctx.total_completion_tokens,
+        "cost_usd": round(estimate_cost(
+            ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens, model=ctx.model_name), 6),
+        "cache_adjusted_cost_usd": round(
+            estimate_cache_adjusted_cost(
+                ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens,
+                ctx.total_cache_read_tokens, ctx.total_cache_creation_tokens, model=ctx.model_name, base_url=ctx.base_url), 6,
+        ),
+        "cache_read_tokens": ctx.total_cache_read_tokens,
+        "cache_creation_tokens": ctx.total_cache_creation_tokens,
+        "cache_hit_ratio": _cache_hit_ratio(ctx),
+        "last_call_prompt": ctx.last_call_prompt_tokens,
+        "last_call_completion": ctx.last_call_completion_tokens,
+        "provider": ctx.provider_name,
+    }
+
+
 def _is_stubbed_tool_result(m) -> bool:
     """Check if ``m`` is an already-evicted (stubbed) tool result.
 
@@ -2494,14 +2474,32 @@ def _is_stubbed_tool_result(m) -> bool:
     return False
 
 
+def _eviction_stub(label: str, size: int) -> str:
+    """Build the eviction stub text shared by every provider format."""
+    return (
+        f"{_EVICTED_MARKER}: {label} — {size} chars "
+        f"evicted to save context; re-read if still needed.]"
+    )
+
+
+def _stub_tool_result_blocks(m, stub: str, replace_block) -> Any:
+    """Shared scaffold for provider-native tool-result stubbing.
+
+    Returns a **copy** of ``m`` with every ``raw_content`` block mapped
+    through *replace_block* (a callable that returns the stubbed replacement
+    for a tool-result block, or the block unchanged otherwise), preserving the
+    block structure so the provider does not reject the request.  When
+    ``raw_content`` is not a list, the whole message content is replaced by
+    *stub* — the standard-format fallback.
+    """
+    raw_content = getattr(m, "raw_content", None)
+    if not isinstance(raw_content, list):
+        return dataclasses.replace(m, content=stub, raw_content=None)
+    stubbed_raw = [replace_block(b) if isinstance(b, dict) else b for b in raw_content]
+    return dataclasses.replace(m, content="", raw_content=stubbed_raw)
 def _stub_anthropic_tool_result(m, stub: str, name_map: dict | None = None):
     """Stub an anthropic-format tool result message (``role="user"`` with
     ``raw_content`` containing ``tool_result`` blocks).
-
-    Returns a **copy** of ``m`` with every ``tool_result`` block's inner
-    ``content`` replaced by a per-block stub, preserving the ``tool_use_id``
-    pairing so the provider does not reject the request.  Text blocks (e.g.
-    strategy warnings folded into the same message) are left intact.
 
     Per-block stubbing (BUG-2 fix): Anthropic batches parallel tool calls'
     results into ONE ``role="user"`` message with N ``tool_result`` blocks.
@@ -2511,42 +2509,27 @@ def _stub_anthropic_tool_result(m, stub: str, name_map: dict | None = None):
     each block. We instead build a per-block stub from that block's own
     ``tool_use_id`` → name (recovered from the preceding assistant ``tool_use``
     block via *name_map*) and its own content size, so the "re-read" hint names
-    the correct tool.
+    the correct tool.  Text blocks (e.g. strategy warnings folded into the
+    same message) are left intact.
     """
-    raw_content = getattr(m, "raw_content", None)
-    if not isinstance(raw_content, list):
-        return dataclasses.replace(m, content=stub, raw_content=None)
-    stubbed_raw = []
-    for block in raw_content:
-        if isinstance(block, dict) and block.get("type") == "tool_result":
-            tid = block.get("tool_use_id", "")
-            bname = ""
-            if name_map and tid:
-                bname = name_map.get(tid, "")
-            # Size of THIS block's payload only (not the aggregated message size).
-            inner = block.get("content", "")
-            bsize = len(inner) if isinstance(inner, str) else len(
-                json.dumps(inner, ensure_ascii=False)
-            ) if inner is not None else 0
-            label = f"{bname} ({tid})" if bname and tid else (bname or tid or "tool")
-            bstub = (
-                f"{_EVICTED_MARKER}: {label} — {bsize} chars "
-                f"evicted to save context; re-read if still needed.]"
-            )
-            stubbed_raw.append({**block, "content": bstub})
-        else:
-            stubbed_raw.append(block)
-    return dataclasses.replace(m, content="", raw_content=stubbed_raw)
+    def replace_block(block: dict) -> dict:
+        if block.get("type") != "tool_result":
+            return block
+        tid = block.get("tool_use_id", "")
+        bname = name_map.get(tid, "") if name_map and tid else ""
+        # Size of THIS block's payload only (not the aggregated message size).
+        inner = block.get("content", "")
+        bsize = len(inner) if isinstance(inner, str) else (
+            len(json.dumps(inner, ensure_ascii=False)) if inner is not None else 0
+        )
+        label = f"{bname} ({tid})" if bname and tid else (bname or tid or "tool")
+        return {**block, "content": _eviction_stub(label, bsize)}
+    return _stub_tool_result_blocks(m, stub, replace_block)
 
 
 def _stub_gemini_tool_result(m, stub: str, name_map: dict | None = None):
     """Stub a Gemini-format tool result message (``role="user"`` with
     ``raw_content`` containing ``functionResponse`` parts).
-
-    Returns a **copy** of ``m`` with every ``functionResponse`` part's inner
-    ``response`` content replaced by a per-part stub, preserving the part
-    structure so the Gemini API does not reject the request.  Text parts in the
-    same message are left intact.
 
     Gemini ``functionResponse`` parts carry their OWN ``name`` (unlike
     Anthropic, whose ``tool_result`` blocks only carry an opaque
@@ -2554,44 +2537,34 @@ def _stub_gemini_tool_result(m, stub: str, name_map: dict | None = None):
     is accepted for signature symmetry with the Anthropic handler but is not
     required.
     """
-    raw_content = getattr(m, "raw_content", None)
-    if not isinstance(raw_content, list):
-        return dataclasses.replace(m, content=stub, raw_content=None)
-    stubbed_raw = []
-    for block in raw_content:
-        if isinstance(block, dict) and "functionResponse" in block:
-            fr = block["functionResponse"] or {}
-            gname = fr.get("name", "") or "tool"
-            # Size of THIS part's payload only.
-            resp = fr.get("response", {})
-            rcontent = resp.get("content", "") if isinstance(resp, dict) else ""
-            psize = len(rcontent) if isinstance(rcontent, str) else (
-                len(json.dumps(resp, ensure_ascii=False)) if resp else 0
-            )
-            pstub = (
-                f"{_EVICTED_MARKER}: {gname} — {psize} chars "
-                f"evicted to save context; re-read if still needed.]"
-            )
-            stubbed_raw.append({
-                **block,
-                "functionResponse": {
-                    **fr,
-                    "response": {"content": pstub},
-                },
-            })
-        else:
-            stubbed_raw.append(block)
-    return dataclasses.replace(m, content="", raw_content=stubbed_raw)
+    def replace_block(block: dict) -> dict:
+        if "functionResponse" not in block:
+            return block
+        fr = block["functionResponse"] or {}
+        gname = fr.get("name", "") or "tool"
+        # Size of THIS part's payload only.
+        resp = fr.get("response", {})
+        rcontent = resp.get("content", "") if isinstance(resp, dict) else ""
+        psize = len(rcontent) if isinstance(rcontent, str) else (
+            len(json.dumps(resp, ensure_ascii=False)) if resp else 0
+        )
+        return {**block, "functionResponse": {
+            **fr, "response": {"content": _eviction_stub(gname, psize)},
+        }}
+    return _stub_tool_result_blocks(m, stub, replace_block)
 
 
 def _build_tool_name_map(messages) -> dict:
     """Build a ``{tool_use_id: name}`` map from assistant tool-call messages.
 
-    Standard (``role="assistant"`` + ``tool_calls``), Anthropic-native
-    (``tool_use`` blocks), and Gemini-native (``functionCall`` parts) formats
-    are all scanned, so per-block eviction stubs can recover the tool name for
-    ANY provider's parallel-result batch. Returns an empty dict when nothing
-    matches (the stub then falls back to ``"tool"`` / the part's own name).
+    Standard (``role="assistant"`` + ``tool_calls``) and Anthropic-native
+    (``tool_use`` blocks) formats are scanned, so per-block eviction stubs can
+    recover the tool name for those result shapes. Gemini is intentionally NOT
+    mapped: its ``functionResponse`` parts carry their own name, and
+    ``functionCall`` parts have no id to key by (a self-referencing name->name
+    entry would only pollute the id->name map). Returns an empty dict when
+    nothing matches (the stub then falls back to ``"tool"`` / the part's own
+    name).
     """
     out: dict = {}
     for m in messages:
@@ -2613,13 +2586,6 @@ def _build_tool_name_map(messages) -> dict:
                     tname = b.get("name")
                     if tid and tname:
                         out[tid] = tname
-                # Gemini-native: {"functionCall": {"name": ...}}
-                # (Gemini functionResponse carries its OWN name, but map the
-                #  functionCall name too for completeness / future pairing.)
-                if isinstance(b, dict) and "functionCall" in b:
-                    tname = (b["functionCall"] or {}).get("name")
-                    if tname:
-                        out[tname] = tname
     return out
 
 

@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from unittest import mock
 
-from external_llm.agent.agent_turn_pipeline import TurnPipelineMixin
 from external_llm.agent.agent_loop_types import TurnContext
+from external_llm.agent.agent_turn_pipeline import TurnPipelineMixin
 
 
 def _make_response(prompt=80, completion=20, cache_read=500, cache_creation=100, content="done", tool_calls=None):

@@ -152,10 +152,11 @@ class SemanticIntentMatcher:
                 return None
             if (best_score - runner_score) < self._margin:
                 return None
-            return best_label, best_score
         except Exception as e:
             logger.debug("semantic matcher '%s' classify failed: %s", self._name, e)
             return None
+        else:
+            return best_label, best_score
 
     def matches(self, text: str, label: str) -> bool:
         """True iff the nearest example for *text* carries *label* above threshold."""

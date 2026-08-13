@@ -25,6 +25,25 @@ def _paths_overlap(a: str, b: str) -> bool:
     return b.startswith(a_dir) or a.startswith(b_dir)
 
 
+def _path_sig(path: str) -> Optional[tuple[int, int]]:
+    """``(st_mtime_ns, st_size)`` of *path*, or None if it does not exist.
+
+    Compared on every cache hit to detect external writers that bypass the
+    registry's own invalidation (background jobs still writing, the user's
+    editor, parallel agent sessions).  For a directory this only catches
+    direct-child add/remove (dir mtime is not bumped by file content edits) —
+    the TTL remains the bound for edits inside a directory scope.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        # Missing/unreadable path since set() — exactly the staleness signal
+        # this guard exists to catch (file deleted by an external writer).
+        logger.debug("tool result cache: path signature unavailable: %s", path)
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
 @dataclass
 class CachedResult:
     """A cached tool result with metadata."""
@@ -36,6 +55,10 @@ class CachedResult:
     # unknown scope are conservatively dropped by invalidate_paths() since we
     # can't prove they don't depend on whatever was just written.
     paths: Optional[frozenset[str]] = None
+    # Path -> (st_mtime_ns, st_size) captured at READ time (pre-handler, by
+    # the dispatch pre-capture) — a hit whose current signature differs is
+    # dropped. None when ``paths`` is None.
+    file_sigs: Optional[dict[str, Optional[tuple[int, int]]]] = None
 
 class ToolResultCache:
     """TTL-based LRU cache for tool results.
@@ -94,6 +117,20 @@ class ToolResultCache:
                 self._misses += 1
                 return None
 
+            # External-writer guard: for entries scoped to concrete paths,
+            # verify the files still match the signature captured at set()
+            # time. TTL alone cannot catch a file rewritten behind the
+            # registry's back (background job still running, user editor,
+            # parallel session) — a stale read_file/grep result would be fed
+            # to the model as fresh context.
+            if cached.paths is not None and cached.file_sigs is not None:
+                for p in cached.paths:
+                    if _path_sig(p) != cached.file_sigs.get(p):
+                        # Changed (or deleted/created) — stale
+                        del self._cache[key]
+                        self._misses += 1
+                        return None
+
             # Move to end (most recently used)
             self._cache.move_to_end(key)
             self._hits += 1
@@ -102,6 +139,7 @@ class ToolResultCache:
     def set(
         self, tool_name: str, args: dict[str, Any], result: dict[str, Any],
         ttl: Optional[int] = None, paths: Optional[frozenset[str]] = None,
+        file_sigs: Optional[dict[str, Optional[tuple[int, int]]]] = None,
     ):
         """Store a result in the cache.
 
@@ -111,6 +149,16 @@ class ToolResultCache:
         None when the scope can't be determined (repo-wide search, etc.) — such
         entries are always dropped by ``invalidate_paths()``, matching the
         previous (always-full-clear) behavior for them.
+
+        ``file_sigs``: path -> (st_mtime_ns, st_size) captured at READ time
+        (i.e. BEFORE the handler ran), if the caller has it. Computing the
+        signatures HERE at set() time would record the file's POST-read state
+        alongside the PRE-read content: a write that landed during the read
+        would be baked in as fresh forever and the external-writer guard would
+        never fire on it (TOCTOU). Callers that capture signatures up front
+        (``ToolRegistry._dispatch_impl``) pass them here so a mid-read rewrite
+        is detected by the next ``get()`` and the stale result dropped. When
+        None, signatures are computed here (backward-compatible default).
         """
         key = self._make_key(tool_name, args)
         with self._lock:
@@ -126,6 +174,14 @@ class ToolResultCache:
                 timestamp=time.monotonic(),
                 ttl=ttl if ttl is not None else self.default_ttl,
                 paths=paths,
+                file_sigs=(
+                    None
+                    if paths is None
+                    else (
+                        file_sigs if file_sigs is not None
+                        else {p: _path_sig(p) for p in paths}
+                    )
+                ),
             )
 
     def clear(self):

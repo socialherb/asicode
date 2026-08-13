@@ -84,3 +84,28 @@ def test_posix_fcntl_path_still_works(monkeypatch: pytest.MonkeyPatch, tmp_path)
 
     with file_lock.cross_process_flock(tmp_path / "x.lock"):
         pass
+
+
+def test_write_failure_degradation_closes_fh_on_body_exception(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """P0-2 regression: when the placeholder write fails, the no-op lock must
+    still close the file handle even when the protected body raises. The old
+    ``except OSError: yield; fh.close()`` leaked the descriptor on body
+    exceptions (close was skipped)."""
+    closed: list[bool] = []
+
+    class _FakeFH:
+        def seek(self, *args):
+            return 0
+
+        def write(self, b):
+            raise OSError("disk full")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(file_lock, "open", lambda *a, **k: _FakeFH(), raising=False)
+
+    with pytest.raises(RuntimeError), file_lock.cross_process_flock(tmp_path / "x.lock"):
+        raise RuntimeError("body failure")
+
+    assert closed, "fh must be closed after body exception in the no-op degradation branch"

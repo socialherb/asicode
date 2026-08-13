@@ -13,7 +13,6 @@ import json
 
 from external_llm.agent.agent_turn_pipeline import _write_touched_test_file
 
-
 # ── apply_patch: direct path ──────────────────────────────────────────────
 
 

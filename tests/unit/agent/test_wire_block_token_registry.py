@@ -12,13 +12,13 @@ from __future__ import annotations
 import json
 
 from external_llm.agent._shared_utils import (
-    CANONICAL_WIRE_BLOCK_TYPES,
     _WIRE_BLOCK_CONSUMED_KEYS,
     _WIRE_BLOCK_TOKENIZERS,
     _WIRE_CONTENT_KEY_MARKERS,
-    _count_block_wholesale,
+    CANONICAL_WIRE_BLOCK_TYPES,
     _cjk_aware_tokens,
     _cjk_tokens_from_jsonable,
+    _count_block_wholesale,
     _estimate_single_message_tokens,
     _tok_tool_use,
     _warn_unknown_block_type,

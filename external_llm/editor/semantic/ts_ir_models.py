@@ -34,7 +34,6 @@ class SymbolKind(Enum):
     INTERFACE = "interface"
     TYPE_ALIAS = "type_alias"
     ENUM = "enum"
-    IMPORT = "import"
 
 
 class ExportKind(Enum):
@@ -42,7 +41,6 @@ class ExportKind(Enum):
 
     NAMED = "named"
     DEFAULT = "default"
-    RE_EXPORT = "re_export"
 
 
 # ── execution metadata (P2.5) ───────────────────────────────────────────────
@@ -74,10 +72,6 @@ class TSTypeRef:
     """A lightweight type reference (not full type system)."""
 
     name: str
-    is_array: bool = False
-    is_optional: bool = False
-    is_union: bool = False
-    type_args: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -108,7 +102,6 @@ class IRExport:
 
     name: str
     kind: ExportKind = ExportKind.NAMED
-    original_name: Optional[str] = None
     meta: Optional[IRNodeMeta] = None
 
 
@@ -133,11 +126,9 @@ class IRFunction:
     params: list[TSParam] = field(default_factory=list)
     return_type: Optional[TSTypeRef] = None
     is_async: bool = False
-    is_generator: bool = False
     is_exported: bool = False
     export_kind: Optional[ExportKind] = None
     calls: list[str] = field(default_factory=list)
-    local_vars: list[str] = field(default_factory=list)
     start_line: int = 0
     end_line: int = 0
     meta: Optional[IRNodeMeta] = None

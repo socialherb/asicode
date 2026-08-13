@@ -7,6 +7,7 @@ Extracted from tool_registry.py to reduce its size and improve SRP.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -15,6 +16,8 @@ from collections.abc import Callable
 from typing import Any, Optional
 
 from external_llm.languages.tree_sitter_utils import grammar_key_for_ext
+
+from .write_targets import parse_patch_targets, write_target_paths
 
 logger = logging.getLogger(__name__)
 
@@ -33,18 +36,22 @@ _MISSING_SNAP = object()
 # (the planner lane may be removed later). Unlike intent assertions, this
 # needs no declared intent — it is computed purely from pre/post snapshots.
 
-def _python_decl_sets(source: str):
+def _python_decl_sets(source: str, _return_tree: bool = False):
     """Extract (symbols, import bindings) declared at module/class level.
 
     Symbols: top-level functions/classes + class methods as 'Class.method'.
     Imports: module-level binding names (alias-aware).
     Returns None when the source does not parse (caller skips the check —
     syntax breakage is handled by the separate verify/rollback path).
+    With ``_return_tree=True`` returns ``(symbols, imports, tree)`` so a
+    caller that also needs the parse tree (e.g. the Phase 3 restore path in
+    ``auto_repair_semantic``) avoids a second ast.parse of the same text.
     """
     import ast
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
+        logger.debug("tool_safety: source does not parse — skipping symbol-set check")
         return None
     symbols: set = set()
     imports: set = set()
@@ -56,12 +63,11 @@ def _python_decl_sets(source: str):
             for sub in node.body:
                 if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     symbols.add(f"{node.name}.{sub.name}")
-        elif isinstance(node, ast.Import):
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for a in node.names:
                 imports.add(a.asname or a.name)
-        elif isinstance(node, ast.ImportFrom):
-            for a in node.names:
-                imports.add(a.asname or a.name)
+    if _return_tree:
+        return symbols, imports, tree
     return symbols, imports
 
 
@@ -76,10 +82,9 @@ def _treesitter_symbol_set(source: str, language: str):
     Names are FLAT (method 'update', not 'Svc.update') — a same-named method
     in another class masks a removal; acceptable for a warning heuristic.
     """
-    try:
-        from external_llm.languages.tree_sitter_utils import find_all_symbols, get_parser
-    except ImportError:
-        return None
+    # tree_sitter_utils guards its own optional tree-sitter import, so this
+    # import cannot fail — the old except ImportError fallback was dead code.
+    from external_llm.languages.tree_sitter_utils import find_all_symbols, get_parser
     parser = get_parser(language)
     if parser is None:
         return None
@@ -88,6 +93,7 @@ def _treesitter_symbol_set(source: str, language: str):
         if tree.root_node.has_error:
             return None
     except Exception:
+        logger.debug("tool_safety: tree-sitter parse failed — skipping symbol-set check", exc_info=True)
         return None
     return {name for name, _kind, _s, _e in find_all_symbols(source, language)}
 
@@ -159,36 +165,27 @@ class WriteSafetyManager:
     def count_patch_files(patch_text: str) -> int:
         """Count number of files affected by a patch.
 
-        Counts ``diff --git`` headers (primary) AND ``--- a/`` / ``--- b/``
-        lines (secondary, for patches that omit the git header).  Match the
-        extraction logic of ``snapshot_target_files`` so the approval gate
-        and the safety snapshot see the same file set — otherwise a bare
-        ``--- a/`` / ``+++ b/`` patch (no ``diff --git`` prefix) bypasses
-        the multi-file approval threshold entirely.
+        Delegates to ``write_targets.parse_patch_targets`` so the approval gate
+        and the safety snapshot see the same file set — otherwise a patch shape
+        one of them does not recognise bypasses the multi-file approval
+        threshold entirely. That is exactly how the no-prefix form that plain
+        ``diff -u`` emits used to slip through: every private copy of this
+        parser required an ``a/`` / ``b/`` prefix, so such a patch counted zero
+        files no matter how many it touched.
         """
-        _seen: set = set()
-        for _line in patch_text.splitlines():
-            if _line.startswith("diff --git "):
-                # Extract b/ path: "diff --git a/foo.py b/foo.py"
-                _parts = _line.split()
-                if len(_parts) >= 4:
-                    _seen.add(_parts[3])
-                else:
-                    _seen.add(_line)  # fallback: count the whole line once
-            elif (
-                _line.startswith("--- a/")
-                or _line.startswith("--- b/")
-                or _line.startswith("+++ b/")
-            ):
-                # "+++ b/" covers new-file hunks whose old side is
-                # "--- /dev/null" — same as snapshot_target_files.
-                _path = _line[6:].strip()
-                if _path and _path != "/dev/null":
-                    _seen.add("b/" + _path)
-        return len(_seen)
+        return len(set(parse_patch_targets(patch_text)))
 
     def approval_preview(self, tool_name: str, args: dict) -> tuple[str, bool]:
         """Generate a preview for approval gating.
+
+        There is deliberately no ``delete_file`` branch. One existed and gated
+        nothing: ``delete_file`` is not in ``_TOOL_HANDLER_MAP``, so no such tool
+        can be dispatched — but ``_gate_check`` runs BEFORE dispatch resolves the
+        handler, so a model hallucinating the name made the user answer a
+        "DELETE FILE: <path>" approval prompt for a deletion that could not
+        happen, and the call then failed with "Unknown tool" anyway. An approval
+        prompt is a claim about what is about to occur; one that overstates the
+        danger of a no-op teaches users to click through the real ones.
 
         Returns:
             (preview_text, needs_approval) tuple.
@@ -198,9 +195,6 @@ class WriteSafetyManager:
             if self.count_patch_files(patch) >= self._PATCH_FILE_THRESHOLD:
                 return patch[:4000], True
             return "", False
-        if tool_name == "delete_file":
-            path = args.get("path", "")
-            return f"DELETE FILE: {path}", True
         if tool_name == "write_plan":
             try:
                 preview = json.dumps(args.get("plan", {}), indent=2, ensure_ascii=False)[:4000]
@@ -245,68 +239,29 @@ class WriteSafetyManager:
     def snapshot_target_files(self, tool_name: str, args: dict) -> dict:
         """Capture file contents before a write operation.
 
-        For apply_patch / write_plan, captures ALL files mentioned in the patch
-        (diff --git headers), not just the first one.  This ensures that multi-file
-        patches are fully restorable on syntax-error rollback.
+        For apply_patch / write_plan, captures ALL files the call touches — not
+        just the first — so a multi-file patch is fully restorable on
+        syntax-error rollback.
+
+        Target resolution is delegated to ``write_targets.write_target_paths``,
+        the single source of truth shared with the Undo checkpoint, the approval
+        gate and the file-lock manager. Only the I/O below is this method's own.
         """
         snapshots: dict = {}
-        try:
-            if tool_name in ("apply_patch", "write_plan"):
-                raw_plan = args.get("patch") or args.get("plan") or ""
-                # write_plan accepts a dict plan; only use string-typed values
-                patch = raw_plan if isinstance(raw_plan, str) else ""
-
-                targets: list = []
-                # Secondary: use "--- a/…" / "+++ b/…" lines when no diff --git
-                # headers present. "+++ b/…" captures new-file targets (--- /dev/null).
-                for _line in patch.splitlines():
-                    if _line.startswith('--- a/') or _line.startswith('--- b/'):
-                        _path = _line[6:].split('\t')[0].strip()
-                        if _path and _path != "/dev/null":
-                            targets.append(_path)
-                    elif _line.startswith('+++ b/'):
-                        _path = _line[6:].split('\t')[0].strip()
-                        if _path and _path != "/dev/null":
-                            targets.append(_path)
-                # For write_plan with dict plan: extract paths from ops
-                if not targets and isinstance(raw_plan, dict):
-                    plan_ops = (
-                        raw_plan.get("ops") or raw_plan.get("operations") or []
-                    )
-                    if not plan_ops and "path" in raw_plan:
-                        plan_ops = [raw_plan]
-                    targets = [str(op["path"]) for op in plan_ops if op.get("path")]
-                # Fallback: explicit file_path / path arg (e.g. apply_patch called
-                # without a unified diff header, or for direct single-file targeting)
-                if not targets:
-                    _explicit = args.get("file_path") or args.get("path") or ""
-                    if _explicit and isinstance(_explicit, str):
-                        targets = [_explicit]
-                for target in targets:
-                    full_path = (
-                        target if os.path.isabs(target)
-                        else os.path.join(self.repo_root, target)
-                    )
-                    if os.path.isfile(full_path) and full_path not in snapshots:
-                        with open(full_path, encoding="utf-8", errors="replace") as f:
-                            snapshots[full_path] = f.read()
-                    elif full_path not in snapshots:
-                        # New file: store sentinel so restore can remove it on rollback
-                        snapshots[full_path] = _MISSING_SNAP
-            else:
-                target = args.get("file_path") or args.get("path") or ""
-                if target and isinstance(target, str):
-                    full_path = (
-                        target if os.path.isabs(target)
-                        else os.path.join(self.repo_root, target)
-                    )
-                    if os.path.isfile(full_path):
-                        with open(full_path, encoding="utf-8", errors="replace") as f:
-                            snapshots[full_path] = f.read()
-                    elif full_path not in snapshots:
-                        snapshots[full_path] = _MISSING_SNAP
-        except OSError:
-            pass
+        with contextlib.suppress(OSError):
+            for target in write_target_paths(tool_name, args):
+                full_path = (
+                    target if os.path.isabs(target)
+                    else os.path.join(self.repo_root, target)
+                )
+                if full_path in snapshots:
+                    continue
+                if os.path.isfile(full_path):
+                    with open(full_path, encoding="utf-8", errors="replace") as f:
+                        snapshots[full_path] = f.read()
+                else:
+                    # New file: store sentinel so restore can remove it on rollback
+                    snapshots[full_path] = _MISSING_SNAP
         return snapshots
 
     def verify_after_write(self, snapshots: dict, _post_contents: dict | None = None) -> tuple[bool, str]:
@@ -393,15 +348,13 @@ class WriteSafetyManager:
                         os.chmod(_tmp, os.stat(path).st_mode)
                     os.replace(_tmp, path)
                 except BaseException:
-                    try:
+                    with contextlib.suppress(OSError):
                         os.unlink(_tmp)
-                    except OSError:
-                        pass
                     raise
             except OSError:
-                logger.error(
+                logger.exception(
                     "Write safety: rollback failed for %s — file may be corrupted",
-                    path, exc_info=True,
+                    path,
                 )
                 _failed.append(path)
         return _failed
@@ -449,6 +402,7 @@ class WriteSafetyManager:
                 with open(path, encoding="utf-8", errors="replace") as f:
                     current = f.read()
             except OSError:
+                logger.debug("tool_safety: cannot read %s for verification — skipping", path)
                 continue
 
             try:
@@ -547,9 +501,14 @@ class WriteSafetyManager:
 
         Graceful degradation: returns None if ruff is unavailable or no .py files.
         """
-        from external_llm.agent.semantic_lint import ruff_findings
+        from external_llm.agent.semantic_lint import ruff_findings, ruff_findings_many
 
         new_findings: list = []
+        # Batch the post-scan: every on-disk .py is linted in ONE ruff spawn
+        # (~9ms for 10 files vs ~66ms one spawn per file); the pre-scan stays
+        # per-file via stdin because it reads snapshot memory, not disk.
+        py_paths = [path for path in snapshots if path.endswith(".py")]
+        posts = ruff_findings_many(py_paths) if py_paths else {}
         for path, pre_content in snapshots.items():
             if not path.endswith(".py"):
                 continue
@@ -558,12 +517,13 @@ class WriteSafetyManager:
                 pre_content = ""
             try:
                 with open(path, encoding="utf-8", errors="replace") as f:
-                    post_content = f.read()
+                    f.read()  # existence/readability probe — content scanned via batch
             except (OSError, FileNotFoundError):
+                logger.debug("tool_safety: cannot read %s — skipping pre/post comparison", path)
                 continue
 
             pre = ruff_findings(pre_content, path=path)
-            post = ruff_findings(post_content, path=path)
+            post = posts.get(path, [])
 
             if not post:
                 continue
@@ -692,8 +652,10 @@ class WriteSafetyManager:
                         if found:
                             break
                     except (SyntaxError, OSError, AttributeError):
+                        logger.debug("tool_safety: AST scan of %s failed — trying next file", fpath)
                         continue
             except (OSError, AttributeError):
+                logger.debug("tool_safety: cannot read %s while resolving import — trying next file", fpath)
                 continue
             if found:
                 break
@@ -770,9 +732,10 @@ class WriteSafetyManager:
         """
         try:
             compile(content, "<safety-net>", "exec")
-            return True
         except SyntaxError:
             return False
+        else:
+            return True
 
     @staticmethod
     def _import_line_resolves(import_line: str) -> bool:
@@ -827,17 +790,21 @@ class WriteSafetyManager:
         Returns count of files where at least one repair was applied.
         Non-fatal: any failure degrades gracefully to Phase 1 warning.
         """
-        from external_llm.agent.semantic_lint import ruff_findings
+        from external_llm.agent.semantic_lint import ruff_findings, ruff_findings_many
 
         repaired_count = 0
         # Reset the _resolve_missing_import memo (see __init__) so this call
         # sees the repo's current on-disk import state.
         self._f821_import_cache = {}
-        for path in snapshots:
+        # Batch the post-scan: every on-disk .py is linted in ONE ruff spawn.
+        # A per-file loop spawns ~8ms of process startup per file; the batch
+        # amortizes it to one spawn (~9ms for 10 files, measured P10-2).
+        py_paths = [path for path in snapshots if path.endswith(".py")]
+        posts = ruff_findings_many(py_paths) if py_paths else {}
+        for path, pre_content in snapshots.items():
             if not path.endswith(".py"):
                 continue
 
-            pre_content = snapshots[path]
             # New file (did not exist before edit): treat as empty content.
             # Required so _python_decl_sets / rollback paths don't choke on
             # the _MISSING_SNAP sentinel (cf. new_semantic_warnings L476-477).
@@ -849,11 +816,17 @@ class WriteSafetyManager:
                 with open(path, encoding="utf-8", errors="replace") as f:
                     current = f.read()
             except (OSError, FileNotFoundError):
+                logger.debug("tool_safety: cannot read %s for post-edit comparison — skipping", path)
                 continue
 
-            post = ruff_findings(current, path=path)
+            post = posts.get(path, [])
             if not post:
                 continue
+
+            # Tracks whether this file's `current` diverged from the batch
+            # scan above (Phase 2 import insertion) — Phase 3 re-scans only
+            # then, otherwise it reuses `post` (no second ruff spawn).
+            _current_mutated = False
 
             # Precondition: file must already parse cleanly.
             # If _ast.parse(current) fails the file has pre-existing syntax
@@ -915,6 +888,7 @@ class WriteSafetyManager:
                         with open(path, "w", encoding="utf-8") as f:
                             f.write(current)
                     except OSError:
+                        logger.debug("tool_safety: cannot write import repair into %s — skipping", path)
                         continue
                     # Safety net: validate syntax after repair, rollback on failure
                     if not self._validate_python_syntax(current):
@@ -924,35 +898,43 @@ class WriteSafetyManager:
                         logger.warning("Phase 2 F821 repair produced invalid syntax in %s — rolled back", path)
                         continue
                     repaired_count += 1
+                    _current_mutated = True  # import inserted — Phase 3 must re-scan
                     # F821 protection: typing imports resolved by AST search may
                     # target symbols used only in deferred string annotations,
                     # which the import_normalizer's AST pass cannot detect.
                     # Mark them so the normalizer preserves them — otherwise the
                     # two passes oscillate (normalizer strips it → F821 returns).
                     if import_line.startswith("from typing import "):
-                        try:
+                        with contextlib.suppress(OSError):  # non-critical — worst case normalizer strips it once
                             from external_llm.editor._editor_core.common.import_normalizer import mark_f821_protected
                             mark_f821_protected(path, missing_name)
                             logger.debug(
                                 "AUTO-REPAIR marked '%s' as F821-protected in %s",
                                 missing_name, path,
                             )
-                        except Exception:
-                            pass  # non-critical — worst case normalizer strips it once
 
             # --- Phase 3: decl-loss symbol → F821 → auto-restore ---
             # If a top-level symbol was removed AND that symbol is now flagged
             # as F821, it was an accidental deletion — restore from pre-snapshot.
             # Symbols are APPENDED at file-end to avoid line-number conflicts
             # after F401 fix (which removes import lines) shifted the document.
-            pre_sets = _python_decl_sets(pre_content)
+            pre_sets = _python_decl_sets(pre_content, _return_tree=True)
             post_sets = _python_decl_sets(current)
             if pre_sets is not None and post_sets is not None:
                 pre_syms = pre_sets[0]
                 post_syms = post_sets[0]
+                pre_tree = pre_sets[2]  # tree shared from _python_decl_sets — no second parse
                 removed_syms = pre_syms - post_syms
                 if removed_syms:
-                    remaining_f821 = ruff_findings(current, path=path)
+                    # Phase 2 may have inserted imports (mutating `current`):
+                    # re-scan only then; otherwise the batch scan above is
+                    # still valid and is reused instead of re-spawning ruff
+                    # (cf. L816-818).
+                    remaining_f821 = (
+                        ruff_findings(current, path=path)
+                        if _current_mutated
+                        else post
+                    )
                     # Ruff uses backticks: "Undefined name `parse_config`"
                     f821_undefined = set()
                     for _f in remaining_f821:
@@ -966,11 +948,11 @@ class WriteSafetyManager:
                                 break
                     to_restore = removed_syms & f821_undefined
                     if to_restore:
-                        import ast as _ast
+                        import ast as _ast  # type-name references only — tree comes from _python_decl_sets
                         pre_lines = pre_content.split("\n")
                         try:
-                            pre_tree = _ast.parse(pre_content)
-                            # Build {name: (start_line, end_line)} from pre-tree
+                            # pre_tree was parsed once by _python_decl_sets
+                            # above (shared tree — no second ast.parse).
                             sym_ranges: dict = {}
                             for node in pre_tree.body:
                                 if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
@@ -1001,6 +983,7 @@ class WriteSafetyManager:
                                     sorted(to_restore_sorted), path,
                                 )
                         except SyntaxError:
+                            logger.debug("tool_safety: restore would produce invalid syntax in %s — skipped", path)
                             continue
 
         return repaired_count

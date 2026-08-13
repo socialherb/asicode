@@ -13,33 +13,55 @@ Fall back to line heuristics only when scanning line-by-line in tight loops.
 from __future__ import annotations
 
 import ast
+import contextlib
 import logging
 import re
-
-from .languages import LanguageId as _LanguageId
-
-try:
-    from .languages.tree_sitter_utils import (
-        find_all_symbols as _ts_find_all_symbols,
-    )
-    from .languages.tree_sitter_utils import (
-        grammar_key_for_path as _ts_grammar_key_for_path,
-    )
-    from .languages.tree_sitter_utils import (
-        parse_to_tree as _ts_parse_to_tree,
-    )
-    _HAS_TS = True
-except ImportError:
-    _HAS_TS = False
-
 from dataclasses import dataclass, field
 from typing import Optional
+
+from .languages import LanguageId as _LanguageId
+from .languages.base import find_brace_block_end_offset
+from .languages.tree_sitter_utils import (
+    find_all_symbols as _ts_find_all_symbols,
+)
+from .languages.tree_sitter_utils import (
+    grammar_key_for_path as _ts_grammar_key_for_path,
+)
+from .languages.tree_sitter_utils import (
+    parse_to_tree as _ts_parse_to_tree,
+)
+
+# tree_sitter_utils guards its own optional tree-sitter import, so this
+# module always imports — the old try/except ImportError was dead code.
+_HAS_TS = True
 
 logger = logging.getLogger('asicode.code_structure_utils')
 __all__ = ['DefinitionInfo', 'FunctionSignature', 'collect_defined_names', 'extract_function_signature', 'extract_function_signature_detailed', 'extract_symbol_name', 'find_definition_at_line', 'find_import_boundary_ast', 'find_last_top_level_def', 'is_class_def', 'is_decorator', 'is_function_def', 'is_import_boundary', 'is_python_definition', 'parse_definitions', 'symbol_defined_anywhere', 'symbol_exists_in_module']
 _RE_FUNC_DEF = re.compile('^(\\s*)(?:async\\s+)?def\\s+(\\w+)\\s*\\(')
 _RE_CLASS_DEF = re.compile('^(\\s*)class\\s+(\\w+)\\s*[\\(\\[:]')
 _RE_DECORATOR = re.compile('^(\\s*)@')
+
+# ── Static regex fallback patterns (non-Python symbol checks) ────────────────
+# Hoisted module-level: per-call re.compile of an identical string only churns
+# the re module's internal cache (maxsize 512) — hoisting keeps these resident
+# and immune to eviction under heavy dynamic-pattern load.
+# NOTE (P11-3): the class-header list parts use [^\s,]+ — \S includes commas,
+# so \S+ and (?:\s*,\s*\S+)* had an ambiguous split that backtracks
+# exponentially when the closing '{' is absent (realistic in .d.ts:
+# 'declare class Foo extends Mixin<T0,...,Tn>;'). [^\s,]+ gives the
+# comma-delimited list a unique parse (linear).
+_RE_TS_CLASS_BODY = re.compile(
+    r"(?:export\s+)?(?:abstract\s+)?class\s+\w+\s*"
+    r"(?:extends\s+[^\s,]+(?:\s*,\s*[^\s,]+)*\s*)?"
+    r"(?:implements\s+[^\s,]+(?:\s*,\s*[^\s,]+)*\s*)?\{"
+)
+_RE_JVM_CLASS_HEADER = re.compile(r"\b(?:class|interface|enum|object)\s+\w+")
+_RE_TS_LAST_TOP_LEVEL_DEF = re.compile(
+    r'^(?:export\s+(?:default\s+)?)?(?:async\s+)?'
+    r'(?:(?:function|class)\s+(\w+)'
+    r'|const\s+(\w+)\s*=)',
+    re.MULTILINE,
+)
 
 
 # ── tree-sitter helpers for non-Python symbol detection ───────────────
@@ -91,6 +113,7 @@ def _go_module_level_symbol_exists(content: str, symbol: str) -> Optional[bool]:
     try:
         tree = _ts_parse_to_tree(content, "go")
     except Exception:
+        logger.debug('_go_module_level_symbol_exists: tree-sitter parse failed', exc_info=True)
         return None
     if tree is None:
         return None
@@ -105,19 +128,17 @@ def _go_module_level_symbol_exists(content: str, symbol: str) -> Optional[bool]:
             # Top-level func Foo() — method_declaration has a receiver and
             # is NOT module-level, so we deliberately skip that node type.
             nm = node.child_by_field_name("name")
-            if nm is not None:
-                if code_bytes[nm.start_byte:nm.end_byte].decode("utf-8", "replace") == symbol:
-                    found = True
-                    break
+            if nm is not None and code_bytes[nm.start_byte : nm.end_byte].decode("utf-8", "replace") == symbol:
+                found = True
+                break
         elif ntype == "type_declaration":
             # type ( Foo struct/interface ) — may declare multiple types.
             for child in node.children:
                 if child.type == "type_spec":
                     nm = child.child_by_field_name("name")
-                    if nm is not None:
-                        if code_bytes[nm.start_byte:nm.end_byte].decode("utf-8", "replace") == symbol:
-                            found = True
-                            break
+                    if nm is not None and code_bytes[nm.start_byte : nm.end_byte].decode("utf-8", "replace") == symbol:
+                        found = True
+                        break
             if found:
                 break
         elif ntype in ("var_declaration", "const_declaration"):
@@ -125,10 +146,12 @@ def _go_module_level_symbol_exists(content: str, symbol: str) -> Optional[bool]:
             for spec in node.children:
                 if spec.type in ("var_spec", "const_spec"):
                     for nm_node in spec.children:
-                        if nm_node.type == "identifier":
-                            if code_bytes[nm_node.start_byte:nm_node.end_byte].decode("utf-8", "replace") == symbol:
-                                found = True
-                                break
+                        if (
+                            nm_node.type == "identifier"
+                            and code_bytes[nm_node.start_byte : nm_node.end_byte].decode("utf-8", "replace") == symbol
+                        ):
+                            found = True
+                            break
                     if found:
                         break
             if found:
@@ -263,24 +286,18 @@ def _ts_symbol_defined(
         member_name = parts[1]
         _class_header_re = re.compile(
             rf"(?:export\s+)?(?:abstract\s+)?class\s+{re.escape(class_name)}\s*"
-            r"(?:extends\s+\S+(?:\s*,\s*\S+)*\s*)?"
-            r"(?:implements\s+\S+(?:\s*,\s*\S+)*\s*)?\{"
+            r"(?:extends\s+[^\s,]+(?:\s*,\s*[^\s,]+)*\s*)?"
+            r"(?:implements\s+[^\s,]+(?:\s*,\s*[^\s,]+)*\s*)?\{"
         )
         _match = _class_header_re.search(content)
         if not _match:
             return False
-        _after_brace = content[_match.end():]
-        _depth = 1
-        _scope_end = len(_after_brace)
-        for i, ch in enumerate(_after_brace):
-            if ch == '{':
-                _depth += 1
-            elif ch == '}':
-                _depth -= 1
-                if _depth == 0:
-                    _scope_end = i + 1
-                    break
-        _class_body = _after_brace[:_scope_end]
+        # Class body = the brace-delimited region opened by the header's `{`.
+        # Delegated to the literal/comment-aware base scanner: the old
+        # hand-rolled depth loop miscounted braces inside strings/comments
+        # (e.g. `s = "}"`) and truncated the body, losing methods after it.
+        _body_end_abs = find_brace_block_end_offset(content, _match.end())
+        _class_body = content[_match.end():_body_end_abs]
         _method_re = re.compile(
             rf"(?:public|private|protected|static|readonly|async|\s)*\b{re.escape(member_name)}\s*[\(=:<]"
         )
@@ -294,27 +311,16 @@ def _ts_symbol_defined(
     # Bare method name fallback: search inside all class bodies.
     # Required because symbol_defined_anywhere is called with bare names
     # (e.g. 'getShape' from op.symbol.split('.')[-1]) for class methods.
-    _class_body_re = re.compile(
-        r"(?:export\s+)?(?:abstract\s+)?class\s+\w+\s*"
-        r"(?:extends\s+\S+(?:\s*,\s*\S+)*\s*)?"
-        r"(?:implements\s+\S+(?:\s*,\s*\S+)*\s*)?\{"
+    # Class-body extents come from the literal/comment-aware base scanner
+    # (same SSOT as the dotted path above); the regex is hoisted out of the
+    # loop (it depends only on `symbol`).
+    _method_re = re.compile(
+        rf"(?:public|private|protected|static|readonly|async|\s)*\b{re.escape(symbol)}\s*[\(=:<]"
     )
-    for _cm in _class_body_re.finditer(content):
+    for _cm in _RE_TS_CLASS_BODY.finditer(content):
         _body_start = _cm.end()
-        _depth = 1
-        _body_end = _body_start
-        for i, ch in enumerate(content[_body_start:], start=_body_start):
-            if ch == '{':
-                _depth += 1
-            elif ch == '}':
-                _depth -= 1
-                if _depth == 0:
-                    _body_end = i + 1
-                    break
-        _class_body = content[_body_start:_body_end]
-        _method_re = re.compile(
-            rf"(?:public|private|protected|static|readonly|async|\s)*\b{re.escape(symbol)}\s*[\(=:<]"
-        )
+        _body_end_abs = find_brace_block_end_offset(content, _body_start)
+        _class_body = content[_body_start:_body_end_abs]
         if _method_re.search(_class_body):
             return True
 
@@ -370,40 +376,84 @@ def _go_symbol_defined(
     _method_re = re.compile(
         rf"\bfunc\s+\([^)]*\)\s+{re.escape(symbol)}\s*[\[\(]"
     )
-    if _method_re.search(content):
-        return True
-
-    return False
+    return bool(_method_re.search(content))
 
 
-def _go_collect_defined_names(content: str) -> set:
-    """Collect all defined symbol names from Go source.
+def _collect_defined_names_via_ts(content: str, lang_id: "_LanguageId") -> Optional[set]:
+    """Tree-sitter primary path shared by the defined-name collection family.
+
+    Returns the defined-name set, or ``None`` when tree-sitter is unavailable
+    or parsing failed (the caller then falls back to language-specific regex).
+    """
+    syms = _collect_symbols_via_ts(content, lang_id)
+    if syms is not None:
+        return {n for (n, _k, _s, _e) in syms}
+    return None
+
+
+# ── Defined-name regex fallbacks (tree-sitter unavailable / parse failed) ──
+_JVM_DEFINED_NAME_PATTERNS: tuple[str, ...] = (
+    # class/interface/enum/object Foo
+    r"\b(?:class|interface|enum|object)\s+(\w+)",
+    # Kotlin: fun foo( / fun <T> foo(
+    r"\bfun\s+(\w+)\s*[(<]",
+    # Kotlin property: val/var foo
+    r"\b(?:val|var)\s+(\w+)\s*[:=,)]",
+)
+_TS_DEFINED_NAME_PATTERNS: tuple[str, ...] = (
+    # function names (including async, export)
+    r"(?:export\s+)?(?:async\s+)?function\s+(\w+)",
+    # class names (including abstract, export)
+    r"(?:export\s+)?(?:abstract\s+)?class\s+(\w+)",
+    # const/let/var names (including export)
+    r"(?:export\s+)?(?:const|let|var)\s+(\w+)",
+    # interface names (including export)
+    r"(?:export\s+)?interface\s+(\w+)",
+    # type aliases (including export)
+    r"(?:export\s+)?type\s+(\w+)\s*=",
+    # enum names (including const enum, export)
+    r"(?:export\s+)?(?:const\s+)?enum\s+(\w+)",
+)
+_DEFINED_NAME_REGEX_PATTERNS: dict["_LanguageId", tuple[str, ...]] = {
+    # func Foo(...)  /  func (r *T) Method(...) or func (r T) Method(...)
+    _LanguageId.GO: (
+        r"\bfunc\s+(\w+)\s*[\[\(]",
+        r"\bfunc\s+\([^)]*\)\s+(\w+)\s*[\[\(]",
+        # type Foo struct / type Foo interface / type Foo [
+        r"\btype\s+(\w+)\s+(?:struct|interface|\[)",
+        # var Foo = / var Foo type
+        r"\bvar\s+(\w+)\s+(?:=|\[?\w)",
+        # const Foo = / const Foo type
+        r"\bconst\s+(\w+)\s+(?:=|\[?\w)",
+    ),
+    _LanguageId.JAVA: _JVM_DEFINED_NAME_PATTERNS,
+    _LanguageId.KOTLIN: _JVM_DEFINED_NAME_PATTERNS,
+    _LanguageId.TYPESCRIPT: _TS_DEFINED_NAME_PATTERNS,
+    _LanguageId.JAVASCRIPT: _TS_DEFINED_NAME_PATTERNS,
+}
+
+
+def _collect_defined_names_regex(content: str, lang_id: "_LanguageId") -> set:
+    """Regex fallback for defined-name collection (tree-sitter unavailable)."""
+    names: set = set()
+    for pattern in _DEFINED_NAME_REGEX_PATTERNS[lang_id]:
+        for m in re.finditer(pattern, content):
+            names.add(m.group(1))
+    return names
+
+
+def _collect_defined_names_ts_first(content: str, lang_id: "_LanguageId") -> set:
+    """Tree-sitter-first defined-name collection for Go/JVM/TS-JS.
 
     Primary path: tree-sitter via ``find_all_symbols`` — accurate, excludes
     comment/string mentions (fixes regex false-positives).
-    Fallback: regex when tree-sitter is unavailable or parsing failed.
+    Fallback: language-specific regex when tree-sitter is unavailable or
+    parsing failed.
     """
-    syms = _collect_symbols_via_ts(content, _LanguageId.GO)
-    if syms is not None:
-        return {n for (n, _k, _s, _e) in syms}
-
-    names: set = set()
-    # func Foo(...)
-    for m in re.finditer(r'\bfunc\s+(\w+)\s*[\[\(]', content):
-        names.add(m.group(1))
-    # func (r *T) Method(...) or func (r T) Method(...)
-    for m in re.finditer(r'\bfunc\s+\([^)]*\)\s+(\w+)\s*[\[\(]', content):
-        names.add(m.group(1))
-    # type Foo struct / type Foo interface / type Foo [
-    for m in re.finditer(r'\btype\s+(\w+)\s+(?:struct|interface|\[)', content):
-        names.add(m.group(1))
-    # var Foo = / var Foo type
-    for m in re.finditer(r'\bvar\s+(\w+)\s+(?:=|\[?\w)', content):
-        names.add(m.group(1))
-    # const Foo = / const Foo type
-    for m in re.finditer(r'\bconst\s+(\w+)\s+(?:=|\[?\w)', content):
-        names.add(m.group(1))
-    return names
+    ts_names = _collect_defined_names_via_ts(content, lang_id)
+    if ts_names is not None:
+        return ts_names
+    return _collect_defined_names_regex(content, lang_id)
 
 
 def _extract_brace_body(content: str, search_from: int) -> Optional[str]:
@@ -497,68 +547,12 @@ def _jvm_symbol_defined(
 
     # Bare member name fallback: search inside ALL class bodies (a bare name
     # may be a method/field rather than a top-level def).
-    _class_header_re = re.compile(r"\b(?:class|interface|enum|object)\s+\w+")
-    for _cm in _class_header_re.finditer(content):
+    for _cm in _RE_JVM_CLASS_HEADER.finditer(content):
         _body = _extract_brace_body(content, _cm.end())
         if _body and _member_re(symbol).search(_body):
             return True
     return False
 
-
-def _jvm_collect_defined_names(content: str, lang_id: "_LanguageId") -> set:
-    """Collect all defined symbol names from Java/Kotlin source.
-
-    Primary path: tree-sitter via ``find_all_symbols`` — accurate, excludes
-    comment/string mentions. Fallback: regex when tree-sitter is unavailable.
-    """
-    syms = _collect_symbols_via_ts(content, lang_id)
-    if syms is not None:
-        return {n for (n, _k, _s, _e) in syms}
-
-    names: set = set()
-    # class/interface/enum/object Foo
-    for m in re.finditer(r'\b(?:class|interface|enum|object)\s+(\w+)', content):
-        names.add(m.group(1))
-    # Kotlin: fun foo( / fun <T> foo(
-    for m in re.finditer(r'\bfun\s+(\w+)\s*[(<]', content):
-        names.add(m.group(1))
-    # Kotlin property: val/var foo
-    for m in re.finditer(r'\b(?:val|var)\s+(\w+)\s*[:=,)]', content):
-        names.add(m.group(1))
-    return names
-
-
-def _ts_collect_defined_names(content: str) -> set:
-    """Collect all defined symbol names from TS/JS source.
-
-    Primary path: tree-sitter via ``find_all_symbols`` — accurate, excludes
-    comment/string mentions (fixes regex false-positives).
-    Fallback: regex when tree-sitter is unavailable or parsing failed.
-    """
-    syms = _collect_symbols_via_ts(content, _LanguageId.TYPESCRIPT)
-    if syms is not None:
-        return {n for (n, _k, _s, _e) in syms}
-
-    names: set = set()
-    # function names (including async, export)
-    for m in re.finditer(r'(?:export\s+)?(?:async\s+)?function\s+(\w+)', content):
-        names.add(m.group(1))
-    # class names (including abstract, export)
-    for m in re.finditer(r'(?:export\s+)?(?:abstract\s+)?class\s+(\w+)', content):
-        names.add(m.group(1))
-    # const/let/var names (including export)
-    for m in re.finditer(r'(?:export\s+)?(?:const|let|var)\s+(\w+)', content):
-        names.add(m.group(1))
-    # interface names (including export)
-    for m in re.finditer(r'(?:export\s+)?interface\s+(\w+)', content):
-        names.add(m.group(1))
-    # type aliases (including export)
-    for m in re.finditer(r'(?:export\s+)?type\s+(\w+)\s*=', content):
-        names.add(m.group(1))
-    # enum names (including const enum, export)
-    for m in re.finditer(r'(?:export\s+)?(?:const\s+)?enum\s+(\w+)', content):
-        names.add(m.group(1))
-    return names
 
 def is_python_definition(line: str) -> bool:
     """Check if a line starts a Python function, async function, or class definition."""
@@ -569,9 +563,9 @@ def is_function_def(line: str) -> bool:
     stripped = line.lstrip()
     if ':' in stripped:
         before_colon = stripped.split(':')[0].strip()
-        if before_colon.isidentifier() and (stripped.startswith('def ') or stripped.startswith('async def ')):
+        if before_colon.isidentifier() and (stripped.startswith(('def ', 'async def '))):
             return False
-    return stripped.startswith('def ') or stripped.startswith('async def ')
+    return stripped.startswith(('def ', 'async def '))
 
 def is_class_def(line: str) -> bool:
     """Check if a line starts a class definition."""
@@ -681,11 +675,9 @@ def parse_definitions(source: str) -> list[DefinitionInfo]:
 # ...`` for module-level binding.
 #
 # CANONICAL DEFINITION: this is the single source of truth for the
-# wrapper-aware module-scope walker family.  ``placement_contract.py``
-# and ``intent_verifier.py`` import ``iter_module_scope_nodes`` from
-# this module rather than maintaining their own copies — adversarial
-# Sets 1 / 5 / 6 all hit the same wrapper-miss class; centralising the
-# helper makes a 4th occurrence physically impossible.
+# wrapper-aware module-scope walker family.  Centralising the helper
+# here makes a duplicate occurrence physically impossible (the former
+# placement_contract.py copy was removed together with the PCL module).
 NON_SCOPE_COMPOUND_STMTS: tuple = (
     ast.If, ast.Try,
     ast.With, ast.AsyncWith,
@@ -715,8 +707,6 @@ def iter_module_scope_nodes(tree: ast.AST):
     runs over the same source produce identical sequences.
 
     Used by:
-      - placement_contract.extract_module_level_names (anchor-name filter)
-      - intent_verifier._find_symbol_node, _check_import_exists
       - code_structure_utils.find_import_boundary_ast,
         symbol_exists_in_module
     """
@@ -769,9 +759,8 @@ def _walk_definitions(node: ast.AST, out: list[DefinitionInfo], parent_class: Op
             _v_targets: list[ast.expr] = []
             if isinstance(child, ast.Assign):
                 _targets = [t for t in child.targets if isinstance(t, ast.Name)]
-            elif isinstance(child, ast.AnnAssign):
-                if isinstance(child.target, ast.Name):
-                    _targets = [child.target]
+            elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+                _targets = [child.target]
             for _t in _targets:
                 _name: str = _t.id  # type: ignore[attr-defined]
                 _start: int = child.lineno
@@ -934,9 +923,9 @@ def _decorator_name(node: ast.expr) -> str:
     """Extract decorator name from AST node."""
     if isinstance(node, ast.Name):
         return node.id
-    elif isinstance(node, ast.Attribute):
+    if isinstance(node, ast.Attribute):
         return ast.dump(node)
-    elif isinstance(node, ast.Call):
+    if isinstance(node, ast.Call):
         return _decorator_name(node.func)
     return '<unknown>'
 
@@ -953,9 +942,8 @@ def find_definition_at_line(source: str, line: int) -> Optional[DefinitionInfo]:
     defs = parse_definitions(source)
     best: Optional[DefinitionInfo] = None
     for d in defs:
-        if d.start_line <= line <= d.end_line:
-            if best is None or d.start_line >= best.start_line:
-                best = d
+        if d.start_line <= line <= d.end_line and (best is None or d.start_line >= best.start_line):
+            best = d
     return best
 
 def find_import_boundary_ast(source: str) -> int:
@@ -1069,7 +1057,9 @@ def is_module_level_import_present(
     for node in iter_module_scope_nodes(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name == module:
+                # Alias-aware: ``import X as Y`` binds Y, not X — only a
+                # same-name binding (or an explicit ``as X``) satisfies the query.
+                if (alias.name == module and alias.asname is None) or alias.asname == module:
                     return True
         elif isinstance(node, ast.ImportFrom):
             node_module = node.module or ""
@@ -1091,25 +1081,21 @@ def is_module_level_import_present(
             # to match absolute dotted paths against relative imports.
             # NOTE: Tiers 1 and 2 DO require relative-ness to match
             # (e.g. query "foo" must NOT match source ".foo" even though node_module == "foo").
-            if node_module == module and _same_import_relativity(module, node):
+            if (
+                (node_module == module and _same_import_relativity(module, node))
+                or (
+                    _same_import_relativity(module, node)
+                    and _relative_depth_matches(module, node)
+                    and node_module == module_normalized
+                )
+                or (module_leaf and node_module_leaf == module_leaf)
+            ):
                 if not name:
                     return True
                 for alias in node.names:
-                    if alias.name == name:
-                        return True
-            elif (_same_import_relativity(module, node)
-                  and _relative_depth_matches(module, node)
-                  and node_module == module_normalized):
-                if not name:
-                    return True
-                for alias in node.names:
-                    if alias.name == name:
-                        return True
-            elif module_leaf and node_module_leaf == module_leaf:
-                if not name:
-                    return True
-                for alias in node.names:
-                    if alias.name == name:
+                    # Alias-aware: ``from X import A as B`` binds B, not A — the
+                    # requested name must actually be bound at module scope.
+                    if (alias.name == name and alias.asname is None) or alias.asname == name:
                         return True
     return False
 
@@ -1187,15 +1173,13 @@ def symbol_exists_in_module(
 
     # Primary: tree-sitter (fast path for valid Python only).
     if _HAS_TS and not _has_syntax_error:
-        try:
+        with contextlib.suppress(RecursionError, TypeError, ValueError, IndexError):  # TS walk → AST fallback
             ts_defs = _walk_definitions_py(source)
             for d in ts_defs:
                 if d.name == symbol and (not d.parent_class):
                     return True
             # Tree-sitter didn't find the symbol — fall through to AST
             # which catches assignments and handles syntax errors correctly.
-        except Exception:
-            pass
     # Fallback: AST
     try:
         tree = ast.parse(source)
@@ -1210,9 +1194,8 @@ def symbol_exists_in_module(
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == symbol:
                     return True
-        elif isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name) and node.target.id == symbol:
-                return True
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == symbol:
+            return True
     return False
 
 
@@ -1311,17 +1294,11 @@ def collect_defined_names(source: str, file_path: Optional[str] = None) -> set:
 
     Returns empty set on parse error.
     """
-    # TS/JS: use regex fallback when file path identifies language
-    if file_path and _LanguageId.from_path(file_path) in (_LanguageId.TYPESCRIPT, _LanguageId.JAVASCRIPT):
-        return _ts_collect_defined_names(source)
-
-    # Go: tree-sitter-first detection (regex fallback)
-    if file_path and _LanguageId.from_path(file_path) == _LanguageId.GO:
-        return _go_collect_defined_names(source)
-
-    # Java/Kotlin (JVM): tree-sitter-first detection (regex fallback)
-    if file_path and _LanguageId.from_path(file_path) in (_LanguageId.JAVA, _LanguageId.KOTLIN):
-        return _jvm_collect_defined_names(source, _LanguageId.from_path(file_path))
+    # Go / JVM / TS-JS: tree-sitter-first detection (regex fallback)
+    if file_path:
+        lang_id = _LanguageId.from_path(file_path)
+        if lang_id in _DEFINED_NAME_REGEX_PATTERNS:
+            return _collect_defined_names_ts_first(source, lang_id)
 
     names: set = set()
 
@@ -1371,14 +1348,12 @@ def collect_defined_names(source: str, file_path: Optional[str] = None) -> set:
                 # something, return early for performance.
                 if names:
                     # Still missing import names — merge from AST
-                    try:
+                    with contextlib.suppress(SyntaxError):
                         _tree = ast.parse(source)
                         for _node in ast.walk(_tree):
                             if isinstance(_node, (ast.ImportFrom, ast.Import)):
                                 for alias in _node.names:
                                     names.add(alias.asname if alias.asname else alias.name.split(".")[0])
-                    except SyntaxError:
-                        pass
                     return names
                 return names
         except Exception:
@@ -1400,10 +1375,7 @@ def collect_defined_names(source: str, file_path: Optional[str] = None) -> set:
             getattr(node, "target", None), ast.Name
         ):
             names.add(node.target.id)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                names.add(alias.asname if alias.asname else alias.name.split(".")[0])
-        elif isinstance(node, ast.Import):
+        elif isinstance(node, (ast.ImportFrom, ast.Import)):
             for alias in node.names:
                 names.add(alias.asname if alias.asname else alias.name.split(".")[0])
     return names
@@ -1450,10 +1422,10 @@ def extract_function_signature_detailed(source: str, symbol_name: str) -> Option
 
     Returns ``None`` if the symbol is not found or *source* cannot be parsed.
     """
-    bare = symbol_name.split(".")[-1]
+    bare = symbol_name.rsplit(".", maxsplit=1)[-1]
 
     # AST-based extraction (primary path — always correct)
-    try:
+    with contextlib.suppress(SyntaxError, ValueError, RecursionError):  # broken source → None
         tree = ast.parse(source)
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == bare:
@@ -1474,8 +1446,6 @@ def extract_function_signature_detailed(source: str, symbol_name: str) -> Option
                     parts.append(f"**{node.args.kwarg.arg}:{ann}")
                 ret = ast.unparse(node.returns) if node.returns else ""
                 return FunctionSignature(param_sig=",".join(parts), return_type=ret)
-    except Exception:
-        return None
     return None
 
 
@@ -1511,29 +1481,32 @@ def find_last_top_level_def(path: str) -> Optional[str]:
     import os as _os
     if not path or not _os.path.isfile(path):
         return None
+    # Read separately from the analysis: a failed open previously left ``_src``
+    # undefined inside the suppress, surfacing a NameError instead of None.
     try:
         with open(path, encoding="utf-8", errors="replace") as _f:
             _src = _f.read()
-        # TS/JS: tree-sitter first (accurate multi-construct detection),
-        # regex fallback when JS/TS grammars are unavailable.
-        if path.endswith(('.ts', '.tsx', '.js', '.jsx')):
-            # _lang is only consumed on the tree-sitter path (regex fallback
-            # ignores it), and _ts_grammar_key_for_path is only defined when
-            # tree-sitter imported cleanly — guard to preserve the no-TS path.
-            _lang = _ts_grammar_key_for_path(path) if _HAS_TS else "typescript"
-            _last = _find_last_top_level_ts(_src, _lang)
-            if _last is not None:
-                return _last
-            # fall through only if tree-sitter returned nothing AND there was
-            # no parseable symbol; the regex fallback inside the helper covers
-            # the grammar-missing case, so reaching here means truly empty.
-            return None
-        # Python: use AST
-        _defs = parse_definitions(_src)
-        _top = [d for d in _defs if d.col_offset == 0]
-        return _top[-1].name if _top else None
-    except Exception:
+    except OSError:
+        logger.debug("find_last_top_level_def: cannot read %s", path)
         return None
+    # TS/JS: tree-sitter first (accurate multi-construct detection),
+    # regex fallback when JS/TS grammars are unavailable.
+    if path.endswith(('.ts', '.tsx', '.js', '.jsx')):
+        # _lang is only consumed on the tree-sitter path (regex fallback
+        # ignores it), and _ts_grammar_key_for_path is only defined when
+        # tree-sitter imported cleanly — guard to preserve the no-TS path.
+        _lang = _ts_grammar_key_for_path(path) if _HAS_TS else "typescript"
+        _last = _find_last_top_level_ts(_src, _lang)
+        if _last is not None:
+            return _last
+        # fall through only if tree-sitter returned nothing AND there was
+        # no parseable symbol; the regex fallback inside the helper covers
+        # the grammar-missing case, so reaching here means truly empty.
+        return None
+    # Python: use AST
+    _defs = parse_definitions(_src)
+    _top = [d for d in _defs if d.col_offset == 0]
+    return _top[-1].name if _top else None
 
 
 def _find_last_top_level_ts(_src: str, _lang: str) -> Optional[str]:
@@ -1577,14 +1550,8 @@ def _find_last_top_level_ts(_src: str, _lang: str) -> Optional[str]:
 
     # Fallback: regex (single pass). Group 1 = named function/class,
     # group 2 = const arrow/expression assignment.
-    _ts_def_re = re.compile(
-        r'^(?:export\s+(?:default\s+)?)?(?:async\s+)?'
-        r'(?:(?:function|class)\s+(\w+)'
-        r'|const\s+(\w+)\s*=)',
-        re.MULTILINE,
-    )
     _last_name: Optional[str] = None
-    for _m in _ts_def_re.finditer(_src):
+    for _m in _RE_TS_LAST_TOP_LEVEL_DEF.finditer(_src):
         _last_name = _m.group(1) or _m.group(2)
     return _last_name
 

@@ -33,15 +33,15 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-import external_llm.agent.symbol_modify_tool as smt  # noqa: E402
-from external_llm.agent.symbol_modify_tool import (  # noqa: E402
+import external_llm.agent.symbol_modify_tool as smt
+from external_llm.agent.symbol_modify_tool import (
     _apply_diff_to_source,
     _block_parses_after_dedent,
     _mode_logical_indent,
     _post_edit_syntax_ok,
     _reindent_relative,
 )
-from external_llm.common.indent_utils import (  # noqa: E402
+from external_llm.common.indent_utils import (
     _analyze_logical_lines,
     _file_indent_unit_from_logical,
     min_indent,
@@ -412,3 +412,68 @@ class TestPostEditSyntaxFallbackTiers:
     def test_python_path_unaffected(self):
         assert smt._post_edit_syntax_ok("def a():\n    return 1\n", "m.py", "") is True
         assert smt._post_edit_syntax_ok("def a(:\n    return 1\n", "m.py", "") is False
+
+# ── _strip_redundant_* shared-tree threading ─────────────────────────────────
+
+class TestStripRedundantSharedTree:
+    """The strip helpers accept a pre-parsed _src_tree so a caller that already
+    parsed the source (symbol_modify_tool._apply_ast_precise) avoids re-parsing
+    the same file text once per strip helper."""
+
+    def test_inline_imports_preseeded_tree_same_result(self):
+        import ast
+
+        from external_llm.agent.repair_helpers import _strip_redundant_inline_imports
+        src = "import os\n\n\ndef g():\n    pass\n"
+        new_body = "def f():\n    import os\n    return 1\n"
+        a = _strip_redundant_inline_imports(new_body, src)
+        b = _strip_redundant_inline_imports(new_body, src, _src_tree=ast.parse(src))
+        assert a == b
+        assert "import os" not in b
+
+    def test_inline_imports_preseeded_tree_skips_source_parse(self, monkeypatch):
+        import ast
+
+        from external_llm.agent.repair_helpers import _strip_redundant_inline_imports
+        src = "import os\n"
+        tree = ast.parse(src)
+        calls = []
+        orig_parse = ast.parse
+
+        def counting(*a, **k):
+            calls.append(a)
+            return orig_parse(*a, **k)
+
+        monkeypatch.setattr(ast, "parse", counting)
+        _strip_redundant_inline_imports(
+            "def f():\n    import os\n    return 1\n", src, _src_tree=tree
+        )
+        # The file_source text is never re-parsed (only new_body/candidate are).
+        assert all(c[0] != src for c in calls)
+
+    def test_dataclass_preseeded_tree_skips_source_parse(self, monkeypatch):
+        import ast
+
+        from external_llm.agent.repair_helpers import _strip_redundant_dataclass_decorator
+        src = (
+            "import dataclasses\n"
+            "from dataclasses import dataclass\n"
+            "\n"
+            "@dataclass\n"
+            "class C:\n"
+            "    x: int\n"
+        )
+        tree = ast.parse(src)
+        calls = []
+        orig_parse = ast.parse
+
+        def counting(*a, **k):
+            calls.append(a)
+            return orig_parse(*a, **k)
+
+        monkeypatch.setattr(ast, "parse", counting)
+        out = _strip_redundant_dataclass_decorator(
+            "@dataclass\nclass C:\n    x: int\n", src, _src_tree=tree
+        )
+        assert "@dataclass" not in out
+        assert all(c[0] != src for c in calls)

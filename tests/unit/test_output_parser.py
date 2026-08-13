@@ -139,3 +139,129 @@ def test_parse_file_blocks_fenced_still_extracted():
     assert len(blocks) == 2
     assert blocks[0]["text"] == "print('a')\n"
     assert blocks[1]["text"] == "print('b')\n"
+
+
+# ── hunk-aware ---/+++ header vs body-line disambiguation ──────────────────
+# Deleting a line whose content starts with "-- " renders as "--- ..." inside
+# the hunk body (likewise "+" additions of "++ " content render as "+++ ..."),
+# which is indistinguishable from a file header by prefix alone.  Git resolves
+# this positionally (headers appear only after the preceding hunk's counts are
+# exhausted), so the parser must too — previously pass1 rewrote such lines into
+# bogus "--- a/<content>" headers and validate_diff listed the content as a
+# touched file.
+
+def test_auto_correct_preserves_double_dash_removal_body_line():
+    diff = (
+        "diff --git a/f.txt b/f.txt\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/f.txt\n"
+        "+++ b/f.txt\n"
+        "@@ -1,2 +1,2 @@\n"
+        " -- keep\n"
+        "--- gone\n"
+        "+-- kept\n"
+    )
+    out = _p().extract_diff(diff)
+    assert out, "valid diff was discarded"
+    assert "--- a/gone" not in out, "body line was rewritten into a bogus header"
+    assert "--- gone" in out
+    ok, err = _p().validate_diff(out, target_file="f.txt")
+    assert ok, f"validate_diff rejected a valid diff: {err}"
+
+
+def test_auto_correct_preserves_double_plus_addition_body_line():
+    diff = (
+        "diff --git a/f.txt b/f.txt\n"
+        "--- a/f.txt\n"
+        "+++ b/f.txt\n"
+        "@@ -1,1 +1,2 @@\n"
+        " old\n"
+        "+++ new\n"
+    )
+    out = _p().extract_diff(diff)
+    assert out, "valid diff was discarded"
+    assert "+++ b/new" not in out, "body line was rewritten into a bogus header"
+    assert "+++ new" in out
+    ok, err = _p().validate_diff(out, target_file="f.txt")
+    assert ok, f"validate_diff rejected a valid diff: {err}"
+
+
+def test_auto_correct_multi_file_header_after_completed_hunk_still_recognized():
+    """A real '--- a/f2.txt' header after a completed hunk must still be
+    treated as a header (not swallowed as a body line)."""
+    diff = (
+        "diff --git a/f1.txt b/f1.txt\n"
+        "--- a/f1.txt\n"
+        "+++ b/f1.txt\n"
+        "@@ -1 +1 @@\n"
+        "-x\n"
+        "+y\n"
+        "diff --git a/f2.txt b/f2.txt\n"
+        "--- f2.txt\n"
+        "+++ f2.txt\n"
+        "@@ -1 +1 @@\n"
+        "-x\n"
+        "+y\n"
+    )
+    out = _p().extract_diff(diff)
+    assert out.count("diff --git") == 2
+    # missing a/ b/ prefixes on the SECOND file's headers still normalized
+    assert "--- a/f2.txt" in out and "+++ b/f2.txt" in out
+    ok, err = _p().validate_diff(out)
+    assert ok, err
+    ok, err = _p().validate_diff(out, target_file="f1.txt")
+    assert not ok  # two touched files → target-scope rejection preserved
+
+
+def test_auto_correct_header_normalization_outside_hunks_unchanged():
+    """Headers outside hunks still get a/ b/ prefixes injected."""
+    diff = (
+        "--- f.txt\n"
+        "+++ f.txt\n"
+        "@@ -1 +1 @@\n"
+        "-x\n"
+        "+y\n"
+    )
+    out = _p().extract_diff(diff)
+    assert "--- a/f.txt" in out and "+++ b/f.txt" in out
+    ok, err = _p().validate_diff(out, target_file="f.txt")
+    assert ok, err
+
+
+# ── parse_tool_args salvage contract ────────────────────────────────────────
+
+def test_parse_tool_args_dict_passthrough():
+    from external_llm.output_parser import parse_tool_args
+    d = {"path": "a.py", "content": "x"}
+    assert parse_tool_args(d) is d
+
+
+def test_parse_tool_args_none_and_empty():
+    from external_llm.output_parser import parse_tool_args
+    assert parse_tool_args(None) == {}
+    assert parse_tool_args("") == {}
+    assert parse_tool_args("   ") == {}
+
+
+def test_parse_tool_args_valid_json_string():
+    from external_llm.output_parser import parse_tool_args
+    assert parse_tool_args('{"path": "a.py", "content": "x"}') == {
+        "path": "a.py", "content": "x",
+    }
+
+
+def test_parse_tool_args_non_dict_json_keeps_raw():
+    from external_llm.output_parser import parse_tool_args
+    assert parse_tool_args("[1, 2, 3]") == {"__raw_arguments": "[1, 2, 3]"}
+
+
+def test_parse_tool_args_malformed_salvage():
+    from external_llm.output_parser import parse_tool_args
+    # prose around a JSON object → first {...} region salvaged
+    assert parse_tool_args('Here: {"path": "a.py"} thanks') == {"path": "a.py"}
+    # no braces → raw fallback
+    assert parse_tool_args("no json here") == {"__raw_arguments": "no json here"}
+    # truncated object → raw fallback
+    assert parse_tool_args('{"path": "a.py"') == {"__raw_arguments": '{"path": "a.py"'}
+    # brace inside a string value does not confuse the rfind("}") salvage
+    assert parse_tool_args('{"content": "line}"}') == {"content": "line}"}

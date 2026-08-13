@@ -7,10 +7,12 @@ parts). Regression guard for GAP-3 (Gemini was previously invisible to repair /
 eviction / sliding-window orphan detection).
 """
 from external_llm.agent.message_shapes import (
-    is_tool_result,
-    is_tool_call,
-    _is_gemini_tool_result,
+    _has_raw_blocks,
+    _has_raw_key,
     _is_gemini_tool_call,
+    _is_gemini_tool_result,
+    is_tool_call,
+    is_tool_result,
 )
 from external_llm.client import LLMMessage
 
@@ -90,3 +92,24 @@ def test_gemini_helpers_directly():
     assert _is_gemini_tool_call(_gemini_tool_call())
     assert not _is_gemini_tool_result(_anthropic_tool_result())
     assert not _is_gemini_tool_call(_anthropic_tool_call())
+
+
+def test_raw_content_helpers_ignore_non_dict_items():
+    """Non-dict entries in ``raw_content`` must be skipped, never crash —
+    pins the shared skeleton behind both raw-content helpers."""
+    msg = LLMMessage(
+        role="user", content="",
+        raw_content=["junk", {"type": "tool_result", "content": "42"}, None],
+    )
+    assert _has_raw_blocks(msg, "user", "tool_result")
+    assert not _has_raw_key(msg, "user", "tool_result")
+
+
+def test_raw_content_helpers_enforce_role():
+    """Role mismatch short-circuits before ``raw_content`` is inspected."""
+    wrong_role = LLMMessage(
+        role="assistant", content="",
+        raw_content=[{"type": "tool_result", "content": "42"}],
+    )
+    assert not _has_raw_blocks(wrong_role, "user", "tool_result")
+    assert not _has_raw_key(wrong_role, "user", "functionResponse")

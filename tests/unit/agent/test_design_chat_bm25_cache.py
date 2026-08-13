@@ -18,13 +18,12 @@ from pathlib import Path
 
 import pytest
 
+import external_llm.agent.design_chat_loop as _dcl
 from external_llm.agent.design_chat_loop import (
     _ARCHIVED_BM25_CACHE,
     _ARCHIVED_BM25_CACHE_LOCK,
     _archived_bm25_entries,
 )
-
-import external_llm.agent.design_chat_loop as _dcl
 
 
 class _FakeSessionMgr:
@@ -43,7 +42,7 @@ class _FakeSessionMgr:
 @pytest.fixture(autouse=True)
 def _clear_cache():
     """Clear the global BM25 cache before each test to avoid cross-test pollution.
-    
+
     Also disables the small-archive skip so all tests exercise the cache properly
     (``test_small_archive_skips_cache`` re-enables it explicitly).
     """
@@ -55,12 +54,14 @@ def _clear_cache():
 
 def _make_archive(lines: list[str]) -> Path:
     """Write a temporary archive JSONL and return its path."""
-    f = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".jsonl", delete=False, encoding="utf-8",
-    )
-    for line in lines:
-        f.write(line + "\n")
-    f.close()
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".jsonl",
+        delete=False,
+        encoding="utf-8",
+    ) as f:
+        for line in lines:
+            f.write(line + "\n")
     return Path(f.name)
 
 
@@ -214,11 +215,11 @@ class TestArchivedBm25Cache:
             mgr = _FakeSessionMgr(p)
             archived = [{"content": "small archive test"}]
             # First call — miss (small archive skips cache, so no store)
-            entries1, sig1, fc1 = _archived_bm25_entries(mgr, "s_small", archived)
+            entries1, _sig1, fc1 = _archived_bm25_entries(mgr, "s_small", archived)
             assert fc1 is False
             assert len(entries1) == 1
             # Second call — still a miss (was never stored)
-            entries2, sig2, fc2 = _archived_bm25_entries(mgr, "s_small", archived)
+            entries2, _sig2, fc2 = _archived_bm25_entries(mgr, "s_small", archived)
             assert fc2 is False  # not cached because small
             assert entries2 is not entries1  # fresh build each time
         finally:

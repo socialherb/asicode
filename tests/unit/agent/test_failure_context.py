@@ -372,7 +372,7 @@ def test_extract_traceback_frames_edge_cases():
         '  File "c.py", line 3, in func3\n'
         '    pass\n'
     )
-    frames = _extract_traceback_frames(text_with_missing_in_rest, repo_root=None, max_frames=2)
+    frames = _extract_traceback_frames(text_with_missing_in_rest, max_frames=2)
     # L283: max_frames=2 → break after 2 frames
     assert len(frames) == 2
     assert frames[0].file == "a.py"

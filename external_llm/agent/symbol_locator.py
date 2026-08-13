@@ -15,8 +15,11 @@ spans.
 from __future__ import annotations
 
 import ast
+import logging
 from dataclasses import dataclass
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -61,14 +64,10 @@ class PythonAstLocator:
                 spans.append(self._span(node, node.name, "function", True))
             elif isinstance(node, ast.ClassDef):
                 spans.append(self._span(node, node.name, "class", True))
-                for item in node.body:
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        spans.append(
-                            self._span(
+                spans.extend(self._span(
                                 item, f"{node.name}.{item.name}", "method", False,
                                 bare=item.name,
-                            )
-                        )
+                            ) for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)))
         return spans
 
     @staticmethod
@@ -101,13 +100,14 @@ class ProviderLocator:
     def locate(self, source: str) -> list[SymbolSpan]:
         try:
             defs = self._provider.find_top_level_definitions(source)  # type: ignore[attr-defined]
-        except Exception:
+        except (AttributeError, TypeError, ValueError):  # provider lacks the method / malformed output
             return []
         spans: list[SymbolSpan] = []
         for item in defs or []:
             try:
                 name, kind, start, end = item
             except (ValueError, TypeError):
+                logger.debug("symbol span unpack failed", exc_info=True)
                 continue
             spans.append(SymbolSpan(
                 name=name, qualname=name,

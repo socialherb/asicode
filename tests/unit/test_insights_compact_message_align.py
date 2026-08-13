@@ -1,6 +1,6 @@
 """Regression guard for compact-message vertical alignment.
 
-``_compact_insights_interactive`` (asi.py) prints a multi-line summary after
+``_compact_insights_interactive`` (repl_impl.py) prints a multi-line summary after
 compaction::
 
     before: N entries · B bytes
@@ -28,14 +28,13 @@ import pytest
 
 
 def _get_compact_insights_source() -> str:
-    """Extract ``_compact_insights_interactive`` source from asi.py.
+    """Extract ``_compact_insights_interactive`` source from repl_impl.py.
 
-    asi.py is a large script with import-time side effects; the function is a
-    closure inside ``run_repl`` so we locate it by its ``def`` line and
-    balance-indent the body.
+    The function is a method inside the REPL class (moved from asi.py in P6-2);
+    we locate it by its ``def`` line and balance-indent the body.
     """
-    src_path = "asi.py"
-    with open(src_path, "r", encoding="utf-8") as f:
+    src_path = "external_llm/repl/repl_impl.py"
+    with open(src_path, encoding="utf-8") as f:
         lines = f.readlines()
     start = None
     for i, ln in enumerate(lines):
@@ -43,13 +42,17 @@ def _get_compact_insights_source() -> str:
             start = i
             break
     if start is None:
-        pytest.skip("_compact_insights_interactive not found in asi.py")
+        pytest.fail("_compact_insights_interactive not found in repl_impl.py — update this test or restore the symbol; silent skip would mask the regression")
     body = [lines[start]]
     for j in range(start + 1, len(lines)):
         ln = lines[j]
-        if ln.strip() and not ln.startswith("        ") and not ln.startswith("\t"):
-            if re.match(r"^    def ", ln) or re.match(r"^def ", ln) or re.match(r"^    [a-zA-Z_]", ln):
-                break
+        if (
+            ln.strip()
+            and not ln.startswith("        ")
+            and not ln.startswith("\t")
+            and (re.match(r"^    def ", ln) or re.match(r"^def ", ln) or re.match(r"^    [a-zA-Z_]", ln))
+        ):
+            break
         body.append(ln)
     return "".join(body)
 
@@ -96,7 +99,7 @@ class TestCompactMessageAlignment:
                 initial_indent="  ", subsequent_indent="  ",
             )
             text_cols = {
-                len((" " * margin + ln)) - len((" " * margin + ln).lstrip(" "))
+                len(" " * margin + ln) - len((" " * margin + ln).lstrip(" "))
                 for ln in filled.split("\n")
             }
             assert text_cols == {6}, (

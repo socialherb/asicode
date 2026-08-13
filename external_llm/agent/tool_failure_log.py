@@ -46,12 +46,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
+import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
+from pathlib import Path
 from typing import Any, Optional
 
-from ._shared_utils import _capped_put
+from external_llm.common.file_lock import cross_process_flock
 
 _logger = logging.getLogger(__name__)
 
@@ -198,38 +199,29 @@ def _log_path() -> str:
     )
 
 
-# Cache the short git SHA for a short window. write-tool failures often come in
-# bursts (a bad plan → several failing edits in a row), so caching avoids one
-# ``git rev-parse`` subprocess per record. 5s TTL keeps it fresh across turns
-# while collapsing intra-burst cost to a single subprocess.
-_GIT_SHA_TTL_S: float = 5.0
-# Bounded entry cap (same FIFO pattern as _shared_utils._capped_put /
-# _PY_WALK_CACHE): a long-lived server handling many distinct repo_roots would
-# otherwise grow this path-keyed dict without bound — the TTL only refreshes
-# values, it never evicts keys.
-_GIT_SHA_CACHE_MAX_ENTRIES: int = 8
-_git_sha_cache: dict[str, tuple] = {}  # repo_root -> (timestamp, sha)
-
-
 def _git_sha(repo_root: Optional[str]) -> str:
-    key = os.path.abspath(repo_root) if repo_root else os.getcwd()
-    now = time.time()
-    cached = _git_sha_cache.get(key)
-    if cached is not None and (now - cached[0]) < _GIT_SHA_TTL_S:
-        return cached[1]
+    """Short HEAD SHA for failure-log records.
+
+    Delegates to the agent-wide git snapshot SSOT
+    (``agent_context_manager.get_git_snapshot``) so a write-tool failure BURST
+    does not spawn one ``git rev-parse --short HEAD`` subprocess per record —
+    the snapshot is already TTL-cached (10s), per-root, and cleared on every
+    successful write (the very condition that ends a failure burst). The short
+    SHA is derived from the snapshot's full ``head_hash`` (git's ``--short``
+    defaults to 7 chars; the fixed 7-char prefix matches it for >99.99% of
+    repos and is exact for a debugging log field). Empty snapshot -> "unknown".
+
+    Previously this carried its OWN path-keyed ``_git_sha_cache`` (5s TTL) — a
+    second parallel cache duplicating the SSOT. Removed in favour of the shared
+    snapshot so a single cached git fetch serves context injection, rollback
+    snapshot, AND failure logging.
+    """
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=2,
-            cwd=repo_root or os.getcwd(),
-        )
-        if result.returncode == 0:
-            sha = result.stdout.strip()
-            _capped_put(_git_sha_cache, key, (now, sha), cap=_GIT_SHA_CACHE_MAX_ENTRIES)
-            return sha
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return "unknown"
+        from .agent_context_manager import get_git_snapshot
+        head_hash = get_git_snapshot(repo_root or "").get("head_hash", "")
+    except Exception:
+        head_hash = ""  # non-critical — never block failure logging
+    return head_hash[:7] if head_hash else "unknown"
 
 
 def _summarize_args(args: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -290,17 +282,33 @@ def _truncate(text: Optional[str], limit: int = _MAX_ERROR_CHARS) -> str:
 
 
 # ── Bounded log size ──────────────────────────────────────────────────────────
-# Mirror of UnifiedStore._maybe_compact: the append-only failure log would grow
-# without bound (no in-memory record list to evict from). We cap it at the same
-# default as UnifiedStore (DEFAULT_MAX_RECORDS=5000) and compact by keeping the
+# The append-only failure log would grow without bound (no in-memory record
+# list to evict from). We cap it at 5000 records and compact by keeping the
 # most-recent records. The line-count read is O(n), so it is amortised — we only
 # check every ``_COMPACT_CHECK_EVERY`` appends, keeping the per-append cost O(1)
-# amortised. The rewrite uses ``atomic_write_jsonl`` (same primitive as
-# UnifiedStore._rewrite_all / _heal_file) so a crash mid-compaction never leaves
-# a truncated log; unparseable lines are dropped during the rewrite (self-heal).
+# amortised. The rewrite uses ``atomic_write_jsonl`` so a crash mid-compaction
+# never leaves a truncated log; unparseable lines are dropped during the
+# rewrite (self-heal).
 _MAX_FAILURE_LOG_RECORDS = 5000
 _COMPACT_CHECK_EVERY = 64
 _append_counter = 0
+
+
+def _append_record(path: str, line: str) -> None:
+    """Append one JSON record and run the amortised compaction under one lock.
+
+    The append (O(1) write) and ``_maybe_compact_log`` (read → atomic
+    ``os.replace`` rewrite) form a single read-modify-write cycle over the
+    same file. Without a cross-process lock, a concurrent compactor can drop
+    records appended between its read and its rename, and its ``os.replace``
+    can unlink the inode an in-flight append fd is still writing to — silent
+    record loss. ``cross_process_flock`` serialises the cycle; the ``.lock``
+    file is left behind deliberately (see file_lock.cross_process_flock).
+    """
+    with cross_process_flock(Path(f"{path}.lock")):
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        _maybe_compact_log(path)
 
 
 def _maybe_compact_log(path: str) -> None:
@@ -309,7 +317,7 @@ def _maybe_compact_log(path: str) -> None:
     Triggered (amortised) after each append. When the live line count exceeds
     ``_MAX_FAILURE_LOG_RECORDS``, the file is atomically rewritten keeping only
     the newest records. Corrupt/unparseable lines are dropped in the process
-    (self-heal, same behaviour as UnifiedStore._heal_file). Never raises —
+    (self-heal: unparseable lines are dropped during the rewrite). Never raises —
     compaction is strictly best-effort, like the append itself.
     """
     global _append_counter
@@ -327,6 +335,7 @@ def _maybe_compact_log(path: str) -> None:
             try:
                 records.append(json.loads(ln))
             except json.JSONDecodeError:
+                _logger.debug("tool_failure_log: dropping corrupt line during compaction")
                 continue  # drop corrupt line (self-heal)
         atomic_write_jsonl(path, records)
         _logger.debug(
@@ -335,6 +344,92 @@ def _maybe_compact_log(path: str) -> None:
         )
     except Exception:
         _logger.debug("tool_failure_log: compaction failed", exc_info=True)
+
+
+# ── Suggestion-hit tracking ────────────────────────────────────────────────
+# Mirrors failure_pattern_store's recall outcome counters (fired/helped/
+# ignored) for the write-tool *suggestion* mechanisms: when a failed
+# write-tool result carries actionable guidance — a near-match "did you mean"
+# hint (metadata["near_match"]) or a fresh-content snippet
+# (metadata["reread_snippet"]) — did the agent's NEXT write-tool attempt in
+# the same run succeed?
+#
+#   fired              — a failed write-tool result carried a suggestion
+#   helped             — the next write-tool result in the same run succeeded
+#   ignored            — the next write-tool result failed again
+#   auto_retried       — a search_string_mismatch auto re-read + retry ran
+#   auto_retry_success — ... and the retry succeeded (within-call)
+#
+# The auto re-read retry (write_tools ``_reread_retry``) settles *within* the
+# same call — a successful retry returns ok=True with reread_retried metadata,
+# which the failure log itself never sees (it only records failures) — so it
+# is counted here at the chokepoint instead of via the fired/helped pipeline.
+#
+# The fired→outcome link is a per-run marker keyed by session_key (the same
+# key the caller passes to record_write_tool_failure_from_tr). The caller
+# settles the marker via record_suggestion_outcome() on the next write-tool
+# result, BEFORE that result's own record can fire a fresh marker
+# (settle-before-arm). Counters are process-lifetime in-memory (not
+# persisted), exposed via the webapp /stats/suggest for monitoring windows.
+_suggest_lock = threading.Lock()
+_suggest_counts: dict[str, int] = {
+    "fired": 0,
+    "helped": 0,
+    "ignored": 0,
+    "auto_retried": 0,
+    "auto_retry_success": 0,
+}
+_pending_suggest: "OrderedDict[str, None]" = OrderedDict()
+_PENDING_SUGGEST_LIMIT = 4096
+
+
+def _record_suggestion_fired(session_key: str) -> None:
+    """Increment ``fired`` and arm the per-run marker for outcome settling."""
+    with _suggest_lock:
+        _suggest_counts["fired"] += 1
+        if session_key:
+            _pending_suggest[session_key] = None
+            while len(_pending_suggest) > _PENDING_SUGGEST_LIMIT:
+                _pending_suggest.popitem(last=False)
+
+
+def record_suggestion_outcome(*, ok: bool, session_key: str = "") -> None:
+    """Settle the pending suggestion marker for *session_key*.
+
+    Called on EVERY write-tool result (success or failure). If a suggestion
+    fired on an earlier write-tool failure in the same run, this result
+    settles it: success → ``helped``, failure → ``ignored``. No-op when no
+    marker is pending for the key (or the key is empty).
+    """
+    if not session_key:
+        return
+    with _suggest_lock:
+        if session_key not in _pending_suggest:
+            return
+        del _pending_suggest[session_key]
+        _suggest_counts["helped" if ok else "ignored"] += 1
+
+
+def get_suggestion_counts() -> dict[str, int]:
+    """Snapshot of the suggestion-hit counters (thread-safe)."""
+    with _suggest_lock:
+        return dict(_suggest_counts)
+
+
+def reset_suggestion_counts() -> dict[str, int]:
+    """Zero all counters and return the pre-reset snapshot."""
+    with _suggest_lock:
+        snap = dict(_suggest_counts)
+        for k in _suggest_counts:
+            _suggest_counts[k] = 0
+        return snap
+
+
+def _suggest_inc(key: str) -> None:
+    with _suggest_lock:
+        _suggest_counts[key] += 1
+
+
 def record_write_tool_failure(
     *,
     tool: str,
@@ -345,17 +440,29 @@ def record_write_tool_failure(
     partial_failure: bool = False,
     model: Optional[str] = None,
     repo_root: Optional[str] = None,
+    session_key: str = "",
 ) -> None:
     """Append one failure record to the JSONL log. Never raises.
 
     Only records when ``ok`` is False (or ``partial_failure`` is True) AND
     ``tool`` is a recognised write tool. A success call is a no-op so callers
     can invoke this unconditionally at the chokepoint without a branch.
+
+    ``session_key`` (a per-run identity from ``failure_pattern_store.
+    new_session_key()``) feeds the suggestion-hit tracker: every write-tool
+    result settles a pending marker (success → helped, failure → ignored) and
+    a failure that carried a suggestion arms a new one (see the tracker docs
+    above).
     """
+    if tool not in WRITE_TOOLS:
+        return
+    # Settle any pending suggestion marker on EVERY write-tool result (ok or
+    # not). Runs before the fire below so a failure that carries a new
+    # suggestion both settles the previous marker and arms the next
+    # (settle-before-arm, mirroring the recall discipline in the agent loops).
+    record_suggestion_outcome(ok=ok, session_key=session_key)
     # Success of a non-partial write tool → nothing to learn here.
     if ok and not partial_failure:
-        return
-    if tool not in WRITE_TOOLS:
         return
 
     md = metadata if isinstance(metadata, dict) else {}
@@ -379,17 +486,37 @@ def record_write_tool_failure(
         "repo": os.path.abspath(repo_root) if repo_root else "",
     }
     # Attach any verify_warning / semantic_repaired hints when present.
-    for hint_key in ("verify_warning", "semantic_repaired", "match_count", "attempt"):
+    for hint_key in (
+        "verify_warning",
+        "semantic_repaired",
+        "match_count",
+        "attempt",
+        # Auto re-read + bounded retry (write_tools): whether a context-mismatch
+        # failure retried after a fresh disk read, whether that retry succeeded,
+        # and whether a fresh-content snippet was attached to the error. Lets
+        # failure-pattern analysis measure whether the retry/snippet mechanism
+        # actually converts a would-be failure into a success or a faster
+        # recovery (e.g. `summarize_log --by reread_retried`).
+        "reread_retried",
+        "reread_retry_success",
+        "reread_snippet",
+    ):
         if hint_key in md:
             record[hint_key] = md[hint_key]
+
+    # ── Suggestion-hit tracking ──
+    # This failure carried actionable guidance for the LLM (a near-match
+    # "did you mean" hint or a fresh-content snippet) → arm the per-run
+    # marker; the NEXT write-tool result in the same run settles it as
+    # helped/ignored.
+    if md.get("near_match") or md.get("reread_snippet"):
+        _record_suggestion_fired(session_key)
 
     try:
         path = _log_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         line = json.dumps(record, ensure_ascii=False)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-        _maybe_compact_log(path)
+        _append_record(path, line)
     except Exception:
         # Logging must never break the main flow.
         _logger.debug("tool_failure_log: failed to append record", exc_info=True)
@@ -402,12 +529,20 @@ def record_write_tool_failure_from_tr(
     args: Optional[dict[str, Any]],
     model: Optional[str] = None,
     repo_root: Optional[str] = None,
+    session_key: str = "",
 ) -> None:
     """Convenience wrapper: extract fields from a ToolResult and record.
 
     ``tr`` is expected to have ``.ok``, ``.error``, ``.metadata`` and
     ``.partial_failure`` attributes (the :class:`ToolResult` shape). Falls back
     gracefully when attributes are missing.
+
+    ``session_key`` is forwarded to :func:`record_write_tool_failure` for
+    suggestion-hit settling. Also counts the auto re-read + bounded retry
+    mechanism (write_tools ``_reread_retry``): a SUCCESSFUL retry returns
+    ok=True with ``reread_retried``/``reread_retry_success`` metadata, which
+    the failure log never sees — so the conversion rate of that mechanism is
+    measured here instead of in the JSONL.
     """
     try:
         ok = getattr(tr, "ok", True)
@@ -415,11 +550,22 @@ def record_write_tool_failure_from_tr(
         metadata = getattr(tr, "metadata", None)
         partial = getattr(tr, "partial_failure", False)
     except Exception:
+        _logger.debug("tool_failure_log: ToolResult attribute extraction failed", exc_info=True)
         return
+    try:
+        _md = metadata if isinstance(metadata, dict) else {}
+        if _md.get("reread_retried"):
+            _suggest_inc("auto_retried")
+            if _md.get("reread_retry_success"):
+                _suggest_inc("auto_retry_success")
+    except Exception:
+        # Counting must never break the main flow (same discipline as the
+        # append below) — but stay observable, not silently swallowed.
+        _logger.debug("tool_failure_log: auto-retry count failed", exc_info=True)
     record_write_tool_failure(
         tool=tool, ok=ok, error=error, metadata=metadata,
         args=args, partial_failure=partial,
-        model=model, repo_root=repo_root,
+        model=model, repo_root=repo_root, session_key=session_key,
     )
 
 
@@ -457,6 +603,7 @@ def summarize_log(path: Optional[str] = None) -> dict[str, Any]:
             try:
                 r = json.loads(line)
             except json.JSONDecodeError:
+                _logger.debug("tool_failure_log: skipping corrupt line in summarize_log")
                 continue
             total += 1
             t = r.get("tool", "?")

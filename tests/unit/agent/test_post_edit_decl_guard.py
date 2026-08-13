@@ -39,6 +39,25 @@ class TestPythonDeclSets:
     def test_unparseable_returns_none(self):
         assert _python_decl_sets("def broken(:\n") is None
 
+    def test_return_tree_mode_shares_single_parse(self, monkeypatch):
+        # Regression pin: _return_tree=True hands the caller the already-parsed
+        # tree (Phase 3 restore path) instead of forcing a second ast.parse of
+        # the same text.
+        import ast
+        calls = []
+        orig_parse = ast.parse
+
+        def counting(*a, **k):
+            calls.append(a)
+            return orig_parse(*a, **k)
+
+        monkeypatch.setattr(ast, "parse", counting)
+        symbols, imports, tree = _python_decl_sets(BASE, _return_tree=True)
+        assert isinstance(tree, ast.Module)
+        assert {"keep_me", "drop_me", "Service", "Service.method_a", "Service.method_b"} == symbols
+        assert imports == {"os", "TList"}
+        assert len(calls) == 1
+
 
 class TestSummarizeDeclLosses:
     def test_dropped_function_flagged(self):

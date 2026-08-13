@@ -9,6 +9,12 @@ from typing import Optional
 class RecoveryAction(str, Enum):
 
     RETRY_SAME = "retry_same"
+    # The call itself was malformed — a required argument was missing
+    # ("'code' is required").  The recovery is to re-issue the call WITH the
+    # argument supplied — never to retry the identical call (that is the
+    # blind-retry failure mode RETRY_SAME exists to avoid) nor to switch tool
+    # (the tool was the right choice; the arguments were wrong).
+    FIX_ARGS = "fix_args"
     SWITCH_TOOL = "switch_tool"
     READ_FIRST = "read_first"
     SKIP = "skip"
@@ -24,7 +30,7 @@ class FailureClassification:
 
 class FailureClassifier:
 
-    def classify(self, tool_name: str, args: dict, result) -> FailureClassification:
+    def classify(self, tool_name: str, result) -> FailureClassification:
         # Priority 0: the handler's own structured verdict.
         #
         # The write tools already compute exactly what went wrong and publish it
@@ -83,6 +89,14 @@ _TEXT_CONTEXT_MISMATCH = ("context mismatch", "does not apply", "hunk")
 # is settled by ``_classify_by_type`` before any text is inspected.
 _TEXT_FILE_MISSING = ("file not found", "path not found", "no such file", "does not exist")
 _TEXT_TRANSIENT = ("timeout", "timed out", "connection", "temporarily unavailable")
+# Missing required argument — the handler returned its own arg validation
+# unwrapped ("'code' is required", "Command is required"), i.e. without
+# metadata["failure_class"], so it reaches this text tier.  The single phrase
+# "is required" covers every handler emission in the tree (write-tool
+# validation, plan_compiler, design_chat_loop tool handlers, ui_tools) and
+# mirrors the failure-log tier's ("is required" → invalid_args) rule so both
+# tiers agree on the same errors.
+_TEXT_MISSING_ARGS = ("is required",)
 
 # Tools that locate an edit site by matching text they were given.  Reaching a
 # "not found" in one of these means the SEARCH failed, so the recovery is to
@@ -96,8 +110,8 @@ _TEXT_MATCHING_EDIT_TOOLS = frozenset({
 
 # ``FailureClass`` value → recovery, for the classes a shipping tool actually
 # publishes.  Deliberately partial: a class with no unambiguous single recovery
-# (syntax_invalid_after_edit, structural_gate_violation, placement_violation —
-# all "your edit was rejected", none of which the five RecoveryActions express)
+# (syntax_invalid_after_edit, structural_gate_violation — all "your edit was rejected",
+# none of which the five RecoveryActions express)
 # is left out and falls through to the text tiers exactly as before.  Reasons
 # reuse the existing vocabulary wherever it fits, because ``reason`` is the
 # persistence key in ``failure_pattern_store`` and a new spelling starts a new
@@ -117,6 +131,8 @@ _ACTION_BY_FAILURE_CLASS: dict[str, tuple[RecoveryAction, str]] = {
     "already_satisfied":         (RecoveryAction.SKIP, "patch already applied"),
     "no_effect":                 (RecoveryAction.SKIP, "patch already applied"),
     "no_op_edit":                (RecoveryAction.SKIP, "patch already applied"),
+    # design_chat_loop's byte-identical apply_patch hard gate (its only issuer)
+    "no_effective_change":       (RecoveryAction.SKIP, "patch already applied"),
     # genuinely absent on disk
     "file_not_found":            (RecoveryAction.SWITCH_TOOL, "file missing"),
     "missing_path":              (RecoveryAction.SWITCH_TOOL, "file missing"),
@@ -262,5 +278,13 @@ def _classify_by_text(error_str: str, tool_name: str = "") -> FailureClassificat
 
     if _has_text_phrase(error_str, _TEXT_TRANSIENT):
         return FailureClassification(action=RecoveryAction.RETRY_SAME, reason="transient failure")
+
+    # Missing required argument — the error text names the argument the call
+    # lacked.  Retrying the identical call is the blind-retry failure mode; the
+    # recovery is to re-issue the call with the argument supplied.  Last in the
+    # cascade ("is required" is the most general phrase): any more specific
+    # signal above it wins when both appear.
+    if _has_text_phrase(error_str, _TEXT_MISSING_ARGS):
+        return FailureClassification(action=RecoveryAction.FIX_ARGS, reason="missing required argument")
 
     return FailureClassification(action=RecoveryAction.RETRY_SAME, reason="generic failure")

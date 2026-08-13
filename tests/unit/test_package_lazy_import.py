@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import importlib
 import sys
-import unittest.mock as mock
+from unittest import mock
 
 import pytest
 
@@ -96,7 +96,7 @@ def test_unknown_attribute_raises_attribute_error() -> None:
     import external_llm
 
     try:
-        external_llm.DefinitelyNotExported  # noqa: B018
+        external_llm.DefinitelyNotExported  # noqa: B018 — negative test: must raise AttributeError
     except AttributeError as exc:
         assert "DefinitelyNotExported" in str(exc)
     else:

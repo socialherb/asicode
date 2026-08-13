@@ -113,3 +113,57 @@ def test_write_namespace_json_sweeps(tmp_path):
     atomic_io.write_namespace_json(tmp_path / "ns.json", "sect", {"k": "v"})
     assert not os.path.exists(stale)
     assert json.loads((tmp_path / "ns.json").read_text())["sect"] == {"k": "v"}
+
+
+# ── Shared pipeline (_atomic_replace) ─────────────────────────────────────────
+
+
+def test_write_body_failure_removes_temp_and_keeps_target(tmp_path):
+    """The shared pipeline must clean up its temp file when the payload
+    serializer raises, and must never touch the existing target."""
+    target = tmp_path / "data.json"
+    target.write_text('{"old": true}', encoding="utf-8")
+
+    def _boom(fh):
+        raise RuntimeError("serializer exploded")
+
+    with pytest.raises(RuntimeError):
+        atomic_io._atomic_replace(target, ".tmp", _boom)
+    assert json.loads(target.read_text()) == {"old": True}
+    leftovers = [p for p in os.listdir(tmp_path) if p.startswith(".atomic_")]
+    assert leftovers == [], f"temp file leaked on write failure: {leftovers}"
+
+
+def test_finalize_failure_removes_temp_and_keeps_target(tmp_path):
+    """The same cleanup contract holds when the post-write hook raises."""
+    target = tmp_path / "data.txt"
+    target.write_text("old", encoding="utf-8")
+
+    def _finalize(tmp_path, target_path):
+        raise OSError("chmod exploded")
+
+    with pytest.raises(OSError, match="chmod exploded"):
+        atomic_io._atomic_replace(
+            target, ".tmp", lambda fh: fh.write("new"), finalize=_finalize,
+        )
+    assert target.read_text() == "old"
+    leftovers = [p for p in os.listdir(tmp_path) if p.startswith(".atomic_")]
+    assert leftovers == [], f"temp file leaked on finalize failure: {leftovers}"
+
+
+def test_every_writer_routes_through_the_shared_pipeline(tmp_path, monkeypatch):
+    """All three public writers must go through _atomic_replace — the dedup is
+    structural, not incidental: json uses .tmp, jsonl .jsonl, and only text
+    passes the mode-preserving finalize hook."""
+    calls: list = []
+    real = atomic_io._atomic_replace
+
+    def spy(*args, **kwargs):
+        calls.append((args[1], kwargs.get("finalize") is not None))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(atomic_io, "_atomic_replace", spy)
+    atomic_io.atomic_write_json(tmp_path / "a.json", {"a": 1})
+    atomic_io.atomic_write_jsonl(tmp_path / "b.jsonl", [{"b": 2}])
+    atomic_io.atomic_write_text(tmp_path / "c.txt", "x", mode=0o600)
+    assert calls == [(".tmp", False), (".jsonl", False), (".tmp", True)]

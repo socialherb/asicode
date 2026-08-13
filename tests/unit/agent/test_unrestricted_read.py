@@ -18,6 +18,8 @@ These tests pin:
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
+from unittest.mock import patch
 
 from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 
@@ -207,3 +209,78 @@ class TestWritePathAlwaysConfined:
         )
         assert result.ok is True
         assert "return 7" in (repo / "mod.py").read_text(encoding="utf-8")
+
+
+class TestSecurePathRootResolveCache:
+    """The repo-root resolution inside ``_secure_path`` is memoized per
+    effective-root string.
+
+    The root is a session constant (``repo_root`` frozen at construction,
+    ``_repo_root_override`` set at most once), so re-resolving it on every
+    read/write tool call was pure filesystem I/O on the hottest tool path.
+    Only the ROOT resolve is cached — the candidate path must keep resolving
+    fresh on every call, because that resolution IS the symlink boundary check.
+    """
+
+    def test_root_resolved_once_candidate_every_call(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "inside.py").write_text("x = 1\n", encoding="utf-8")
+        reg = ToolRegistry(str(repo), AgentConfig())
+        # NOTE: a wraps= mock does NOT bind self for Path.resolve (TypeError →
+        # _secure_path's blanket except returns None); a plain function as the
+        # patched class attribute binds via the descriptor protocol and works.
+        real_resolve = Path.resolve
+        resolve_calls: list = []
+
+        def counting_resolve(p, *args, **kwargs):
+            resolve_calls.append(p)
+            return real_resolve(p, *args, **kwargs)
+
+        with patch.object(Path, "resolve", counting_resolve):
+            assert reg._secure_path("inside.py") is not None
+            first_call_count = len(resolve_calls)
+            assert first_call_count == 2, (
+                f"first call: root + candidate resolves expected 2, got {first_call_count}"
+            )
+            assert reg._secure_path("inside.py") is not None
+        assert len(resolve_calls) == first_call_count + 1, (
+            "second call must re-resolve ONLY the candidate (root memoized)"
+        )
+
+    def test_override_change_rekeys_cache(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo2 = tmp_path / "repo2"
+        repo.mkdir()
+        repo2.mkdir()
+        (repo / "a.py").write_text("a = 1\n", encoding="utf-8")
+        (repo2 / "b.py").write_text("b = 1\n", encoding="utf-8")
+        reg = ToolRegistry(str(repo), AgentConfig())
+        # Seed the cache under the original root.
+        assert reg._secure_path("a.py") is not None
+        # A relative traversal that escapes the original root is blocked.
+        assert reg._secure_path("../repo2/b.py") is None
+        # Switching the override re-keys: the same traversal now lands INSIDE
+        # the new effective root and must resolve.
+        reg._repo_root_override = str(repo2)
+        got = reg._secure_path("../repo2/b.py")
+        assert got is not None
+        assert got == (repo2 / "b.py").resolve()
+        assert reg._secure_path("b.py") is not None
+        # Both roots are cached independently (no cross-contamination).
+        assert set(reg._secure_root_resolve_cache) == {
+            str(Path(repo).resolve()),
+            str(repo2),
+        }
+
+    def test_clone_for_subagent_gets_own_cache(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "a.py").write_text("a = 1\n", encoding="utf-8")
+        reg = ToolRegistry(str(repo), AgentConfig())
+        assert reg._secure_path("a.py") is not None
+        clone = reg.clone_for_subagent(AgentConfig())
+        # clone_for_subagent bypasses __init__ (object.__new__); the clone must
+        # still resolve paths (own fresh memo, NOT the parent's object).
+        assert clone._secure_path("a.py") is not None
+        assert clone._secure_root_resolve_cache is not reg._secure_root_resolve_cache

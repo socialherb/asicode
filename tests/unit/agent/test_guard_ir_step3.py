@@ -1,21 +1,22 @@
-"""Step 3 verification: op.metadata consistency invariants
+"""parse_guard compact invariants.
 
-Step 3a: guard_ir is the analyze_guard result (no fallback _extract_guard_ir)
-Step 3b: guard_statement is always synced to compact form
-Step 3c: ast_ops[0]["statement"] also matches compact
+The compact form must be a single line, semantically equivalent to the raw
+input (to_legacy_tuple round-trip), and stable under round-trip.
 """
+
+from typing import ClassVar
 
 import pytest
 
-from external_llm.agent.guard_ir import analyze_guard, parse_guard
+from external_llm.agent.guard_ir import parse_guard
 
 # ── Tests: compact invariant ──────────────────────────────────────────────────────
 
 class TestCompactInvariant:
-    """ir.compact returned by analyze_guard must be a single line and
+    """ir.compact returned by parse_guard must be a single line and
     semantically equivalent to to_legacy_tuple()."""
 
-    CASES = [
+    CASES: ClassVar[list] = [
         "if not x: continue",
         "if not value: return",
         "if not value: return None",
@@ -49,62 +50,15 @@ class TestCompactInvariant:
         assert ir_raw.condition.operands == ir_compact.condition.operands
 
 
-# ── Tests: op.metadata guard_statement sync ─────────────────────────────────
-
-_SRC_SIMPLE = """
-def process(items, limit=10):
-    result = []
-    for item in items:
-        result.append(item)
-    return result
-"""
-
-_SRC_PARAM = """
-def validate(max_retries, threshold):
-    pass
-"""
-
-
-def _make_op_metadata(guard_statement, edit_kind="guard_add", symbol="process"):
-    """simulate the op.metadata dict built by DPB/contract_driven_planning"""
-    return {
-        "guard_statement": guard_statement,
-        "edit_kind": edit_kind,
-    }
-
+# ── Tests: compact form sync ────────────────────────────────────────────────
 
 class TestGuardStatementSync:
-    """guard_statement must be in compact form after analyze_guard.
-
-    Verified via analyze_guard itself, even when _attach_edit_contracts
-    isn't actually invoked.
-    """
+    """guard_statement must be in compact form after parse_guard."""
 
     def test_block_form_produces_compact(self):
         raw = "if not x:\n    continue"
         ir = parse_guard(raw)
         assert ir is not None and ir.compact == "if not x: continue"
-
-    def test_analyze_guard_compact_matches_parse_compact(self):
-        raw = "if not item:\n    continue"
-        ir = parse_guard(raw)
-        analyzed = analyze_guard(ir, _SRC_SIMPLE, "process")
-        # compact from analyze_guard == compact from parse_guard (ir is not mutated)
-        assert ir.compact == analyzed.compact
-
-    def test_guard_ir_dict_uses_compact_as_canonical(self):
-        raw = "if not x: continue"
-        ir = parse_guard(raw)
-        analyzed = analyze_guard(ir, _SRC_SIMPLE, "process")
-        # guard_ir dict would store condition from analyzed
-        if analyzed.condition:
-            gir_dict = {
-                "condition": analyzed.condition.to_legacy_dict(),
-                "control": analyzed.control,
-                "insert_scope": analyzed.feasibility.insert_scope if analyzed.feasibility else "",
-            }
-            assert gir_dict["condition"] is not None
-            assert gir_dict["control"] in ("continue", "break", "return", "raise")
 
 
 # ── Tests: ast_ops statement == guard_statement invariant ──────────────────────────

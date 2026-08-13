@@ -23,7 +23,7 @@ the new language's ``LanguageId`` simply maps to its ``CommentSyntax``.
 Scope note
 -----------
 This SSOT governs the *bracket-delta* scanners only. The brace-only ``{}``
-scanner (``_brace_match_depth`` / ``_iter_brace_tokens`` in ``languages/base``)
+scanner (``_iter_brace_tokens`` in ``languages/base``)
 is intentionally C-style-scoped per the two-tier brace-scanner design — it is
 used for TS/JS class-body brace matching where ``#`` is never a comment.
 """
@@ -31,7 +31,7 @@ used for TS/JS class-body brace matching where ``#`` is never a comment.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache
 
 from external_llm.languages.models import LanguageId
 
@@ -106,7 +106,7 @@ _COMMENT_SYNTAX: dict[LanguageId, CommentSyntax] = {
 }
 
 
-@lru_cache(maxsize=None)
+@cache
 def comment_syntax_for(lang_id: LanguageId) -> CommentSyntax:
     """Return the :class:`CommentSyntax` for *lang_id*.
 

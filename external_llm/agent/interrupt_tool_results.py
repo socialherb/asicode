@@ -23,7 +23,7 @@ Result-item shape (design_chat_loop.py):
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from typing import Any
 
 # Budget caps for full render. per-tool 8KB / total 50KB — large enough to keep
 # a readable code body, small enough to bound the context blowup on resume.
@@ -37,7 +37,7 @@ _HEADER = "[Interrupted tool-loop results — full detail preserved]"
 
 
 def render_interrupt_tool_results(
-    tool_results: list[Dict[str, Any]],
+    tool_results: list[dict[str, Any]],
     *,
     per_result_chars: int = PER_RESULT_CHARS,
     total_chars: int = TOTAL_CHARS,

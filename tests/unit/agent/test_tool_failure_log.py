@@ -16,6 +16,7 @@ import json
 import os
 
 from external_llm.agent.tool_failure_log import (
+    _ERROR_PATTERNS,
     _classify_from_error,
     record_write_tool_failure,
     record_write_tool_failure_from_tr,
@@ -272,7 +273,7 @@ def test_summarize_args_redacts_all_payload_keys():
     """Every key in _ARG_KEYS_TO_DROP must be replaced by a size hint."""
     payload = "payload-value"
     expected = f"<{len(payload)} chars>"
-    args = {k: payload for k in _ARG_KEYS_TO_DROP}
+    args = dict.fromkeys(_ARG_KEYS_TO_DROP, payload)
     summary = _summarize_args(args)
     for key in _ARG_KEYS_TO_DROP:
         assert summary[key] == expected, f"{key} not redacted: {summary[key]}"
@@ -499,13 +500,29 @@ def test_classify_modify_symbol_missing_arg_still_invalid_args():
     ) == "invalid_args"
 
 
-# ── Regression: FailureClass enum must include MODIFY_FAILED so the emitted
-#    string literal is a recognized member. ────────────────────────────────────
-def test_failure_class_enum_has_modify_failed_member():
-    from external_llm.agent.operation_models import FailureClass
+# ── Parity: every _ERROR_PATTERNS fallback value must be a canonical
+#    FailureClass value.  Generalizes the old single-member MODIFY_FAILED
+#    regression: a string that is emitted but absent from the enum silently
+#    collapses to UNKNOWN in normalize_failure_class — exactly the B1 drift
+#    class ("no_effective_change" was issued by design_chat_loop but absent
+#    from the enum).  ``invalid_args`` was the one live value that drifted. ──
+class TestErrorPatternsParity:
+    def test_all_error_pattern_values_are_canonical_failure_classes(self):
+        from external_llm.agent.operation_models import FailureClass
 
-    values = [m.value for m in FailureClass]
-    assert "modify_failed" in values
+        canonical = {fc.value for fc in FailureClass}
+        emitted = {p[1] for p in _ERROR_PATTERNS}
+        assert emitted <= canonical, sorted(emitted - canonical)
+
+    def test_invalid_args_normalizes_to_real_member(self):
+        """'is required' → invalid_args must normalize to a real member,
+        not collapse to UNKNOWN before any map lookup / pattern key use."""
+        from external_llm.agent.operation_models import (
+            FailureClass,
+            normalize_failure_class,
+        )
+        assert FailureClass.INVALID_ARGS.value == "invalid_args"
+        assert normalize_failure_class("invalid_args") is FailureClass.INVALID_ARGS
 
 
 # ── Regression: batch edit_text occurrence errors must NOT be stolen by the
@@ -622,35 +639,42 @@ def test_classify_empty_diff_is_no_diff_generated():
 # ── Regression: _git_sha is cached within TTL but refreshed after ────────────
 
 
-def test_git_sha_caches_within_ttl(monkeypatch, tmp_path):
-    """Within the TTL window, repeated _git_sha calls must hit the subprocess
-    only once — failures burst, so collapsing them avoids N git rev-parse
-    calls per burst."""
-    import subprocess
+def test_git_sha_delegates_to_snapshot_and_collapses_burst(monkeypatch, tmp_path):
+    """_git_sha delegates to the agent-wide git snapshot SSOT, so a write-tool
+    failure BURST collapses to a single snapshot fetch instead of one
+    ``git rev-parse --short HEAD`` subprocess per record. Caching is now the
+    SSOT's responsibility (10s TTL, cleared on write) — verified here by
+    counting ``_run_git_raw`` calls across two ``_git_sha`` invocations (one
+    snapshot miss = 3 git commands; the second call must hit the cache and add
+    zero)."""
+    import threading
 
-    from external_llm.agent import tool_failure_log as mod
+    from external_llm.agent import agent_context_manager as acm
 
+    lock = threading.Lock()
     calls = {"n": 0}
 
-    def _counting_run(*a, **k):
-        calls["n"] += 1
-        # Simulate a successful git rev-parse --short HEAD.
-        class _R:
-            returncode = 0
-            stdout = "abc1234\n"
-        return _R()
+    def _counting_raw(repo_root, *args):
+        with lock:
+            calls["n"] += 1
+        # Return parseable values so get_git_snapshot populates head_hash.
+        if args[:2] == ("log", "-1"):
+            return "deadbeefdeadbeef\tabc1234 msg"
+        return ""
 
-    mod._git_sha_cache.clear()
-    monkeypatch.setattr(subprocess, "run", _counting_run)
-    monkeypatch.chdir(tmp_path)
+    acm._git_cache.clear()
+    acm._git_dirty_since.clear()
+    monkeypatch.setattr(acm, "_run_git_raw", _counting_raw)
     try:
-        sha1 = mod._git_sha(str(tmp_path))
-        sha2 = mod._git_sha(str(tmp_path))
-        assert sha1 == "abc1234"
-        assert sha2 == "abc1234"
-        assert calls["n"] == 1, f"expected 1 subprocess call, got {calls['n']}"
+        sha1 = _git_sha(str(tmp_path))
+        sha2 = _git_sha(str(tmp_path))
+        # head_hash = "deadbeefdeadbeef" -> short = first 7 chars.
+        assert sha1 == "deadbee" == sha2
+        # One snapshot miss = 3 git commands; the second _git_sha hit the cache.
+        assert calls["n"] == 3, f"expected 3 git calls (one snapshot), got {calls['n']}"
     finally:
-        mod._git_sha_cache.clear()
+        acm._git_cache.clear()
+        acm._git_dirty_since.clear()
 
 
 # -- handler metadata failure_class is preferred over error-text fallback ------
@@ -733,7 +757,7 @@ def test_log_compacted_when_exceeding_max_records(tmp_path, monkeypatch):
 
 def test_compaction_drops_corrupt_lines(tmp_path):
     """Compaction doubles as self-heal: unparseable lines are dropped during the
-    atomic rewrite (mirrors UnifiedStore._heal_file). The newest valid records
+    atomic rewrite (mirrors the JSONL-store heal rewrite). The newest valid records
     are kept; corrupt lines never survive a compaction pass."""
     path = str(tmp_path / "write_tool_failures.jsonl")
     tfl._append_counter = tfl._COMPACT_CHECK_EVERY - 1  # +1 → % CHECK_EVERY == 0
@@ -764,3 +788,229 @@ def test_compaction_drops_corrupt_lines(tmp_path):
     finally:
         tfl._MAX_FAILURE_LOG_RECORDS = orig_max
         tfl._append_counter = 0
+
+
+# ── Suggestion-hit tracking ─────────────────────────────────────────────────
+from external_llm.agent.tool_failure_log import (
+    get_suggestion_counts,
+    reset_suggestion_counts,
+)
+
+
+def _suggestion_failure(**kw):
+    """Shorthand: a search_string_mismatch failure with a suggestion."""
+    base = {
+        "tool": "edit_text",
+        "ok": False,
+        "error": "old_string not found in file",
+        "metadata": {"failure_class": "search_string_mismatch"},
+        "args": {"file_path": "a.py"},
+    }
+    base.update(kw)
+    return base
+
+
+def test_suggestion_fired_when_failure_carries_hint(tmp_path, monkeypatch):
+    """near_match (did-you-mean hint) and reread_snippet (fresh content) both
+    count as a fired suggestion; a plain mismatch does not."""
+    reset_suggestion_counts()
+    rec = _Recorder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    try:
+        record_write_tool_failure(**_suggestion_failure(metadata={
+            "failure_class": "search_string_mismatch", "near_match": True,
+        }), session_key="run-1")
+        record_write_tool_failure(**_suggestion_failure(metadata={
+            "failure_class": "search_string_mismatch", "reread_snippet": True,
+        }), session_key="run-2")
+        record_write_tool_failure(**_suggestion_failure(metadata={}),
+                                  session_key="run-3")
+        counts = get_suggestion_counts()
+        assert counts["fired"] == 2
+        assert counts["helped"] == 0 and counts["ignored"] == 0
+    finally:
+        rec.cleanup()
+
+
+def test_suggestion_settles_helped_on_next_success(tmp_path, monkeypatch):
+    reset_suggestion_counts()
+    rec = _Recorder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    try:
+        record_write_tool_failure(**_suggestion_failure(
+            metadata={"failure_class": "search_string_mismatch", "reread_snippet": True},
+        ), session_key="run-A")
+        # The agent retries (same run) and succeeds → helped.
+        tr = ToolResult(ok=True, content="done", metadata={})
+        record_write_tool_failure_from_tr(
+            tool="edit_text", tr=tr, args={"file_path": "a.py"}, session_key="run-A",
+        )
+        counts = get_suggestion_counts()
+        assert counts["fired"] == 1
+        assert counts["helped"] == 1
+        assert counts["ignored"] == 0
+    finally:
+        rec.cleanup()
+
+
+def test_suggestion_settles_ignored_and_rearms_on_next_failure(tmp_path, monkeypatch):
+    """Settle-before-arm: a follow-up failure settles the previous suggestion as
+    ignored AND arms a new marker when it carries its own suggestion."""
+    reset_suggestion_counts()
+    rec = _Recorder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    try:
+        record_write_tool_failure(**_suggestion_failure(
+            metadata={"failure_class": "search_string_mismatch", "near_match": True},
+        ), session_key="run-B")
+        record_write_tool_failure(**_suggestion_failure(
+            metadata={"failure_class": "search_string_mismatch", "near_match": True},
+        ), session_key="run-B")
+        counts = get_suggestion_counts()
+        assert counts["fired"] == 2
+        assert counts["ignored"] == 1
+        assert counts["helped"] == 0
+        # The second failure armed a fresh marker → a success now settles helped.
+        tr = ToolResult(ok=True, content="ok", metadata={})
+        record_write_tool_failure_from_tr(
+            tool="edit_text", tr=tr, args={}, session_key="run-B",
+        )
+        counts = get_suggestion_counts()
+        assert counts["helped"] == 1
+    finally:
+        rec.cleanup()
+
+
+def test_suggestion_settle_noop_without_marker(tmp_path, monkeypatch):
+    """A write-tool success with no pending marker must not fabricate a helped."""
+    reset_suggestion_counts()
+    rec = _Recorder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    try:
+        tr = ToolResult(ok=True, content="done", metadata={})
+        record_write_tool_failure_from_tr(
+            tool="edit_text", tr=tr, args={}, session_key="run-C",
+        )
+        counts = get_suggestion_counts()
+        assert counts["fired"] == 0
+        assert counts["helped"] == 0
+        assert counts["ignored"] == 0
+    finally:
+        rec.cleanup()
+
+
+def test_suggestion_empty_session_key_fires_but_never_settles(tmp_path, monkeypatch):
+    """Without a session_key the fired count still grows (global visibility) but
+    no marker is armed, so a later success cannot settle it."""
+    reset_suggestion_counts()
+    rec = _Recorder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    try:
+        record_write_tool_failure(**_suggestion_failure(
+            metadata={"failure_class": "search_string_mismatch", "near_match": True},
+        ))
+        tr = ToolResult(ok=True, content="done", metadata={})
+        record_write_tool_failure_from_tr(
+            tool="edit_text", tr=tr, args={},  # no session_key
+        )
+        counts = get_suggestion_counts()
+        assert counts["fired"] == 1
+        assert counts["helped"] == 0
+    finally:
+        rec.cleanup()
+
+
+def test_suggestion_non_write_tool_result_does_not_settle(tmp_path, monkeypatch):
+    """Only write-tool results settle the marker — an intervening read/search
+    success must not be mistaken for the agent recovering on the edit."""
+    reset_suggestion_counts()
+    rec = _Recorder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    try:
+        record_write_tool_failure(**_suggestion_failure(
+            metadata={"failure_class": "search_string_mismatch", "near_match": True},
+        ), session_key="run-D")
+        record_write_tool_failure(
+            tool="run_tests", ok=True, error=None, metadata={}, args={},
+            session_key="run-D",
+        )
+        counts = get_suggestion_counts()
+        assert counts["helped"] == 0  # marker still pending
+        tr = ToolResult(ok=True, content="done", metadata={})
+        record_write_tool_failure_from_tr(
+            tool="edit_text", tr=tr, args={}, session_key="run-D",
+        )
+        assert get_suggestion_counts()["helped"] == 1
+    finally:
+        rec.cleanup()
+
+
+def test_suggestion_auto_retry_counted_from_success_metadata(tmp_path, monkeypatch):
+    """Auto re-read + bounded retry outcomes are visible only on the ok=True
+    result's metadata (the failure log never sees them) → counted here."""
+    reset_suggestion_counts()
+    rec = _Recorder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    try:
+        ok_tr = ToolResult(
+            ok=True, content="done",
+            metadata={"reread_retried": True, "reread_retry_success": True},
+        )
+        record_write_tool_failure_from_tr(
+            tool="edit_text", tr=ok_tr, args={}, session_key="run-E",
+        )
+        # Retry failed: failure record carries reread_retried but no success flag.
+        fail_tr = ToolResult(
+            ok=False, content="", error="old_string not found",
+            metadata={"failure_class": "search_string_mismatch", "reread_retried": True},
+        )
+        record_write_tool_failure_from_tr(
+            tool="edit_text", tr=fail_tr, args={}, session_key="run-E",
+        )
+        counts = get_suggestion_counts()
+        assert counts["auto_retried"] == 2
+        assert counts["auto_retry_success"] == 1
+    finally:
+        rec.cleanup()
+
+
+def test_suggestion_partial_failure_settles_and_records(tmp_path, monkeypatch):
+    """partial_failure=True is recorded even when ok=True, and settles a pending
+    marker as a success (the tool did make progress)."""
+    reset_suggestion_counts()
+    rec = _Recorder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    try:
+        record_write_tool_failure(**_suggestion_failure(
+            metadata={"failure_class": "search_string_mismatch", "near_match": True},
+        ), session_key="run-F")
+        tr = ToolResult(
+            ok=True, partial_failure=True,
+            content="applied 2/3 edits",
+            metadata={"failure_class": "search_string_mismatch"},
+        )
+        record_write_tool_failure_from_tr(
+            tool="edit_text", tr=tr, args={}, session_key="run-F",
+        )
+        counts = get_suggestion_counts()
+        assert counts["helped"] == 1
+        assert len(rec.records()) == 2  # the failure + the partial record
+    finally:
+        rec.cleanup()
+
+
+def test_reset_suggestion_counts_returns_snapshot(tmp_path, monkeypatch):
+    reset_suggestion_counts()
+    rec = _Recorder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    try:
+        record_write_tool_failure(**_suggestion_failure(
+            metadata={"failure_class": "search_string_mismatch", "near_match": True},
+        ), session_key="run-G")
+        snap = reset_suggestion_counts()
+        assert snap["fired"] == 1
+        counts = get_suggestion_counts()
+        assert counts == {"fired": 0, "helped": 0, "ignored": 0,
+                          "auto_retried": 0, "auto_retry_success": 0}
+    finally:
+        rec.cleanup()

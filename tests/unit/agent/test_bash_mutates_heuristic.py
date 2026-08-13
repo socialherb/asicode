@@ -16,11 +16,24 @@ running the heuristic against real commands:
 """
 from __future__ import annotations
 
+import pytest
+
 from external_llm.agent.tool_registry import ToolRegistry
 
 
 def _mutates(cmd: str) -> bool:
     return ToolRegistry._bash_command_mutates_files(cmd)
+
+
+@pytest.fixture(autouse=True)
+def _clear_bash_classifier_cache():
+    """``_bash_command_mutates_files`` is lru_cached; a classification must not
+    leak across tests because several tests monkeypatch a sub-classifier
+    (``_bash_command_segments_via_ts`` / ``_has_file_redirect_via_ts``) to pin
+    the fallback path — a stale cache entry would bypass the patch."""
+    ToolRegistry._bash_command_mutates_files.cache_clear()
+    yield
+    ToolRegistry._bash_command_mutates_files.cache_clear()
 
 
 class TestFindDeleteExec:
@@ -240,21 +253,21 @@ class TestFallbackWhenTreeSitterUnavailable:
 
     def test_fallback_preserves_conservative_substitution(self, monkeypatch):
         monkeypatch.setattr(
-            ToolRegistry, "_bash_command_segments_via_ts", staticmethod(lambda c: None)
+            ToolRegistry, "_bash_command_segments_via_ts", staticmethod(lambda c, _tree=None: None)
         )
         # `$(...)` → conservative invalidate (bail-out path).
         assert _mutates("ls $(git stash pop)") is True
 
     def test_fallback_preserves_readonly_pipeline(self, monkeypatch):
         monkeypatch.setattr(
-            ToolRegistry, "_bash_command_segments_via_ts", staticmethod(lambda c: None)
+            ToolRegistry, "_bash_command_segments_via_ts", staticmethod(lambda c, _tree=None: None)
         )
         # Unquoted pure-read pipeline still recognized read-only via regex split.
         assert _mutates("git log --oneline | head") is False
 
     def test_fallback_preserves_quoted_pipe_bailout(self, monkeypatch):
         monkeypatch.setattr(
-            ToolRegistry, "_bash_command_segments_via_ts", staticmethod(lambda c: None)
+            ToolRegistry, "_bash_command_segments_via_ts", staticmethod(lambda c, _tree=None: None)
         )
         # With the fallback, a quoted pipeline bails out conservatively (the
         # structural path is what resolves it; without it we stay fail-closed).
@@ -324,7 +337,7 @@ class TestRedirectFdDupVsFile:
         catches ``2>&1`` (over-invalidation → cache miss, never stale data).
         This pins that the fallback never loosens safety."""
         monkeypatch.setattr(
-            ToolRegistry, "_has_file_redirect_via_ts", classmethod(lambda cls, c: None)
+            ToolRegistry, "_has_file_redirect_via_ts", classmethod(lambda cls, c, _tree=None: None)
         )
         assert _mutates("git log 2>&1 | head") is True
 
@@ -465,3 +478,77 @@ class TestDevNullAndFdSinks:
                     "ls > /dev/nullx",
                     "ls > /dev/null/foo"):
             assert _mutates(cmd) is True, cmd
+
+
+class TestParseBashTreeSharedBootstrap:
+    """Both structural bash classifiers share one tree-sitter bootstrap
+    (_parse_bash_tree). Pin the shared contract: unavailable or parse failure →
+    None (caller falls back conservatively), and both classifiers delegate to
+    the same helper."""
+
+    def test_returns_none_when_ts_unavailable(self, monkeypatch):
+        import external_llm.languages.tree_sitter_utils as _ts
+
+        monkeypatch.setattr(_ts, "is_available", lambda: False)
+        assert ToolRegistry._parse_bash_tree("ls") is None
+
+    def test_parse_failure_swallowed_and_both_delegate(self, monkeypatch):
+        import types
+
+        import external_llm.languages.tree_sitter_utils as _ts
+
+        calls: list = []
+
+        def _fake_parse(_cmd):
+            calls.append(_cmd)
+            raise RuntimeError("bootstrap failure must be swallowed by helper")
+
+        monkeypatch.setattr(_ts, "is_available", lambda: True)
+        monkeypatch.setattr(
+            _ts, "get_parser", lambda _lang: types.SimpleNamespace(parse=_fake_parse)
+        )
+        assert ToolRegistry._has_file_redirect_via_ts("ls") is None
+        assert ToolRegistry._bash_command_segments_via_ts("ls") is None
+        assert len(calls) == 2
+
+
+# ── single-parse / shared-tree / classification cache (P1) ───────────────────
+
+class TestSingleParseSharedTree:
+    """P1: ``_bash_command_mutates_files`` used to parse the same command TWICE
+    per classification (once for the redirect scan, once for segment splitting).
+    Both structural classifiers now share ONE tree parsed from the ORIGINAL
+    command. These pin the single-parse contract and the N1 offset pitfall."""
+
+    def test_classification_parses_command_once(self, monkeypatch):
+        calls: list = []
+        real = ToolRegistry._parse_bash_tree.__func__
+
+        def counting(cls, command):
+            calls.append(command)
+            return real(cls, command)
+
+        monkeypatch.setattr(ToolRegistry, "_parse_bash_tree", classmethod(counting))
+        # Read-only pipeline exercises BOTH structural classifiers (redirect
+        # scan + segment split) — must still parse exactly once.
+        assert _mutates("git log --oneline | head -5") is False
+        assert len(calls) == 1
+
+    def test_shared_tree_slices_original_command_offsets(self):
+        # N1 pitfall: the shared tree is parsed from the ORIGINAL command (not
+        # the stripped text); node byte offsets slice into that same string.
+        # Leading whitespace shifts every offset — a stripped-based tree would
+        # mis-slice the redirect body and the segment texts.
+        assert _mutates("  echo hi > out.txt") is True
+        assert _mutates("\n  git status --short") is False
+        segs = ToolRegistry._bash_command_segments_via_ts("  ls $(git stash pop) | head")
+        assert segs is not None
+        assert any(s.startswith("ls") for s in segs)
+
+    def test_repeated_command_served_from_classification_cache(self):
+        # Repeated commands (git status / ls between edits) must not be
+        # re-parsed — second classification comes from the lru_cache.
+        assert _mutates("git status --short") is False
+        assert _mutates("git status --short") is False
+        info = ToolRegistry._bash_command_mutates_files.cache_info()
+        assert info.hits >= 1

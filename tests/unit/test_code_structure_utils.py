@@ -26,6 +26,7 @@ from external_llm.code_structure_utils import (
     is_class_def,
     is_decorator,
     is_function_def,
+    is_module_level_import_present,
     iter_module_scope_nodes,
     parse_definitions,
     symbol_defined_anywhere,
@@ -310,7 +311,7 @@ class TestFindImportBoundary:
         src = "import os\nimport sys\n\ndef f(): pass\n"
         boundary = find_import_boundary_ast(src)
         # Last import end is line 2; first non-import (def) is line 4.
-        assert boundary == 3 or boundary == 4
+        assert boundary in {3, 4}
 
     def test_empty_source_returns_one(self):
         assert find_import_boundary_ast("") == 1
@@ -722,10 +723,9 @@ class TestExtractFunctionSignature:
 
 
 class TestIterModuleScopeNodes:
-    """The single source of truth helper that placement_contract,
-    intent_verifier, and code_structure_utils itself all import.  Pin
-    the contract so a refactor can't silently re-introduce wrapper-miss
-    by changing the descent rules."""
+    """The single source of truth helper that code_structure_utils
+    itself exports.  Pin the contract so a refactor can't silently
+    re-introduce wrapper-miss by changing the descent rules."""
 
     def _names_yielded(self, src: str):
         import ast as _ast
@@ -809,10 +809,10 @@ class TestIterModuleScopeNodes:
     def test_expression_descent_for_walrus(self):
         """Module-level ``if (n := compute()):`` — NamedExpr is nested
         inside If.test (not a stmt-level child).  The walker must
-        descend into expression nodes too so callers like
-        placement_contract.extract_module_level_names can find walrus
-        bindings.  Pin this; if a future refactor stops at stmt level,
-        the walrus capture in placement_contract regresses silently."""
+        descend into expression nodes too so module-scope-name
+        callers can find walrus bindings.  Pin this; if a future
+        refactor stops at stmt level, the walrus capture regresses
+        silently."""
         import ast as _ast
         tree = _ast.parse("if (n := 1):\n    pass\n")
         named_exprs = [
@@ -949,3 +949,129 @@ class TestExtractFunctionSignatureDetailed:
         assert sig is not None
         assert "*args:" in sig.param_sig
         assert "**kwargs:" in sig.param_sig
+
+
+# ── is_module_level_import_present (alias-aware availability) ───────────────
+
+
+class TestIsModuleLevelImportPresent:
+    """Availability semantics: a query name must actually be BOUND at module
+    scope.  ``from X import A as B`` binds B (not A); ``import X as Y`` binds Y
+    (not X) — the alias-blind ``alias.name == query`` match falsely reported
+    these as already present, silently skipping the requested import.
+    """
+
+    def test_plain_name_found(self):
+        assert is_module_level_import_present("from os import path\n", "os", "path") is True
+
+    def test_plain_module_import_found(self):
+        assert is_module_level_import_present("import os\n", "os") is True
+
+    def test_asname_binds_only_alias(self):
+        # ``from os import path as p``: 'path' is NOT bound — must not match.
+        assert is_module_level_import_present("from os import path as p\n", "os", "path") is False
+        # ... but the alias itself IS bound.
+        assert is_module_level_import_present("from os import path as p\n", "os", "p") is True
+
+    def test_explicit_same_name_as_still_matches(self):
+        # ``from X import A as A`` binds A explicitly — query for A matches.
+        assert is_module_level_import_present("from os import path as path\n", "os", "path") is True
+
+    def test_import_as_binds_only_alias(self):
+        assert is_module_level_import_present("import os as o\n", "os") is False
+        assert is_module_level_import_present("import os as o\n", "o") is True
+
+    def test_multi_name_line_with_alias(self):
+        # One aliased name on the line does not break the plain-name match.
+        src = "from os import path as p, getcwd\n"
+        assert is_module_level_import_present(src, "os", "path") is False
+        assert is_module_level_import_present(src, "os", "p") is True
+        assert is_module_level_import_present(src, "os", "getcwd") is True
+
+
+# ── P11-3: TS class-header regex catastrophic backtracking ────────────────────
+# The old list parts used \S+ — \S includes commas, so \S+ and
+# (?:\s*,\s*\S+)* had an ambiguous split that backtracks exponentially when
+# the closing '{' is absent (realistic in .d.ts:
+# 'declare class Foo extends Mixin<T0,...,Tn>;'). The fix uses [^\s,]+ so the
+# comma-delimited list has a unique parse (linear). These tests pin both the
+# equivalence (valid headers still match) and the performance (n=26 no-brace
+# input returns in <2s; the old pattern took ~24s).
+
+
+class TestTsClassHeaderRegexBacktracking:
+    @staticmethod
+    def _catastrophic_content() -> str:
+        # 26 type args + no closing '{' — the shape that made the old pattern
+        # try every split of the comma list before giving up.
+        return "declare class Foo extends Mixin<T0," + ",".join(f"T{i}" for i in range(1, 27)) + ">;\n"
+
+    def test_extends_implements_headers_still_match(self, monkeypatch):
+        # Force the regex fallback (tree-sitter path disabled) so the
+        # equivalence of the rewritten pattern is what is actually tested.
+        monkeypatch.setattr("external_llm.code_structure_utils._collect_symbols_via_ts",
+                            lambda content, lid: None)
+        for header in [
+            "export class A extends B implements C {",
+            "abstract class A extends B<X,Y> {",
+            "class A implements I1, I2 {",
+            "export abstract class A extends B implements I1,I2 {",
+        ]:
+            content = header + "\n  m() {}\n}\n"
+            assert symbol_defined_anywhere(content, "A.m", "dummy.ts") is True
+
+    def test_dotted_member_no_closing_brace_returns_fast(self, monkeypatch):
+        import time
+
+        monkeypatch.setattr("external_llm.code_structure_utils._collect_symbols_via_ts",
+                            lambda content, lid: None)
+        t0 = time.monotonic()
+        assert symbol_defined_anywhere(self._catastrophic_content(), "Foo.m", "dummy.ts") is False
+        assert time.monotonic() - t0 < 2.0, "no-brace extends list must not backtrack exponentially"
+
+    def test_bare_name_scan_no_closing_brace_returns_fast(self, monkeypatch):
+        import time
+
+        monkeypatch.setattr("external_llm.code_structure_utils._collect_symbols_via_ts",
+                            lambda content, lid: None)
+        t0 = time.monotonic()
+        # Bare-name path runs _RE_TS_CLASS_BODY.finditer over the WHOLE file —
+        # the no-brace catastrophic line must not blow that up either.
+        assert symbol_defined_anywhere(self._catastrophic_content(), "zzz_missing_symbol", "dummy.ts") is False
+        assert time.monotonic() - t0 < 2.0, "bare-name scan must stay linear"
+
+
+class TestTsRegexFallbackClassScopeIsLiteralAware:
+    """The TS regex fallback's class-body extents must come from the
+    literal/comment-aware base scanner — a '}' inside a string literal must
+    not truncate the body (the old hand-rolled depth loop ended the body at
+    the string, losing every method after it)."""
+
+    _SRC = (
+        "class A {\n"
+        '  s = "}"\n'
+        "  real() { return 1; }\n"
+        "}\n"
+    )
+
+    def _force_regex_fallback(self, monkeypatch):
+        monkeypatch.setattr("external_llm.code_structure_utils._collect_symbols_via_ts",
+                            lambda content, lid: None)
+
+    def test_dotted_member_after_string_brace_found(self, monkeypatch):
+        self._force_regex_fallback(monkeypatch)
+        assert symbol_defined_anywhere(self._SRC, "A.real", "app.ts") is True
+
+    def test_bare_member_after_string_brace_found(self, monkeypatch):
+        self._force_regex_fallback(monkeypatch)
+        assert symbol_defined_anywhere(self._SRC, "real", "app.ts") is True
+
+    def test_member_in_comment_brace_comment_found(self, monkeypatch):
+        self._force_regex_fallback(monkeypatch)
+        src = (
+            "class A {\n"
+            "  /* } */\n"
+            "  real() { return 1; }\n"
+            "}\n"
+        )
+        assert symbol_defined_anywhere(src, "A.real", "app.ts") is True

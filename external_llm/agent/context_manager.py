@@ -14,6 +14,7 @@ different strategies:
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import threading
@@ -27,25 +28,30 @@ from typing import Any, Optional
 from external_llm.agent.agent_context_manager import _SYSTEM_PROMPT_TEMPLATE
 from external_llm.agent.interrupt_tool_results import render_interrupt_tool_results
 from external_llm.agent.message_shapes import (
-    _is_anthropic_tool_result,
     _is_anthropic_tool_call,
+    _is_anthropic_tool_result,
 )
 from external_llm.client import (
     LLMAuthenticationError,
     LLMQuotaExceededError,
     LLMRateLimitError,
 )
-import dataclasses
 
 logger = logging.getLogger(__name__)
+
+# Stand-in for a conversation turn persisted with empty content. Kept short:
+# it is fed back to the model as history, and its only job is to hold the
+# user/assistant alternation slot that the real content vacated.
+_EMPTY_TURN_PLACEHOLDER = "(no response)"
 
 # Per-session once-latch: an auth/quota failure is sticky (the key/quota won't
 # change between turns), so re-notifying every compress cycle is pure noise.
 # The latch clears only when a *different* failure class is seen — e.g. after an
 # auth error, a later quota error still gets one notice, but repeated auth
-# errors stay silent. A transient success does NOT clear the latch: the next
-# same-class failure would re-notify, but that's the desired behavior (the user
-# may have rotated the key and needs to know it's still bad).
+# errors stay silent. A transient success does NOT clear the latch: a
+# same-class failure after the user rotated the key stays silent until a
+# different failure class appears (or the entry is evicted by the cap below) —
+# the per-turn debug log remains the only per-turn signal.
 #
 # The latch is keyed by session_id and NEVER cleared on session end, so a
 # long-lived server accumulates one entry per distinct session that hit a
@@ -464,6 +470,8 @@ class SlidingWindowContext(ContextManager):
                         categories["changes"].append(_entry)
                     elif name in ("find_symbol", "find_references"):
                         categories["search"].append(_entry)
+                    elif name in ("read_file", "read_symbol", "get_file_outline"):
+                        categories["files_read"].append(_entry)
                     else:
                         categories["other_tools"].append(_entry)
                 # Do NOT fall through to "user" discussion — the tool_result
@@ -490,6 +498,8 @@ class SlidingWindowContext(ContextManager):
                     categories["changes"].append(_entry)
                 elif name in ("find_symbol", "find_references"):
                     categories["search"].append(_entry)
+                elif name in ("read_file", "read_symbol", "get_file_outline"):
+                    categories["files_read"].append(_entry)
                 else:
                     categories["other_tools"].append(_entry)
 
@@ -588,8 +598,12 @@ class SessionCompressionContext(ContextManager):
         self._load_project_context_md_fn = _lpm
         self._cfg = _cfg
 
-        # project.md mtime cache
-        self._project_md_cache: Optional[tuple[float, str]] = None
+        # project.md content cache: keyed on (mtime_ns, size) so two writes within
+        # the same mtime-resolution window (1s on many filesystems) but with
+        # different content are not mistaken for unchanged. st_mtime_ns gives
+        # sub-second granularity where the filesystem supports it; st_size
+        # discriminates same-mtime-same-second rewrites.
+        self._project_md_cache: Optional[tuple[tuple[int, int], str]] = None
         # Per-session compression threading state. Reference the module-level
         # dicts so all per-request instances share one Lock per session (see
         # _MODULE_COMPRESS_LOCKS rationale above); cross-instance dedup of
@@ -614,23 +628,29 @@ class SessionCompressionContext(ContextManager):
     # ── Project context (mtime-cached) ───────────────────────────────
 
     def load_project_context_md(self) -> str:
-        """Read .asicode/project.md with mtime caching (per-turn reload)."""
+        """Read .asicode/project.md with mtime+size caching (per-turn reload).
+
+        The cache key is ``(st_mtime_ns, st_size)`` rather than mtime alone: on
+        filesystems with coarse (1s) mtime granularity, two writes landing in the
+        same window would otherwise make the cache return the pre-edit bytes.
+        """
         path = self._repo_root_path / ".asicode" / "project.md"
         try:
             if not path.is_file():
                 return ""
             stat = path.stat()
-            current_mtime = stat.st_mtime
-            if self._project_md_cache and self._project_md_cache[0] == current_mtime:
+            current_fp = (stat.st_mtime_ns, stat.st_size)
+            if self._project_md_cache and self._project_md_cache[0] == current_fp:
                 return self._project_md_cache[1]
             result = self._load_project_context_md_fn(
                 self._repo_root_str,
             )
-            self._project_md_cache = (current_mtime, result)
-            return result
+            self._project_md_cache = (current_fp, result)
         except Exception as e:
             logger.warning("Could not load project context: %s", e)
             return ""
+        else:
+            return result
 
     def needs_compression(
         self, session, recent_keep: Optional[int] = None,
@@ -724,6 +744,7 @@ class SessionCompressionContext(ContextManager):
             return
 
         # LLM compress the non-preserve turns
+        _llm_summary_ok = False
         if compressible and llm_client:
             conv_text = ""
             if session.compressed_summary:
@@ -787,6 +808,7 @@ class SessionCompressionContext(ContextManager):
                 new_summary = effective_content(response).strip()
                 if new_summary:
                     session.compressed_summary = new_summary
+                    _llm_summary_ok = True
             except Exception as e:
                 logger.debug("Failed to compress conversation: %s", e)
                 # A persistent helper-model auth/quota problem would otherwise be
@@ -800,6 +822,19 @@ class SessionCompressionContext(ContextManager):
                 return  # don't discard turns if compression failed
             finally:
                 _llm_logger.removeFilter(_suppress)
+
+        # A helper-model call that produced NO summary — empty content AND empty
+        # reasoning_content after effective_content() recovery — must not advance
+        # the pointer: the turns would be silently dropped from context with no
+        # summary covering them (the exact loss the exception path above avoids).
+        # Keep them verbatim; the next compression cycle retries.
+        if compressible and llm_client and not _llm_summary_ok:
+            logger.debug(
+                "compress_old_turns: helper model returned an empty summary for "
+                "session %s; keeping turns uncompressed for retry",
+                session.session_id,
+            )
+            return
 
         # Advance the ABSOLUTE compressed_up_to pointer so build_context_messages()
         # skips the summarized turns; the next _save() moves them to the archive
@@ -816,11 +851,10 @@ class SessionCompressionContext(ContextManager):
                 t.pop("tool_results", None)
 
         _msg = (
-            "Compressed %d user/AI turns into summary (%d chars), "
-            "compressed_up_to advanced to %d for session %s" % (
-                len(compressible), len(session.compressed_summary or ""),
-                abs_cutoff, session.session_id,
-            )
+            f"Compressed {len(compressible)} user/AI turns into summary "
+            f"({len(session.compressed_summary or '')} chars), "
+            f"compressed_up_to advanced to {abs_cutoff} for "
+            f"session {session.session_id}"
         )
         if notify:
             notify(_msg)
@@ -859,7 +893,7 @@ class SessionCompressionContext(ContextManager):
 
     # ── Unified entry points ─────────────────────────────────────────
     def schedule_background_compress(
-        self, session, model: str, llm_client, system_chars: int = 0,
+        self, session, model: str, llm_client,
         force: bool = False,
         notify: Optional[Callable[[str], None]] = None,
         persist: Optional[Callable[[], None]] = None,
@@ -943,7 +977,7 @@ class SessionCompressionContext(ContextManager):
     # ── Context message builder ──────────────────────────────────────
 
     def build_context_messages(
-        self, session, current_model: str = "", system_chars: int = 0,
+        self, session, current_model: str = "",
         skip_core_prompt: bool = False,
         mode: str = "code",
         owner: str = "",
@@ -953,7 +987,6 @@ class SessionCompressionContext(ContextManager):
         Args:
             session: DesignSession instance.
             current_model: Current model name for model-switch annotations.
-            system_chars: System prompt character count (unused).
             skip_core_prompt: If True, skip embedding the core system prompt.
             mode: "code" (full context) or "general" (light — no project.md /
                   insights; repo root, conversation summary and recent turns
@@ -974,10 +1007,7 @@ class SessionCompressionContext(ContextManager):
         # (Chunk 1 before "## Available Tools", without tool/session/context placeholders)
         _marker = "\n## Available Tools\n"
         _midx = _SYSTEM_PROMPT_TEMPLATE.find(_marker)
-        if _midx != -1:
-            core_prompt = _SYSTEM_PROMPT_TEMPLATE[:_midx].rstrip()
-        else:
-            core_prompt = _SYSTEM_PROMPT_TEMPLATE
+        core_prompt = _SYSTEM_PROMPT_TEMPLATE[:_midx].rstrip() if _midx != -1 else _SYSTEM_PROMPT_TEMPLATE
         if not skip_core_prompt:
             messages.append({"role": "system", "content": core_prompt})
             messages.append(_divider)
@@ -1222,13 +1252,14 @@ class SessionCompressionContext(ContextManager):
                 try:
                     from external_llm.agent.design_chat_loop import load_promoted_insights
                     _promoted = load_promoted_insights(self._repo_root_str, _task_q)
+                except Exception as _exc:
+                    logger.debug("promoted insights load failed: %s", _exc)
+                else:
                     if _promoted:
                         messages.append({
                             "role": "system",
                             "content": _promoted.strip(),
                         })
-                except Exception:
-                    pass  # non-critical
 
         # Static current-request marker (no turn number — the text must be
         # byte-identical every turn; on Anthropic it is hoisted into the system
@@ -1260,7 +1291,32 @@ class SessionCompressionContext(ContextManager):
                 ),
             })
 
-        return messages
+        # ── Empty-content turn guard ─────────────────────────────────────────
+        # A turn can be persisted with empty content (a design-chat turn that
+        # ended with an empty LLM response before the funnel guard, or an
+        # ESC-interrupted turn with no text). Blank turns must not reach the
+        # provider — Anthropic rejects empty text blocks outright — so this
+        # single funnel, shared by every consumer (REPL, webapp, orchestrator,
+        # IPC worker), neutralises them instead of patching each builder.
+        #
+        # Conversation turns are REPLACED, not dropped. Dropping an empty
+        # assistant turn leaves the user turns on either side adjacent, and
+        # Anthropic rejects non-alternating roles exactly as hard as it rejects
+        # the empty block — anthropic_client builds its payload verbatim and
+        # does not merge consecutive same-role messages, so dropping would only
+        # trade one 400 for another. A placeholder keeps the alternation intact
+        # and still ships no empty content.
+        #
+        # Anything that is not a conversation turn (system scaffolding) carries
+        # no alternation role, so an empty one is simply dropped.
+        _kept: list[dict] = []
+        for _m in messages:
+            if (_m.get("content") or "").strip():
+                _kept.append(_m)
+            elif _m.get("role") in ("user", "assistant"):
+                _kept.append({**_m, "content": _EMPTY_TURN_PLACEHOLDER})
+        return _kept
+
 
 # ── Module-level helpers (shared between strategies) ────────────────────────
 
@@ -1294,8 +1350,7 @@ def _extract_topics(messages: list, max_keywords: int = 8) -> list[str]:
         raw = raw or ""
         for word in raw.lower().split():
             w = word.strip('.,;:!?\"\'()[]{}')
-            if len(w) >= 4:
-                if w not in _STOP:
-                    word_freq[w] = word_freq.get(w, 0) + 1
+            if len(w) >= 4 and w not in _STOP:
+                word_freq[w] = word_freq.get(w, 0) + 1
     top_words = sorted(word_freq.items(), key=lambda x: -x[1])[:max_keywords]
     return [w for w, _ in top_words]

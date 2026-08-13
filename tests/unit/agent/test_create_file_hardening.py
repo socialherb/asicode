@@ -25,7 +25,7 @@ def repo(tmp_path: Path) -> Path:
 
 
 def _registry(repo: Path) -> ToolRegistry:
-    return ToolRegistry(str(repo), AgentConfig(planning_enabled=False, rag_enabled=False))
+    return ToolRegistry(str(repo), AgentConfig(rag_enabled=False))
 
 
 class TestRepoConfinement:
@@ -155,3 +155,4 @@ class TestApplyPatchFallbackReachesGate:
         assert r is not None
         assert r.ok is True
         assert (repo / "ok_fallback.py").read_text().rstrip() == "x = 1"
+

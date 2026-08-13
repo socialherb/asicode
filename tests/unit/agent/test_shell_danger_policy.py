@@ -292,6 +292,42 @@ def test_dangerous_word_inside_a_quoted_argument_is_not_an_executable(gate):
     assert result.ok
 
 
+# ── nested quotes inside a double-quoted substitution body ────────────────
+# A `"` inside a `$(...)` body that itself sits inside double quotes used to
+# fall into the outer-quote toggle, whose cmdsub-state reset orphaned the
+# substitution: the scan copy ended quote-unbalanced and shlex refused the
+# WHOLE command ("Invalid command syntax: No closing quotation"). Live
+# incident 2026-08-02: `echo "tip: $(git rev-parse "$b")"` was unrunnable.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'echo "tip: $(git rev-parse "$b")"',
+        'b="x/y"; echo "branch=$b tip=$(git rev-parse "$b")"',
+        'echo "A $(git log --format="%h" -1) B"',
+        'echo "$(git for-each-ref --format="%(refname)" refs/heads)"',
+        'echo "x: $(basename "$(pwd)")"',
+    ],
+)
+def test_nested_quotes_in_dq_substitution_body_still_run(gate, command):
+    result = _run(gate, command)
+    assert result.ok, f"benign command refused: {result.error}"
+    assert gate._recorder.asked == []
+    # The scan reads a normalised COPY; the executing command is untouched.
+    assert gate._recorder.spawned[0].endswith(command)
+
+
+def test_dangerous_command_in_nested_quoted_substitution_is_seen(gate):
+    """The fix must surface the body's commands, not hide them: the same
+    shape carrying an `rm` still prompts (and fails closed on deny)."""
+    result = _run(gate, 'echo "gone: $(rm -rf "/tmp/x")"')
+    assert gate._recorder.asked, "rm inside nested-quoted $() body not seen"
+    assert "rm" in gate._recorder.asked[0][0]
+    assert not result.ok
+    assert gate._recorder.spawned == []
+
+
 # ── policy set shape ──────────────────────────────────────────────────────
 
 
@@ -2339,3 +2375,110 @@ class TestPythonPayloadResolution:
 
     def test_an_unparseable_payload_yields_nothing(self):
         assert gt_mod._python_payload_effects("def (") == (set(), [], False)
+
+
+class TestOverwriteWithoutARedirect:
+    """Destroying a file without a `>` for the redirect gate to see.
+
+    The redirect gate exists because `echo '' > src/main.py` destroys a source
+    file as thoroughly as `rm`. `tee`, `cp` and `mv` name their destination as
+    an ARGUMENT instead, so neither that gate (no `>`) nor the name gate (no
+    dangerous executable) saw them: all three ran unprompted while the `>`
+    spelling of the same act prompted. Probed by dispatch, not by reading the
+    policy — the sets say nothing about reachability.
+
+    Scoping is inherited from _truncating_redirect_targets unchanged, so the
+    quiet cases below stay quiet for the same reasons `>>` and `/tmp` do.
+    """
+
+    @pytest.fixture()
+    def victim(self, tool_registry):
+        """A real, non-empty in-repo file, plus a legitimate source operand."""
+        root = Path(tool_registry.repo_root)
+        (root / "victim.py").write_text("def important():\n    return 1\n", encoding="utf-8")
+        (root / "src.py").write_text("x = 1\n", encoding="utf-8")
+        return "victim.py"
+
+    @pytest.mark.parametrize("command", [
+        "echo '' | tee victim.py",
+        "cp /dev/null victim.py",
+        "cp src.py victim.py",
+        "mv src.py victim.py",
+        "/usr/bin/tee victim.py < src.py",     # absolute path → basename match
+        "ls && cp src.py victim.py",           # second segment
+    ])
+    def test_overwriting_an_existing_source_file_is_prompted(self, gate, victim, command):
+        result = _run(gate, command)
+        assert gate._recorder.asked, f"ran unprompted: {command!r}"
+        assert "victim.py" in gate._recorder.asked[0][0]
+        assert not result.ok
+        assert gate._recorder.spawned == [], "denied command still reached the shell"
+
+    @pytest.mark.parametrize("command", [
+        "echo '' | tee -a victim.py",   # append is not truncation — as with `>>`
+        "cp -n src.py victim.py",       # no-clobber writes nothing
+        "echo '' | tee brand_new.py",   # does not exist yet → nothing to lose
+        "cp src.py /tmp/out.py",        # outside the repo
+        "echo '' | tee /dev/null",      # outside the repo
+        "cp src.py",                    # one operand is not a destination
+        "mv /tmp/a /tmp/b",             # neither end is in the repo
+    ])
+    def test_non_destroying_forms_stay_quiet(self, gate, victim, command):
+        """Over-prompting is the failure this gate's scoping exists to avoid."""
+        _run(gate, command)
+        assert gate._recorder.asked == [], f"over-prompted: {command!r}"
+
+
+class TestInPlaceStreamEditors:
+    """`sed -i` was blocked while `perl -i` — the same act — ran unimpeded.
+
+    FORBIDDEN_FLAGS made the restriction a property of the spelling rather than
+    of the act. The rejection message points at apply_patch, so the policy had
+    already decided in-place stream editing is what it wants to prevent.
+    """
+
+    @pytest.mark.parametrize("command,exe", [
+        ("sed -i '' 's/a/b/' f.py", "sed"),
+        ("perl -i -pe 's/a/b/' f.py", "perl"),
+        ("perl -i.bak -pe 's/a/b/' f.py", "perl"),
+        ("perl --in-place -pe 's/a/b/' f.py", "perl"),
+        ("ruby -i -pe 'x' f.py", "ruby"),
+    ])
+    def test_in_place_flag_is_rejected(self, gate, command, exe):
+        result = _run(gate, command)
+        assert not result.ok, f"in-place edit allowed: {command!r}"
+        assert exe in result.error
+        assert "apply_patch" in result.error
+        assert gate._recorder.spawned == [], "rejected command still reached the shell"
+
+    @pytest.mark.parametrize("command", [
+        "perl -pe 's/a/b/' f.py",        # no -i: reads, writes stdout
+        "perl -e 'print 1'",
+        "ruby -e 'puts 1'",
+        "sed 's/a/b/' f.py",
+    ])
+    def test_reading_forms_are_untouched(self, gate, command):
+        result = _run(gate, command)
+        assert result.ok, f"non-destructive form rejected: {command!r}"
+
+
+def test_shell_c_payload_index_stops_at_shared_segment_bound():
+    """The `-c` flag scan shares its segment bound with `eval` (R4 refactor).
+
+    The inline separator loop was replaced by a call to ``_segment_end_index``,
+    the same primitive the ``eval`` scan uses. These cases pin the delegation
+    contract: the bound is the NEXT separator, never ``len(tokens)``.
+    """
+    # -c inside the segment → the payload index (token right after the flag)
+    assert gt_mod._shell_c_payload_index(["bash", "-c", "ls", ";", "ls"], 1) == 2
+    # separator before any -c → grep's --count must not be spliced
+    assert gt_mod._shell_c_payload_index(
+        ["bash", "deploy.sh", ";", "grep", "-c", "rm", "file"], 1
+    ) is None
+    # dangling -c at the end of the tokens → no payload
+    assert gt_mod._shell_c_payload_index(["bash", "-c"], 1) is None
+    # -c as the last token of the segment (separator right after) → payload is
+    # the separator itself; identical to the pre-refactor return value
+    assert gt_mod._shell_c_payload_index(["bash", "-c", ";", "ls"], 1) == 2
+    # no -c anywhere in the segment → None
+    assert gt_mod._shell_c_payload_index(["bash", "script.sh"], 1) is None

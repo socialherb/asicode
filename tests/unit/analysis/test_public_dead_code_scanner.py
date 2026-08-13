@@ -18,11 +18,13 @@ from external_llm.analysis.public_dead_code_scanner import (
 
 def _make_py_file(source: str) -> str:
     """Write source to a temp .py file and return its absolute path."""
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, encoding="utf-8",
-    )
-    tmp.write(textwrap.dedent(source))
-    tmp.close()
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".py",
+        delete=False,
+        encoding="utf-8",
+    ) as tmp:
+        tmp.write(textwrap.dedent(source))
     return tmp.name
 
 
@@ -482,9 +484,7 @@ def test_same_file_reference_prevents_dead():
 def test_max_per_file_enforced():
     """Respect max_per_file limit."""
     # Need enough gap between groups so they form separate clusters
-    lines = []
-    for i in range(7):
-        lines.append(f"def _dead_{chr(ord('a') + i)}(): pass\n")
+    lines = [f"def _dead_{chr(ord('a') + i)}(): pass\n" for i in range(7)]
     # All adjacent, forms 1 cluster → can't test max_per_file this way
     # Instead generate 4 clusters of 2 defs each with gaps
     lines = []
@@ -500,9 +500,8 @@ def test_max_per_file_enforced():
 
 def test_non_py_file_skipped():
     """Non-.py files are skipped (pre-filtered by ScannerRegistry)."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w")
-    tmp.write("def _dead(): pass\n")
-    tmp.close()
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w") as tmp:
+        tmp.write("def _dead(): pass\n")
     from external_llm.agent.scanner_registry import get_registry
     reg = get_registry()
     result = reg.run("public_dead_code_scanner", file_paths=[tmp.name])
@@ -665,6 +664,30 @@ def test_for_iterable_and_rhs_references_are_not_dead():
     assert "_LOCK" not in dead_names
 
 
+def test_default_parameter_value_is_a_reference():
+    """A module-level private symbol whose only use is a default-parameter
+    value (`def _verify(assertions, code=_SAMPLE_CODE)`) must not be flagged
+    dead.  The tree-sitter def-position check used to blanket-mark every
+    identifier under `default_parameter` as a definition, dropping the
+    value-side reference)."""
+    src = _make_py_file("""\
+        _SAMPLE_CODE = "print(1)"
+
+        def _HELPER():
+            return 42
+
+        def _verify(assertions, code=_SAMPLE_CODE, default=_HELPER):
+            return assertions(code or default)
+
+        def public_api():
+            return _verify(assertions=bool)
+    """)
+    candidates = scan_public_dead_blocks(repo_root="", file_paths=[src])
+    dead_names = {m.name for c in candidates for m in c.members}
+    assert "_SAMPLE_CODE" not in dead_names
+    assert "_HELPER" not in dead_names
+
+
 def test_class_level_assignment_not_scanned_via_tree_sitter():
     """Class-level assignments can't be judged dead via single-file analysis,
     since mixin/instance attribute access (self._FOO) is cross-file — the ts
@@ -679,3 +702,46 @@ def test_class_level_assignment_not_scanned_via_tree_sitter():
     candidates = scan_public_dead_blocks(repo_root="", file_paths=[src])
     dead_names = {m.name for c in candidates for m in c.members}
     assert "_CLASS_TABLE" not in dead_names
+
+
+def test_module_level_call_is_a_reference_not_a_def():
+    """A module-level bare call ``_init()`` keeps the callee alive.  The
+    expression_statement wrapper used to collect the callee identifier as an
+    assignment def — that fake def's only reference is its own line, so the
+    live init hook was reported dead (real cases: asi._silence_socks_dependency
+    _warning, scanner_registry._auto_register, context_budget._ensure_override
+    _cache_loaded, deterministic_repairs._register_default_handlers; 2026-08)."""
+    src = _make_py_file("""\
+        def _init():
+            return None
+
+        def _second():
+            return None
+
+        _init()
+        _second()
+    """)
+    candidates = scan_public_dead_blocks(repo_root="", file_paths=[src])
+    dead_names = {m.name for c in candidates for m in c.members}
+    assert "_init" not in dead_names
+    assert "_second" not in dead_names
+    Path(src).unlink()
+
+
+def test_subscript_assignment_rhs_identifier_not_a_def():
+    """``_SCHEMA[...] = _SCANNER_NAMES``: the RHS identifier is a USE.  The
+    first-identifier scan on the assignment wrapper used to misread it as the
+    binding, reporting the live symbol dead (real case:
+    tool_schemas._scanner_names; 2026-08)."""
+    src = _make_py_file("""\
+        _SCANNER_NAMES = ["all"]
+
+        _SCHEMA = {}
+
+        _SCHEMA["properties"]["scanner"]["enum"] = _SCANNER_NAMES
+    """)
+    candidates = scan_public_dead_blocks(repo_root="", file_paths=[src])
+    dead_names = {m.name for c in candidates for m in c.members}
+    assert "_SCANNER_NAMES" not in dead_names
+    assert "_SCHEMA" not in dead_names
+    Path(src).unlink()

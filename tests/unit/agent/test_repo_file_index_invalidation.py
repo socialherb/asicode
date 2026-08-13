@@ -18,8 +18,8 @@ import pytest
 
 from external_llm.agent.tool_handlers import write_tools as wt
 from external_llm.agent.tool_handlers.write_tools import (
-    _file_index_key,
     _repo_file_index,
+    canonical_repo_key,
     invalidate_repo_file_index,
 )
 from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
@@ -35,7 +35,7 @@ def repo(tmp_path: Path) -> Path:
 
 
 def _registry(repo: Path) -> ToolRegistry:
-    return ToolRegistry(str(repo), AgentConfig(planning_enabled=False, rag_enabled=False))
+    return ToolRegistry(str(repo), AgentConfig(rag_enabled=False))
 
 
 def _globbed(reg: ToolRegistry) -> set[str]:
@@ -89,7 +89,7 @@ class TestGlobSeesFreshWrites:
         the index worth having depends on it surviving interleaved reads."""
         reg = _registry(repo)
         _globbed(reg)
-        key = _file_index_key(str(repo))
+        key = canonical_repo_key(str(repo))
         before = wt._FILE_INDEX_CACHE.get(key)
         assert before is not None
         assert reg.dispatch("bash", {"command": "ls -la"}).ok
@@ -102,7 +102,7 @@ class TestFileIndexKey:
         resolved spelling of one repo occupied two entries of an 8-entry cache
         — and the invalidator could clear a key the reader never used."""
         resolved = tmp_path.resolve()
-        assert _file_index_key(str(tmp_path)) == _file_index_key(str(resolved))
+        assert canonical_repo_key(str(tmp_path)) == canonical_repo_key(str(resolved))
 
     def test_one_repo_occupies_one_entry(self, repo: Path):
         wt._FILE_INDEX_CACHE.clear()
@@ -117,15 +117,17 @@ class TestFileIndexKey:
 
     def test_invalidate_drops_the_entry(self, repo: Path):
         _repo_file_index(str(repo))
-        assert _file_index_key(str(repo)) in wt._FILE_INDEX_CACHE
+        assert canonical_repo_key(str(repo)) in wt._FILE_INDEX_CACHE
         invalidate_repo_file_index(str(repo))
-        assert _file_index_key(str(repo)) not in wt._FILE_INDEX_CACHE
+        assert canonical_repo_key(str(repo)) not in wt._FILE_INDEX_CACHE
 
 
 def test_suggester_and_glob_share_one_index(repo: Path):
     """Both read `_repo_file_index`, so the invalidation covers both. Pinned
     because a future split would silently reintroduce the stale suggester."""
     import inspect
+
     from external_llm.agent.tool_handlers.read_tools import ReadToolsMixin
     assert "_repo_file_index" in inspect.getsource(ReadToolsMixin._tool_glob)
     assert "_repo_file_index" in inspect.getsource(wt.WriteToolsMixin._suggest_missing_paths)
+

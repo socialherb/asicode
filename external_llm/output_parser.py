@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+from contextlib import suppress
 from typing import Any, Optional
 
 from common import normalize_rel_path_fast
@@ -71,7 +72,7 @@ class EnhancedOutputParser:
             return ""
 
         # Log first 500 chars of LLM output for debugging
-        logger.debug(f"LLM output (first 500 chars): {llm_output[:500]}")
+        logger.debug("LLM output (first 500 chars): %s", llm_output[:500])
 
         diff = self._extract_from_fences(llm_output)
         if not diff:
@@ -172,9 +173,7 @@ class EnhancedOutputParser:
         if line.startswith(("diff --git", "--- ", "+++ ", "@@ ", "index ")):
             return True
         # diff body lines may start with +, -, space, or "\"
-        if line[:1] in {"+", "-", " ", "\\"}:
-            return True
-        return False
+        return line[:1] in {"+", "-", " ", "\\"}
 
     # -----------------------------
     # Cleaning & autocorrect
@@ -208,31 +207,76 @@ class EnhancedOutputParser:
         corrected: list[str] = []
 
         # pass1: normalize ---/+++ a/ b/
+        # Hunk-aware: a removed line whose content starts with "-- " renders as
+        # "--- ..." (likewise "+" additions of "++ " content render as "+++ ...")
+        # — indistinguishable from a file header by prefix alone.  Git resolves
+        # this positionally: headers appear only once the preceding hunk's line
+        # counts are exhausted.  Track the counts and leave such lines untouched
+        # while the current hunk still expects lines; otherwise a valid diff
+        # (e.g. removing a "-- comment" line) is corrupted into "--- a/comment",
+        # fails git apply, and surfaces a confusing touched-files error.
+        in_hunk = False
+        exp_old = exp_new = cur_old = cur_new = 0
         for line in raw_lines:
-            if line.startswith("---"):
+            if line.startswith("diff --git"):
+                in_hunk = False
+                corrected.append(line)
+                continue
+
+            if line.startswith(("---", "+++")):
+                if in_hunk and not (cur_old >= exp_old and cur_new >= exp_new):
+                    # Positionally inside the current hunk → body line
+                    # ("- -- x" / "+ ++ x"), not a file header.  Leave as-is.
+                    corrected.append(line)
+                    if line.startswith("---"):
+                        cur_old += 1
+                    else:
+                        cur_new += 1
+                    continue
+                in_hunk = False
+                if line.startswith("---"):
+                    parts = line.split(maxsplit=1)
+                    path = parts[1].strip() if len(parts) > 1 else ""
+                    if path and path != "/dev/null" and not (path.startswith(("a/", "b/"))):
+                        corrected.append(f"--- a/{path}")
+                    else:
+                        corrected.append(line)
+                    continue
+
                 parts = line.split(maxsplit=1)
                 path = parts[1].strip() if len(parts) > 1 else ""
-                if path and path != "/dev/null" and not (path.startswith("a/") or path.startswith("b/")):
-                    corrected.append(f"--- a/{path}")
+                if path and path != "/dev/null" and not (path.startswith(("a/", "b/"))):
+                    corrected.append(f"+++ b/{path}")
+                elif path.startswith("a/") and path != "/dev/null":
+                    corrected.append("+++ b/" + path[2:])
                 else:
                     corrected.append(line)
                 continue
 
-            if line.startswith("+++"):
-                parts = line.split(maxsplit=1)
-                path = parts[1].strip() if len(parts) > 1 else ""
-                if path and path != "/dev/null" and not (path.startswith("a/") or path.startswith("b/")):
-                    corrected.append(f"+++ b/{path}")
+            if line.startswith("@@"):
+                m = self.HUNK_HEADER_RE.match(line)
+                if m:
+                    exp_old = int(m.group(2) or 1)
+                    exp_new = int(m.group(4) or 1)
                 else:
-                    if path.startswith("a/") and path != "/dev/null":
-                        corrected.append("+++ b/" + path[2:])
-                    else:
-                        corrected.append(line)
+                    # Keep line, but log
+                    logger.warning("Invalid hunk header: %s", line)
+                cur_old = cur_new = 0
+                in_hunk = True
+                corrected.append(line)
                 continue
 
-            if line.startswith("@@") and not self.HUNK_HEADER_RE.match(line):
-                # Keep line, but log
-                logger.warning("Invalid hunk header: %s", line)
+            if in_hunk:
+                # Count body lines toward the @@ expectations (used only to
+                # disambiguate "--- "/"+++ " body lines from file headers).
+                if line[:1] == " " or not line:
+                    cur_old += 1
+                    cur_new += 1
+                elif line[:1] == "-":
+                    cur_old += 1
+                elif line[:1] == "+":
+                    cur_new += 1
+                # "\ No newline at end of file" counts as neither.
 
             corrected.append(line)
 
@@ -242,7 +286,7 @@ class EnhancedOutputParser:
 
         def _norm(p: str) -> str:
             p = (p or "").strip()
-            if p.startswith("a/") or p.startswith("b/"):
+            if p.startswith(("a/", "b/")):
                 p = p[2:]
             return p
 
@@ -511,10 +555,9 @@ class EnhancedOutputParser:
     @staticmethod
     def _norm_rel(p: str) -> str:
         p = (p or "").strip()
-        if p.startswith("a/") or p.startswith("b/"):
+        if p.startswith(("a/", "b/")):
             p = p[2:]
-        p = normalize_rel_path_fast(p)
-        return p
+        return normalize_rel_path_fast(p)
 
     def validate_diff(
         self,
@@ -552,6 +595,15 @@ class EnhancedOutputParser:
         found_files: list[str] = []
 
         in_hunk = False
+        # Hunk line-count tracking: a "--- "/"+++ " line inside a hunk body
+        # (deleting "-- x" / adding "++ x") is NOT a file header.  Real unified
+        # diffs resolve this positionally — headers appear only once the
+        # preceding hunk's counts are exhausted — so mirror that here instead
+        # of misreading such lines as headers (which would pollute found_files
+        # with phantom paths and surface bogus "touched_files_not_target"
+        # errors for otherwise-valid diffs).
+        exp_old = exp_new = 0
+        cur_old = cur_new = 0
 
         for line in lines:
             if line.startswith("diff --git"):
@@ -562,7 +614,15 @@ class EnhancedOutputParser:
                     found_files.append(self._norm_rel(m.group(1)))
                 continue
 
-            if line.startswith("---") or line.startswith("+++"):
+            if line.startswith(("---", "+++")):
+                if in_hunk and not (cur_old >= exp_old and cur_new >= exp_new):
+                    # Positionally inside the current hunk → body line
+                    # ("- -- x" / "+ ++ x"), not a file header.
+                    if line.startswith("---"):
+                        cur_old += 1
+                    else:
+                        cur_new += 1
+                    continue
                 in_hunk = False
                 has_file_headers = True
                 parts = line.split(maxsplit=1)
@@ -571,10 +631,14 @@ class EnhancedOutputParser:
                 continue
 
             if line.startswith("@@"):
+                m = self.HUNK_HEADER_RE.match(line)
+                if not m:
+                    return False, f"invalid_hunk_header: {line}"
+                exp_old = int(m.group(2) or 1)
+                exp_new = int(m.group(4) or 1)
+                cur_old = cur_new = 0
                 in_hunk = True
                 has_hunks = True
-                if not self.HUNK_HEADER_RE.match(line):
-                    return False, f"invalid_hunk_header: {line}"
                 continue
 
             # inside hunk: enforce per-line prefixes
@@ -582,9 +646,19 @@ class EnhancedOutputParser:
                 if line == "":
                     # empty line should still have a prefix in real diff;
                     # tolerate here (extract_diff() normalizes), but still accept.
+                    cur_old += 1
+                    cur_new += 1
                     continue
                 if line[:1] not in {" ", "+", "-", "\\"}:
                     return False, f"invalid_hunk_line_prefix: {line}"
+                if line[:1] == " ":
+                    cur_old += 1
+                    cur_new += 1
+                elif line[:1] == "-":
+                    cur_old += 1
+                elif line[:1] == "+":
+                    cur_new += 1
+                # "\\ No newline at end of file" counts as neither.
 
         if not has_hunks:
             return False, "missing_hunks"
@@ -630,8 +704,8 @@ class EnhancedOutputParser:
         out: list[dict[str, str]] = []
         text = str(llm_output or "").replace("\r\n", "\n")
 
-        logger.debug(f"parse_file_blocks input length: {len(text)}")
-        logger.debug(f"parse_file_blocks first 1000 chars: {text[:1000]}")
+        logger.debug("parse_file_blocks input length: %s", len(text))
+        logger.debug("parse_file_blocks first 1000 chars: %s", text[:1000])
 
         for m in self.FILE_BLOCK_RE.finditer(text):
             path = (m.group("path") or "").strip().strip('"').strip("'")
@@ -642,11 +716,11 @@ class EnhancedOutputParser:
                 code = ""
             code = str(code).replace("\r\n", "\n").rstrip("\n") + "\n"
 
-            logger.debug(f"Found FILE block: path='{path}', code length={len(code)}")
+            logger.debug("Found FILE block: path='%s', code length=%s", path, len(code))
             if path:
                 out.append({"path": path, "text": code, "content": code})
 
-        logger.debug(f"parse_file_blocks returning {len(out)} blocks")
+        logger.debug("parse_file_blocks returning %s blocks", len(out))
         return out
 
 
@@ -713,9 +787,7 @@ def parse_tool_args(raw: Any) -> dict[str, Any]:
         r = s.rfind("}")
         if left != -1 and r != -1 and r > left:
             mid = s[left : r + 1]
-            try:
+            with suppress(_json.JSONDecodeError):
                 obj2 = _json.loads(mid)
                 return obj2 if isinstance(obj2, dict) else {"__raw_arguments": s}
-            except _json.JSONDecodeError:
-                pass
         return {"__raw_arguments": s}

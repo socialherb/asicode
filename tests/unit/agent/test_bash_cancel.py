@@ -218,6 +218,7 @@ def test_no_orphans_remain_after_cancel(cancel_reg):
     time.sleep(1)
     survivors = subprocess.run(
         ["pgrep", "-f", marker], capture_output=True, text=True,
+        check=False,
     ).stdout.split()
     # pgrep matches its own invocation shell in some environments; allow none.
     assert not survivors, f"orphaned processes after cancel: {survivors}"

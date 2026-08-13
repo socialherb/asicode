@@ -109,10 +109,28 @@ def _norm_op_type(op_type_raw: str) -> str:
     return aliases.get(s, s)
 
 
+# P24-2: plan compile reads target files in full (current-content diff +
+# content-normalization gates) and pushes the resulting unified diff toward
+# the LLM prompt. Mirror patch_engine._MAX_FILE_CHARS so an oversized target
+# fails loudly (PlanCompileError) instead of unboundedly inflating memory
+# and the prompt.
+_PLAN_READ_MAX_BYTES = 250_000
+
+
 def _read_text_if_exists(abs_path: Path) -> Optional[str]:
     try:
         if abs_path.exists():
+            if abs_path.stat().st_size > _PLAN_READ_MAX_BYTES:
+                raise PlanCompileError(
+                    "file_too_large",
+                    details={
+                        "path": str(abs_path),
+                        "max_bytes": _PLAN_READ_MAX_BYTES,
+                    },
+                )
             return abs_path.read_text(encoding="utf-8")
+    except PlanCompileError:
+        raise
     except Exception as e:
         raise PlanCompileError(
             "failed to read file",
@@ -238,10 +256,10 @@ def _normalize_str_content(s: str, *, path: str, recover_encoding: bool = True) 
     ):
         try:
             decoded = json.loads(s)
-            if isinstance(decoded, str):
-                s = decoded
-        except Exception:
-            pass
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, str):
+            s = decoded
 
     # Literal backslash-n / backslash-t unescape when no real newline present.
     if "\n" not in s and "\\n" in s:
@@ -363,37 +381,47 @@ def _unified_diff_for_file(rel_path: str, old: Optional[str], new: str) -> str:
     return header + diff_body
 
 
+def _lno_prefix_colon_idx(s: str) -> int:
+    """Return the colon index of a line-number prefix like '28: ' / '28:\t', else -1.
+
+    Single source of truth for prefix detection — shared by _has_lno_prefix and
+    _strip_lno_prefix so the lstrip/find/isdigit logic is not reimplemented.
+    """
+    colon_idx = s.find(":")
+    return colon_idx if colon_idx > 0 and s[:colon_idx].isdigit() else -1
+
+
 def _has_lno_prefix(line: str) -> bool:
     """Check if line has a line-number prefix like '  28: ' or '28:\t'."""
-    s = line.lstrip()
-    colon_idx = s.find(":")
-    return colon_idx > 0 and s[:colon_idx].isdigit()
+    return _lno_prefix_colon_idx(line.lstrip()) >= 0
 
 
-def _strip_lno_prefix(line: str) -> str:
-    """Strip prefix: leading ws + digits + colon + optional tab + optional space."""
+def _strip_lno_prefix(line: str, *, allow_space: bool = True) -> str:
+    """Strip prefix: leading ws + digits + colon + optional tab + optional space.
+
+    ``allow_space=False`` (used by the insert_after_line path) keeps a single
+    space after the colon so payload indentation that is not part of the
+    prefix survives verbatim.
+    """
     s = line.lstrip()
-    colon_idx = s.find(":")
-    if colon_idx <= 0 or not s[:colon_idx].isdigit():
+    colon_idx = _lno_prefix_colon_idx(s)
+    if colon_idx < 0:
         return line
     start = colon_idx + 1
     if start < len(s) and s[start] == "\t":
         start += 1
-    if start < len(s) and s[start] == " ":
+    if allow_space and start < len(s) and s[start] == " ":
         start += 1
     return s[start:]
 
 
 def _strip_lno_prefix_no_space(line: str) -> str:
-    """Strip prefix: leading ws + digits + colon + optional tab only (no space)."""
-    s = line.lstrip()
-    colon_idx = s.find(":")
-    if colon_idx <= 0 or not s[:colon_idx].isdigit():
-        return line
-    start = colon_idx + 1
-    if start < len(s) and s[start] == "\t":
-        start += 1
-    return s[start:]
+    """Strip prefix: leading ws + digits + colon + optional tab only (no space).
+
+    Thin wrapper kept for the insert_after_line caller (and the docstring
+    reference in _normalize_insert_lines_payload).
+    """
+    return _strip_lno_prefix(line, allow_space=False)
 
 
 def _strip_lno_prefixes(text: str) -> str:
@@ -441,8 +469,7 @@ def _normalize_decorative(s: str) -> str:
     """
     s = unicodedata.normalize("NFC", s)
     s = s.translate(_DECORATIVE_TRANSLATION)
-    s = _DECORATIVE_RUN_RE.sub(r"\1", s)
-    return s
+    return _DECORATIVE_RUN_RE.sub(r"\1", s)
 
 
 def _restore_decorative_lines(after: str, actual_before: str) -> str:
@@ -496,7 +523,7 @@ def _apply_edit_blocks(
             )
 
         count = out.count(before)
-        if expect_unique and count != 1 and count != 0:
+        if expect_unique and count not in {1, 0}:
             # Collect line numbers of every match so the LLM can see exactly
             # which locations are ambiguous and add more surrounding context.
             out_lines = out.split("\n")
@@ -623,7 +650,11 @@ def _apply_edit_blocks(
             blen = max(1, len(before_lines))
             for si in range(max(0, len(out_lines) - blen + 1)):
                 segment = "\n".join(out_lines[si : si + blen])
-                ratio = difflib.SequenceMatcher(None, before_sample, segment[:300]).ratio()
+                # autojunk=False (P23-2): char-level autojunk treats any char
+                # appearing in >1% of the window ('\n', ' ', '=') as junk and
+                # collapses ratio() for multi-line blocks — the same failure
+                # class as P22-1's rewrite valve.
+                ratio = difflib.SequenceMatcher(None, before_sample, segment[:300], autojunk=False).ratio()
                 if ratio > best_ratio:
                     best_ratio = ratio
                     best_start = si
@@ -679,10 +710,7 @@ def _find_anchor_line_index(lines: list[str], anchor: str, expect_unique: bool, 
             )
 
         # Build error message with suggestions
-        if anchor_preview:
-            error_msg = f"anchor not found: '{anchor_preview}'"
-        else:
-            error_msg = "anchor not found (empty anchor)"
+        error_msg = f"anchor not found: '{anchor_preview}'" if anchor_preview else "anchor not found (empty anchor)"
 
         if similar_lines:
             suggestions = ', '.join(f"'{line[:60]}{'...' if len(line) > 60 else ''}'" for line in similar_lines[:2])
@@ -729,9 +757,8 @@ def _normalize_insert_lines(insert_lines: list[str]) -> list[str]:
         ensure_trailing_newline(ln).splitlines(keepends=True)[0] if "\n" not in ln else ln
         for ln in insert_lines
     ]
-    ins = [ln if ln.endswith("\n") else (ln + "\n") for ln in ins]
+    return [ln if ln.endswith("\n") else (ln + "\n") for ln in ins]
 
-    return ins
 
 
 def _apply_insert_after(
@@ -806,7 +833,7 @@ def compile_plan_to_unified_diff(
                 "kind": kind,
                 "expected": "ASICODE_PLAN_V1",
                 "available_ops": _SUPPORTED_OPS,
-                "available_keys": sorted(list(plan.keys())),
+                "available_keys": sorted(plan.keys()),
             },
         )
 
@@ -818,7 +845,7 @@ def compile_plan_to_unified_diff(
     if not isinstance(ops, list) or not ops:
         raise PlanCompileError(
             "ops must be a non-empty list",
-            details={"kind": kind, "available_keys": sorted(list(plan.keys()))},
+            details={"kind": kind, "available_keys": sorted(plan.keys())},
         )
 
     repo_root_p = Path(str(repo_root))
@@ -843,7 +870,7 @@ def compile_plan_to_unified_diff(
                     "op_type_raw": op_type_raw,
                     "op_type": op_type,
                     "supported": _SUPPORTED_OPS,
-                    "available_keys": sorted(list(op.keys())),
+                    "available_keys": sorted(op.keys()),
                 },
             )
 
@@ -851,10 +878,7 @@ def compile_plan_to_unified_diff(
         abs_path = resolve_inside_repo(repo_root_p, rel)
 
         # Load current staged base: staged -> repo file -> empty (for create/replace)
-        if rel in staged:
-            cur_text = staged[rel]
-        else:
-            cur_text = _read_text_if_exists(abs_path) or ""
+        cur_text = staged[rel] if rel in staged else _read_text_if_exists(abs_path) or ""
 
         if op_type == "create_file":
             if abs_path.exists():
@@ -901,7 +925,7 @@ def compile_plan_to_unified_diff(
                             "ratio": round(ratio, 3),
                         },
                     )
-                elif ratio < 0.30:
+                if ratio < 0.30:
                     warnings.append(
                         f"replace_file '{rel}': new content is {ratio:.0%} of original "
                         f"({len(new_content)} vs {len(old_for_check)} chars). "
@@ -919,7 +943,7 @@ def compile_plan_to_unified_diff(
             if not isinstance(edits, list) or not edits:
                 raise PlanCompileError(
                     "edit_blocks.edits must be a non-empty list",
-                    details={"op_index": idx, "path": rel, "available_keys": sorted(list(op.keys()))},
+                    details={"op_index": idx, "path": rel, "available_keys": sorted(op.keys())},
                 )
             expect_unique = bool(op.get("expect_unique", True))
             staged[rel] = _apply_edit_blocks(text=cur_text, edits=edits, expect_unique=expect_unique, path=rel)
@@ -930,11 +954,11 @@ def compile_plan_to_unified_diff(
             line_no = op.get("line")
             try:
                 line_no = int(line_no)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as e:
                 raise PlanCompileError(
                     "insert_after_line: 'line' must be an integer (1-based line number)",
                     details={"op_index": idx, "path": rel},
-                )
+                ) from e
             # Normalize the payload (handles list, literal \n, double-encoded quotes)
             # via the same path as create_file/replace_file. 'lines' is the canonical
             # key, but 'content' is accepted as a fallback.

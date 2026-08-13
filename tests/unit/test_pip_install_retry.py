@@ -11,6 +11,7 @@ Covers two classes of bug the ``/claude`` one-shot SDK install surfaced:
 """
 
 import io
+import subprocess
 
 import asi
 
@@ -101,3 +102,40 @@ class TestInvalidateCachesOnSuccess:
 
         assert asi._pip_install(["some-pkg"]) is False
         assert invalidated == []
+
+
+class TestTimeoutSurfacesPartialOutput:
+    def test_timeout_shows_captured_tail(self, monkeypatch):
+        """A timed-out install must surface the output captured so far, so a
+        stalled download is diagnosable (where did it stop?)."""
+
+        def fake_run(cmd, **kw):
+            raise subprocess.TimeoutExpired(
+                cmd,
+                timeout=kw.get("timeout", 1),
+                output="Collecting torch\nDownloading torch.whl\nStill fetching…",
+            )
+
+        monkeypatch.setattr(asi.subprocess, "run", fake_run)
+        _force_non_tty(monkeypatch)
+        recorded = []
+        monkeypatch.setattr(asi, "_print", lambda *a, **k: recorded.append(a[0]))
+
+        assert asi._pip_install(["torch"], timeout=1) is False
+        assert any("timed out after 1s" in p for p in recorded)
+        # the last lines of pip's partial output are shown under the error
+        assert any("Still fetching…" in p for p in recorded), recorded
+
+    def test_timeout_without_partial_output_is_quiet(self, monkeypatch):
+        def fake_run(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, timeout=kw.get("timeout", 1))
+
+        monkeypatch.setattr(asi.subprocess, "run", fake_run)
+        _force_non_tty(monkeypatch)
+        recorded = []
+        monkeypatch.setattr(asi, "_print", lambda *a, **k: recorded.append(a[0]))
+
+        assert asi._pip_install(["torch"], timeout=1) is False
+        assert any("timed out after 1s" in p for p in recorded)
+        # no partial output → no tail lines
+        assert not any(p.startswith("    ") for p in recorded), recorded

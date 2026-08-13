@@ -1,5 +1,5 @@
 from .base import SyntaxProvider
-from .capabilities import AnalysisCapability, filter_by_capability
+from .capabilities import AnalysisCapability
 from .models import (
     LanguageCapabilities,
     LanguageId,
@@ -20,5 +20,4 @@ __all__ = [
     "SyntaxProvider",
     "SyntaxValidationResult",
     "SyntaxValidator",
-    "filter_by_capability",
 ]

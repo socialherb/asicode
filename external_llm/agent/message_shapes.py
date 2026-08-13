@@ -61,16 +61,21 @@ def _is_gemini_tool_call(m) -> bool:
     return _has_raw_key(m, "assistant", "functionCall")
 
 
-def _has_raw_blocks(m, role: str, block_type: str) -> bool:
-    """True if *m* has ``role`` == *role* and at least one
-    ``{"type": block_type, ...}`` dict in ``raw_content``."""
+def _has_raw_content(m, role: str, predicate) -> bool:
+    """True if *m* has ``role`` == *role* and at least one dict in
+    ``raw_content`` matches *predicate*."""
     if getattr(m, "role", "") != role:
         return False
     raw = getattr(m, "raw_content", None)
     return isinstance(raw, list) and any(
-        isinstance(b, dict) and b.get("type") == block_type
-        for b in raw
+        isinstance(b, dict) and predicate(b) for b in raw
     )
+
+
+def _has_raw_blocks(m, role: str, block_type: str) -> bool:
+    """True if *m* has ``role`` == *role* and at least one
+    ``{"type": block_type, ...}`` dict in ``raw_content``."""
+    return _has_raw_content(m, role, lambda b: b.get("type") == block_type)
 
 
 def _has_raw_key(m, role: str, key: str) -> bool:
@@ -81,9 +86,4 @@ def _has_raw_key(m, role: str, key: str) -> bool:
     unlike Anthropic blocks — are keyed by name rather than by a ``"type"``
     field, so :func:`_has_raw_blocks` cannot match them.
     """
-    if getattr(m, "role", "") != role:
-        return False
-    raw = getattr(m, "raw_content", None)
-    return isinstance(raw, list) and any(
-        isinstance(b, dict) and key in b for b in raw
-    )
+    return _has_raw_content(m, role, lambda b: key in b)

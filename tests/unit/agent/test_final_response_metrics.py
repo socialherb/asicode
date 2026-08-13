@@ -30,7 +30,6 @@ from external_llm.client import (
     ToolCallResponse,
 )
 
-
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 _MAX_TOOL_ITERS = 1  # minimum — tool loop runs once, then final response
@@ -61,8 +60,7 @@ def _make_loop(client, repo_root: str) -> DesignChatLoop:
     """Build a DesignChatLoop with a stub client and minimal config."""
     config = AgentConfig(model_name="test-model")
     registry = ToolRegistry(repo_root, config, [])
-    loop = DesignChatLoop(client, registry, config.model_name)
-    return loop
+    return DesignChatLoop(client, registry, config.model_name)
 
 
 def _respond(loop: DesignChatLoop):

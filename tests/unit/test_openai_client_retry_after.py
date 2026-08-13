@@ -6,15 +6,21 @@ of falling back to fixed backoff.
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from typing import ClassVar
 
 import pytest
 
 import external_llm.openai_client as oc
 from external_llm.client import (
     RETRY_AFTER_MAX_WAIT,
+    LLMCancelled,
     LLMMessage,
     LLMRateLimitError,
     LLMServerUnavailableError,
+    interruptible_sleep,
+    parse_retry_after,
 )
 from external_llm.openai_client import OpenAIClient, _short_error_reason
 
@@ -55,6 +61,23 @@ def test_retry_after_clamped_to_max(monkeypatch):
     assert ei.value.retry_after == RETRY_AFTER_MAX_WAIT
 
 
+# ── LLMRateLimitError constructor clamp (P2-3) ─────────────────────────────
+
+
+def test_retry_after_clamped_at_construction():
+    """A directly-constructed absurd hint (e.g. Retry-After: 3600) must not
+    stall retry loops for an hour — the constructor clamps to the same bound
+    the header parser uses."""
+    assert LLMRateLimitError("x", retry_after=3600).retry_after == RETRY_AFTER_MAX_WAIT
+    assert LLMRateLimitError("x", retry_after=RETRY_AFTER_MAX_WAIT).retry_after == RETRY_AFTER_MAX_WAIT
+    assert LLMRateLimitError("x", retry_after=0).retry_after == 1  # tiny hint still means "wait a moment"
+    assert LLMRateLimitError("x", retry_after=-5).retry_after == 1
+    assert LLMRateLimitError("x", retry_after=5.9).retry_after == 5  # float normalized (truncated)
+    assert LLMRateLimitError("x", retry_after=None).retry_after is None
+    # Non-numeric hints are kept as-is; consumers reject them via isinstance.
+    assert LLMRateLimitError("x", retry_after="later").retry_after == "later"
+
+
 # ── Log/message cleanliness (_short_error_reason) ────────────────────────────
 
 
@@ -80,9 +103,8 @@ def test_short_error_reason_flattens_and_truncates():
 
 def test_transient_retry_logged_at_info_off_the_prompt_and_raise_is_clean(monkeypatch, caplog):
     client = _client(monkeypatch, {})  # no Retry-After -> exercises the plain retry path
-    with caplog.at_level(logging.INFO):
-        with pytest.raises(LLMRateLimitError) as ei:
-            client.chat_with_tools([LLMMessage(role="user", content="hi")], tools=[], model="gpt-4")
+    with caplog.at_level(logging.INFO), pytest.raises(LLMRateLimitError) as ei:
+        client.chat_with_tools([LLMMessage(role="user", content="hi")], tools=[], model="gpt-4")
 
     rate_records = [r for r in caplog.records if "rate limited (429)" in r.getMessage()]
     assert rate_records, "expected at least one retry log record"
@@ -106,7 +128,7 @@ def test_parse_error_code_extracts_glm_error_codes():
 
     class _FakeResponse:
         text: str = ""
-        headers: dict = {}
+        headers: ClassVar[dict] = {}
 
         def __init__(self, text: str) -> None:
             self.text = text
@@ -265,7 +287,7 @@ def test_chat_uses_unified_retry_helper(monkeypatch):
 # The shared 429 handler must detect the balance signal and raise a
 # NON-retryable LLMQuotaExceededError instead.
 
-from external_llm.client import LLMQuotaExceededError  # noqa: E402
+from external_llm.client import LLMQuotaExceededError
 
 _ZAI_BALANCE_BODY = (
     '{"error":{"code":"1113","message":"Insufficient balance or no resource '
@@ -314,3 +336,111 @@ def test_balance_429_via_chat_raises_quota_error(monkeypatch):
     with pytest.raises(LLMQuotaExceededError):
         client.chat([LLMMessage(role="user", content="hi")], model="glm-4.6")
     assert sleeps == []
+
+
+# ── parse_retry_after HTTP-date (zone-less → UTC) ──────────────────────────
+
+
+def test_retry_after_http_date_without_zone_treated_as_utc():
+    """RFC 7231 HTTP-date is GMT, but parsedate_to_datetime returns a NAIVE
+    datetime for a zone-less date; .timestamp() then reads it as LOCAL time —
+    on KST (+9h) a valid 5s wait became wait<=0 and the server's hint was
+    silently dropped. A zone-less GMT date must be pinned to UTC."""
+    import time as _time
+
+    _future = _time.gmtime(_time.time() + 5)
+    _date_str = _time.strftime("%a, %d %b %Y %H:%M:%S", _future)  # no zone → naive
+    wait = parse_retry_after({"Retry-After": _date_str})
+    assert wait is not None
+    assert 1 <= wait <= 60
+
+
+# ── ESC-interruptible backoff (P1-2) ───────────────────────────────────────
+# The client's internal retry sleeps must abort when cancel_event is set, so
+# ESC stays responsive during up-to-36s backoff / 120s Retry-After waits.
+
+
+def test_interruptible_sleep_full_duration_without_cancel():
+    t0 = time.monotonic()
+    assert interruptible_sleep(0.05) is False
+    assert time.monotonic() - t0 >= 0.04
+
+
+def test_interruptible_sleep_already_cancelled_returns_true_immediately():
+    ev = threading.Event()
+    ev.set()
+    t0 = time.monotonic()
+    assert interruptible_sleep(30, ev) is True
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_interruptible_sleep_wakes_early_midwait():
+    ev = threading.Event()
+    threading.Timer(0.05, ev.set).start()
+    t0 = time.monotonic()
+    assert interruptible_sleep(30, ev) is True
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_llmcancelled_when_cancel_during_429_retry_after():
+    """Wall-clock regression: a 30s Retry-After wait must abort within ~1s of
+    the cancel_event firing, not block the whole 30s."""
+    client = OpenAIClient(api_key="test")
+    ev = threading.Event()
+    client.cancel_event = ev
+    threading.Timer(0.1, ev.set).start()
+
+    class _Resp429:
+        status_code = 429
+        text = '{"error":{"message":"overloaded"}}'
+        headers: ClassVar[dict] = {"Retry-After": "30"}
+
+    client._session.post = lambda *a, **k: _Resp429()
+    t0 = time.monotonic()
+    with pytest.raises(LLMCancelled):
+        client.chat_with_tools([LLMMessage(role="user", content="hi")], tools=[], model="gpt-4")
+    assert time.monotonic() - t0 < 2.0  # not 30s
+
+
+def test_llmcancelled_when_cancel_during_backoff():
+    """Same for the exponential-backoff branch (connection error path)."""
+    import requests
+
+    client = OpenAIClient(api_key="test")
+    ev = threading.Event()
+    client.cancel_event = ev
+    threading.Timer(0.1, ev.set).start()
+
+    def _boom(*a, **k):
+        raise requests.ConnectionError("refused")
+
+    client._session.post = _boom
+    t0 = time.monotonic()
+    with pytest.raises(LLMCancelled):
+        client.chat([LLMMessage(role="user", content="hi")], model="gpt-4")
+    assert time.monotonic() - t0 < 2.0  # not 4-6s backoff
+
+
+def test_no_cancel_event_unchanged_behavior(monkeypatch):
+    """Clients without cancel_event keep plain time.sleep semantics (no
+    LLMCancelled can fire) and retries proceed exactly as before."""
+    client = OpenAIClient(api_key="test")
+    assert client.cancel_event is None
+    calls = []
+    monkeypatch.setattr(
+        oc, "interruptible_sleep",
+        lambda d, ce=None: calls.append((d, ce)) or False,
+    )
+
+    class _Resp429:
+        status_code = 429
+        text = '{"error":{"message":"overloaded"}}'
+        headers: ClassVar[dict] = {}
+
+    client._session.post = lambda *a, **k: _Resp429()
+    with pytest.raises(LLMRateLimitError):
+        client.chat([LLMMessage(role="user", content="hi")], model="gpt-4")
+    # Two retries → two backoff sleeps, each with cancel_event=None (plain
+    # sleep path) — and no LLMCancelled at exhaustion.
+    assert len(calls) == 2
+    assert all(ce is None for _, ce in calls)

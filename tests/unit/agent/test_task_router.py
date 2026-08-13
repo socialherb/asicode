@@ -252,7 +252,6 @@ class TestDeterministicClassifier:
         )
         d = clf._build_main_agent_decision(f)
         assert d.lane == Lane.MAIN_AGENT
-        assert d.planning_enabled is False
         assert d.requires_planner is False
 
     # ── extract_features (structural extraction only) ─────────────────
@@ -288,23 +287,6 @@ class TestTaskRouter:
     """Tests for TaskRouter — integration + lane defaults."""
 
     @patch("external_llm.agent.task_router.create_intent_resolver")
-    def test_apply_lane_defaults_planner(self, mock_resolver):
-        mock_resolver.return_value = MagicMock()
-        router = TaskRouter()
-        d = RouteDecision(
-            task_kind=TaskKind.SINGLE_FILE_EDIT,
-            complexity=Complexity.LOW,
-            scope=Scope.SINGLE_FILE,
-            lane=Lane.PLANNER,
-            confidence=0.7,
-            reasoning="test",
-        )
-        d = router._apply_lane_defaults(d)
-        assert d.planning_enabled is True
-        assert d.self_review_enabled is True
-        assert d.rag_enabled is True
-
-    @patch("external_llm.agent.task_router.create_intent_resolver")
     def test_apply_lane_defaults_main_agent(self, mock_resolver):
         mock_resolver.return_value = MagicMock()
         router = TaskRouter()
@@ -317,25 +299,7 @@ class TestTaskRouter:
             reasoning="test",
         )
         d = router._apply_lane_defaults(d)
-        assert d.planning_enabled is False
         assert d.rag_enabled is False
-
-    @patch("external_llm.agent.task_router.create_intent_resolver")
-    def test_apply_lane_defaults_preserves_explicit(self, mock_resolver):
-        """Explicitly set fields should NOT be overwritten by defaults."""
-        mock_resolver.return_value = MagicMock()
-        router = TaskRouter()
-        d = RouteDecision(
-            task_kind=TaskKind.SINGLE_FILE_EDIT,
-            complexity=Complexity.LOW,
-            scope=Scope.SINGLE_FILE,
-            lane=Lane.PLANNER,
-            confidence=0.7,
-            reasoning="test",
-            planning_enabled=False,  # explicitly False
-        )
-        d = router._apply_lane_defaults(d)
-        assert d.planning_enabled is False  # preserved
 
     @patch("external_llm.agent.task_router.create_intent_resolver")
     def test_route_without_llm_client(self, mock_resolver):

@@ -12,6 +12,11 @@ Matching rules:
   - OLLAMA_VISION_KEYWORDS uses substring matching (keyword in name), not exact tags.
   - CLOUD_PROVIDER_PREFIXES and MODEL_ANSWER_MAX_TOKENS are checked in order;
     first match wins — put more specific entries before general ones.
+  - Any table doing an EXACT lookup must reduce the id with bare_model_name()
+    first; a model arrives spelled however its route spells it. Skipping that
+    is what gave context_budget._CONTEXT_LIMITS two different windows for one
+    Claude model depending on whether it was reached natively or via
+    OpenRouter (see tests/unit/test_model_catalog_context_parity.py).
   - num_ctx resolution lives in providers.py (_num_ctx_for_model): priority 0
     reads the model's Modelfile via Ollama /api/show, priority 1 is
     OLLAMA_NUM_CTX_OVERRIDES, priority 2 is a flat 8192 floor (asicode's system
@@ -23,29 +28,35 @@ from __future__ import annotations
 
 from typing import Optional
 
+from external_llm.model_catalog import MODEL_ALIASES
+from external_llm.ollama_api import query_ollama_capabilities
+
 # ── Ollama: Vision-capable models ─────────────────────────────────────────────
 # Keyword substring match — vision capability is identified by name keywords,
 # not exact tags, since vision models have many version/quantization variants.
-# Fast-path detection; runtime API detection is used as a slow-path fallback.
+# Fast-path detection; runtime API detection (/api/show capabilities, cached)
+# is used as a slow-path fallback for names the keywords miss (qwen2.5vl:7b
+# carries no "-vl"/"_vl" separator — plain "vl" covers it, as do pixtral /
+# internvl, which are vision-only model families).
 OLLAMA_VISION_KEYWORDS: tuple[str, ...] = (
     "llava", "bakllava", "moondream", "minicpm-v", "vision", "-vl", "_vl",
+    "vl", "pixtral", "internvl",
 )
 
-# Runtime model capability cache — populated lazily by _check_model_capability_cached.
-_MODEL_CAPABILITY_CACHE: dict[str, dict[str, bool]] = {}
 
-
-def _check_model_capability_cached(model_name: str, capability: str) -> bool:
+def _check_model_capability_cached(model_name: str, capability: str,
+                                   base_url_hint: Optional[str] = None) -> bool:
     """Query model capability with in-memory caching.
 
-    Returns False if the capability is unknown or the Ollama API is unavailable.
-    The cache is populated by :func:`populate_model_capability_cache` which can
-    be called at startup or on-demand.
+    Returns False if the capability is unknown or the Ollama API is
+    unavailable.  Delegates to :func:`external_llm.ollama_api.query_ollama_capabilities`,
+    which owns the TTL/negative caching (5-min positive, 15-s negative) —
+    the slow path is therefore safe to call on every generation.
     """
-    cache_key = model_name.lower()
-    if cache_key in _MODEL_CAPABILITY_CACHE:
-        return _MODEL_CAPABILITY_CACHE[cache_key].get(capability, False)
-    return False
+    caps = query_ollama_capabilities(model_name, base_url_hint)
+    if caps is None:
+        return False
+    return capability in caps
 
 
 # ── Ollama: Explicit num_ctx overrides ────────────────────────────────────────
@@ -65,7 +76,7 @@ OLLAMA_NUM_CTX_OVERRIDES: dict[str, int] = {}
 
 # ── Cloud models: answer generation max_tokens ────────────────────────────────
 # NOTE: max_tokens was previously managed by MODEL_ANSWER_MAX_TOKENS (removed).
-# See anthropic_client.py (ANTHROPIC_DEFAULT=65536) for the Anthropic fallback.
+# Anthropic max_tokens fallback SSOT: agent/config/thresholds.py (ANTHROPIC_DEFAULT).
 # For non-Anthropic providers, max_tokens=None → API uses model's own default.
 
 # ── Cloud provider detection from model name ──────────────────────────────────
@@ -83,9 +94,15 @@ CLOUD_PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
     ("openrouter/", "openrouter"),
     ("claude",    "anthropic"),
     ("gpt-",      "openai"),
-    ("o1-",       "openai"),
-    ("o3-",       "openai"),
-    ("o4-",       "openai"),
+    # No trailing hyphen: OpenAI ships the bare reasoning-model ids alongside
+    # their sized variants, and ``KNOWN_MODELS["openai"]`` offers ``o3``. With
+    # ``"o3-"`` here that id matched nothing, and the one live caller
+    # (webapp/routes/agent_stream.py) reads a None as "not a cloud model" and
+    # falls back to ``"deepseek"`` — so asking for o3 dispatched to DeepSeek.
+    # ``o3-mini``/``o4-mini`` still match, being prefixed by the bare id.
+    ("o1",        "openai"),
+    ("o3",        "openai"),
+    ("o4",        "openai"),
     ("gemini",    "google"),
     ("deepseek",  "deepseek"),
     ("glm-",      "zai"),
@@ -142,20 +159,36 @@ def _norm(model: str) -> str:
     return name
 
 
-def ollama_vision(model: str) -> bool:
+def ollama_vision(model: str, base_url_hint: Optional[str] = None) -> bool:
     """Return True if this Ollama model supports image/vision input.
 
     Detection strategy (two-tier):
     1. Fast path — keyword substring match against OLLAMA_VISION_KEYWORDS.
-    2. Slow path — check runtime capability cache (populated externally via
-       :func:`populate_model_capability_cache` or ``ollama show``).
+    2. Slow path — runtime capability query via Ollama ``/api/show``
+       (cached 5 min, negative-cached 15 s; ``base_url_hint`` matches the
+       num_ctx query so a non-default Ollama server is consulted).
     """
     m = _norm(model)
     # Fast path: keyword detection
     if any(kw in m for kw in OLLAMA_VISION_KEYWORDS):
         return True
     # Slow path: runtime capability cache
-    return _check_model_capability_cached(m, "vision")
+    return _check_model_capability_cached(m, "vision", base_url_hint)
+
+
+def ollama_supports_tools(model: str, base_url_hint: Optional[str] = None) -> Optional[bool]:
+    """Return whether this Ollama model supports native tool calling.
+
+    True/False when the server reported the ``tools`` capability (via the
+    same cached ``/api/show`` query as :func:`ollama_vision`); None when the
+    capability is unknown (server unreachable, non-tag name, older Ollama) —
+    callers should treat None as "assume supported" (status quo).
+    """
+    m = _norm(model)
+    caps = query_ollama_capabilities(m, base_url_hint)
+    if caps is None:
+        return None
+    return "tools" in caps
 
 
 def get_ollama_num_ctx(model: str) -> Optional[int]:
@@ -179,7 +212,27 @@ def detect_cloud_provider(model: str) -> Optional[str]:
     return None
 
 
+def bare_model_name(model: str) -> str:
+    """Reduce any spelling of a model id to the bare ``model_catalog`` id.
+
+    A model reaches a lookup table in whatever spelling its route uses:
+    ``openrouter/anthropic/claude-sonnet-5``, ``anthropic:claude-opus-5``, a
+    deprecated alias, or the bare id.  Every table in this repo that does an
+    *exact* lookup has to normalise first, and until now only
+    ``text_only_model`` did (with a local ``_norm(...).split("/")[-1]``).
+    ``context_budget._CONTEXT_LIMITS`` did not, so the same Claude model
+    resolved to 200K natively and to the 1M fallback through OpenRouter — one
+    model, two context windows, depending on which route asked.  Hoisted here
+    so both tables share the one normaliser rather than growing a second copy.
+
+    Ollama tags (``gemma4:e2b``) carry no ``/`` and are returned unchanged.
+    """
+    bare = _norm(model).split("/")[-1]
+    # Alias last: MODEL_ALIASES is keyed on bare ids, so it can only match once
+    # the routing/vendor prefixes are gone.
+    return MODEL_ALIASES.get(bare, bare)
+
+
 def text_only_model(model: str) -> bool:
     """True if this cloud model is known to reject image (vision) input."""
-    bare = _norm(model).split("/")[-1]
-    return bare.startswith(TEXT_ONLY_MODEL_PREFIXES)
+    return bare_model_name(model).startswith(TEXT_ONLY_MODEL_PREFIXES)

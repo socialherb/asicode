@@ -1,11 +1,9 @@
 """
 CollaborationOrchestrator — manages the asicode ↔ Claude Code Agent collaboration flow.
 
-Phases:
+Flow (single-shot — run() executes exactly one analysis session, no iteration/review loop):
   1. asicode Preprocessing: digest generation (cheap engine)
   2. Claude Code Agent Analysis: receives digest, uses asicode MCP tools
-  3. asicode Execution: optionally executes the plan from Claude
-  4. Review Loop: Claude reviews asicode's execution (configurable)
 """
 from __future__ import annotations
 
@@ -16,14 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
 
-# Strip Claude Code SDK internal XML tool call tags (used in format_verdict_for_session etc.)
-# SDK internal tool tags (<invoke>, <parameter>) + structured verdict XML (<confidence>, <suggestions>, <plan>, <status>)
-# ※ <details>/<summary> are standard HTML5 tags, excluded from stripping
-_STRIP_XML_RE = re.compile(
-    r'</?(?:invoke|parameter|confidence|suggestions|plan|status)[^>]*>'
-)
-
-from config import CLAUDE_SDK_MAX_TURNS
+from config import CLAUDE_SDK_MAX_TURNS, CLAUDE_SESSION_TIMEOUT
 
 from .asi_mcp_adapter import (
     build_asr_mcp_server,
@@ -32,6 +23,13 @@ from .asi_mcp_adapter import (
     get_restricted_options,
 )
 from .claude_session import ClaudeSession, SessionEvent, SessionResult
+
+# Strip Claude Code SDK internal XML tool call tags (used in format_verdict_for_session etc.)
+# SDK internal tool tags (<invoke>, <parameter>) + structured verdict XML (<confidence>, <suggestions>, <plan>, <status>)
+# ※ <details>/<summary> are standard HTML5 tags, excluded from stripping
+_STRIP_XML_RE = re.compile(
+    r'</?(?:invoke|parameter|confidence|suggestions|plan|status)[^>]*>'
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +42,8 @@ DEFAULT_COLLAB_MODEL = "sonnet"
 @dataclass
 class CollaborationOrchestratorConfig:
     """Configuration for CollaborationOrchestrator."""
-    max_iterations: int = 1  # analysis-only by default
+    # Max turns for the single analysis session (single-shot — no iteration loop,
+    # kept as legacy name "per_iteration" for CLI arg compatibility).
     max_turns_per_iteration: int = CLAUDE_SDK_MAX_TURNS
     permission_mode: str = "bypassPermissions"
     system_prompt: Optional[str] = None
@@ -57,6 +56,9 @@ class CollaborationOrchestratorConfig:
     include_scanner_results: bool = False
     # False (default) = analysis mode: bash/apply_patch/edit_* etc. destructive tools hidden
     allow_write_tools: bool = False
+    # Overall session timeout (seconds); None = config default (CLAUDE_SESSION_TIMEOUT).
+    # On expiry ClaudeSession interrupts the agent and returns a failure verdict.
+    query_timeout: Optional[float] = CLAUDE_SESSION_TIMEOUT or None
     event_callback: Optional[Callable[[SessionEvent], None]] = None
     repo_root: str = "."
 
@@ -140,6 +142,7 @@ class CollaborationOrchestrator:
             options=self._sdk_options,
             event_callback=self._config.event_callback,
             include_partial=True,
+            query_timeout=self._config.query_timeout,
         )
         return self._session
 

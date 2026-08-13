@@ -9,6 +9,8 @@ indent at the edit site (``matched_indent`` / ``symbol_def_indent``), mirroring
 the gutter — so the LLM can self-verify it matched the file's depth without a
 read_file round-trip.
 """
+from pathlib import Path
+
 import pytest
 
 from external_llm.agent.symbol_search import SymbolDef
@@ -16,14 +18,29 @@ from external_llm.agent.tool_handlers.read_tools import (
     _INDENT_GUTTER_BAR,
     ReadToolsMixin,
     _format_numbered_line,
-    _split_source_lines,
 )
 from external_llm.agent.tool_handlers.write_tools import (
     WriteToolsMixin,
     _leading_indent_width,
 )
 from external_llm.agent.tool_registry import ToolResult
-from pathlib import Path
+
+
+def _split_source_lines(src: str) -> list[str]:
+    """\n-only split mirror of the read_tools helper removed in P25-1.
+
+    The windowed reader that replaced it (_read_symbol_window) implements the
+    same ast-aligned model internally; this local copy pins the exact contract
+    the indent gutter and ast.lineno alignment depend on: split on \n only
+    (never splitlines() — \f/\x85/\u2028 are NOT line breaks to ast), and drop
+    the trailing empty element a final newline produces.
+    """
+    if not src:
+        return []
+    parts = src.split("\n")
+    if parts[-1] == "":
+        parts.pop()
+    return parts
 
 
 class _Harness(WriteToolsMixin):
@@ -313,8 +330,8 @@ class TestReadSymbolIndentGutter:
         # Regression: str.splitlines() counts \f (form-feed) as a line break,
         # but ast.lineno counts \n only. A form-feed-only line above a def
         # made read_symbol index a splitlines() array with an ast lineno,
-        # slicing/displaying the WRONG lines. Now aligned to \n via
-        # _split_source_lines (sym.line comes from ast, so the array must
+        # slicing/displaying the WRONG lines. Now aligned to \n via the
+        # \n-only splitter (sym.line comes from ast, so the array must
         # use the same \n-only model).
         src = "# header\n\x0c\n\ndef bar():\n    return 1\n"
         harness = self._build(tmp_path, src, sym_line=4, sym_end=5)

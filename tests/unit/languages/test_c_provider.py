@@ -22,7 +22,13 @@ from external_llm.languages.base import (
     _filter_genuine_syntax_errors,
     _is_resolution_error,
 )
-from external_llm.languages.c_provider import CppSyntaxProvider, CSyntaxProvider
+from external_llm.languages.c_provider import (
+    CppSyntaxProvider,
+    CSyntaxProvider,
+    _keep_only_target_diagnostics,
+    _match_compile_commands_entry,
+    _same_path,
+)
 from external_llm.languages.models import LanguageId, SyntaxError_
 
 
@@ -514,3 +520,89 @@ class TestCompilerResolutionCache:
             cpp_res = p._resolve_compilers(_CPP_COMPILERS)
         assert c_res == "gcc"
         assert cpp_res == "g++"
+    # ── Path normalization: same-basename sibling safety ─────────────────────────
+    # Regression: the sibling-TU diagnostic filter and the compile_commands.json
+    # matcher compared basenames. (1) a sibling TU with the SAME basename in another
+    # directory could leak errors into / steal flags from the target; (2) equivalent
+    # spellings of one file (``util.c`` vs ``./util.c`` vs the absolute path) were
+    # dropped or missed. All comparisons now go through normalized absolute paths.
+
+    class TestSamePath:
+        def test_absolute_and_relative_spellings_agree(self):
+            assert _same_path("/a/b/util.c", "/x", "/a/b/util.c")
+            assert _same_path("util.c", "/a/b", "/a/b/util.c")
+            assert _same_path("./util.c", "/a/b", "/a/b/util.c")
+            assert _same_path("../b/util.c", "/a/c", "/a/b/util.c")
+
+        def test_same_basename_different_dir_is_not_equal(self):
+            assert not _same_path("util.c", "/a/z", "/a/b/util.c")
+
+        def test_empty_paths_never_match(self):
+            assert not _same_path("", "/a", "/a/b/util.c")
+            assert not _same_path("util.c", "/a/b", "")
+
+
+    class TestKeepOnlyTargetDiagnostics:
+        @staticmethod
+        def _err(file, message):
+            return SyntaxError_(file=file, line=1, col=1, message=message, severity="error")
+
+        def test_same_basename_sibling_diagnostic_is_dropped(self):
+            target = "/proj/src/util.c"
+            errors = [
+                self._err("/proj/src/util.c", "real"),
+                self._err("/proj/other/util.c", "sibling"),
+                self._err("/proj/src/util.c:1:1", "malformed-noise"),
+            ]
+            kept = _keep_only_target_diagnostics(errors, target, "/proj/src")
+            assert [e.message for e in kept] == ["real"]
+
+        def test_equivalent_spellings_all_kept(self):
+            target = "/proj/src/util.c"
+            errors = [self._err("util.c", "a"), self._err("./util.c", "b")]
+            kept = _keep_only_target_diagnostics(errors, target, "/proj/src")
+            assert len(kept) == 2
+
+
+    class TestMatchCompileCommandsEntry:
+        def test_exact_path_wins_over_same_basename(self):
+            entries = [
+                {"file": "/proj/other/util.c", "directory": "/proj/other", "arguments": ["-I/other"]},
+                {"file": "/proj/src/util.c", "directory": "/proj/src", "arguments": ["-I/src"]},
+            ]
+            entry = _match_compile_commands_entry(entries, "/proj/src/util.c")
+            assert entry["arguments"] == ["-I/src"]
+
+        def test_relative_file_resolved_against_directory(self):
+            entries = [{"file": "src/util.c", "directory": "/proj", "arguments": ["-I/proj"]}]
+            assert _match_compile_commands_entry(entries, "/proj/src/util.c") is not None
+
+        def test_basename_fallback_when_spelling_differs(self):
+            entries = [{"file": "build//util.c", "directory": "", "arguments": ["-I/fallback"]}]
+            entry = _match_compile_commands_entry(entries, "/proj/src/util.c")
+            assert entry["arguments"] == ["-I/fallback"]
+
+        def test_no_match_returns_none(self):
+            entries = [{"file": "/a/other.c", "directory": "/a", "arguments": []}]
+            assert _match_compile_commands_entry(entries, "/proj/src/util.c") is None
+
+
+    class TestSemanticsSiblingFiltering:
+        def test_sibling_same_basename_error_does_not_fail_target(self, tmp_path):
+            """A same-basename sibling TU error must not roll back the target file."""
+            f = tmp_path / "util.c"
+            f.write_text("int main(void) { return 0; }\n")
+            p = CSyntaxProvider()
+
+            def _run(cmd, **kwargs):
+                return _fake_proc(1, (
+                    "other/util.c:4:5: error: use of undeclared identifier 'x'\n"
+                    "util.c:2:7: error: expected ';' after expression\n"
+                ))
+
+            with patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/gcc"), \
+                 patch("external_llm.languages.c_provider.subprocess.run", side_effect=_run):
+                r = p.validate_semantics(str(f))
+            assert r.ok is False
+            assert len(r.errors) == 1
+            assert "expected ';'" in r.errors[0].message

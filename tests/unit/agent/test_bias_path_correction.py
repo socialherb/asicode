@@ -85,6 +85,38 @@ def test_bare_rewrite_and_quoted_protect_in_same_command(bias):
     assert 'grep "/workspace/myproj"' in out
 
 
+# ── pass 2: repo-basename correction fires on ABSOLUTE tokens only ───────────
+# Training-data bias paths are virtual roots, always spelled absolute
+# (/home/ubuntu/myproj, ~/myproj, /myproj). A RELATIVE token that merely ends
+# with the repo basename is real data — live incident 2026-08-02: a branch
+# literally named `rename/asicode` had `git rev-parse rename/asicode` rewritten
+# to `git rev-parse <repo_root>`, which resolves to nothing and reads as ref
+# corruption.
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git rev-parse rename/myproj",
+        "git symbolic-ref HEAD refs/heads/rename/myproj",
+        "git log feature/myproj --oneline",
+    ],
+)
+def test_relative_token_ending_in_basename_is_not_rewritten(bias, cmd):
+    assert bias(cmd) == cmd
+
+
+@pytest.mark.parametrize(
+    "cmd,expected",
+    [
+        ("cat /home/ubuntu/myproj/tests/x.py", f"cat {REPO_ROOT}/tests/x.py"),
+        ("ls ~/myproj/src", f"ls {REPO_ROOT}/src"),
+        ("cat /myproj/tests/x.py", f"cat {REPO_ROOT}/tests/x.py"),
+    ],
+)
+def test_absolute_embedded_basename_is_still_rewritten(bias, cmd, expected):
+    assert bias(cmd) == expected
+
+
 # ── idempotency ──────────────────────────────────────────────────────────────
 
 def test_real_repo_path_is_idempotent(bias):
@@ -94,3 +126,67 @@ def test_real_repo_path_is_idempotent(bias):
 
 def test_empty_input(bias):
     assert bias("") == ""
+
+
+# ── pass 1/2: REAL existing paths are NEVER rewritten ─────────────────────────
+# The pass-2 prefix regex matches ANY absolute path ending in the repo
+# basename — including real user paths like /tmp/<basename> (live bug: `ls
+# /tmp/asicode/files` was rewritten to `ls <repo_root>/files`, reading the
+# wrong file). A matched path that actually EXISTS on disk is real user data,
+# not a training-data bias path, and must be left untouched; only nonexistent
+# (virtual) paths are corrected.
+
+def test_real_existing_dir_not_rewritten(bias, tmp_path):
+    real_dir = tmp_path / "myproj"
+    real_dir.mkdir()
+    cmd = f"ls {real_dir}/tests/x.py"
+    assert bias(cmd) == cmd
+
+
+def test_real_existing_dir_with_cd_not_rewritten(bias, tmp_path):
+    real_dir = tmp_path / "myproj"
+    real_dir.mkdir()
+    cmd = f"cd {real_dir} && pwd"
+    assert bias(cmd) == cmd
+
+
+def test_real_existing_workspace_dir_not_rewritten(bias, monkeypatch):
+    # /workspace as a REAL existing directory (e.g. inside a container) is a
+    # real path — pass 1 must not redirect it into the repo either.
+    import os as _os
+
+    _real_exists = _os.path.exists
+
+    def _fake_exists(path):
+        return str(path) == "/workspace" or _real_exists(path)
+
+    monkeypatch.setattr(_os.path, "exists", _fake_exists)
+    cmd = "cat /workspace/config.yaml"
+    assert bias(cmd) == cmd
+
+
+# ── pass 2: scratch/temp destinations are NEVER rewritten ─────────────────────
+# Live bug class (2026-08-05): `mkdir -p /tmp/myproj/out`, `tar -C /tmp/myproj`,
+# `rm -rf /tmp/myproj` were rewritten to repo_root — a NOT-YET-CREATED scratch
+# destination is indistinguishable from a training-data virtual root by
+# exists() alone (the whole point of scratch is that it does not exist yet).
+# Paths under machine scratch roots (/tmp, /var/tmp, /var/folders, ...) are
+# user-intended destinations, never bias paths — rewriting sends the command
+# at the real repository (tar/cp/mv/rsync have no approval gate → silent
+# destructive overwrite).
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "mkdir -p /tmp/myproj/out",
+        "tar -xzf pkg.tgz -C /tmp/myproj",
+        "rm -rf /tmp/myproj",
+        "rsync -a src/ /tmp/myproj/",
+        "git worktree add /tmp/myproj HEAD",
+        "python3 -m venv /tmp/myproj",
+        "cp -r build/ /var/folders/myproj/",
+        "cat /var/folders/myproj/files/x.txt",
+    ],
+)
+def test_scratch_destinations_not_rewritten(bias, cmd):
+    assert bias(cmd) == cmd

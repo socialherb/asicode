@@ -11,14 +11,20 @@ All clients return standardized response format for consistent processing.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
+
+from external_llm.agent._response_utils import extract_llm_reasoning
 
 logger = logging.getLogger(__name__)
 
@@ -137,14 +143,10 @@ def effective_content(response) -> str:
         return content
     raw_resp = getattr(response, "raw_response", None)
     if isinstance(raw_resp, dict):
-        try:
-            choices = raw_resp.get("choices") or []
-            msg_obj = (choices[0].get("message", {}) if choices else {}) or {}
-            rc = msg_obj.get("reasoning_content", "") or ""
-            if isinstance(rc, str) and rc.strip():
-                return rc.strip()
-        except (AttributeError, TypeError, IndexError):
-            pass
+        with suppress(AttributeError, TypeError, IndexError):
+            rc = extract_llm_reasoning(raw_resp, strip=True)
+            if rc:
+                return rc
     return content if isinstance(content, str) else ""
 # Upper bound on a single Retry-After wait (seconds). Guards against absurdly
 # large server values (e.g. far-future HTTP-dates) that would stall the agent.
@@ -164,20 +166,23 @@ def parse_retry_after(headers: "Any") -> Optional[int]:
     raw = headers.get("Retry-After") or headers.get("retry-after")
     if raw is None:
         return None
-    try:
+    with suppress(ValueError):
         return min(RETRY_AFTER_MAX_WAIT, max(1, int(str(raw).strip())))
-    except ValueError:
-        pass
-    try:
+    with suppress(ValueError, TypeError, OSError):
         import time as _time
+        from datetime import timezone
         from email.utils import parsedate_to_datetime
         retry_time = parsedate_to_datetime(str(raw).strip())
+        if retry_time.tzinfo is None:
+            # RFC 7231 HTTP-date is GMT; a timezone-less parse must not be read
+            # as LOCAL time (KST +9h would make wait<=0 and silently drop the
+            # server's Retry-After hint).
+            retry_time = retry_time.replace(tzinfo=timezone.utc)
         wait = int(retry_time.timestamp() - _time.time())
         if wait <= 0:
             return None
         return min(RETRY_AFTER_MAX_WAIT, max(1, wait))
-    except (ValueError, TypeError, OSError):
-        return None
+    return None
 
 
 # zai/GLM (and similar providers) report an EXHAUSTED ACCOUNT BALANCE / quota
@@ -213,19 +218,111 @@ def is_balance_quota_signal(error_code: Optional[int], body_text: str = "") -> b
     if error_code is not None and error_code in _BALANCE_QUOTA_CODES:
         return True
     return any(_p in (body_text or "").lower() for _p in _BALANCE_QUOTA_PHRASES)
+
+
+# Per-SSE-line cap for the shared stream parser below.  A single `data:` line
+# from a well-behaved LLM provider is a few KB (a handful of tokens per delta
+# frame).  An unbounded line — from a broken or hostile upstream — buffers
+# forever in iter_lines()/our splitter and then spikes CPU in json.loads
+# (P28-1): the file-read bounds closed in P19-P25 had no network-read
+# counterpart.  4 MiB is generous for any legitimate frame while keeping the
+# worst-case buffer bounded.
+_SSE_MAX_LINE_BYTES = 4 * 1024 * 1024
+
+
+def _parse_sse_line(line: bytes) -> Optional[dict[str, Any]]:
+    """Parse one physical SSE line (no trailing ``\\n``) into an event dict.
+
+    Returns ``None`` for keep-alive/blank lines, non-``data:`` frames
+    (``event:``/``id:``/``retry:``), empty data, the ``[DONE]`` sentinel, and
+    malformed JSON (logged at debug level).  Kept as a separate helper so the
+    chunk-splitting loop stays a pure framing concern.
+    """
+    if line.endswith(b"\r"):
+        line = line[:-1]
+    if not line:
+        return None
+    line_str = line.decode("utf-8")
+    if not line_str.startswith("data:"):
+        return None
+    data_str = line_str[5:].strip()
+    if not data_str or data_str == "[DONE]":
+        return None
+    try:
+        return json.loads(data_str)
+    except Exception:
+        logger.debug("Skipping malformed SSE data frame: %.120s", data_str)
+        return None
+
+
+def iter_sse_data_events(response: "Any") -> Iterator[dict[str, Any]]:
+    """Yield parsed JSON events from an SSE ``data:`` stream.
+
+    Shared SSE framing used by the OpenAI-, DeepSeek-, Gemini- and
+    Anthropic-compatible clients: consumes ``response.iter_bytes()`` and
+    splits chunks on ``\\n`` itself (``iter_lines()`` buffers a whole line
+    before yielding — unbounded memory on a line that never terminates).
+    A line exceeding ``_SSE_MAX_LINE_BYTES`` aborts the stream with a warning
+    instead of buffering it.  Skips blank keep-alive lines, decodes bytes
+    lines, ignores non-``data:`` frames and the ``[DONE]`` sentinel, and
+    skips malformed JSON events (logged at debug level).  The caller retains
+    ownership of ``response`` (including ``close()``); status handling and
+    event-type dispatch stay in the per-client loop.
+    """
+    buf = b""
+    for chunk in response.iter_bytes():
+        if not chunk:
+            continue
+        buf += chunk
+        while True:
+            idx = buf.find(b"\n")
+            if idx < 0:
+                break
+            line, buf = buf[:idx], buf[idx + 1:]
+            if len(line) > _SSE_MAX_LINE_BYTES:
+                logger.warning(
+                    "SSE stream line exceeds %d bytes (%d) — aborting stream "
+                    "(runaway/oversized frame)",
+                    _SSE_MAX_LINE_BYTES, len(line),
+                )
+                return
+            event = _parse_sse_line(line)
+            if event is not None:
+                yield event
+            if len(buf) > _SSE_MAX_LINE_BYTES:
+                logger.warning(
+                    "SSE stream line exceeds %d bytes (%d) — aborting stream "
+                    "(runaway/oversized frame)",
+                    _SSE_MAX_LINE_BYTES, len(buf),
+                )
+                return
+        # No newline in the remainder: it is a (partial) line.  If it already
+        # exceeds the cap there is no legitimate completion — abort now
+        # instead of buffering the rest of it.
+        if len(buf) > _SSE_MAX_LINE_BYTES:
+            logger.warning(
+                "SSE stream line exceeds %d bytes (%d) — aborting stream "
+                "(runaway/oversized frame)",
+                _SSE_MAX_LINE_BYTES, len(buf),
+            )
+            return
+    # Tail after EOF without a trailing newline (iter_lines() also yields it).
+    if buf:
+        event = _parse_sse_line(buf)
+        if event is not None:
+            yield event
+
+
 class LLMClientError(Exception):
     """Base exception for LLM client errors"""
-    pass
 
 
 class LLMConnectionError(LLMClientError):
     """Cannot connect to LLM API"""
-    pass
 
 
 class LLMAuthenticationError(LLMClientError):
     """Invalid API key or authentication failed"""
-    pass
 
 
 class LLMRateLimitError(LLMClientError):
@@ -239,23 +336,68 @@ class LLMRateLimitError(LLMClientError):
     def __init__(self, *args: object, retry_after: "Optional[int]" = None,
                  error_code: "Optional[int]" = None) -> None:
         super().__init__(*args)
+        # Clamp at construction so every consumer sees a bounded hint. The
+        # header parser (parse_retry_after) already clamps to
+        # RETRY_AFTER_MAX_WAIT; this guards direct constructions with absurd
+        # values (e.g. retry_after=3600) that would stall a retry loop for an
+        # hour. Floats are normalized to int (truncated); values below 1 clamp
+        # to 1 (a present-but-tiny hint still means "wait a moment").
+        # Non-numeric hints are left as-is; consumers reject them via isinstance.
+        if isinstance(retry_after, (int, float)):
+            retry_after = min(RETRY_AFTER_MAX_WAIT, max(1, int(retry_after)))
         self.retry_after = retry_after
         self.error_code = error_code
 
 
 class LLMQuotaExceededError(LLMClientError):
     """API key has insufficient credits / quota exceeded (HTTP 402)"""
-    pass
 
 
 class LLMAPIError(LLMClientError):
     """API returned error response"""
-    pass
+
+
+class ContextWindowCollapseError(LLMAPIError):
+    """Local pre-flight detection: the model's context window is too small for
+    the serialised tool schemas + output reserve, so no message trimming can
+    save the call.
+
+    Raised locally (before the request) instead of letting the provider return
+    an inevitable 400 "context length exceeded" — the retry path would shrink
+    messages toward zero, never fit, and burn three attempts per turn.  Carries
+    the structural cause (small window / oversized toolset) so the user-facing
+    error mapper can show an actionable message.
+    """
 
 
 class LLMServerUnavailableError(LLMClientError):
     """Server is unavailable (503, timeout, connection failure) — abort, do not fall back."""
-    pass
+
+
+class LLMCancelled(LLMClientError):  # noqa: N818 — Cancelled-suffix convention (AgentCancelled parity)
+    """A retry backoff wait was interrupted by the caller's cancel_event.
+
+    Raised from client-layer retry sleeps (``_request_with_retry``) when the
+    attached ``cancel_event`` is set mid-wait, so ESC / orchestrator
+    cancellation stays responsive even while the client is inside its own
+    internal retry backoff (up to ~36s of sleeps otherwise).  Agent loops
+    convert this to their own ``AgentCancelled`` at the loop boundary; other
+    callers must handle it like any other LLMClientError.
+    """
+
+
+def interruptible_sleep(seconds: float, cancel_event: "Optional[Any]" = None) -> bool:
+    """Sleep *seconds*, waking early (returning True) when *cancel_event* is set.
+
+    Returns True when the wait was interrupted by cancellation — the caller
+    should then abort the retry rather than proceed.  With no *cancel_event*
+    (or one already set), behaves like ``time.sleep`` (returning False /
+    True immediately, respectively).
+    """
+    if cancel_event is None:
+        time.sleep(seconds)
+        return False
+    return bool(cancel_event.wait(timeout=seconds))
 
 
 class LLMClient(ABC):
@@ -277,6 +419,11 @@ class LLMClient(ABC):
         self.api_key = api_key
         self.base_url = base_url
         self.timeout = timeout
+        # Optional cancellation signal for retry backoff (see
+        # interruptible_sleep).  Wired by agent loops (agent_loop /
+        # design_chat_loop) from their config.cancel_event so ESC stays
+        # responsive during client-internal retries; None = plain sleeps.
+        self.cancel_event: "Optional[Any]" = None
         # HTTP connection pooling: reuse TCP/TLS handshake to save 50-200ms per call
         self._session = requests.Session()
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
@@ -311,12 +458,10 @@ class LLMClient(ABC):
             LLMRateLimitError: Rate limit exceeded
             LLMAPIError: Other API errors
         """
-        pass
 
     @abstractmethod
     def get_provider_name(self) -> str:
         """Return provider name (e.g., 'openai', 'anthropic')"""
-        pass
 
     def chat_with_tools(
         self,
@@ -424,44 +569,43 @@ def create_llm_client(
     # number 120, so explicit per-call overrides are still respected.
     if provider_lower == "ollama" and timeout == DEFAULT_LLM_TIMEOUT:
         timeout = OLLAMA_LLM_TIMEOUT
-        logger.debug(f"Using extended timeout for Ollama: {timeout}s")
+        logger.debug("Using extended timeout for Ollama: %ss", timeout)
 
     if provider_lower == "openai":
         from .openai_client import OpenAIClient
         return OpenAIClient(api_key, base_url, timeout)
 
-    elif provider_lower == "anthropic":
+    if provider_lower == "anthropic":
         from .anthropic_client import AnthropicClient
         return AnthropicClient(api_key, base_url, timeout)
 
-    elif provider_lower == "google":
+    if provider_lower == "google":
         from .providers import GoogleClient
         return GoogleClient(api_key, base_url, timeout)
 
-    elif provider_lower == "deepseek":
+    if provider_lower == "deepseek":
         from .providers import DeepSeekClient
         return DeepSeekClient(api_key, base_url, timeout)
 
-    elif provider_lower == "ollama":
+    if provider_lower == "ollama":
         from .providers import OllamaClient
         return OllamaClient(api_key, base_url, timeout)
 
-    elif provider_lower in ("zai",):
+    if provider_lower in ("zai",):
         from .anthropic_client import ZAIAnthropicClient
         return ZAIAnthropicClient(api_key, base_url, timeout)
 
-    elif provider_lower == "openrouter":
+    if provider_lower == "openrouter":
         from .openai_client import OpenRouterClient
         return OpenRouterClient(api_key, base_url, timeout)
 
-    elif provider_lower == "opencode":
+    if provider_lower == "opencode":
         from .openai_client import OpenAIClient
         if not base_url:
             base_url = "https://opencode.ai/zen/go/v1"  # default for OpenCode Go
         return OpenAIClient(api_key, base_url, timeout)
 
-    else:
-        raise ValueError(
-            f"Unknown LLM provider: {provider}. "
-            f"Supported: openai, anthropic, google, deepseek, ollama, zai, openrouter, opencode"
-        )
+    raise ValueError(
+        f"Unknown LLM provider: {provider}. "
+        f"Supported: openai, anthropic, google, deepseek, ollama, zai, openrouter, opencode"
+    )

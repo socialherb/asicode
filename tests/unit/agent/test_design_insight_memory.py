@@ -53,7 +53,8 @@ class TestSaveInsight:
         _save_insight_to_file(tmp_repo, "Second insight", "bug")
 
         path = os.path.join(tmp_repo, ".asicode", "design_insights.md")
-        content = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
 
         assert "### [gotcha]" in content
         assert "First insight" in content
@@ -65,7 +66,8 @@ class TestSaveInsight:
         _save_insight_to_file(tmp_repo, long_text, "pattern")
 
         path = os.path.join(tmp_repo, ".asicode", "design_insights.md")
-        content = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
         # The function receives already-truncated text ([:500] in caller),
         # but _save_insight_to_file itself doesn't truncate — that's the caller's job
         assert len(content) > 0
@@ -75,7 +77,8 @@ class TestSaveInsight:
         _save_insight_to_file(tmp_repo, "B", "architecture")
 
         path = os.path.join(tmp_repo, ".asicode", "design_insights.md")
-        content = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
         assert content.count("# Design Chat Insights") == 1
 
 
@@ -238,7 +241,8 @@ class TestDeleteInsight:
         assert result.startswith("✅")
 
         path = os.path.join(tmp_repo, ".asicode", "design_insights.md")
-        content2 = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as fh:
+            content2 = fh.read()
         assert "Delete this" not in content2
         assert "Keep this" in content2
 
@@ -271,7 +275,8 @@ class TestEditInsight:
         assert result.startswith("✅")
 
         path = os.path.join(tmp_repo, ".asicode", "design_insights.md")
-        content = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
         assert "Old content" not in content
         assert "New content" in content
 
@@ -281,7 +286,8 @@ class TestEditInsight:
         assert result.startswith("✅")
 
         path = os.path.join(tmp_repo, ".asicode", "design_insights.md")
-        content = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
         assert "### [pattern]" in content
         assert "Updated content" in content
         assert "Old content" not in content
@@ -459,9 +465,8 @@ class TestInsightsWriteLockConcurrency:
         assert not p_save.is_alive(), "save worker hung — cross-process lock deadlock"
         assert not p_compact.is_alive(), "compact worker hung — cross-process lock deadlock"
 
-        saved_markers = [
-            ln.strip() for ln in open(results_path, encoding="utf-8") if ln.strip()
-        ]
+        with open(results_path, encoding="utf-8") as _fh:
+            saved_markers = [ln.strip() for ln in _fh if ln.strip()]
         active = load_insights_file(tmp_repo)
         archive = load_archive_file(tmp_repo) or ""
         combined = active + "\n" + archive

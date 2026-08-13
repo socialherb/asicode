@@ -115,9 +115,9 @@ Examples:
     )
     mcp_start_parser.add_argument(
         "--mode",
-        choices=["stdio", "sse"],
+        choices=["stdio", "sse", "http"],
         default="stdio",
-        help="Server mode (default: stdio)",
+        help="Server mode (default: stdio; 'http' = Streamable-HTTP)",
     )
     mcp_start_parser.add_argument(
         "--port",
@@ -216,12 +216,21 @@ async def _run_async(
     from external_llm.repl.collaborate import CollaborationOrchestrator
 
     async with CollaborationOrchestrator(registry, config) as orch:
-        result = await orch.run(
-            task=args.task,
-            context=args.context,
-            enable_preprocessing=not args.no_digest,
-        )
-        return result
+        try:
+            return await orch.run(
+                task=args.task,
+                context=args.context,
+                enable_preprocessing=not args.no_digest,
+            )
+        except asyncio.CancelledError:
+            # Ctrl+C → asyncio.run cancels this task. Tell the SDK to stop the
+            # agent subprocess (best-effort) so it does not keep burning
+            # tokens/CPU in the background, then re-raise for the CLI handler.
+            try:
+                await orch.interrupt()
+            except Exception as ex:
+                logger.debug("Interrupt on cancel failed: %s", ex)
+            raise
 
 
 def _run_mcp(args: argparse.Namespace) -> None:

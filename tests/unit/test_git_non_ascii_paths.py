@@ -57,7 +57,7 @@ def test_git_really_does_c_quote_without_the_flag(kr_repo):
     future git stops quoting, these tests should say so rather than pass
     vacuously."""
     raw = subprocess.run(["git", "ls-files"], cwd=kr_repo, capture_output=True,
-                         text=True, timeout=15).stdout
+                         text=True, timeout=15, check=False).stdout
     assert '\\355' in raw, "git no longer C-quotes; this suite's premise changed"
     assert _KR_PY not in raw
 
@@ -148,6 +148,11 @@ def test_no_shipping_git_call_prints_paths_unprotected():
     for f in _shipping_files():
         try:
             tree = ast.parse(f.read_text(encoding="utf-8", errors="replace"))
+        except FileNotFoundError:
+            # Concurrent test (test_check_structural_scanners creates and
+            # unlinks a root-level probe) can remove a file between the glob
+            # in _shipping_files() and this read — skip it, it was transient.
+            continue
         except SyntaxError:
             continue
         for node in ast.walk(tree):

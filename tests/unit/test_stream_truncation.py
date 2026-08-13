@@ -21,7 +21,7 @@ class FakeWriteToolsMixin:
         self._secure_path = MagicMock(side_effect=lambda p: self.repo_root / p)
 
     # ------------------------------------------------------------------
-    # _recover_args_from_raw – the core truncation defense
+    # _recover_args_from_raw - the core truncation defense
     # ------------------------------------------------------------------
     def _recover_args_from_raw(self, raw: str) -> dict:
         """Attempt to parse raw as JSON, with recovery for truncation.
@@ -64,7 +64,7 @@ class FakeWriteToolsMixin:
 
         # 3. If still failing, try to find any complete JSON object via regex
         import re
-        # simple non‑recursive regex for a JSON object
+        # simple non-recursive regex for a JSON object
         pattern = r'\{[^{}]*\}'
         matches = re.findall(pattern, candidate)
         for m in matches:
@@ -79,7 +79,7 @@ class FakeWriteToolsMixin:
         return {}
 
     # ------------------------------------------------------------------
-    # Tool methods – each uses _recover_args_from_raw
+    # Tool methods - each uses _recover_args_from_raw
     # ------------------------------------------------------------------
     def _tool_edit_file(self, file_path: str, old_string: str, new_string: str,
                         raw: str = "", **kwargs):
@@ -124,7 +124,7 @@ class FakeWriteToolsMixin:
         return {"error": f"cannot parse plan: no JSON found in {raw[:50]!r}"}
 
     def _repair_plan_json(self, raw: str) -> dict:
-        """Mock repair – always return empty for simplicity."""
+        """Mock repair - always return empty for simplicity."""
         return {}
 
     # ------------------------------------------------------------------

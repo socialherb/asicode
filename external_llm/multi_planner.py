@@ -111,7 +111,7 @@ class MultiFilePlanner:
         if analysis.needs_planning:
             plan = self._create_complex_plan(analysis, structure)
         else:
-            plan = self._create_simple_plan(analysis, structure)
+            plan = self._create_simple_plan(analysis)
 
         # Order operations by dependencies
         plan.operations = self._order_operations(plan.operations)
@@ -124,7 +124,6 @@ class MultiFilePlanner:
     def _create_simple_plan(
         self,
         analysis: RequestAnalysis,
-        structure: ProjectStructure
     ) -> ExecutionPlan:
         """Create plan for simple requests (single file)"""
 
@@ -165,7 +164,7 @@ class MultiFilePlanner:
         # First, check if we have suggested files from analysis
         if analysis.suggested_files:
             # Convert suggested files to operations
-            plan.operations.extend(self._suggested_files_to_operations(analysis, structure))
+            plan.operations.extend(self._suggested_files_to_operations(analysis))
         else:
             # Use generic feature planning — Developer LLM handles
             # framework-specific details based on project context
@@ -174,7 +173,7 @@ class MultiFilePlanner:
             )
 
         # Add success criteria
-        plan.success_criteria = self._define_success_criteria(analysis, plan.operations)
+        plan.success_criteria = self._define_success_criteria(plan.operations)
 
         return plan
 
@@ -205,7 +204,7 @@ class MultiFilePlanner:
 
         return ops
 
-    def _suggested_files_to_operations(self, analysis: RequestAnalysis, structure: ProjectStructure) -> list[FileOperation]:
+    def _suggested_files_to_operations(self, analysis: RequestAnalysis) -> list[FileOperation]:
         """Convert suggested files from analysis to FileOperation objects"""
         ops = []
 
@@ -223,14 +222,14 @@ class MultiFilePlanner:
             priority = 0
             if file_path.endswith('.css'):
                 priority = 2  # CSS after HTML/JS
-            elif file_path.endswith('.js') or file_path.endswith('.jsx'):
+            elif file_path.endswith(('.js', '.jsx')):
                 priority = 1  # JS after HTML
             elif file_path.endswith('.html'):
                 priority = 0  # HTML first
 
             # Add dependencies for CSS/JS files
             dependencies = []
-            if file_path.endswith('.css') or file_path.endswith('.js'):
+            if file_path.endswith(('.css', '.js')):
                 # CSS/JS might depend on HTML template
                 html_files = [f for f in analysis.suggested_files if f.endswith('.html')]
                 if html_files:
@@ -300,14 +299,12 @@ class MultiFilePlanner:
 
         if num_ops <= 1:
             return "simple"
-        elif num_ops <= 3:
+        if num_ops <= 3:
             return "moderate"
-        else:
-            return "complex"
+        return "complex"
 
     def _define_success_criteria(
         self,
-        analysis: RequestAnalysis,
         operations: list[FileOperation]
     ) -> list[str]:
         """Define success criteria for the plan"""
@@ -375,12 +372,11 @@ class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
             try:
                 llm_plan = self._create_llm_based_plan(user_request, analysis, structure)
                 if llm_plan:
-                    logger.info(f"LLM-based plan created with {len(llm_plan.operations)} operations")
+                    logger.info("LLM-based plan created with %s operations", len(llm_plan.operations))
                     return llm_plan
-                else:
-                    logger.warning("LLM planning failed, falling back to rule-based")
+                logger.warning("LLM planning failed, falling back to rule-based")
             except Exception as e:
-                logger.error(f"LLM planning error: {e}, falling back to rule-based")
+                logger.exception("LLM planning error: %s, falling back to rule-based", e)
 
         # Fallback to original rule-based planning
         return super().create_plan(user_request)
@@ -436,7 +432,7 @@ class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
 
             # Parse response
             llm_content = effective_content(response)
-            logger.debug(f"LLM planning response ({len(llm_content)} chars): {llm_content[:5000]}...")
+            logger.debug("LLM planning response (%s chars): %s...", len(llm_content), llm_content[:5000])
 
             # Parse plan from LLM response
             parsed_plan = self._parse_llm_plan_response(llm_content, user_request)
@@ -446,11 +442,11 @@ class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
                 parsed_plan.operations = self._order_operations(parsed_plan.operations)
                 parsed_plan.complexity = self._assess_complexity(parsed_plan.operations)
                 return parsed_plan
-            else:
-                return None
 
         except Exception as e:
-            logger.error(f"LLM planning failed: {e}")
+            logger.exception("LLM planning failed: %s", e)
+            return None
+        else:
             return None
 
     def _build_project_context_summary(self, structure: ProjectStructure) -> str:
@@ -492,7 +488,7 @@ class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
         project_context: str
     ) -> str:
         """Build LLM prompt for hierarchical, step-by-step planning"""
-        prompt = f"""# Architecture-Driven Implementation Plan
+        return f"""# Architecture-Driven Implementation Plan
 
 ## Project Context
 {project_context}
@@ -577,7 +573,6 @@ plan:
 
 Now, think through the architecture step by step and generate the plan:"""
 
-        return prompt
 
     def _parse_llm_plan_response(self, llm_content: str, original_request: str) -> Optional[ExecutionPlan]:
         """
@@ -608,11 +603,8 @@ Now, think through the architecture step by step and generate the plan:"""
                 yaml_section = llm_content
                 # Try to find from "plan:" to end
                 plan_start = llm_content.find('plan:')
-                if plan_start != -1:
-                    yaml_section = llm_content[plan_start:]
-                else:
-                    # Last resort: use entire content
-                    yaml_section = llm_content
+                # "plan:" found → take from there; last resort: use entire content
+                yaml_section = llm_content[plan_start:] if plan_start != -1 else llm_content
 
                 matches = [yaml_section]
 
@@ -642,7 +634,7 @@ Now, think through the architecture step by step and generate the plan:"""
                         for phase in plan_data.get('phases', []):
                             for op_data in phase.get('operations', []):
                                 # Log op_data for debugging
-                                logger.debug(f"Parsing op_data from phase: {op_data}")
+                                logger.debug("Parsing op_data from phase: %s", op_data)
                                 # Get file path, try 'file_path' first, then 'file'
                                 file_path = op_data.get('file_path') or op_data.get('file') or ''
                                 operation = FileOperation(
@@ -659,7 +651,7 @@ Now, think through the architecture step by step and generate the plan:"""
                         # Old format: direct operations list
                         for op_data in plan_data.get('operations', []):
                             # Log op_data for debugging
-                            logger.debug(f"Parsing op_data: {op_data}")
+                            logger.debug("Parsing op_data: %s", op_data)
                             # Get file path, try 'file_path' first, then 'file'
                             file_path = op_data.get('file_path') or op_data.get('file') or ''
                             operation = FileOperation(
@@ -688,23 +680,25 @@ Now, think through the architecture step by step and generate the plan:"""
                         warnings=plan_data.get('warnings') or [],
                     )
 
-                    logger.info(f"Parsed LLM plan with {len(operations)} operations")
-                    return plan
+                    logger.info("Parsed LLM plan with %s operations", len(operations))
 
                 except yaml.YAMLError as e:
-                    logger.debug(f"YAML parsing failed for a section: {e}")
+                    logger.debug("YAML parsing failed for a section: %s", e)
                     continue
                 except Exception as e:
-                    logger.debug(f"Failed to parse plan from YAML section: {e}")
+                    logger.debug("Failed to parse plan from YAML section: %s", e)
                     continue
+                else:
+                    return plan
 
             # If we get here, no valid plan was found
             logger.warning("Could not extract valid plan from LLM response")
-            return None
 
         except ImportError:
             logger.warning("PyYAML not available, cannot parse LLM plan response")
             return None
         except Exception as e:
-            logger.error(f"Error parsing LLM plan response: {e}")
+            logger.exception("Error parsing LLM plan response: %s", e)
+            return None
+        else:
             return None

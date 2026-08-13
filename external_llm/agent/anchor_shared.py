@@ -1,9 +1,9 @@
-"""Shared anchor-matching helpers used by both REPL and editor paths.
+"""Shared anchor-matching helpers for the REPL anchor_edit tool.
 
-Extracted from editor/operation_handlers/symbol_handlers_anchor.py so that
-the REPL (anchor_edit tool) can use these functions without pulling in the
-entire editor/ subtree.  The editor path re-imports from here too, keeping
-a single source of truth.
+Originally extracted from the editor's symbol_handlers_anchor.py so the REPL
+could use these without pulling in the whole editor/ subtree. That editor path
+went with the PLANNER lane, so this is now the sole definition rather than the
+shared half of a pair.
 """
 from __future__ import annotations
 
@@ -54,9 +54,8 @@ def _find_anchor_line(
     for _i, _line in enumerate(lines):
         if not _match_anchor(pattern, _line):
             continue
-        if ctx_before is not None and _i > 0:
-            if not _match_anchor(ctx_before, lines[_i - 1]):
-                continue
+        if ctx_before is not None and _i > 0 and not _match_anchor(ctx_before, lines[_i - 1]):
+            continue
         if ctx_after is not None:
             if _i >= len(lines) - 1:
                 continue  # last line: no following line to verify ctx_after
@@ -117,6 +116,9 @@ def resolve_multiline_anchor(
     Failure classes:
       - ``anchor_multiline_pattern`` : empty pattern (no non-empty lines)
       - ``anchor_miss``              : first line not found exactly
+      - ``anchor_not_unique``        : first line matched >1 location with default
+                                      occurrence=-1 and no context (block position
+                                      ambiguous); supply occurrence/context
       - ``multiline_mismatch``       : a later pattern line ≠ file line / EOF
     """
     _pat_lines = [pl for pl in pattern.split("\n") if pl.strip()]
@@ -144,6 +146,29 @@ def resolve_multiline_anchor(
             ),
             "failure_class": "anchor_miss",
         }
+
+    # ── Uniqueness guard (mirrors anchor_edit's inline guard) ──────────
+    # A multiline block is located by its FIRST line. If that first line
+    # matches multiple locations with default occurrence=-1 and no context,
+    # the block position is ambiguous and resolve must fail loudly rather
+    # than anchor the block at the LAST match. This closes the gap for the
+    # multiline insert/replace/delete paths, which bypass the per-mode
+    # inline guard in _tool_anchor_edit. Delete is irreversible, so an
+    # ambiguous block location is especially dangerous here.
+    if occurrence in (-1, None) and not ctx_before and not ctx_after:
+        _ml_match_count = sum(1 for _item_ in lines if _match_anchor(_search_pat, _item_))
+        if _ml_match_count > 1:
+            return {
+                "ok": False,
+                "error": (
+                    f"multiline anchor: first line {_search_pat!r} matched "
+                    f"{_ml_match_count} times in the file — the block location "
+                    f"is ambiguous. Specify `occurrence` or "
+                    f"context_before/context_after to disambiguate."
+                ),
+                "failure_class": "anchor_not_unique",
+                "match_count": _ml_match_count,
+            }
 
     # Verify ALL subsequent pattern lines match before accepting the range.
     for _pi in range(1, _count):

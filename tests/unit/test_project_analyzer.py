@@ -364,3 +364,82 @@ def test_neutral_filenames_reported_unknown(tmp_path: Path):
 
     assert s.languages == ["go"]
     assert s.naming_style == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# P23-3: bounded gradle reads (per-file 1 MiB / total 8 MiB)
+# ---------------------------------------------------------------------------
+
+def test_read_gradle_text_skips_oversized_single_file(tmp_path: Path):
+    """A single gradle file larger than the per-file cap is skipped entirely
+    (framework detection only needs marker substrings)."""
+    _write(tmp_path, "build.gradle.kts", "x\n" * 600_000)  # 1.2 MB > 1 MiB
+    s = ProjectAnalyzer(str(tmp_path))
+    assert s._read_gradle_text() == ""
+
+
+def test_read_gradle_text_total_capped(tmp_path: Path):
+    """Many gradle files: combined text is capped at 8 MiB instead of being
+    cached unbounded for the instance lifetime."""
+    for i in range(10):
+        _write(tmp_path, f"m{i}.gradle", "x\n" * 500_000)  # ~1 MB each, < 1 MiB
+    s = ProjectAnalyzer(str(tmp_path))
+    text = s._read_gradle_text()
+    # 8 full files (8 MB) + a partial 9th; the +16 covers the "\n".join
+    # separators between chunks, which are not counted in the per-file total.
+    assert len(text) <= 8 * 1024 * 1024 + 16
+    assert "x" in text  # at least the first files were read
+
+
+def test_source_file_walk_capped(tmp_path: Path, monkeypatch):
+    """P28-2: the cached source-file walk stops at _WALK_MAX_FILES instead of
+    materializing every path in the repo (unbounded memory on huge trees);
+    framework markers live near the tree top, so a prefix walk is enough."""
+    for i in range(25):
+        _write(tmp_path, f"f{i}.txt", "x")
+    s = ProjectAnalyzer(str(tmp_path))
+    monkeypatch.setattr(s, "_WALK_MAX_FILES", 10)
+    files = s._iter_source_files()
+    assert len(files) == 10  # capped prefix, not all 25
+    assert all(f.is_file() for f in files)
+
+
+def test_source_file_walk_uncapped_below_limit(tmp_path):
+    """Under the cap the walk yields every file (behavior unchanged)."""
+    for i in range(5):
+        _write(tmp_path, f"g{i}.txt", "x")
+    s = ProjectAnalyzer(str(tmp_path))
+    assert len(s._iter_source_files()) == 5
+
+
+def test_source_walk_skips_vendored_via_walk_policy(tmp_path: Path):
+    """F7 follow-up: the ProjectAnalyzer source walk delegates directory
+    pruning to walk_policy._walk_should_skip_dir, so venv* prefixes,
+    *.egg-info and site-packages dirs are excluded from language/framework
+    detection — the former exact-match SKIP_DIRS + startswith('.') check
+    missed venv310, dep.egg-info and .tox (vendored trees could out-vote
+    the real source language).  NOTE: myvenv (venv as suffix, not prefix)
+    is intentionally NOT skipped — walk_policy only prunes venv* prefixes
+    (pinned by test_shared_utils)."""
+    for d in ("venv310", "pkg.egg-info", ".tox"):
+        _write(tmp_path, d + "/v.py", "def v():\n    return 1\n")
+    _write(tmp_path, "site-packages/s.py", "def s():\n    return 1\n")
+    _write(tmp_path, "real.py", "def real():\n    return 1\n")
+
+    s = ProjectAnalyzer(str(tmp_path))
+    files = s._iter_source_files()
+
+    assert [f.name for f in files] == ["real.py"]
+
+
+def test_analyzer_keeps_target_dir_extra(tmp_path: Path):
+    """F7 follow-up: ``target/`` (JVM build output) is an analyzer-specific
+    skip that walk_policy does not include — it must stay pruned via the
+    private extra set."""
+    _write(tmp_path, "src/main/java/App.java", "class App {}\n")
+    _write(tmp_path, "target/classes/Gen.java", "class Gen {}\n")
+
+    s = ProjectAnalyzer(str(tmp_path))
+    files = list(s._iter_source_files())
+
+    assert [f.name for f in files] == ["App.java"]

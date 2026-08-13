@@ -8,8 +8,9 @@ removed again, the corresponding test will fail first.
 """
 from __future__ import annotations
 
-from external_llm.service import ExternalLLMService
+from typing import ClassVar
 
+from external_llm.service import ExternalLLMService
 
 # ============================================================
 # Builder content tests — verify each builder returns the
@@ -208,7 +209,7 @@ def _run_minimal_generate_patch(
         content = "NOOP"
         finish_reason = "stop"
         tokens_used = 10
-        usage = {"total_tokens": 10}
+        usage: ClassVar[dict] = {"total_tokens": 10}
 
     class _FakeClient:
         def chat(self, *args, **kwargs):
@@ -219,8 +220,15 @@ def _run_minimal_generate_patch(
     monkeypatch.setattr(ExternalLLMService, "_is_trivial_edit_request", lambda *a: True)
     monkeypatch.setattr(ExternalLLMService, "_noop_precheck_for_literal_add", lambda *a: False)
     monkeypatch.setattr(ExternalLLMService, "_build_context_best_effort", lambda *a: ("", {}))
-    monkeypatch.setattr(ExternalLLMService, "_read_target_file_focused_snippet_best_effort", lambda *a, **kw: "")
-    monkeypatch.setattr(ExternalLLMService, "_read_target_file_snippet_best_effort", lambda *a, **kw: "")
+    # P21-2: signature-faithful stubs (no *a, **kw) — a call site passing a
+    # kwarg the definition dropped (the 6-week max_chars TypeError) now fails
+    # loudly instead of being swallowed by a permissive lambda.
+    def _stub_focused_snippet(self, repo_root, target_file, *, needles, radius_lines=120):
+        return ""
+    def _stub_head_snippet(self, repo_root, target_file, *, max_bytes=1024 * 1024):
+        return ""
+    monkeypatch.setattr(ExternalLLMService, "_read_target_file_focused_snippet_best_effort", _stub_focused_snippet)
+    monkeypatch.setattr(ExternalLLMService, "_read_target_file_snippet_best_effort", _stub_head_snippet)
     monkeypatch.setattr(ExternalLLMService, "_extract_identifier_needles", lambda *a: [])
     monkeypatch.setattr(ExternalLLMService, "_build_llm_context_v7_best_effort", lambda *a, **kw: ("", {}))
     monkeypatch.setattr(ExternalLLMService, "_build_llm_context_super_best_effort", lambda *a, **kw: ("", {}))

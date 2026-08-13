@@ -14,12 +14,11 @@ critical ``tool_calls`` guard: on a tool-call turn empty ``content`` is NORMAL
 from __future__ import annotations
 
 import json
-
+from typing import ClassVar
 
 import external_llm.openai_client as oc
 from external_llm.client import LLMMessage, LLMResponse, ToolCallResponse
 from external_llm.openai_client import ZAIClient
-
 
 # ── response builders ──────────────────────────────────────────────────────
 
@@ -100,7 +99,7 @@ def test_helper_plain_llmresponse_recovers_reasoning():
 
 class _OK:
     status_code = 200
-    headers = {}
+    headers: ClassVar[dict] = {}
 
     def __init__(self, data):
         self._data = data

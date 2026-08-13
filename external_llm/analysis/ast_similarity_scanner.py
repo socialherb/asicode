@@ -33,7 +33,7 @@ class SimilarityCandidate:
     file: str
     symbol_a: str           # qualified name, e.g. "MyClass._foo"
     symbol_b: str
-    similarity: float       # 0.0–1.0
+    similarity: float       # 0.0-1.0
     duplication_kind: str   # see DUPLICATION_KINDS below
     shared_inputs: list[str] = field(default_factory=list)
     extractable: bool = False
@@ -384,7 +384,7 @@ def _guard_count(body: list[ast.stmt]) -> int:
 
 
 def _extract_ast_anchors(body: list[ast.stmt]) -> tuple[list[str], list[str]]:
-    """Extract 2–5 representative statements as AST-canonical anchors.
+    """Extract 2-5 representative statements as AST-canonical anchors.
 
     Returns (fingerprints, anchor_texts) where:
     - fingerprints: md5(ast.dump(stmt, include_attributes=False))[:12]
@@ -438,6 +438,7 @@ def _extract_ast_anchors(body: list[ast.stmt]) -> tuple[list[str], list[str]]:
             fp = hashlib.md5(dump.encode(), usedforsecurity=False).hexdigest()[:12]
             text = ast.unparse(stmt)
         except Exception:
+            logger.debug("ast fingerprint failed", exc_info=True)
             continue
 
         if not text or len(text.strip()) < 4:
@@ -534,10 +535,7 @@ def _param_role_similarity(a: NormalisedSymbol, b: NormalisedSymbol) -> float:
     la, lb = len(a.params), len(b.params)
 
     # Jaccard on shared param names
-    if pa or pb:
-        name_jaccard = len(pa & pb) / len(pa | pb)
-    else:
-        name_jaccard = 1.0
+    name_jaccard = len(pa & pb) / len(pa | pb) if pa or pb else 1.0
 
     # count ratio
     if la == 0 and lb == 0:
@@ -695,9 +693,7 @@ def _is_extractable(
     # call ecosystem overlap: low overlap means the two functions call different
     # method sets — extraction produces an incoherent shared helper.
     call_overlap = _set_similarity(na.call_shapes, nb.call_shapes)
-    if call_overlap < _CALL_OVERLAP_EXTRACT_THRESHOLD:
-        return False
-    return True
+    return call_overlap >= _CALL_OVERLAP_EXTRACT_THRESHOLD
 
 
 def _is_trivial_function_body(body: list[ast.stmt]) -> bool:
@@ -737,13 +733,11 @@ def _collect_symbols(tree: ast.Module) -> list[_SymbolEntry]:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             entries.append(_SymbolEntry(qualname=node.name, node=node, parent_class=None))
         elif isinstance(node, ast.ClassDef):
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    entries.append(_SymbolEntry(
+            entries.extend(_SymbolEntry(
                         qualname=f"{node.name}.{child.name}",
                         node=child,
                         parent_class=node.name,
-                    ))
+                    ) for child in ast.iter_child_nodes(node) if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)))
     return entries
 
 
@@ -822,9 +816,10 @@ def scan_similarity_candidates(
 
                 a_class = entries[i].parent_class
                 b_class = entries[j].parent_class
-                if a_class != b_class:
-                    if na.line_count < _MIN_LINE_COUNT_CROSS or nb.line_count < _MIN_LINE_COUNT_CROSS:
-                        continue
+                if a_class != b_class and (
+                    na.line_count < _MIN_LINE_COUNT_CROSS or nb.line_count < _MIN_LINE_COUNT_CROSS
+                ):
+                    continue
 
                 # Skip pairs where BOTH symbols are trivial stubs —
                 # they score high on structure but aren't semantically related.

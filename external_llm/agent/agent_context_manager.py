@@ -14,18 +14,14 @@ Moved here:
 """
 from __future__ import annotations
 
-import ast
-import logging
 import subprocess
 import threading
 import time
+from contextlib import suppress
 
-from ..languages import LanguageId
-from ..languages.capabilities import AnalysisCapability, is_supported
+from external_llm.common.repo_files import canonical_repo_key
+
 from ._shared_utils import _capped_put
-from .config.thresholds import config
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module-level git result cache (10 s TTL, per-root keyed)
@@ -39,17 +35,59 @@ _git_cache: dict[str, tuple[float, dict[str, str]]] = {}
 _git_cache_gen: int = 0  # incremented on invalidation; stale writes skip cache store
 _GIT_CACHE_TTL: float = 10.0
 _GIT_CACHE_MAX_ENTRIES = 8
-# Guards _git_cache. Held only for the fast cache-check and
+# Prompt-injection bound for the snapshot's DISPLAY status (system-prompt
+# block, code-review git context, rollback metadata). A large worktree
+# (thousands of dirty files) previously injected the FULL `git status --short`
+# output into the token budget. Parsing consumers (orchestrator's `-z`
+# changed-path detection, diff_apply's porcelain) run their own git calls and
+# are deliberately NOT bound by this.
+GIT_STATUS_MAX_CHARS: int = 5000
+# Coalesced-invalidation window (P3): a read that arrives within this long
+# after a write is served the pre-write entry instead of paying a full
+# ~40 ms rebuild (3 parallel git subprocesses). Writes and the reads that
+# must see them are separated by LLM calls (seconds) in the agent loop, so a
+# <1 s write→read gap is the rebuild-burst case (parallel subagents, webapp
+# requests), not the freshness case; every snapshot consumer (system-prompt
+# status block, rollback metadata, failure-log SHA, service display) is
+# display/metadata — no decision input.
+_GIT_REBUILD_COALESCE_S: float = 1.0
+# {repo_root: monotonic ts of last invalidation} — per-root so a write to
+# repo A does not force repo B's entry (or its own, past the window) to be
+# treated as permanently dirty. Entries are only added for roots that have a
+# cache entry at clear time and are popped when a post-invalidation rebuild
+# stores, so this stays bounded by _GIT_CACHE_MAX_ENTRIES.
+_git_dirty_since: dict[str, float] = {}
+# Guards _git_cache + _git_dirty_since. Held only for the fast cache-check and
 # the final store — NOT while running git subprocesses (which can be slow).
 _git_cache_lock = threading.Lock()
 
 
-def _clear_git_cache() -> None:
-    """Reset the git result cache (call after any write operation)."""
-    global _git_cache, _git_cache_gen
+def _clear_git_cache(repo_root: str | None = None) -> None:
+    """Coalesced git-cache invalidation (call after any write operation).
+
+    Pre-P3 this emptied the whole dict, so the very next read — even
+    milliseconds after the write — paid a full ~40 ms rebuild. Now entries are
+    kept and stamped dirty in ``_git_dirty_since``; ``get_git_snapshot`` serves
+    the pre-write entry for reads within ``_GIT_REBUILD_COALESCE_S`` and
+    rebuilds afterwards, so a stale snapshot never outlives the window.
+
+    ``repo_root`` may be omitted (legacy/global call sites): then every root
+    currently in the cache is stamped — safe, just less precise. The
+    generation is bumped either way so an in-flight collector that started
+    before the invalidation never stores pre-write data (see
+    ``get_git_snapshot``).
+    """
+    global _git_cache_gen
     with _git_cache_lock:
-        _git_cache = {}
         _git_cache_gen += 1
+        _now = time.monotonic()
+        if repo_root:
+            _key = canonical_repo_key(repo_root)
+            if _key in _git_cache:
+                _git_dirty_since[_key] = _now
+        else:
+            for _root in _git_cache:
+                _git_dirty_since[_root] = _now
 
 
 def _run_git_raw(repo_root: str, *args: str) -> str:
@@ -79,7 +117,7 @@ def _run_git_raw(repo_root: str, *args: str) -> str:
             capture_output=True, text=True, check=False, timeout=8,
         )
         return r.stdout.strip()
-    except Exception:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):  # git best-effort
         return ""  # non-critical — never block execution
 
 
@@ -89,6 +127,12 @@ def get_git_snapshot(repo_root: str) -> dict[str, str]:
     Single source of truth for per-run git state, consumed by:
       - _collect_git_info (rollback snapshot: head_hash, has_changes)
       - _build_session_context (system-prompt injection: branch, status)
+      - EnhancedContextBuilder / SuperContextBuilder (code-review git context)
+
+    ``status`` is truncated to GIT_STATUS_MAX_CHARS HERE, at the SSOT, so every
+    prompt/metadata consumer shares one bound instead of each injection site
+    (re)discovering truncation. Truthiness is preserved, so ``has_changes`` /
+    ``if status:`` callers keep their semantics.
 
     Both used to fetch branch + status independently (5 git subprocesses per
     run: 3 here + 2 there); now a single shared snapshot fetches branch, status
@@ -98,21 +142,44 @@ def get_git_snapshot(repo_root: str) -> dict[str, str]:
     serves multiple repos cannot leak repo A's snapshot to repo B's request.
     Entries are FIFO-bounded via _capped_put (cap _GIT_CACHE_MAX_ENTRIES).
 
-    The cache is cleared after any successful write operation (_clear_git_cache
-    is registered as a write-success callback), so a stale snapshot never
-    follows a successful edit. Double-checked locking keeps the slow git
+    The cache is cleared after any successful MUTATING tool call —
+    ``ToolRegistry._dispatch_impl`` calls _clear_git_cache at the same central
+    post-success point it invalidates its other caches — so a stale snapshot
+    never follows a successful edit. It is NOT a write-success *callback*: both
+    ToolRegistry clone paths reset that list, and this cache is module-global
+    and shared across clones, so a subagent's write has to invalidate it too.
+    (It was documented as a callback and registered as none, which left every
+    caller a test and the snapshot stale for the full TTL after each write.)
+    Invalidation is coalesced (_clear_git_cache stamps the root dirty instead
+    of emptying the dict): reads within _GIT_REBUILD_COALESCE_S of a write
+    serve the pre-write entry, reads after it rebuild — so the "no stale
+    snapshot after an edit" guarantee holds for every read that is not
+    millisecond-adjacent to the write.
+    Double-checked locking keeps the slow git
     subprocess OUTSIDE the lock while the fast cache read / final store run
     INSIDE it (preventing a torn / duplicate-populated cache across threads).
 
     Returns {branch, status, head_hash, last_commit}; missing repo_root -> {}.
     """
-    global _git_cache, _git_cache_gen
     if not repo_root:
         return {}
+    # Canonical key shared with the file-index cache: callers spell the same
+    # repo differently (resolved registry.repo_root vs raw request strings from
+    # service.py; macOS /var vs /private/var), and an uncanonicalized key let
+    # one repo occupy 2+ entries of the 8-entry cache.
+    repo_root = canonical_repo_key(repo_root)
     _now = time.monotonic()
     with _git_cache_lock:
         _entry = _git_cache.get(repo_root)
-        if _entry is not None and (_now - _entry[0]) < _GIT_CACHE_TTL:
+        _dirty_ts = _git_dirty_since.get(repo_root)
+        if (
+            _entry is not None
+            and (_now - _entry[0]) < _GIT_CACHE_TTL
+            # Clean, or dirty but inside the coalesce window: serve the entry.
+            # Dirty AND past the window falls through to a rebuild below so a
+            # pre-write snapshot never outlives _GIT_REBUILD_COALESCE_S.
+            and (_dirty_ts is None or (_now - _dirty_ts) < _GIT_REBUILD_COALESCE_S)
+        ):
             return dict(_entry[1])
     # Read generation BEFORE the slow git subprocesses — if invalidation bumps
     # the generation while we're collecting, the result is stale and must NOT be
@@ -143,6 +210,11 @@ def get_git_snapshot(repo_root: str) -> dict[str, str]:
     except Exception:
         for key in _cmds:  # non-critical — never block execution
             _fresh.setdefault(key, "")
+    # Bound the display status at the SSOT: every prompt consumer
+    # (_build_session_context, context_builder, super_context_builder) and the
+    # rollback metadata share this one truncation contract — a consumer-side
+    # slice would silently miss the next injection site.
+    _fresh["status"] = (_fresh.get("status") or "")[:GIT_STATUS_MAX_CHARS]
     # Decompose the combined log line into head_hash + last_commit.
     _log_line = _fresh.pop("log", "")
     if "\t" in _log_line:
@@ -152,13 +224,27 @@ def get_git_snapshot(repo_root: str) -> dict[str, str]:
     # Store under lock; re-check in case another thread populated meanwhile.
     with _git_cache_lock:
         _entry = _git_cache.get(repo_root)
-        if _entry is not None and (_now - _entry[0]) < _GIT_CACHE_TTL:
+        _dirty_ts2 = _git_dirty_since.get(repo_root)
+        if (
+            _entry is not None
+            and (_now - _entry[0]) < _GIT_CACHE_TTL
+            # P3: only serve the re-check hit when the entry is not a pre-write
+            # entry we are currently replacing. A concurrent thread's store
+            # already popped the dirty stamp (its entry is post-write); this
+            # root's own pre-write entry still carries a stamp past the window
+            # and must NOT be served — we just collected fresh data for it.
+            and (_dirty_ts2 is None or (_now - _dirty_ts2) < _GIT_REBUILD_COALESCE_S)
+        ):
             return dict(_entry[1])
         # Generation changed while we were collecting — invalidation ran
         # mid-collection; don't cache stale data, just return it fresh.
         if _git_cache_gen != _gen_before:
             return _fresh
         _capped_put(_git_cache, repo_root, (_now, _fresh), _GIT_CACHE_MAX_ENTRIES)
+        # The entry just stored was collected AFTER the last invalidation
+        # (generation matched), so this root is no longer dirty — otherwise
+        # every read past the coalesce window would rebuild forever.
+        _git_dirty_since.pop(repo_root, None)
         return _fresh
 
 
@@ -168,7 +254,6 @@ def get_git_snapshot(repo_root: str) -> dict[str, str]:
 
 class ContextTier(str):
     """Context injection tier — controls how much startup context is loaded."""
-    PLANNER = "planner"      # ~5,000 tokens: structural overview + symbol index
     MAIN_AGENT = "main_agent"  # ~2,500 tokens: lean start, tool-driven exploration
     COMPACT = "compact"      # ~1,000 tokens: small model / subagent
 
@@ -198,6 +283,7 @@ You operate inside the user's current repository (see "Working directory" below)
 10. Out-of-domain detection — Before invoking any tool, check whether the user's question is actually about this codebase. If the question is a clear real-world factual query (e.g., stock price, news, weather, general knowledge, current events), use `search_web` directly. If the intent is ambiguous (could be code-related or real-world), ask for clarification before proceeding.
 11. If there is a user's next request while the most recent conversation turn has not been answered, prioritize the request from the most recent conversation turn.
 12. Work plan for large goals — When the request is a large or open-ended goal needing many steps (multi-file feature, broad refactor, "build X"), FIRST call `update_plan` to break it into concrete verifiable items, keep statuses updated as you work (one in_progress at a time), and re-plan freely when reality diverges. Verify each item before marking it done (run tests, check behavior). For small requests (1-3 steps), do NOT create a plan — just do the work.
+13. Test-file inclusion — For bug-fix or behavior-change requests, the fix MUST be accompanied by test changes: extend the existing tests that exercise the affected code, or add a focused new test matching the project's test framework and conventions (e.g. pytest files under tests/) when none exists. A fix that only modifies source files is incomplete.
 
 ## ═══ CURRENT REPOSITORY STATE ═══
 {session_context}
@@ -221,7 +307,6 @@ class ContextManagerMixin:
       - self.registry     (ToolRegistry)
       - self._cb(event, data) — stream callback helper
       - self._check_small_model() -> bool
-      - self._build_quick_symbol_index() -> str  (defined in this mixin)
       - self._run_git(*args) -> str               (defined in this mixin)
       - self._build_session_context(tier) -> str  (defined in this mixin)
     Context trimming/compression/eviction is delegated to a
@@ -278,46 +363,11 @@ class ContextManagerMixin:
     # Context tier resolution
     # ------------------------------------------------------------------
 
-    def _resolve_context_tier(self, route=None) -> str:
+    def _resolve_context_tier(self) -> str:
         """Determine context injection tier based on model size, role, and lane."""
-        from .task_router import Lane
         if getattr(self.config, "is_subagent", False):
             return ContextTier.COMPACT
-        if route and getattr(route, "lane", None) == Lane.PLANNER:
-            return ContextTier.PLANNER
         return ContextTier.MAIN_AGENT
-
-    # ------------------------------------------------------------------
-    # Context loading
-    # ------------------------------------------------------------------
-
-    def _build_rag_context(self, query: str) -> str:
-        """Run BM25 relevance search and return a compact context block."""
-        try:
-            # Use monotonic clock for elapsed-time measurement: wall-clock
-            # (time.time()) can jump backwards on NTP sync / DST transitions,
-            # which would yield negative durations or never-trigger limits.
-            start_time = time.monotonic()
-            results = self.registry._rag_searcher.find_relevant_files(
-                query, top_k=self.config.rag_top_k
-            )
-            search_time_ms = (time.monotonic() - start_time) * 1000
-
-            # Record RAG search metrics
-            self.performance_collector.record_rag_search(search_time_ms)
-
-            if not results:
-                return ""
-            lines = [
-                f"[Auto-RAG: Top-{len(results)} files relevant to request (BM25 auto-selected)]",
-            ]
-            for i, r in enumerate(results, 1):
-                lines.append(f"  {i}. {r.file}:{r.line}  (score {r.score:.2f})  — {r.snippet[:80]}")
-            lines.append("[Use as exploration starting points; verify actual content with bash (cat)]")
-            return "\n".join(lines)
-        except Exception as e:
-            logger.warning("RAG context build failed: %s", e)
-            return ""
 
     # ------------------------------------------------------------------
     # Session context enrichment
@@ -335,9 +385,10 @@ class ContextManagerMixin:
             if max_lines and out:
                 lines = out.splitlines()
                 out = "\n".join(lines[:max_lines])
-            return out
-        except Exception:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):  # git best-effort
             return ""  # non-critical — never block execution
+        else:
+            return out
 
     def _build_session_context(self, tier: ContextTier = None) -> str:
         """Build rich session context block — injected into system prompt at startup.
@@ -352,10 +403,8 @@ class ContextManagerMixin:
             tier: ContextTier value controlling how much context is injected.
                   COMPACT — branch only (small model / subagent).
                   MAIN_AGENT — branch + status (lean start, tool-driven exploration).
-                  PLANNER — branch + status + root structure + symbol index.
                   None defaults to MAIN_AGENT.
         """
-        import os
 
         if tier is None:
             tier = ContextTier.MAIN_AGENT
@@ -373,11 +422,9 @@ class ContextManagerMixin:
         # Working directory must be explicit: "asicode" in the system prompt is
         # the TOOL's name, not the target repo. Without this line the model can
         # confuse the two and operate on the wrong directory.
-        try:
+        with suppress(AttributeError):
             _wd = self.registry.repo_root
             parts.append(f"Working directory: {_wd}")
-        except AttributeError:
-            pass
         if _git_results.get("branch"):
             parts.append(f"Branch: {_git_results['branch']}")
 
@@ -388,119 +435,14 @@ class ContextManagerMixin:
             else:
                 parts.append("Working tree: clean (no uncommitted changes)")
 
-        # ── 3. Project root files overview (PLANNER only) ───────────────
-        if tier == ContextTier.PLANNER:
-            try:
-                root = self.registry.repo_root
-                entries = sorted(os.listdir(root))
-                py_files = [e for e in entries if LanguageId.from_path(e) is LanguageId.PYTHON and not e.startswith("_")]
-                dirs = [e for e in entries if os.path.isdir(os.path.join(root, e))
-                        and not e.startswith(".") and e not in ("__pycache__", "node_modules", ".git")]
-                overview_lines = []
-                if py_files:
-                    overview_lines.append("  Python entry files: " + ", ".join(py_files))
-                if dirs:
-                    overview_lines.append("  Subdirectories: " + ", ".join(dirs))
-                if overview_lines:
-                    parts.append("Root structure:\n" + "\n".join(overview_lines))
-            except (AttributeError, TypeError):
-                pass
-
-        # ── 4. GSG: compact symbol index (PLANNER only) ─────────────────
-        if tier == ContextTier.PLANNER:
-            sym_index = self._build_quick_symbol_index()
-            if sym_index:
-                parts.append(sym_index)
-
         return "\n\n".join(parts) if parts else "(session context unavailable)"
-
-    def _build_quick_symbol_index(self) -> str:
-        """Build a compact top-level symbol index for system prompt injection.
-
-        Scans key directories with a plain AST walk (no full graph build).
-        Time-limited to 1.0s to avoid adding startup latency. Performs a
-        broader scan across agent, graph, learning, ui, and common source
-        directories to give the LLM a wider instant file→symbol mapping so it
-        can skip exploratory find_symbol / bash grep turns for well-known
-        classes and functions.
-        """
-        import os
-
-        root = self.registry.repo_root
-        # Monotonic clock — see _build_rag_context for rationale.
-        start = time.monotonic()
-        _TIME_LIMIT = config.counts.AGENT_CTX_BUDGET_TIME_S
-
-        # Dynamically detect source directories (MAIN_AGENT-first: broader scan)
-        _CANDIDATE_DIRS = [
-            "external_llm/agent",
-            "external_llm",
-            "external_llm/agent/graph",
-            "external_llm/agent/learning",
-            "src", "lib", "app", "api",
-            "ui",
-        ]
-        scan_dirs = [
-            d for d in _CANDIDATE_DIRS
-            if os.path.isdir(os.path.join(root, d))
-        ]
-
-        lines: list = []
-        seen_dirs: set = set()
-        _time_exceeded = False
-
-        for scan_dir in scan_dirs:
-            if _time_exceeded:
-                break
-            dirpath = os.path.join(root, scan_dir)
-            if not os.path.isdir(dirpath) or dirpath in seen_dirs:
-                continue
-            seen_dirs.add(dirpath)
-
-            try:
-                fnames = sorted(os.listdir(dirpath))
-            except OSError:
-                continue
-
-            for fname in fnames:
-                if time.monotonic() - start > _TIME_LIMIT:
-                    logger.warning(
-                        "[SYM_INDEX] time limit (%.1fs) reached after %d dirs / %d files",
-                        _TIME_LIMIT, len(seen_dirs), len(lines),
-                    )
-                    _time_exceeded = True
-                    break
-                if not is_supported(fname, AnalysisCapability.AGENT_CONTEXT) or fname.startswith("_"):
-                    continue
-                fpath = os.path.join(dirpath, fname)
-                rel = os.path.relpath(fpath, root)
-                try:
-                    with open(fpath, encoding="utf-8", errors="ignore") as f:
-                        source = f.read()
-                    tree = ast.parse(source, filename=fpath)
-                    names = [
-                        n.name for n in tree.body
-                        if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-                        and not n.name.startswith("_")
-                    ]
-                    if names:
-                        lines.append(f"  {rel}: {', '.join(names)}")
-                except (SyntaxError, TypeError, AttributeError):
-                    continue
-
-        if not lines:
-            return ""
-        return (
-            "Symbol index (top-level classes & public functions — skip find_symbol for these):\n"
-            + "\n".join(lines)
-        )
 
     # ------------------------------------------------------------------
     # Initial messages builder
     # ------------------------------------------------------------------
 
     def _build_initial_messages(
-        self, request: str, context: str, has_native_tools: bool,
+        self, request: str, context: str,
         tier: str | None = None,
     ) -> list:
         """Build the initial message list for the agent."""
@@ -522,7 +464,6 @@ class ContextManagerMixin:
         self,
         continuation_data: dict,
         request: str,
-        has_native_tools: bool = True,
     ) -> list:
         """Build message list from design chat continuation data.
 

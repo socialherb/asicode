@@ -17,7 +17,6 @@ import pytest
 from external_llm.agent.tool_handlers.write_tools import WriteToolsMixin
 from external_llm.agent.tool_registry import ToolResult
 
-
 # ── Minimal test harnesses (copies of the ones in test_write_tools_bugfixes;
 # duplicated here to keep this file free of the operation_handlers import) ──
 

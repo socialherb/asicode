@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
 from external_llm.agent.agent_turn_pipeline import TurnPipelineMixin
-
 
 BROKEN = "undefined_symbol_xyz"
 
@@ -170,8 +170,8 @@ def test_a_broken_file_does_not_taint_its_batch_partner(reg, temp_repo_root):
     drained = reg.drain_pending_semantic_checks()
 
     assert len(reg._sem_spawns) == 1, "precondition: the two files shared a spawn"
-    broken = [p for p in drained if p.endswith("sample.py")][0]
-    clean = [p for p in drained if p.endswith("other.py")][0]
+    broken = next(p for p in drained if p.endswith("sample.py"))
+    clean = next(p for p in drained if p.endswith("other.py"))
     assert [d["message"] for d in drained[broken].diagnostics] == [f'"{BROKEN}" is not defined']
     assert drained[clean].diagnostics == [], "the clean file inherited its partner's diagnostics"
 
@@ -355,7 +355,7 @@ def test_provider_groups_run_concurrently(tool_registry, temp_repo_root, monkeyp
     overlapped: list[str] = []
 
     class _Res:
-        errors: list = []
+        errors: ClassVar[list] = []
         ok = True
 
     def _make(tag):
@@ -520,7 +520,7 @@ def test_settle_tells_the_model_the_check_was_skipped(unavailable):
 def test_a_genuinely_clean_check_is_still_reported_as_checked(reg):
     """The mirror: a check that RAN and found nothing keeps saying so."""
     reg.begin_semantic_turn()
-    m = _msg_for(_edit(reg, '    return "world"', '    return "world"  # a'))
+    _edit(reg, '    return "world"', '    return "world"  # a')
     outcome = next(iter(reg.drain_pending_semantic_checks().values()))
     assert outcome.checked is True
     assert outcome.diagnostics == []
@@ -537,3 +537,84 @@ def test_a_file_with_no_semantic_provider_is_a_skip(tool_registry, temp_repo_roo
     outcome = next(iter(tool_registry.drain_pending_semantic_checks().values()))
     assert outcome.checked is False
     assert outcome.skip_reason
+
+
+def test_drain_cancel_event_skips_pending_groups(reg, monkeypatch, tmp_path):
+    """ESC during the deferred drain must stop waiting on the in-flight
+    toolchain: the still-pending group is marked skipped and the drain returns
+    promptly instead of blocking the turn end on the slow provider.
+
+    Regression: future.result() had no timeout, so a slow second toolchain
+    (tsc/go cold start) blocked turn end even after ESC — the drain is
+    advisory and must never delay a cancelled turn."""
+    import threading
+    import time as _time
+
+    from external_llm.languages.registry import LanguageRegistry
+
+    cancel_event = threading.Event()
+    reg.config.cancel_event = cancel_event
+
+    # Two providers: the FIRST group always runs inline on the drain thread
+    # (fast), the second is scheduled on the pool and blocks — the cancel must
+    # cut that wait short, not outlast it.
+    blocked = threading.Event()
+    calls: list[str] = []
+
+    class _Cap:
+        has_semantic_validator = True
+
+    class _Res:
+        def __init__(self, errors):
+            self.errors = errors
+
+    class _FastProvider:
+        def capabilities(self):
+            return _Cap()
+
+        def validate_semantics_batch(self, paths):
+            calls.append("fast")
+            return {p: _Res([]) for p in paths}
+
+    class _SlowProvider:
+        def capabilities(self):
+            return _Cap()
+
+        def validate_semantics_batch(self, paths):
+            calls.append("slow")
+            blocked.wait(10)  # must be abandoned, not waited out
+            return {p: _Res([]) for p in paths}
+
+    fast_file = tmp_path / "fast.py"
+    slow_file = tmp_path / "slow.ts"
+    fast_file.write_text("x = 1")
+    slow_file.write_text("const x = 1;")
+
+    def _fake_get(abs_path):
+        return _FastProvider() if abs_path == str(fast_file) else _SlowProvider()
+
+    monkeypatch.setattr(LanguageRegistry.instance(), "get", _fake_get)
+
+    reg.begin_semantic_turn()
+    reg.defer_semantic_check(str(fast_file))
+    reg.defer_semantic_check(str(slow_file))
+
+    drained: dict = {}
+
+    def _drain():
+        drained.update(reg.drain_pending_semantic_checks())
+
+    t = threading.Thread(target=_drain)
+    t.start()
+    _time.sleep(0.3)  # let the slow provider start and block in the pool
+    cancel_event.set()  # user presses ESC
+    t.join(timeout=5)
+    assert not t.is_alive(), "drain did not return after cancel"
+    assert "fast" in calls, "first (inline) group should still have run"
+    assert drained[str(fast_file)].checked
+    assert drained[str(slow_file)].skip_reason == (
+        "cancelled before the semantic check ran"), (
+        f"pending group must be skipped on cancel, got {drained[str(slow_file)].skip_reason!r}")
+    # Release the still-blocked pool worker so the shared pool can wind down
+    # without keeping the interpreter alive for the full wait.
+    blocked.set()

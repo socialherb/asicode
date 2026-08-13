@@ -10,11 +10,14 @@ Key principles:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 from .config.thresholds import config as _cfg
 from .enums import Complexity, Scope
+
+_logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .guard_ir import GuardIR
@@ -24,8 +27,8 @@ if TYPE_CHECKING:
 class IntentResult:
     """LLM-based intent understanding result.
 
-    Produced by IntentResolver and consumed by TaskRouter, SpecResolver,
-    and downstream components to avoid duplicate LLM calls.
+    Produced by IntentResolver and consumed by TaskRouter and downstream
+    components to avoid duplicate LLM calls.
     """
 
     # Original request
@@ -47,7 +50,7 @@ class IntentResult:
     # New symbols to be created (not yet in codebase)
     # Populated when intent_type is "extend", "feature", or "create".
     # Each entry is a dict: {"name": str, "kind": "method"|"function"|"class", "parent": str|None}
-    # SpecResolver passes these through unchanged — they are owned by the intent layer.
+    # Passed through unchanged — they are owned by the intent layer.
     new_symbols: list[dict[str, Any]] = field(default_factory=list)
 
     # ── Symbol role classification (intent-aware) ─────────────────────────────
@@ -64,19 +67,15 @@ class IntentResult:
     guard_statement: str = ""
 
     # Authoritative typed guard IR — populated by IntentResolver (parse_guard on
-    # guard_statement) and backfilled/canonicalized by SpecResolver.  Consumers
+    # guard_statement) and backfilled/canonicalized downstream.  Consumers
     # MUST prefer this over guard_statement string to avoid re-parsing.
     # [GUARD_SPEC] source: "intent_resolver" or "spec_resolver"
     guard_spec: Optional["GuardIR"] = None
 
     # Legacy dict repr (compact + condition + control) — kept for backward compat.
-    # New code should read guard_spec instead; this is only written by SpecResolver
-    # for callers that still expect a dict (e.g. old tool_schemas telemetry paths).
+    # New code should read guard_spec instead; this is only written for backward
+    # compat (callers that still expect a dict, e.g. old tool_schemas telemetry paths).
     guard_ir: Optional[dict[str, Any]] = None
-
-    # Target loop iterable for guard_add when the guard must go inside a specific loop.
-    # e.g. "undefined_names" — the iterable expression (as it appears in source code)
-    target_loop_iterable: str = ""
 
     # Lane suggestion
     lane_hint: str = ""  # "planner", "main_agent", "read_only", "clarify"
@@ -118,11 +117,11 @@ class IntentResult:
     # Metadata about the resolution process
     metadata: dict[str, Any] = field(default_factory=dict)  # language detection, typo corrections, transformations
 
-    # Hints for SpecResolver (compatible with existing llm_hints format)
+    # Hints for downstream resolution (compatible with existing llm_hints format)
     spec_hints: dict[str, Any] = field(default_factory=dict)  # modify_files, new_files
 
     # Behavioral code concepts — drives dataflow-anchored symbol resolution.
-    # Extracted by IntentResolver and consumed by SpecResolver to find the
+    # Extracted by IntentResolver and consumed downstream to find the
     code_concepts: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -179,6 +178,21 @@ class IntentResult:
             "new_symbols": self.new_symbols,
             "modify_symbols": self.modify_symbols,
             "reference_symbols": self.reference_symbols,
+            "edit_kind": self.edit_kind,
+            "guard_statement": self.guard_statement,
+            "guard_spec": (
+                {
+                    "compact": self.guard_spec.compact,
+                    "condition": (
+                        self.guard_spec.condition.to_legacy_dict()
+                        if self.guard_spec.condition else None
+                    ),
+                    "control": self.guard_spec.control,
+                }
+                if self.guard_spec is not None else None
+            ),
+            "guard_ir": self.guard_ir,
+            "code_concepts": self.code_concepts,
             "lane_hint": self.lane_hint,
             "scope_hint": self.scope_hint.value,
             "complexity_hint": self.complexity_hint.value,
@@ -200,7 +214,38 @@ class IntentResult:
             data['scope_hint'] = Scope(data['scope_hint'])
         if 'complexity_hint' in data:
             data['complexity_hint'] = Complexity(data['complexity_hint'])
+        # Rehydrate the typed GuardIR from its serialized form so consumers
+        # can rely on guard_spec being a GuardIR (or None) after round-trips.
+        if isinstance(data.get("guard_spec"), dict):
+            data = dict(data)
+            data["guard_spec"] = cls._guard_spec_from_dict(data["guard_spec"])
         return cls(**{k: v for k, v in data.items() if k in known})
+
+    @staticmethod
+    def _guard_spec_from_dict(d: dict[str, Any]) -> Optional["GuardIR"]:
+        """Rehydrate a GuardIR from the serialized dict produced by to_dict()."""
+        from .guard_ir import GuardCondition, GuardIR
+
+        _cond_raw = d.get("condition")
+        _condition = None
+        if isinstance(_cond_raw, dict):
+            _condition = GuardCondition(
+                op_class=_cond_raw.get("op", ""),
+                operands=list(_cond_raw.get("operands", []) or []),
+                attribute_pairs=list(_cond_raw.get("attribute_pairs", []) or []),
+            )
+        _compact = d.get("compact", "")
+        try:
+            return GuardIR(
+                raw=_compact,
+                canonical=_compact,
+                compact=_compact,
+                condition=_condition,
+                control=d.get("control", ""),
+            )
+        except (TypeError, ValueError) as exc:
+            _logger.debug("failed to rehydrate GuardIR from %r: %s", d, exc)
+            return None
 
     def is_read_only(self) -> bool:
         """Check if this appears to be a read-only request."""
@@ -212,7 +257,7 @@ class IntentResult:
         return self.intent_type in ("bugfix", "feature", "refactor", "modify", "extend", "create")
 
     def get_spec_hints(self) -> dict[str, Any]:
-        """Get SpecResolver hints in compatible format."""
+        """Get resolution hints in compatible format."""
         hints = {}
         if self.target_files:
             hints["modify_files"] = self.target_files

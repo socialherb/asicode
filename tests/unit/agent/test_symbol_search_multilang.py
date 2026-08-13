@@ -1,11 +1,11 @@
 """Tests for multi-language symbol search (TS/JS via TSSemanticTracer)."""
+import subprocess
 import textwrap
+from pathlib import Path
 
 import pytest
 
 from external_llm.agent.symbol_search import SymbolSearcher, _is_definition_line
-from pathlib import Path
-import subprocess
 
 # ── Fixture: temp repo with TS files ────────────────────────────────────────
 
@@ -159,6 +159,28 @@ class TestFileOutlineTS:
         outline = searcher.get_file_outline("src/todoService.ts")
         lines = [s.line for s in outline]
         assert lines == sorted(lines)
+
+
+class TestOutlineTSReadError:
+    """_outline_ts_js must swallow a read failure (vanished file) instead of
+    propagating OSError — mirrors the sibling _outline_treesitter. The except
+    clause had regressed to the import-block's (ImportError, AttributeError),
+    which never catches read_text's OSError, so a file that vanished between
+    the caller's is_file() check and this read crashed the outline path."""
+
+    def test_outline_ts_js_swallows_missing_file_read(self, tmp_path):
+        try:
+            from external_llm.editor.semantic.ts_semantic_tracer import (
+                TSSemanticTracer,  # noqa: F401 — availability gate: ImportError → skip
+            )
+        except ImportError:
+            pytest.skip("TSSemanticTracer unavailable")
+        searcher = SymbolSearcher(str(tmp_path))
+        gone = tmp_path / "gone.ts"
+        gone.write_text("export function f() {}\n", encoding="utf-8")
+        gone.unlink()  # vanish between caller's is_file() check and this read
+        # No exception may escape; graceful empty list (matches _outline_treesitter).
+        assert searcher._outline_ts_js(gone, "gone.ts") == []
 
 
 # ── _build_ts_function_signature tests ──────────────────────────────────────
@@ -319,6 +341,47 @@ class TestFileOutlineRipgrepFallback:
         outline = searcher.get_file_outline("src/Engine.kt")
         kinds_by_name = {s.name: s.kind for s in outline}
         assert kinds_by_name.get("AudioRecorderEngine") == "class"
+
+    # ── subprocess timeout handling (B1 parity) ────────────────────────────
+    # Regression: the pattern loop caught (AttributeError, TypeError, OSError)
+    # only — TimeoutExpired (a SubprocessError) escaped and crashed
+    # get_file_outline on a hung rg. All other subprocess call sites in this
+    # module already catch SubprocessError; this is the parity pin.
+
+    def test_outline_ripgrep_timeout_expired_swallowed(self, ripgrep_repo, monkeypatch):
+        """TimeoutExpired from a hung rg must degrade gracefully — empty result,
+        no exception propagation to get_file_outline's caller."""
+        import external_llm.agent.symbol_search as ss
+
+        def _boom(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs.get("timeout", 5))
+
+        monkeypatch.setattr(ss.subprocess, "run", _boom)
+        searcher = SymbolSearcher(str(ripgrep_repo))
+        outline = searcher._outline_ripgrep(
+            ripgrep_repo / "src" / "Engine.kt", "src/Engine.kt")
+        assert outline == []
+
+    def test_outline_ripgrep_timeout_skips_only_struck_pattern(self, ripgrep_repo, monkeypatch):
+        """A timeout on ONE pattern must not abort the remaining patterns —
+        later patterns still run and still match symbols."""
+        import external_llm.agent.symbol_search as ss
+        real_run = ss.subprocess.run
+        calls = {"n": 0}
+
+        def _flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs.get("timeout", 5))
+            return real_run(*args, **kwargs)
+
+        monkeypatch.setattr(ss.subprocess, "run", _flaky)
+        searcher = SymbolSearcher(str(ripgrep_repo))
+        outline = searcher._outline_ripgrep(
+            ripgrep_repo / "src" / "Engine.kt", "src/Engine.kt")
+        assert calls["n"] >= 2            # later patterns were still attempted
+        assert isinstance(outline, list)  # function completed normally
+        assert len(outline) > 0           # remaining patterns still matched symbols
 
 
 def _ts_grammar_available(lang: str) -> bool:
@@ -699,6 +762,7 @@ class TestProviderFallbackPatterns:
         \\s*\\( saw '.'), dropping the symbol entirely from the outline.
         """
         import re
+
         from external_llm.languages.lua_provider import LuaSyntaxProvider
         sp = LuaSyntaxProvider().get_symbol_patterns(kind="any")[0]
         pat = sp.regex.replace("{name}", f"({sp.name_capture})")
@@ -710,6 +774,7 @@ class TestProviderFallbackPatterns:
         """Lua OOP colon form ``function Obj:method()`` must index under its full
         qualified name — name_capture includes ':'."""
         import re
+
         from external_llm.languages.lua_provider import LuaSyntaxProvider
         sp = LuaSyntaxProvider().get_symbol_patterns(kind="any")[0]
         pat = sp.regex.replace("{name}", f"({sp.name_capture})")
@@ -722,6 +787,7 @@ class TestProviderFallbackPatterns:
         require ``(`` or ``[`` after the name (the previous ``[\\[(]``-requiring
         form silently dropped them)."""
         import re
+
         from external_llm.languages.scala_provider import ScalaSyntaxProvider
         sp = ScalaSyntaxProvider().get_symbol_patterns(kind="any")[0]
         cases = [
@@ -754,8 +820,8 @@ class TestIndexWasTruncated:
     def test_true_when_walk_hit_the_cap(self, tmp_path, monkeypatch):
         """When the walk hits the file cap, index_was_truncated() must report
         True so a subsequent find_symbol miss can be annotated as unreliable."""
-        import external_llm.agent.symbol_search as ss
         import external_llm.agent._shared_utils as su
+        import external_llm.agent.symbol_search as ss
 
         # More files than the cap; name them so they are all distinct .py files.
         for i in range(6):
@@ -775,8 +841,8 @@ class TestIndexWasTruncated:
         (beyond the cap) yields a find_symbol miss AND index_was_truncated=True.
         This is exactly the scenario where the agent must be told 'may exist in
         un-indexed files' rather than 'does not exist'."""
-        import external_llm.agent.symbol_search as ss
         import external_llm.agent._shared_utils as su
+        import external_llm.agent.symbol_search as ss
 
         src = tmp_path / "src"
         src.mkdir()

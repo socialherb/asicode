@@ -7,22 +7,35 @@ This module consolidates those common patterns.
 """
 from __future__ import annotations
 
-import logging
-
-logger = logging.getLogger(__name__)
-
-import functools
 import json
+import logging
 import os
-import re as _re
 import threading
+import time as _walk_time
 import warnings
 from pathlib import Path
 from typing import Any, Optional
 
 from external_llm.languages.comment_syntax import CommentSyntax, comment_syntax_for
 from external_llm.languages.models import _LANGUAGE_EXTENSION_GROUPS
+
+from ..common.cache_utils import (  # noqa: F401  # re-export (SSOT: common/cache_utils.py)
+    _WALK_CACHE_MAX_ENTRIES,
+    _capped_put,
+)
+from ..common.walk_policy import (  # noqa: F401  # re-export (SSOT: common/walk_policy.py)
+    _WALK_DEPRIORITIZED_DIRS,
+    _WALK_SKIP_DIRS,
+    _WALK_SKIP_FILE_SUFFIXES,
+    _path_is_walk_admissible,
+    _rel_under_skipped_dir,
+    _walk_dir_sort_key,
+    _walk_should_skip_dir,
+)
+from ..languages import LanguageId
 from .operation_models import OpStatus
+
+logger = logging.getLogger(__name__)
 
 
 def compile_quiet(source: str, filename: str, mode: str = "exec"):
@@ -98,43 +111,10 @@ _PY_EXTENSIONS: tuple = tuple(sorted(
 # implementation + ONE process-global cache (previously each module walked
 # independently; call_graph had no cache at all and re-rglobbed every build).
 #
-# The skip-set is the union of the two former implementations — the stricter of
-# each — so both consumers now also exclude venv/site-packages/*.egg-info dirs
-# that call_graph previously indexed.
-import time as _walk_time
-from ..languages import LanguageId
-
-_WALK_SKIP_DIRS: frozenset = frozenset({
-    ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache",
-    "node_modules", ".venv", "venv", "env", ".tox", "dist", "build",
-    ".eggs", "worktrees",
-})
-
-# Directories whose contents are least useful for code-navigation tools
-# (find_symbol / find_relevant_files / analyze_change_impact). The walker
-# visits these LAST, so when a file cap is reached, real source code fills it
-# before tests / fixtures / generated output do. This is a typed NAME set (a
-# policy), not a regex — ``os.walk`` already prunes vendor dirs via
-# :data:`_WALK_SKIP_DIRS`; this set only reorders the survivors by relevance.
-# Case-insensitive match against the directory basename.
-_WALK_DEPRIORITIZED_DIRS: frozenset = frozenset({
-    "tests", "test", "__tests__", "tst", "spec", "specs", "__specs__",
-    "fixtures", "testdata", "test_data", "test-data", "mocks", "stubs",
-    "snapshots", "__snapshots__", "fakes", "examples", "samples",
-    "out", "target", "generated", "gen", "autogen",
-})
-
-
-def _walk_dir_sort_key(d: str) -> tuple[int, str]:
-    """Sort key for ``os.walk`` directory descent order.
-
-    Lower tuple = visited first. Deprioritized dirs (tests/fixtures/generated)
-    get tier 1 so source subtrees (tier 0) are enumerated — and thus fill the
-    file cap — before them. Within a tier, plain alphabetical order keeps the
-    walk deterministic across machines/clones (``os.walk`` otherwise returns
-    filesystem-enumeration order, which is non-reproducible).
-    """
-    return (1 if d.lower() in _WALK_DEPRIORITIZED_DIRS else 0, d)
+# Walk ADMISSION policy (skip dirs / suffixes / descent ordering) is defined in
+# common/walk_policy.py and re-exported at the top of this module — the single
+# source of truth every walker (agent + graph layer) consumes (B2' parity
+# contract, 2026-08-11).
 
 
 # Module-level guard so the truncation warning fires at most once per
@@ -205,7 +185,6 @@ _WALK_CACHE_TTL: float = 30.0
 # lived REPL that visited many repos (each holding a full file list). FIFO
 # eviction under the GIL stays consistent with the lock-free, single-threaded
 # design; the current repo is the newest entry, stale repos are evicted first.
-_WALK_CACHE_MAX_ENTRIES: int = 8
 # Generation counters — bumped by post-write invalidation so a walk that was
 # already in flight cannot resurrect its pre-write result into the cache (the
 # `pop()` alone loses the race: it runs while os.walk is still collecting, and
@@ -223,55 +202,12 @@ _WALK_CACHE_MAX_ENTRIES: int = 8
 # Both mistakes are no-ops that read as working code, so keep the list.
 _PY_WALK_GEN: list[int] = [0]
 _TS_WALK_GEN: list[int] = [0]
-# 3‑tuple: (timestamp, files, was_truncated).  ``was_truncated`` is True when
+# 3-tuple: (timestamp, files, was_truncated).  ``was_truncated`` is True when
 # the walk exited early because ``max_files`` was reached — on cache hit the
 # caller's own cap must be checked (no truncated list may masquerade as a full
 # one for a larger cap; see ``_walk_repo_files`` cache-hit logic).
 _PY_WALK_CACHE: dict[str, tuple[float, list, bool]] = {}
 _TS_WALK_CACHE: dict[str, tuple[float, list, bool]] = {}
-
-
-def _capped_put(cache: dict, key, value, cap: int = _WALK_CACHE_MAX_ENTRIES) -> None:
-    """Set ``cache[key] = value`` then FIFO-evict the oldest entry if over *cap*.
-
-    Note: ``iter(cache)`` / ``next(iter(cache))`` is *not* atomic under
-    free-threaded CPython (PEP 703 or concurrent threads that insert/delete).
-    ``next()`` can fail with ``RuntimeError`` (dict resized during iteration)
-    or ``StopIteration`` (concurrent drain) — the eviction loop catches both
-    and bails out, leaving the cache temporarily over cap (harmless).
-
-    ``dict`` insertion order (3.7+) yields the oldest via ``next(iter(cache))``;
-    the most-recently-inserted path is the current repo, so stale repos are the
-    correct eviction candidates.
-    """
-    cache[key] = value
-    while len(cache) > cap:
-        try:
-            _oldest = next(iter(cache))
-            cache.pop(_oldest, None)
-        except (RuntimeError, StopIteration):
-            logger.debug("_capped_put: concurrent dict resize, stopping eviction (cap=%s, size=%s)", cap, len(cache))
-            break  # concurrent dict resize or empty — give up eviction
-
-
-def _walk_should_skip_dir(d: str) -> bool:
-    """True if directory name *d* must be excluded from repo walks.
-
-    Single pruning predicate shared by both ``_walk_py_files`` and
-    ``_walk_ts_js_files`` so the two walkers cannot drift. They previously
-    diverged: the TS/JS walker carried a redundant ``node_modules`` substring
-    check (already in ``_WALK_SKIP_DIRS`` as an exact match) while *missing*
-    ``venv*`` (e.g. ``venv310``, ``myvenv``) and ``site-packages`` dirs —
-    letting vendored JS/TS bundled inside a Python package pollute the index.
-    """
-    return (
-        d.startswith(".")
-        or d in _WALK_SKIP_DIRS
-        or d.endswith(".egg-info")
-        or d.startswith("venv")
-        or "site-packages" in d
-    )
-
 
 def _walk_repo_files(root, max_files: int, cache: dict, keep, gen_counter: list[int]) -> list:
     """Shared walk engine behind :func:`_walk_py_files` / :func:`_walk_ts_js_files`.
@@ -302,16 +238,15 @@ def _walk_repo_files(root, max_files: int, cache: dict, keep, gen_counter: list[
     cached = cache.get(key)
     if cached is not None:
         ts, files, was_truncated = cached
-        if (_walk_time.monotonic() - ts) < _WALK_CACHE_TTL:
-            if not was_truncated or len(files) >= max_files:
-                # Slice to the caller's cap THEN shallow-copy. A complete walk
-                # cached under a large cap (e.g. vulture max_files=4000) must
-                # not hand a smaller caller (symbol_search max_files=600) more
-                # files than it asked for — callers consume the list directly
-                # without re-slicing, so an over-long result causes redundant
-                # symbol indexing. The copy prevents cache pollution from
-                # callers that mutate the result (.append() / .sort()).
-                return list(files[:max_files])
+        if (_walk_time.monotonic() - ts) < _WALK_CACHE_TTL and (not was_truncated or len(files) >= max_files):
+            # Slice to the caller's cap THEN shallow-copy. A complete walk
+            # cached under a large cap (e.g. vulture max_files=4000) must
+            # not hand a smaller caller (symbol_search max_files=600) more
+            # files than it asked for — callers consume the list directly
+            # without re-slicing, so an over-long result causes redundant
+            # symbol indexing. The copy prevents cache pollution from
+            # callers that mutate the result (.append() / .sort()).
+            return list(files[:max_files])
             # Truncated and the cached result doesn't have enough files for this
             # caller's cap — re-walk to collect the required number.
 
@@ -364,7 +299,8 @@ def _walk_py_files(root, max_files: int) -> list:
 
 
 def _walk_ts_js_files(root, max_files: int) -> list:
-    """Walk *root* returning TS/JS files, skipping hidden/vendor/node_modules.
+    """Walk *root* returning TS/JS files, skipping hidden/vendor/node_modules
+    dirs and ``*.min.js`` bundles.
 
     Cached per root with the same TTL scheme as :func:`_walk_py_files`. A single
     ``os.walk`` pass collects all four extensions (``.ts/.tsx/.js/.jsx``) so one
@@ -372,7 +308,11 @@ def _walk_ts_js_files(root, max_files: int) -> list:
     ``.tsx`` — the primary source files of a TypeScript project.
     """
     return _walk_repo_files(
-        root, max_files, _TS_WALK_CACHE, lambda n: n.endswith(_TS_JS_EXTENSIONS), _TS_WALK_GEN
+        root,
+        max_files,
+        _TS_WALK_CACHE,
+        lambda n: n.endswith(_TS_JS_EXTENSIONS) and not n.endswith(_WALK_SKIP_FILE_SUFFIXES),
+        _TS_WALK_GEN,
     )
 
 
@@ -443,151 +383,6 @@ def make_tool_signature(tool_name: str, tool_args: Any) -> str:
     stable_args = json.dumps(tool_args, sort_keys=True, default=str)
     key_str = f"{tool_name}:{stable_args}"
     return hashlib.sha256(key_str.encode("utf-8")).hexdigest()
-
-
-def is_test_block_description(name: str, file_content: str) -> bool:
-    """Check if `name` looks like a test block description string in file_content.
-
-    Test frameworks (Jest, Vitest, Mocha) use patterns like:
-      describe('sum', () => { ... })
-      it('should add numbers', () => { ... })
-      test('compact removes falsy values', () => { ... })
-
-    These 'names' are human-readable description strings, NOT code symbols.
-    Returns True when `name` appears as a test block argument in the file.
-    """
-    if not name or not file_content:
-        return False
-    _ename = _re.escape(name)
-    for _quote in ("'", '"', '`'):
-        _eq = _re.escape(_quote)
-        _pattern = _re.compile(
-            r"""(?:describe|it|test|beforeEach|afterEach|beforeAll|afterAll)\("""
-            rf"""\s*{_eq}{_ename}{_eq}"""
-        )
-        if _pattern.search(file_content):
-            return True
-    return False
-
-
-# ── TS/JS brace-matching helpers ────────────────────────────────────────
-
-
-def _brace_skip_str_literal(text: str, start: int) -> int:
-    """Skip past a string/template literal starting at *start*.
-
-    Handles single-quoted, double-quoted, and backtick-template strings
-    with escape sequences.  Returns the index after the closing quote.
-    """
-    _quote = text[start]
-    _i = start + 1
-    while _i < len(text):
-        if text[_i] == '\\' and _i + 1 < len(text):
-            _i += 2  # skip escaped char
-            continue
-        if text[_i] == _quote:
-            return _i + 1  # past closing quote
-        _i += 1
-    return len(text)  # unterminated — consume rest
-
-
-def _brace_skip_line_comment(text: str, start: int) -> int:
-    """Skip past a //-style line comment starting at *start*.
-
-    The caller must ensure text[start:start+2] == '//'.
-    Returns the index after the newline (or end of text).
-    """
-    nl = text.find('\n', start + 2)
-    return nl + 1 if nl >= 0 else len(text)
-
-
-def _brace_skip_block_comment(text: str, start: int) -> int:
-    """Skip past a /* */ block comment starting at *start*.
-
-    The caller must ensure text[start:start+2] == '/*'.
-    Returns the index after '*/'.
-    """
-    end = text.find('*/', start + 2)
-    return end + 2 if end >= 0 else len(text)  # unterminated
-
-
-def _brace_skip_regex_literal(text: str, start: int) -> int:
-    """Attempt to skip past a regex literal starting at *start*.
-
-    TS regex detection is tricky (needs full parser context); this is a
-    best-effort heuristic: forward-scan for an unescaped '/' that ends
-    the regex, counting nested '[' ']' pairs.
-
-    Returns index after closing '/' on success, or *start* (no skip) on
-    uncertainty to avoid false skips.
-    """
-    if text[start] != '/':
-        return start
-    # A regex literal can appear after: =, (, ,, !, &, |, ?,
-    # :, ;, {, return, typeof, etc.  Skip detection if preceding
-    # char suggests we're in a division context.
-    if start > 0 and text[start - 1].isalnum() and text[start - 1] not in ('n', 'r'):
-        # 'n' for 'return', 'r' for 'typeof' — too complex, be conservative
-        return start
-    _i = start + 1
-    _bracket_depth = 0
-    while _i < len(text):
-        if text[_i] == '\\' and _i + 1 < len(text):
-            _i += 2
-            continue
-        if text[_i] == '[':
-            _bracket_depth += 1
-        elif text[_i] == ']':
-            _bracket_depth -= 1
-        elif text[_i] == '/' and _bracket_depth == 0:
-            return _i + 1  # past closing /
-        _i += 1
-    return start  # uncertainty — don't skip
-
-
-def _brace_match_depth(text: str, start: int, initial_depth: int = 1) -> int:
-    """Scan *text* from *start*, tracking brace depth with string/comment skipping.
-
-    Returns the index AFTER the brace that brings depth to 0, or len(text)
-    if no matching brace is found.
-
-    Skips braces inside:
-    - String/template literals ('...', "...", '...')
-    - Single-line comments (//)
-    - Block comments (/* */)
-    - Regex literals (best-effort)
-    """
-    _depth = initial_depth
-    _i = start
-    while _i < len(text):
-        _ch = text[_i]
-        # String / template literals
-        if _ch in ('"', "'", '`'):
-            _i = _brace_skip_str_literal(text, _i)
-            continue
-        # Comments
-        if _ch == '/' and _i + 1 < len(text):
-            if text[_i + 1] == '/':
-                _i = _brace_skip_line_comment(text, _i)
-                continue
-            if text[_i + 1] == '*':
-                _i = _brace_skip_block_comment(text, _i)
-                continue
-        # Regex literal (best-effort)
-        if _ch == '/':
-            _next = _brace_skip_regex_literal(text, _i)
-            if _next > _i:
-                _i = _next
-                continue
-        # Brace tracking
-        if _ch == '{':
-            _depth += 1
-        elif _ch == '}':
-            _depth -= 1
-            if _depth == 0:
-                return _i + 1
-        _i += 1
-    return len(text)
 
 
 def _scan_to_line_state(
@@ -922,413 +717,6 @@ def _scan_line_brackets_delta(
     return _delta, in_str, in_triple, block_close
 
 
-# Hoisted compiled regexes for the TS/JS class anchor-fallback helpers below.
-# _find_class_body_range / _ts_class_scan_methods are invoked per class during
-# anchor resolution; re-compiling on every call was pure overhead. The method
-# regex is fully static. The class-header regex embeds the (escaped) class name,
-# so it is memoised per name via lru_cache — this preserves the exact "search for
-# the literal name" behaviour (correct even when other classes precede the
-# target) without paying a re-compile each call.
-_TS_CLASS_METHOD_RE = _re.compile(
-    r'^\s*(?:public|private|protected|static|readonly|async|\s)*\s*'
-    r'(?:get\s+|set\s+)?'
-    r'(?P<name>[a-zA-Z_$]\w*)\s*[(<]'
-)
-
-
-@functools.lru_cache(maxsize=128)
-def _ts_class_header_re(class_name: str):
-    return _re.compile(
-        rf"(?:export\s+)?(?:abstract\s+)?class\s+{_re.escape(class_name)}\s*"
-        r"(?:extends\s+\S+(?:\s*,\s*\S+)*\s*)?"
-        r"(?:implements\s+\S+(?:\s*,\s*\S+)*\s*)?\{"
-    )
-
-
-def _find_class_body_range(source: str, class_name: str) -> Optional[tuple]:
-    """Find a class's body byte range in TS/JS source, handling strings/comments.
-
-    Returns (open_brace_byte + 1, close_brace_byte) — the range of content
-    INSIDE the class braces.  Returns None if class is not found.
-
-    Unlike naive brace counting, this helper uses ``_brace_match_depth`` to
-    skip braces inside string literals, template literals, and comments.
-    """
-    _match = _ts_class_header_re(class_name).search(source)
-    if not _match:
-        return None
-
-    _after_brace = source[_match.end():]
-    _scope_end = _brace_match_depth(_after_brace, 0, initial_depth=1)
-    return (_match.end(), _match.end() + _scope_end)
-
-
-
-
-def _ts_class_scan_methods(source: str, class_name: str) -> Optional[tuple[int, int, str]]:
-    """Scan a TS/JS class body and return the last method's (line, end_line, name).
-
-    1-indexed. Returns None if class or no method found.
-    Uses regex-based detection — sufficient for anchor-fallback purposes.
-    """
-    _body = _find_class_body_range(source, class_name)
-    if _body is None:
-        return None
-    _body_start_byte, _body_end_byte = _body
-    _class_body = source[_body_start_byte:_body_end_byte]
-    _class_body_lines = _class_body.splitlines(keepends=False)
-    if not _class_body_lines:
-        return None
-
-    _last_method = None  # (line_1idx_in_source, name)
-    _current_line_1idx = source[:_body_start_byte].count('\n') + 1
-    for _line_text in _class_body_lines:
-        _m = _TS_CLASS_METHOD_RE.match(_line_text)
-        if _m:
-            _name = _m.group('name')
-            if _name not in ('constructor', 'new', class_name):
-                _last_method = (_current_line_1idx, _name)
-        _current_line_1idx += 1
-
-    if _last_method is None:
-        return None
-    _method_line, _method_name = _last_method
-
-    # End line: scan forward for next sibling method or class closing brace
-    _all_lines = source.splitlines(keepends=False)
-    _depth = 0
-    _found_self = False
-    for _i in range(_method_line - 1, len(_all_lines)):
-        _ln = _all_lines[_i]
-        _depth += _ln.count('{') - _ln.count('}')
-        if not _found_self:
-            if _i == _method_line - 1:
-                _found_self = True
-            continue
-        # Next sibling at same or lower depth?
-        if _depth <= 0:
-            return (_method_line, _i + 1, _method_name)
-        if _depth <= 1 and _re.match(
-            r'^\s*(?:public|private|protected|static|readonly|async|\s)*\s*'
-            r'(?:get\s+|set\s+)?'
-            r'[a-zA-Z_$]\w*\s*[(<]',
-            _ln,
-        ):
-            return (_method_line, _i, _method_name)
-    return (_method_line, len(_all_lines), _method_name)
-
-
-# ── TS/JS symbol detection ──────────────────────────────────────────────
-
-
-def _is_real_ts_symbol(name: str, file_content: str, file_path: str = "") -> bool:
-    """Check if `name` is a real TypeScript/JavaScript symbol using tree-sitter AST.
-
-    Uses tree-sitter AST parsing when available (most accurate).
-    Falls back to deep tree-sitter traversal (``symbol_exists_deep``).
-
-    Returns True if:
-      - name appears in a function/class/const/let/var/interface/type/enum declaration
-      - name is a method, accessor (get/set), or abstract method in a class
-      - name is an export default or export list entry
-      - name is an import specifier
-      - name is defined as a const arrow function
-    Returns False if name only appears as a test block description string.
-
-    Originally defined in ts_aware_strategy.py; migrated here as part of
-    TSAwareCandidateStrategy removal (2026-06-04).
-    """
-    if not name or not file_content:
-        return False
-
-    # ── Primary: tree-sitter AST (most accurate) ────────────────────
-    _lang = "typescript"
-    if file_path:
-        from external_llm.languages.tree_sitter_utils import grammar_key_for_path
-        _detected = grammar_key_for_path(file_path)
-        if _detected:
-            _lang = _detected
-            try:
-                from external_llm.languages.tree_sitter_utils import find_all_symbols
-                _symbols = find_all_symbols(file_content, _lang)
-                if _symbols:
-                    _bare = name.split(".")[-1]
-                    for _sym_name, _kind, _start, _end in _symbols:
-                        if _sym_name == _bare or _sym_name == name:
-                            return True
-            except Exception:
-                pass
-
-    # ── Deep tree-sitter traversal (replaces regex fallback) ────────
-    from external_llm.languages.tree_sitter_utils import symbol_exists_deep
-    return symbol_exists_deep(file_content, name, _lang)
-
-
-# ── Tree-sitter class member node types (TS/JS grammar) ───────────────
-_TS_CLASS_MEMBER_TYPES: frozenset = frozenset({
-    "method_definition",
-    "field_definition",
-    "public_field_definition",
-    "abstract_method_signature",
-})
-
-# ── Tree-sitter top-level definition node types (TS/JS) ────────────────
-_TS_TOP_LEVEL_TYPES: frozenset = frozenset({
-    "function_declaration",
-    "class_declaration",
-    "abstract_class_declaration",
-    "interface_declaration",
-    "type_alias_declaration",
-    "enum_declaration",
-    "lexical_declaration",
-})
-
-
-def _ts_unwrap_export(node):
-    """Unwrap ``export_statement`` to reveal the inner definition.
-
-    Returns the inner definition node (function, class, interface, etc.),
-    or ``None`` if the export is a re-export (``export { ... }`` /
-    ``export * from ...``) or has no recognised inner node.
-    """
-    n = node
-    while n.type == "export_statement":
-        for child in n.children:
-            if child.type in _TS_TOP_LEVEL_TYPES:
-                n = child
-                break
-        else:
-            return None  # re-export or anonymous default
-    return n
-
-
-def _ts_unwrap_decorator(node):
-    """If *node* is a ``decorated_definition``, return the inner definition.
-
-    E.g. ``@Bind() method() { ... }`` → the ``method_definition`` node.
-    Returns ``None`` if *node* is not a decorated definition.
-    """
-    if node.type == "decorated_definition":
-        for child in node.children:
-            if child.type in (_TS_CLASS_MEMBER_TYPES | _TS_TOP_LEVEL_TYPES):
-                return child
-    return None
-
-
-def _ts_extract_def_name(node):
-    """Extract the name of a top-level or class-member definition node."""
-    if node.type == "lexical_declaration":
-        for child in node.children:
-            if child.type == "variable_declarator":
-                name_node = child.child_by_field_name("name")
-                if name_node:
-                    return name_node.text.decode("utf-8")
-        return None
-    name_node = node.child_by_field_name("name")
-    if name_node:
-        return name_node.text.decode("utf-8")
-    return None
-
-
-def _ts_member_name(node):
-    """Extract the member name from a class-body child node.
-
-    Handles ``method_definition``, ``field_definition``,
-    ``public_field_definition``, and ``decorated_definition`` wrappers.
-    Returns ``None`` for non-member nodes (semicolons, index signatures, …).
-    """
-    inner = _ts_unwrap_decorator(node)
-    if inner is None:
-        inner = node
-    if inner.type in _TS_CLASS_MEMBER_TYPES:
-        name_node = inner.child_by_field_name("name")
-        if name_node:
-            return name_node.text.decode("utf-8")
-    return None
-
-
-def _ts_has_top_level_def(root, symbol: str) -> bool:
-    """Return ``True`` if a top-level definition named *symbol* exists.
-
-    Searches all direct children of *root*, unwrapping both
-    ``export_statement`` and ``decorated_definition`` wrappers.
-    """
-    for child in root.children:
-        target = _ts_unwrap_export(child)
-        if target is None:
-            continue
-        target = _ts_unwrap_decorator(target) or target
-        if target.type not in _TS_TOP_LEVEL_TYPES:
-            continue
-        if _ts_extract_def_name(target) == symbol:
-            return True
-    return False
-
-
-def _ts_class_has_member(root, class_name: str, member_name: str) -> bool:
-    """Return ``True`` if *class_name* has a member named *member_name*."""
-    for child in root.children:
-        target = _ts_unwrap_export(child)
-        if target is None:
-            continue
-        if target.type not in ("class_declaration", "abstract_class_declaration"):
-            continue
-        name_node = target.child_by_field_name("name")
-        if name_node is None:
-            continue
-        _decoded = name_node.text.decode("utf-8")
-        if _decoded != class_name:
-            continue
-        body = target.child_by_field_name("body")
-        if body is None:
-            continue
-        for member in body.children:
-            if _ts_member_name(member) == member_name:
-                return True
-    return False
-
-
-def _ts_plain_name_as_member(root, symbol: str) -> bool:
-    """Check if a bare *symbol* is a member name inside any class body.
-
-    Used when *symbol* is not dotted — a name like ``lockPiece`` may be
-    a class method rather than a top-level definition.
-    """
-    for child in root.children:
-        target = _ts_unwrap_export(child)
-        if target is None:
-            continue
-        if target.type not in ("class_declaration", "abstract_class_declaration"):
-            continue
-        body = target.child_by_field_name("body")
-        if body is None:
-            continue
-        for member in body.children:
-            if _ts_member_name(member) == symbol:
-                return True
-    return False
-
-
-def _ts_symbol_exists(root, symbol: str) -> bool:
-    """Check if *symbol* exists in the tree-sitter AST *root*.
-
-    For dotted names (``Game.lockPiece``): finds the class and walks its
-    body children using grammar-aware member detection.
-
-    For plain names: checks top-level definitions first, then falls back
-    to searching inside all class bodies for a matching member name.
-    """
-    if "." in symbol:
-        parts = symbol.split(".", 1)
-        return _ts_class_has_member(root, parts[0], parts[1])
-    return _ts_has_top_level_def(root, symbol) or _ts_plain_name_as_member(root, symbol)
-
-
-def ts_symbol_exists_in_file(file_path: str, symbol: str) -> bool:
-    """Check if a TS/JS symbol exists in the given file.
-
-    **Primary path:** tree-sitter AST traversal — grammar-aware, no regex.
-    Detection is precise for all edge cases (decorators, getters/setters,
-    template literals, string escapes, regex literals, …).
-
-    **Fallback path:** regex heuristics (tree-sitter unavailable).
-
-    Supports:
-    - Plain names: ``SHAPES``, ``game``, ``randomPiece``
-    - Dotted names: ``Game.lockPiece``, ``Game.SHAPES``
-    - Top-level: function, const/let, class, interface, type alias, enum
-    - Class methods/fields: ``ClassName.memberName`` or bare ``memberName``
-    - Export/decorator wrappers — handled automatically by the AST walk
-
-    Args:
-        file_path: Absolute path to the file.
-        symbol: Symbol name (optionally dotted like ``ClassName.method``).
-
-    Returns:
-        True if the symbol is confirmed present in the file.
-    """
-    try:
-        with open(file_path, encoding="utf-8", errors="replace") as _fh:
-            content = _fh.read()
-    except OSError:
-        return False
-
-    # ── Tree-sitter AST path (primary) ──────────────────────────────
-    from external_llm.languages.tree_sitter_utils import grammar_key_for_path
-    language = grammar_key_for_path(file_path)
-    if language:
-        try:
-            from ..languages.tree_sitter_utils import is_available, parse_to_tree
-            if is_available():
-                tree = parse_to_tree(content, language)
-                if tree:
-                    if _ts_symbol_exists(tree.root_node, symbol):
-                        return True
-        except Exception:
-            pass  # fall through to legacy fallback
-
-    # ── Legacy fallback (tree-sitter unavailable) ──────────────────
-    return _legacy_regex_symbol_exists(content, symbol)
-
-
-def _legacy_regex_symbol_exists(content: str, symbol: str) -> bool:
-    """Legacy regex-based symbol detection (tree-sitter not available).
-
-    ═══════════════════════════════════════════════════════════════════
-    This function exists solely as a fallback for environments where
-    tree-sitter and its language grammars are not installed.
-
-    Regex-based symbol matching is inherently fragile (template literals,
-    string escapes, decorators, getter/setter syntax, …).  When
-    tree-sitter *is* available (the common case), it is never called.
-    ═══════════════════════════════════════════════════════════════════
-    """
-    import re
-
-    if "." in symbol:
-        parts = symbol.split(".", 1)
-        class_name = parts[0]
-        member_name = parts[1]
-        _body_range = _find_class_body_range(content, class_name)
-        if _body_range is None:
-            return False
-        _class_body = content[_body_range[0]:_body_range[1]]
-        _method_re = re.compile(
-            rf"(?:public|private|protected|static|readonly|async|\s)*\b{re.escape(member_name)}\s*[\(=:<]"
-        )
-        return bool(_method_re.search(_class_body))
-
-    _patterns = [
-        rf"(?:export\s+)?(?:async\s+)?function\s+{re.escape(symbol)}\s*[\(<]",
-        rf"(?:export\s+)?(?:const|let|var)\s+{re.escape(symbol)}\s*[=:]",
-        rf"(?:export\s+)?(?:abstract\s+)?class\s+{re.escape(symbol)}\s*(?:extends|implements|<|\{{)",
-        rf"(?:export\s+)?interface\s+{re.escape(symbol)}\s*(?:extends|<|\{{)",
-        rf"(?:export\s+)?type\s+{re.escape(symbol)}\s*(?:=|<)",
-        rf"(?:export\s+)?(?:const\s+)?enum\s+{re.escape(symbol)}\s*\{{",
-    ]
-    for _pat in _patterns:
-        if re.search(_pat, content, re.MULTILINE):
-            return True
-
-    _class_header_re = re.compile(
-        r"(?:export\s+)?(?:abstract\s+)?class\s+\w+\s*"
-        r"(?:extends\s+\S+(?:\s*,\s*\S+)*\s*)?"
-        r"(?:implements\s+\S+(?:\s*,\s*\S+)*\s*)?\{"
-    )
-    _method_re = re.compile(
-        rf"(?:public|private|protected|static|readonly|async|\s)*\b{re.escape(symbol)}\s*[\(=:<]"
-    )
-    for _class_match in _class_header_re.finditer(content):
-        _after_brace = content[_class_match.end():]
-        _scope_end = _brace_match_depth(_after_brace, 0, initial_depth=1)
-        _class_body = _after_brace[:_scope_end]
-        if _method_re.search(_class_body):
-            return True
-
-    return False
-
-
-
 # ── LLM cost estimation ──────────────────────────────────────────────────────
 
 # (input_per_M_usd, output_per_M_usd)
@@ -1486,7 +874,7 @@ def _is_zai_payg_url(base_url: str) -> bool:
 _CACHE_TOKENS_SEPARATE: set = {"anthropic", "zai"}
 
 # Multiplier on the input rate charged for cache-WRITE (creation) tokens.
-# Anthropic charges a 25% premium to write the cache (1.25× input rate).
+# Anthropic charges a 25% premium to write the cache (1.25x input rate).
 _CACHE_CREATION_MULT: dict[str, float] = {"anthropic": 1.25}
 
 
@@ -1627,6 +1015,28 @@ def total_input_tokens(
     if provider.lower() in _CACHE_TOKENS_SEPARATE:
         return (prompt_tok or 0) + (cache_read_tok or 0) + (cache_creation_tok or 0)
     return prompt_tok or 0
+
+
+def coerce_token_count(value: Any) -> int:
+    """Coerce a provider usage-field value to a safe int.
+
+    Usage payloads are contractually ints, but non-conforming responses must
+    not TypeError the per-turn ``+=`` accumulation — a crash in token
+    bookkeeping kills the whole agent loop. Non-int values are treated as 0,
+    i.e. "no usage reported":
+
+      * Mock auto-attributes — ``getattr(mock, name, default)`` never returns
+        the default for an unset name; it fabricates a truthy Mock.
+      * JSON-decoded strings from gateway shims / non-conforming providers.
+      * ``None`` (no usage report in the response).
+
+    Only ``int`` (``bool`` included, as a subclass) passes through; anything
+    else — including floats, which usage payloads never legitimately carry —
+    is treated as 0.
+    """
+    return value if isinstance(value, int) else 0
+
+
 def cache_hit_pct(
     provider: str, prompt_tok: int, cache_read_tok: int, cache_creation_tok: int = 0
 ) -> float:
@@ -1710,10 +1120,10 @@ def _discover_repo_files(repo_root: str, max_files: int = 120) -> list:
     result = []
     try:
         for _root, _dirs, _files in os.walk(repo_root):
-            _dirs[:] = [d for d in _dirs
-                        if not d.startswith(".") and d != "__pycache__"
-                        and d not in ("node_modules", "venv", ".venv", "dist", "build", ".git")]
-            for _f in _files:
+            _dirs[:] = sorted(d for d in _dirs
+                              if not d.startswith(".") and d != "__pycache__"
+                              and d not in ("node_modules", "venv", ".venv", "dist", "build", ".git"))
+            for _f in sorted(_files):
                 if _f.startswith("."):
                     continue
                 _rel = os.path.relpath(os.path.join(_root, _f), repo_root)
@@ -1721,8 +1131,12 @@ def _discover_repo_files(repo_root: str, max_files: int = 120) -> list:
                     result.append(_rel)
                 if len(result) >= max_files:
                     return result
-    except Exception:
-        pass
+    except Exception as e:
+        # Best-effort discovery for project.md auto-generation. A subtree that
+        # cannot be walked (permission denied, vanished dir, cross-drive
+        # relpath) must not crash session start — partial results are kept and
+        # the failure stays traceable at debug level (silent-swallow gate).
+        logger.debug("_discover_repo_files: walk of %s failed: %s", repo_root, e)
     return result
 
 
@@ -1739,8 +1153,7 @@ def load_project_context_md(repo_root: str) -> str:
             # Auto-generate project.md
             _all = _discover_repo_files(repo_root)
             _parts = [f"# {os.path.basename(repo_root)}", "", "## Repository Structure"]
-            for _f in _all[:120]:
-                _parts.append(f"- {_f}")
+            _parts.extend(f"- {_f}" for _f in _all[:120])
             _content = "\n".join(_parts)
             try:
                 os.makedirs(_asicode_dir, exist_ok=True)
@@ -1769,11 +1182,6 @@ def load_project_context_md(repo_root: str) -> str:
 
 # ── Token estimation & context trimming (shared by AgentLoop and DesignChatLoop) ──
 
-CHARS_PER_TOKEN: float = 3.0
-"""Rough estimate: ~4 chars/token for English, ~2 for code-heavy text.
-Conservative default of 3 chars/token avoids underestimation.
-Primarily used by estimate_tokens_from_tool_schemas (English-only schema text)."""
-
 MAX_SAFE_TOKENS: int = 80000
 """Conservative safety margin below typical 128k-200k model limits."""
 
@@ -1783,7 +1191,7 @@ def _cjk_aware_tokens(text: str) -> int:
 
     English/ASCII (~1 byte/char) yields ~2 chars/token.
     CJK text (~3 bytes/char) yields ~1.5 chars/token — a conservative
-    upper bound that avoids the 2-3× underestimation of ``chars//3`` alone.
+    upper bound that avoids the 2-3x underestimation of ``chars//3`` alone.
     Returns 0 for empty/None text.
 
     This is the single canonical token estimator for message content across
@@ -2203,14 +1611,13 @@ def _estimate_single_message_tokens(m: object) -> int:
     _can_cache = not isinstance(m, dict) and hasattr(m, '__dict__')
     if _can_cache:
         cached = getattr(m, '_msg_token_estimate', None)
-        if cached is not None:
+        if cached is not None and getattr(m, "_msg_token_fp", None) == _msg_token_fingerprint(m):
             # Fingerprint guard: recompute if any counted field's length changed
             # since the estimate was cached.  Self-heals in-place mutation that
             # bypasses copy-on-write (see .. note:: above).  Lengths keep the
             # guard cheap while catching every realistic mutation path.
-            if getattr(m, '_msg_token_fp', None) == _msg_token_fingerprint(m):
-                return cached
-            # fp mismatch -> fall through and recompute a fresh estimate.
+            return cached
+        # fp mismatch -> fall through and recompute a fresh estimate.
 
     mt = 0
     # Content (CJK-aware) — skip when raw_content is present because it is the
@@ -2312,7 +1719,7 @@ def _estimate_single_message_tokens(m: object) -> int:
     # When an image dict carries a pre-computed ``ocr_text`` (set by
     # _images_to_text on first call), use its token-equivalent length
     # as a floor so that text-only model paths never under-count
-    # Korean-heavy OCR output (which can be ~2× the flat cap).
+    # Korean-heavy OCR output (which can be ~2x the flat cap).
     images = _msg_field(m, 'images', None)
     if images:
         for img in images:
@@ -2392,16 +1799,28 @@ def estimate_tokens_from_tool_schemas(tool_schemas: Optional[list]) -> int:
     _cached = _tool_schema_token_cache.get(_fp)
     if _cached is not None:
         return _cached
-    try:
-        _chars = len(json.dumps(tool_schemas, ensure_ascii=False, default=str))
-    except Exception:
-        _chars = sum(len(str(s)) for s in tool_schemas)
-    result = int(_chars / CHARS_PER_TOKEN) + 1
+    # CJK-aware byte-based estimator (same fail-safe as message content): the
+    # old chars/3 count under-estimated Korean/CJK descriptions ~2-3x, which
+    # inflated context_message_cap and could 400 on CJK-heavy schemas.
+    result = _cjk_tokens_from_jsonable(tool_schemas)
     # FIFO-bounded via the shared SSOT helper (same family as the file-index and
     # walk caches) — evicts only the oldest entry instead of nuking the whole
     # cache on the 9th distinct schema, so recently-used schemas stay warm.
     _capped_put(_tool_schema_token_cache, _fp, result, cap=8)
     return result
+
+
+# The smallest message budget at which a prompt can still be useful. When
+# ``ctx_limit - output_reserve - tool_tokens`` falls below this, the window is
+# structurally too small for the current toolset — ``context_message_cap``
+# logs a diagnosis (once per signature) instead of silently returning its 512
+# floor, and ``_record_context_overflow`` (context_budget.py) refuses to
+# reduce the window below the matching structural floor.
+MIN_USABLE_MESSAGE_BUDGET: int = 2048
+
+# (ctx_limit, output_reserve, tool_tokens) signatures already diagnosed —
+# prevents one identical ERROR per LLM call while an impossible budget persists.
+_IMPOSSIBLE_BUDGET_WARNED: set = set()
 
 
 def context_message_cap(ctx_limit: int, safety_margin: int,
@@ -2424,11 +1843,26 @@ def context_message_cap(ctx_limit: int, safety_margin: int,
     ``estimate_tokens_from_tool_schemas(tool_schemas)``.
     """
     _output_reserve = max(safety_margin, min(4096, ctx_limit // 5))
-    if tool_tokens is None:
-        _tool_tokens = estimate_tokens_from_tool_schemas(tool_schemas)
-    else:
-        _tool_tokens = tool_tokens
-    return max(512, ctx_limit - _output_reserve - _tool_tokens)
+    _tool_tokens = estimate_tokens_from_tool_schemas(tool_schemas) if tool_tokens is None else tool_tokens
+    _raw = ctx_limit - _output_reserve - _tool_tokens
+    if _raw < MIN_USABLE_MESSAGE_BUDGET:
+        # Structurally impossible: even with zero chat history the output
+        # reserve + tool schemas already exceed the window. Surface the numbers
+        # once per signature instead of silently returning the 512 floor —
+        # which hides the cause (and the fix: smaller toolset / larger window)
+        # forever.
+        _sig = (ctx_limit, _output_reserve, _tool_tokens)
+        if _sig not in _IMPOSSIBLE_BUDGET_WARNED:
+            _IMPOSSIBLE_BUDGET_WARNED.add(_sig)
+            logger.error(
+                "Context budget is structurally impossible for this model: "
+                "window=%d, output reserve=%d, tool schemas=%d → only %d tokens "
+                "left for messages (below the %d minimum). Reduce the toolset "
+                "or use a larger context window.",
+                ctx_limit, _output_reserve, _tool_tokens, _raw,
+                MIN_USABLE_MESSAGE_BUDGET,
+            )
+    return max(512, _raw)
 
 
 def _msg_role(m) -> str:

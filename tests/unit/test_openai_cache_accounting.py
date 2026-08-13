@@ -14,6 +14,7 @@ when the design-chat failover flips from the Anthropic facade to the OpenAI one.
 from __future__ import annotations
 
 import json
+from typing import ClassVar
 
 import pytest
 
@@ -66,7 +67,7 @@ def test_extract_cached_tokens_zero_is_not_none():
 
 class _OK:
     status_code = 200
-    headers = {}
+    headers: ClassVar[dict] = {}
 
     def __init__(self, data):
         self._data = data
@@ -81,7 +82,7 @@ class _OK:
 
 class _Stream:
     status_code = 200
-    headers = {}
+    headers: ClassVar[dict] = {}
 
     def __init__(self, sse_lines):
         self._lines = sse_lines
@@ -89,6 +90,12 @@ class _Stream:
     def iter_lines(self):
         for ln in self._lines:
             yield ln.encode()
+
+    def iter_bytes(self):
+        # SSE parser (P28-1) consumes iter_bytes() and splits on \n itself —
+        # frames must be newline-terminated like a real SSE stream.
+        for ln in self._lines:
+            yield (ln + "\n").encode()
 
     def close(self):
         pass
@@ -102,12 +109,11 @@ def _payload(content="hi", finish="stop", usage=None, tool_calls=None):
     msg = {"role": "assistant", "content": content}
     if tool_calls:
         msg["tool_calls"] = tool_calls
-    body = {
+    return {
         "id": "x", "object": "chat.completion",
         "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
         "usage": usage or _usage(),
     }
-    return body
 
 
 def _parent(monkeypatch, resp):

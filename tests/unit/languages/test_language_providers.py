@@ -3,16 +3,19 @@
 Focuses on symbol detection and API contracts that don't require
 external toolchains (go, tsc, kotlinc, javac).
 """
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
 
+from external_llm.languages.base import tree_sitter_syntax_fallback
 from external_llm.languages.bash_provider import BashSyntaxProvider
 from external_llm.languages.go_provider import GoSyntaxProvider
 from external_llm.languages.java_provider import JavaSyntaxProvider
 from external_llm.languages.javascript_provider import JavaScriptSyntaxProvider
 from external_llm.languages.kotlin_provider import KotlinSyntaxProvider
 from external_llm.languages.models import LanguageId
+from external_llm.languages.tree_sitter_utils import SyntaxErrorNode
 from external_llm.languages.typescript_provider import TypeScriptSyntaxProvider
 
 # ── GoSyntaxProvider ──────────────────────────────────────────────────────────
@@ -94,7 +97,7 @@ class TestGoProvider:
             "func (u *User) Greet() string {\n    return \"hi\"\n}\n"
             "func (u *User) Bye() string {\n    return \"bye\"\n}\n"
         )
-        methods = provider._find_class_methods_regex(content, "User")
+        methods = provider._find_all_class_methods_regex(content)["User"]
         names = {m[0] for m in methods}
         assert "Greet" in names, f"Greet missing: {names}"
         assert "Bye" in names, f"Bye missing: {names}"
@@ -153,6 +156,42 @@ class TestTypeScriptProvider:
         content = "const myFn = (x: number) => {\n    return x;\n};\n"
         result = provider.find_symbol_in_file("foo.ts", "myFn", content)
         assert result is not None
+
+    def test_find_generator_function_regex_fallback(self, provider):
+        """Bug (P3): the fallback regexes matched only ``function Name(`` —
+        ``function* Name(`` generators were invisible (both the
+        get_symbol_patterns path and the hardcoded top-level-definitions
+        regex). Tree-sitter is bypassed so the regex path is what runs."""
+        import re as _re
+        from unittest.mock import patch
+
+        # get_symbol_patterns path (used by _find_symbol_regex / ripgrep outline)
+        pats = [p for p in provider.get_symbol_patterns("function")
+                if "const" not in p.regex and "let" not in p.regex]
+        for p in pats:
+            rx = _re.compile(p.regex.format(name="genSeq"))
+            assert rx.search("function* genSeq() {") is not None, p.regex
+            assert rx.search("async function* genSeq() {") is not None, p.regex
+            assert rx.search("export function* genSeq() {") is not None, p.regex
+            assert rx.search("function genSeq() {") is not None, p.regex
+
+        # Hardcoded top-level-definitions regex
+        out = provider._find_top_level_definitions_regex(
+            "export function* genSeq() {\n  yield 1;\n}\n\n"
+            "async function* stream(): AsyncGenerator<string> {\n}\n"
+        )
+        names = [r[0] for r in out]
+        assert "genSeq" in names, names
+        assert "stream" in names, names
+
+        # End-to-end through find_symbol_in_file with tree-sitter disabled
+        # (local import re-binds at call time, so patching the module attr works)
+        with patch("external_llm.languages.tree_sitter_utils.is_available", return_value=False):
+            result = provider.find_symbol_in_file(
+                "foo.ts", "genSeq", "function* genSeq(): Generator<number> {\n  yield 1;\n}\n"
+            )
+        assert result is not None
+        assert result[0] == 1
 
     def test_not_found_returns_none(self, provider):
         content = "function other() {}\n"
@@ -305,6 +344,122 @@ class TestKotlinProvider:
         body = provider._find_symbol_body_range_regex(content, "helper")
         assert body is not None, "body should not be None"
         assert body[0] >= 1, f"body start valid: {body}"
+
+    # ── kotlinc cold-start optimisations (tree-sitter prefilter + JVM flags) ──
+    #
+    # Every kotlinc invocation pays JVM startup (~2s) regardless of file size.
+    # The prefilter short-circuits syntax errors tree-sitter already caught, so
+    # broken code is rejected without a JVM boot; kotlinc stays authoritative
+    # for tree-sitter-clean content. KOTLINC_JVM_FLAGS trim the remaining boot.
+
+    def _capture_run(self, monkeypatch, rc=0, stdout="", stderr=""):
+        """Patch ``subprocess.run`` in the provider module; return captured cmds."""
+        calls = []
+
+        def _fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=rc, stdout=stdout, stderr=stderr)
+
+        monkeypatch.setattr(
+            "external_llm.languages.kotlin_provider.subprocess.run", _fake_run
+        )
+        return calls
+
+    def test_validate_syntax_broken_skips_kotlinc(self, provider, monkeypatch):
+        # Unbalanced braces are visible to tree-sitter — the prefilter must
+        # reject WITHOUT spawning kotlinc (no JVM boot for broken code).
+        def _boom(*a, **k):
+            raise AssertionError("kotlinc must not be spawned for tree-sitter-visible errors")
+
+        monkeypatch.setattr(
+            "external_llm.languages.kotlin_provider.subprocess.run", _boom
+        )
+        result = provider._validate_syntax_impl("Broken.kt", "fun alpha( {\n    return 1\n}\n")
+        assert result.ok is False
+
+    def test_validate_syntax_broken_missing_paren_rejected(self, provider, monkeypatch):
+        # Same contract for a MISSING-token error (not just unbalanced braces).
+        def _boom(*a, **k):
+            raise AssertionError("must not spawn kotlinc")
+
+        monkeypatch.setattr(
+            "external_llm.languages.kotlin_provider.subprocess.run", _boom
+        )
+        result = provider._validate_syntax_impl("Broken.kt", "fun alpha( {\n    return 1\n}\n")
+        assert result.ok is False
+
+    def test_validate_syntax_broken_rejects_even_if_tempfile_fails(
+        self, provider, monkeypatch
+    ):
+        # Fail-open contract only applies to CLEAN code: if the temp-file
+        # plumbing fails, broken content must still be rejected by the
+        # prefilter rather than waved through as ok=True.
+        calls = self._capture_run(monkeypatch)
+        monkeypatch.setattr(
+            "external_llm.languages.kotlin_provider._tempfile_for_content",
+            lambda *a, **k: (None, lambda: None),
+        )
+        result = provider._validate_syntax_impl("Broken.kt", "fun alpha( {\n    return 1\n}\n")
+        assert result.ok is False
+        assert calls == []
+
+    def test_validate_syntax_valid_invokes_kotlinc_with_jvm_flags(
+        self, provider, monkeypatch
+    ):
+        # tree-sitter-clean content still gets the authoritative kotlinc pass —
+        # the prefilter must NOT skip the JVM for valid code.
+        calls = self._capture_run(monkeypatch, rc=0)
+        result = provider._validate_syntax_impl("Good.kt", "fun main() { val x = 1 }\n")
+        assert result.ok is True
+        assert len(calls) == 1
+        assert calls[0][0] == "kotlinc"
+        assert "-J-XX:TieredStopAtLevel=1" in calls[0]
+        assert "-J-XX:+UseSerialGC" in calls[0]
+        assert "-J-Xverify:none" in calls[0]
+
+    def test_validate_syntax_semantic_error_still_invokes_kotlinc(
+        self, provider, monkeypatch
+    ):
+        # An unresolved reference is SEMANTICALLY broken but syntactically
+        # clean — tree-sitter sees nothing, so kotlinc must still run and its
+        # diagnostic must survive the prefilter untouched.
+        calls = self._capture_run(
+            monkeypatch,
+            rc=1,
+            stderr="Bad.kt:1:21: error: unresolved reference: undefinedSymbol\n",
+        )
+        result = provider._validate_syntax_impl(
+            "Bad.kt", "fun main() { val x = undefinedSymbol }\n"
+        )
+        assert result.ok is False
+        assert len(calls) == 1
+        assert any("unresolved reference" in e.message for e in (result.errors or []))
+
+    def test_validate_syntax_ts_unavailable_falls_through_to_kotlinc(
+        self, provider, monkeypatch
+    ):
+        # When tree-sitter cannot answer (grammar missing), the prefilter is
+        # silent and kotlinc remains the sole authority.
+        calls = self._capture_run(monkeypatch, rc=0)
+        monkeypatch.setattr(
+            "external_llm.languages.tree_sitter_utils.find_error_nodes",
+            lambda *a, **k: None,
+        )
+        result = provider._validate_syntax_impl("Good.kt", "fun main() { val x = 1 }\n")
+        assert result.ok is True
+        assert len(calls) == 1
+
+    def test_validate_semantics_uses_jvm_flags(self, monkeypatch, tmp_path):
+        # The on-disk semantic pass also pays JVM startup — flags must apply there.
+        kt = tmp_path / "App.kt"
+        kt.write_text("fun main() { println(1) }\n")
+        (tmp_path / "build.gradle.kts").write_text("plugins {}\n")
+        calls = self._capture_run(monkeypatch, rc=0)
+        result = KotlinSyntaxProvider().validate_semantics(str(kt))
+        assert result.ok is True
+        assert len(calls) == 1
+        assert "-J-XX:TieredStopAtLevel=1" in calls[0]
+        assert "-J-Xverify:none" in calls[0]
 
 
 # ── JavaSyntaxProvider ────────────────────────────────────────────────────────
@@ -603,6 +758,43 @@ class TestFindBlockEndOffsetSharedSSOT:
         assert "void real()" in body, f"{provider_cls.__name__}: method lost, body={body!r}"
 
 
+def test_no_naive_brace_counting_in_block_extent_consumers():
+    """Repo guard: block-extent brace scanning must live in languages.base.
+
+    write_tools_core._find_block_end_line (insert_after block-end) and
+    code_structure_utils._ts_symbol_defined (TS regex-fallback class bodies)
+    once hand-rolled ``count('{') - count('}')`` depth loops that miscounted
+    braces inside string/comment literals and truncated blocks early. Both
+    now delegate to the base SSOT scanner — this test fails if a naive count
+    loop is re-introduced in either file (it is pinned by AST because a
+    source grep cannot distinguish the naive form from a legitimate balance
+    check).
+    """
+    import ast as _ast
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[3]
+    offenders = []
+    for rel in (
+        "external_llm/agent/tool_handlers/write_tools_core.py",
+        "external_llm/code_structure_utils.py",
+    ):
+        tree = _ast.parse((repo_root / rel).read_text(encoding="utf-8"))
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            if not (
+                isinstance(node.func, _ast.Attribute)
+                and node.func.attr == "count"
+                and len(node.args) == 1
+                and isinstance(node.args[0], _ast.Constant)
+                and node.args[0].value in ("{", "}")
+            ):
+                continue
+            offenders.append(f"{rel}:{node.lineno}")
+    assert not offenders, f"naive brace counting re-introduced: {offenders}"
+
+
 # ── Rust lifetimes vs char literals: the char-vs-lifetime disambiguation ──────
 # Regression for the fail-closed bug where a Rust lifetime tick ('a) was treated
 # as a char-literal start: _skip_quoted_literal swallowed everything up to the
@@ -761,3 +953,104 @@ class TestBraceScannerCSharpVerbatimStrings:
 
         src = 'var a = """has { brace } here""";\nvoid f() {\n}\n'
         assert net_brace_count(src) == 0
+
+# ── tree_sitter_syntax_fallback (B2: language-parser fallback contract) ──────
+
+class TestTreeSitterSyntaxFallback:
+    """Direct coverage for the tree-sitter fallback gate (previously 0 tests).
+
+    The fallback is the ONLY syntax gate for toolchain-less languages
+    (rust/ruby/swift/php/csharp/bash/scala) and the last-resort gate when
+    go/javac/kotlinc are absent. Toolchain-parity tests exercise it only
+    indirectly via subprocess patching; these pin its contract directly:
+    fail-open when the grammar is unavailable, and 1-based line/col in
+    SyntaxError_ (find_error_nodes reports 0-based — off-by-one regression).
+    """
+
+    def test_fail_open_when_grammar_unavailable(self, monkeypatch):
+        """Grammar missing (find_error_nodes -> None) must stay permissive."""
+        monkeypatch.setattr(
+            "external_llm.languages.tree_sitter_utils.find_error_nodes",
+            lambda *a, **k: None,
+        )
+        r = tree_sitter_syntax_fallback(
+            "fun a( { return 1 }\n", LanguageId.KOTLIN, "X.kt")
+        assert r.ok is True
+        assert r.errors == []
+
+    def test_clean_source_ok(self, monkeypatch):
+        monkeypatch.setattr(
+            "external_llm.languages.tree_sitter_utils.find_error_nodes",
+            lambda *a, **k: [],
+        )
+        r = tree_sitter_syntax_fallback(
+            "fun a() { return 1 }\n", LanguageId.KOTLIN, "X.kt")
+        assert r.ok is True
+
+    def test_error_nodes_reported_one_based(self, monkeypatch):
+        """0-based SyntaxErrorNode positions become 1-based SyntaxError_."""
+        monkeypatch.setattr(
+            "external_llm.languages.tree_sitter_utils.find_error_nodes",
+            lambda *a, **k: [SyntaxErrorNode(
+                kind="ERROR", missing_token="", line=2, column=3)],
+        )
+        r = tree_sitter_syntax_fallback(
+            "fun a() {\n  val x = \n}\n", LanguageId.KOTLIN, "X.kt")
+        assert r.ok is False
+        assert len(r.errors) == 1
+        assert r.errors[0].line == 3   # 0-based 2 -> 1-based 3
+        assert r.errors[0].col == 4    # 0-based 3 -> 1-based 4
+        assert "tree-sitter" in r.errors[0].message
+
+    def test_missing_token_surfaces_expected_message(self, monkeypatch):
+        monkeypatch.setattr(
+            "external_llm.languages.tree_sitter_utils.find_error_nodes",
+            lambda *a, **k: [SyntaxErrorNode(
+                kind="MISSING", missing_token=")", line=0, column=0)],
+        )
+        r = tree_sitter_syntax_fallback(
+            "fun main( }\n", LanguageId.KOTLIN, "X.kt")
+        assert r.ok is False
+        assert "expected ')'" in r.errors[0].message
+
+    def test_grammar_key_from_path_forwarded(self, monkeypatch):
+        """file_path drives the grammar key (e.g. .tsx -> tsx)."""
+        seen: dict = {}
+        monkeypatch.setattr(
+            "external_llm.languages.tree_sitter_utils.find_error_nodes",
+            lambda content, language: seen.update(lang=language) or None,
+        )
+        tree_sitter_syntax_fallback("x", LanguageId.TYPESCRIPT, "comp.tsx")
+        assert seen["lang"] == "tsx"
+
+# ── Shared regex scaffold: SyntaxProvider._iter_symbol_matches ────────────────
+
+class TestIterSymbolMatches:
+    """Contract of the shared ``_iter_symbol_matches`` regex fallback scaffold."""
+
+    @pytest.fixture
+    def provider(self):
+        return GoSyntaxProvider()
+
+    def test_yields_pattern_and_match_in_order(self, provider):
+        content = "package main\n\nvar Foo = 1\nconst Bar = 2\nfunc Foo() {\n}\n"
+        hits = list(provider._iter_symbol_matches(content, "Foo"))
+        kinds = {sp.kind for sp, _ in hits}
+        assert kinds <= {p.kind for p in provider.get_symbol_patterns("any")}
+        assert "variable" in kinds and "function" in kinds
+        # Yielded in pattern order, then position order within each pattern.
+        order = {p.kind: i for i, p in enumerate(provider.get_symbol_patterns("any"))}
+        kind_seq = [sp.kind for sp, _ in hits]
+        assert kind_seq == sorted(kind_seq, key=order.__getitem__)
+        for kind in set(kind_seq):
+            positions = [m.start() for sp, m in hits if sp.kind == kind]
+            assert positions == sorted(positions)
+
+    def test_absent_symbol_yields_nothing(self, provider):
+        content = "package main\n\nvar Foo = 1\n"
+        assert list(provider._iter_symbol_matches(content, "Missing")) == []
+
+    def test_symbol_name_is_escaped(self, provider):
+        # Unescaped, "Foo+" would match the "Foo" prefix of FooPlus.
+        content = "package main\n\nvar FooPlus = 1\n"
+        assert list(provider._iter_symbol_matches(content, "Foo+")) == []

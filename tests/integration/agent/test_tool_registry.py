@@ -379,7 +379,7 @@ def test_tool_registry_apply_patch_hunk_only_invalid(tool_registry):
 
 # Direct tests for diff_apply.apply_patch
 def test_diff_apply_hunk_only(temp_repo_root):
-    """Test diff_apply.apply_patch with hunk‑only diffs."""
+    """Test diff_apply.apply_patch with hunk-only diffs."""
     from unittest.mock import patch
 
     with patch('config.STRICT_CLEAN', False):
@@ -404,14 +404,14 @@ def test_diff_apply_hunk_only(temp_repo_root):
      def add(self, a: int, b: int) -> int:
          return a + b
 """
-        ok, msg, reason, details = apply_patch(temp_repo_root, full_patch, file_path_hint=None)
+        ok, msg, reason, _details = apply_patch(temp_repo_root, full_patch, file_path_hint=None)
         assert ok, f"Full patch failed: {msg}"
 
         # Reset file (git checkout)
         import subprocess
-        subprocess.run(["git", "checkout", "--", "sample.py"], cwd=temp_repo_root, capture_output=True)
+        subprocess.run(["git", "checkout", "--", "sample.py"], cwd=temp_repo_root, capture_output=True, check=False)
 
-        # Hunk‑only patch (no headers)
+        # Hunk-only patch (no headers)
         hunk_only = """@@ -1,6 +1,9 @@
  def hello() -> str:
      return "world"
@@ -424,16 +424,16 @@ def test_diff_apply_hunk_only(temp_repo_root):
          return a + b
 """
         # Should fail without file_path_hint
-        ok, msg, reason, details = apply_patch(temp_repo_root, hunk_only, file_path_hint=None)
+        ok, msg, reason, _details = apply_patch(temp_repo_root, hunk_only, file_path_hint=None)
         assert not ok
         assert "MISSING_PATH_HINT" in reason or "path" in msg.lower()
 
         # Should succeed with file_path_hint
         ok, msg, reason, _details = apply_patch(temp_repo_root, hunk_only, file_path_hint="sample.py")
-        assert ok, f"Hunk‑only patch failed: {msg}"
+        assert ok, f"Hunk-only patch failed: {msg}"
 
         # Verify the patch was applied
-        diff_proc = subprocess.run(["git", "diff", "sample.py"], cwd=temp_repo_root, capture_output=True, text=True)
+        diff_proc = subprocess.run(["git", "diff", "sample.py"], cwd=temp_repo_root, capture_output=True, text=True, check=False)
         assert "def __init__" in diff_proc.stdout
         assert "self.memory = 0" in diff_proc.stdout
 
@@ -801,3 +801,39 @@ def test_dispatch_parallel_keeps_readonly_bash_parallel(tool_registry, agent_con
     assert len(results) == 3
     assert concurrency["max"] >= 2, (
         f"read-only-bash batch did not parallelize (max={concurrency['max']})")
+
+
+def test_dispatch_parallel_cancel_during_wait_propagates(tool_registry, agent_config):
+    """ESC mid-batch must abort the parallel wait within one poll interval and
+    propagate as AgentCancelled — NOT be wrapped into a fake tool error the LLM
+    would read as a failure.
+
+    Deterministic by construction: the first dispatch completes and SETS the
+    cancel_event from its own worker; the collect loop's next poll (0.25 s)
+    observes it while the second dispatch is still running.
+    """
+    import time as _time
+
+    from external_llm.agent.agent_loop_types import AgentCancelled
+    from external_llm.agent.tool_registry import ToolResult
+
+    cancel_event = threading.Event()
+    agent_config.cancel_event = cancel_event
+    agent_config.parallel_tool_execution_enabled = True
+    registry = ToolRegistry(tool_registry.repo_root, agent_config)
+
+    def _dispatch(name, args):
+        if name == "find_symbol":
+            _time.sleep(0.1)
+            cancel_event.set()  # fired inside the first worker thread
+            return ToolResult(ok=True, content="ok", error="", metadata={})
+        _time.sleep(2.0)  # must be abandoned, not waited out
+        return ToolResult(ok=True, content="ok", error="", metadata={})
+
+    tool_calls = [
+        {"tool": "find_symbol", "args": {"name": "a"}},
+        {"tool": "grep", "args": {"pattern": "x"}},
+    ]
+    with patch.object(registry, "dispatch", side_effect=_dispatch), pytest.raises(AgentCancelled):
+        registry.dispatch_parallel(tool_calls)
+    assert cancel_event.is_set()

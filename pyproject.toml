@@ -1,6 +1,6 @@
 [project]
 name = "asicode"
-version = "0.2.18"
+version = "0.2.19"
 description = "Autonomous Software Improvement — AST-precise code editing agent with verification gates (CLI + MCP server)"
 readme = "README.md"
 license = "MIT"
@@ -177,26 +177,10 @@ py-modules = ["asi", "common", "config", "context_collector", "diff_apply", "pat
 # CLI-only distribution: the wheel ships only what the `asi` CLI reaches at
 # runtime. Excluded from the package (still in the repo, used by webapp/dev):
 #   - webapp*  — FastAPI server/UI, not part of the CLI deployment
-#   - tools*   — dev/verification scripts; the only runtime importer of
-#                tools.* is the excluded PLANNER lane (executor_verification)
-#   - external_llm.editor._editor_core.lane* — PLANNER lane, permanently
-#     disabled at routing (task_router always returns MAIN_AGENT); only the
-#     webapp injects Lane.PLANNER. planner_lane_facade degrades to None on
-#     ImportError, so the CLI runs MAIN_AGENT-only without it (129k lines).
-#   - editor.operation_handlers / refactor / safety / semantic_lineage —
-#     lane-only machinery living outside lane/ (operation_handlers top-level
-#     imports lane; sole importers are lane executor mixins). Verified: no
-#     retained module imports these, absolutely or relatively.
+#   - tools*   — dev/verification scripts
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["external_llm*", "services*", "utils*"]
-exclude = [
-    "external_llm.editor._editor_core.lane*",
-    "external_llm.editor.operation_handlers*",
-    "external_llm.editor.refactor*",
-    "external_llm.editor.safety*",
-    "external_llm.editor.semantic_lineage*",
-]
 
 [build-system]
 # >=77: PEP 639 SPDX `license = "MIT"` + `license-files` support
@@ -205,9 +189,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.coverage.run]
 source = ["external_llm", "webapp", "asi"]
-omit = [
-    "*/_editor_core/lane/*",
-]
 concurrency = ["multiprocessing"]
 parallel = true
 
@@ -236,6 +217,15 @@ addopts = [
     "--strict-markers",
     "--tb=short",
     "--import-mode=importlib",
+    # -n auto: pytest-xdist default parallelism. Verified 2026-08-01 under
+    # 8-way: unit 12190 passed / 0 failed / 12 skipped / 4 xfailed in 2:46,
+    # integration 382 passed / 0 failed / 14 xfailed in 0:19. Serial
+    # debugging: override with `pytest -n 0`.
+    # NOTE: pytest 9 passes each addopts element to argv verbatim (no shlex
+    # split) — "-n auto" as ONE element parses as value ' auto' and fails, so
+    # the flag and its value must be separate elements.
+    "-n",
+    "auto",
 ]
 # ASICODE_SHOW_WARNINGS=1: show all Python warnings (default: only errors shown via filterwarnings)
 filterwarnings = [
@@ -261,6 +251,62 @@ select = [
     "B",    # flake8-bugbear (likely bugs)
     "ASYNC",# flake8-async (async patterns)
     "RUF",  # ruff-specific rules
+    "PT011", # pytest.raises without match — test expectations pinned (A2)
+    "TRY004",# type checks must raise TypeError, not ValueError (A3)
+    "PLW1510",# subprocess.run must pass explicit check= — every site pinned (PLW1510 round; enforced by the full-scan gate)
+    "PLR5501",# else-if → elif (collapsible-else-if, P-4 round)
+    "PLR0402",# import x.y → from x import y (consider-using-from-import, P-4 round)
+    "PLC0207",# split() maxsplit reduction (unnecessary-string-split, P-4 round)
+    "PLR1730",# manual min/max/clamp → builtin (prefer-min-max, P-4 round)
+    "PLR1711",# trailing bare return (useless-return, P-4 round)
+    "SIM102", # nested if → and-merged single if (P-2 round: 149건 전량 정리, full-scan gate 강제)
+    "SIM103", # needless-bool — return the condition directly (P-2 round: 17건, 주석 보존 수동 3건 포함)
+    "SIM114", # if/elif with identical arms → or-merged condition (P-2 round: 38건 + 주석 보존)
+    "SIM115", # open → with context manager (P-2 round: 6건 — with 변환 1 + 구조적 예외 noqa 5)
+    "SIM108", # if-else-block → ternary (P-2 round: 52건 — unsafe-fix 46 + 주석 보존 수동 6, 병렬 WIP 2건 제외)
+    "PLC0414",# useless-import-alias (P-4 continuation round)
+    "PLC2401",# non-ascii-name (P-4 continuation round)
+    "PLR1714",# repeated eq comparisons → membership test (P-4 continuation round)
+    "PLC0206",# dict iteration without .items() (P-4 continuation round)
+    "PLR1704",# redefined-argument-from-local (P-4 continuation round)
+    "SIM300", # yoda-conditions — constants on the right side (P-2 round: 9건)
+    "SIM910", # dict.get(k, None) → dict.get(k) (P-2 round: 7건)
+    "TRY203", # immediate re-raise except → must do real work (P-1 round: 1건 — unguarded-subprocess 게이트가 try 필요, 메시지 강화로 해결)
+    "SIM118", # key in dict.keys() → key in dict (P-1 round: 3건)
+    "SIM117", # nested with → single multi-context with (P-2 round: 17건 — auto 10 + 수동 7)
+    "SIM110", # for-loop with early return True → any() (P-3 round: 7건 — 전부 순수 비교 루프, 수동 변환)
+    "RET505", # superfluous-else-return → early return (P-2 round: 64건 — 전부 auto-fix)
+    "RET506", # superfluous-else-raise (P-2 round: 1건)
+    "RET507", # superfluous-else-continue (P-2 round: 1건)
+    "RET508", # superfluous-else-break (P-2 round: 3건)
+    "SIM101", # duplicate-isinstance-call → tuple merge (P-5 round: 6건 — unsafe-fix, 전부 동등)
+    "SIM113", # manual index counting → enumerate(start=1) (P-5 round: 3건 — 수동 변환, n_total/_ts_count/emitted)
+    "SIM211", # False if not X else True → bool(X) (P-5 round: 1건 — unsafe-fix 후 bool()으로 다듬음)
+    "SIM222", # x or True → True (P-5 round: 1건 — no-op assertion을 실제 검증 assert updated != initial로 회복)
+    "SIM105", # try-except-pass → contextlib.suppress (P-6 round: 114건 — unsafe-fix 97 + 주석 보존 수동 17, 전부 동등)
+    "C401", # set(generator) → set comprehension (P-1 round: 10건 — unsafe-fix, 전부 동등)
+    "C408", # dict() → dict literal (P-1 round: 13건 — unsafe-fix, 전부 동등)
+    "C414", # unnecessary double cast — sorted(list(...)) → sorted(...) (P-1 round: 6건)
+    "C416", # unnecessary comprehension — {k: v for k, v in items()} → dict(items()) (P-1 round: 3건)
+    "C420", # unnecessary dict comprehension → dict.fromkeys(...) (P-1 round: 10건 — safe-fix)
+    "RET501", # unnecessary-return-none: annotated-return (P-8 round: 0건)
+    "RET502", # unnecessary-return-none: explicit-return (P-8 round: 0건)
+    "RET503", # missing explicit return at end of non-None function (P-8 round: 3건 — fix 1 + invariant raise 1 + noqa 1)
+    "RET504",# unnecessary-assign-before-return (P-7 round: 60건 — unsafe-fix, 전부 동등, 주석 1건 복원)
+    "TRY400",# logging .error in except must be .exception (P10-4: 54건 unsafe-fix + G201 수동 10건 — 트레이스백 유실 복구)
+    "G201",  # .error(..., exc_info=True) → .exception(...) (P10-4: 10건 수동 — 의미 동등)
+    "G202",  # redundant exc_info kwarg — exception(exc_info=True) (P10-4 재검증: TRY400/G201 이미 활성 확인, G202 실측 0건 + 샌드박스 발화 검증)
+    # NOTE: "B904" (raise-without-from) is NOT listed here — it is already
+    # active under the "B" (flake8-bugbear) prefix above. The P-9 round added
+    # a per-rule entry that was a no-op; scripts/check_select_not_redundant.py
+    # now rejects such redundant entries (P10-1).
+    "PIE810", # multiple-starts-ends-with → tuple merge (P11 round: 62건 — unsafe-fix 전수 심사, 리터럴/f-string 인자만, 동등 확인)
+    "PIE790", # unnecessary-pass (P10-6 part 1: 36건 docstring 뒤 pass 정리 / part 2: 16건 except trailing pass — 주석 승격 5건 포함, 의미 동등)
+    "G001",  # logging-string-format (.format()) → lazy %-format (P13 round: 실측 0건 + 샌드박스 발화 5건 확인 — 이 버전 fix 미지원, 신규 위반은 수동)
+    "G002",  # logging-percent-format (eager % 연산) → lazy %-format (P13 round: 실측 0건 + 샌드박스 발화 2건 확인 — lazy "%.200s", arg 형태는 대상 아님, fix 미지원)
+    "G004",  # logging-f-string → lazy %-format (P12 round: 142건 수동 변환 — 이 버전 fix 미지원, 전수 심사: 리터럴/표현식 인자 이동, %r/%.1f 대응, 하이브리드 8건 label 인자화)
+    "G010",  # logging-warn → warning (P12 round: 실측 0건 + 샌드박스 발화 2건 확인 — safe-fix)
+    "TRY300",# return in try → else block (TRY300 round: 131건 else 이동 + lazy-import 1건 noqa(asi.py:461) — 전부 예외 불가 식(Call 0건)이라 의미 동등, 5161 tests 검증)
 ]
 # Rules excluded globally (enable gradually after baseline cleanup):
 ignore = [
@@ -270,7 +316,6 @@ ignore = [
     "N999",         # invalid-module-name: 46 violations (from __init__ re-exports)
     "UP037",        # quoted-annotation: 902 violations — enable after staged migration
     "UP045",        # non-pep604-annotation-optional: 2,845 violations — staged migration
-    "B023",         # function-uses-loop-variable: 25 violations (intentional closures)
     "ASYNC100",     # async-function-with-no-await: too noisy for mixed sync/async
 ]
 
@@ -283,10 +328,59 @@ line-ending = "lf"
     "N806",   # non-lowercase variable allowed in tests
     "ASYNC100",
 ]
+# E402 (module-level import not at top of file): tests deliberately group
+# imports by test section — keeps collection light and avoids import-time side
+# effects (importorskip gates, heavy-module avoidance; the reasons are
+# documented at each site). Same convention as "tests/*" naming entries.
+"tests/**" = [
+    "E402",
+]
 "tools/*" = [
     "N802",
     "N806",
+    "E402",   # section-local imports after sys.path bootstrap (script convention)
 ]
 "__init__.py" = [
     "N999",   # __init__.py module names match package
 ]
+
+# RUF102: `# noqa: V1xx` — vulture's own error codes (V101-V107) are not ruff
+# rules. The scanner implements the flake8-style V-code noqa contract, so these
+# directives document audited intentional/unused-looking code (stdlib callback
+# overrides, framework contract attrs, re-exports, library API attrs).
+"external_llm/agent/tool_handlers/web_search_tools.py" = ["RUF102"]
+"external_llm/agent/tool_handlers/write_tools_core.py" = ["RUF102"]
+"external_llm/languages/libcst_utils.py" = ["RUF102"]
+"webapp/main.py" = ["RUF102"]   # V-code noqa contract: FastAPI fallback stub catch-alls + mount_ui fallback signature
+
+# RUF001: ambiguous-unicode-in-string — audited 2026-08-07: every occurrence is
+# an intentional display convention, not a logic string: range notation "5–7"
+# (read_tools.py output + its test fixtures), multiplication "3×" (bench/LLM
+# hints), console symbols "❯ ℹ ➕ ➖" (REPL/verifier UI), U+2212 sign alignment
+# (asi.py +/- columns), decorative-char translation keys (plan_compiler.py),
+# and str.splitlines() break-char fixtures (test_read_file_streaming.py).
+"external_llm/agent/tool_handlers/read_tools.py" = ["RUF001"]
+"external_llm/agent/failure_pattern_store.py" = ["RUF001"]
+"external_llm/providers.py" = ["RUF001"]
+"external_llm/repl/collaborate/verdict.py" = ["RUF001"]
+"external_llm/repl/repl_impl.py" = ["RUF001"]
+"plan_compiler.py" = ["RUF001"]
+"asi.py" = ["RUF001", "RUF102"]
+"tests/unit/agent/test_read_file_output_budget.py" = ["RUF001"]
+"tests/unit/agent/test_read_file_streaming.py" = ["RUF001"]
+"tests/unit/agent/test_orchestrator.py" = ["RUF001"]
+"tools/agent_behavior_analyzer.py" = ["RUF001"]
+"tools/ast_diff_verifier.py" = ["RUF001"]
+"tools/checkpoint_batch.py" = ["RUF001"]
+"tools/patch_strategy_bench.py" = ["RUF001"]
+
+# ast.NodeVisitor callback assignments (visit_<NodeName> = <method>) are
+# mixedCase by API contract — N815 is inapplicable to this dispatch pattern.
+# RUF102 too: `# noqa: V1xx` directives (vulture's own codes) are not ruff
+# rules; see the RUF102 block above.
+"external_llm/analysis/container_reachability_scanner.py" = ["N815"]
+"external_llm/analysis/vulture_scanner.py" = ["N815", "RUF102"]
+"external_llm/graph/repository_graph.py" = ["N815"]
+"external_llm/agent/tool_handlers/write_tools_edit_mixin.py" = ["N815"]
+"scripts/check_no_new_silent_except.py" = ["N815"]
+"scripts/check_no_new_unguarded_subprocess.py" = ["N815"]

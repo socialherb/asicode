@@ -17,8 +17,8 @@ should proceed to the CLARIFY verdict path, not block execution entirely.
 """
 from __future__ import annotations
 
-from typing import Literal
 import logging
+from typing import Literal
 
 RoutingIntent = Literal["read_only", "clarification_needed", "explore_and_edit"]
 

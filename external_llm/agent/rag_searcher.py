@@ -16,26 +16,28 @@ import fnmatch
 import hashlib
 import logging
 import math
+import os
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-import os
 from pathlib import Path
 from typing import Any, Optional
 
-from .config.thresholds import config as _cfg
-from .performance_metrics import get_global_collector
-from .rag_configs import CodeTokenizer
 # Deterministic, source-prioritized descent order shared with the symbol /
 # call-graph walkers — keeps the RAG corpus reproducible and source-first.
-from ._shared_utils import _walk_dir_sort_key
+from ..common.walk_policy import _WALK_SKIP_FILE_SUFFIXES, _walk_dir_sort_key, _walk_should_skip_dir
+
 # Language extension SSOT — keeps the RAG corpus in lock-step with the rest of
 # the language layer (see the "6 SSOT dimensions" invariant in test_tree_sitter
 # _utils.py).  Importing _EXT_MAP here closes the last open drift the invariant
 # documents: _INDEXED_EXTS was a hardcoded subset that silently dropped
 # half-wired languages (.lua/.scala/.css/.html/.json/.pyi/.mjs/.cc/.kts/…).
 from ..languages.models import _EXT_MAP
+from .config.thresholds import config as _cfg
+from .performance_metrics import get_global_collector
+from .rag_configs import CodeTokenizer
+from .vector_cache import HAS_FAISS, HAS_NUMPY, HAS_SENTENCE_TRANSFORMERS, VectorCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +50,22 @@ logger = logging.getLogger(__name__)
 # RAG-indexable automatically — no manual sync, no silent omission.
 _INDEXED_EXTS = set(_EXT_MAP) | {".md", ".toml", ".yaml", ".yml"}
 
-_SKIP_DIRS = {
-    ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache",
-    "node_modules", ".venv", "venv", "env", ".tox", "dist", "build",
-    ".eggs", "migrations", "worktrees",
-}
+# RAG-only extra exclusions layered on the shared walk policy (below).
+_RAG_EXTRA_SKIP_DIRS = frozenset({"migrations"})
+
+
+def _rag_should_skip_dir(d: str) -> bool:
+    """Shared walk-admission predicate (B2' parity) + RAG-only ``migrations``.
+
+    The RAG walker is the 4th repo walker: it must prune exactly what
+    CGI/symbol_search/vulture/RepositoryGraph prune (hidden / venv* / vendor /
+    site-packages / *.egg-info via ``_walk_should_skip_dir``), or the corpus
+    drifts from the graph universes — vendored bundles or a venv
+    site-packages subtree can even starve real source under the file cap
+    (F-RAG-2, 2026-08-12).  ``migrations`` is a deliberate RAG-only
+    exclusion (DB migrations carry no searchable symbols).
+    """
+    return _walk_should_skip_dir(d) or d in _RAG_EXTRA_SKIP_DIRS
 
 _MAX_FILES = _cfg.counts.RAG_MAX_FILES
 _MAX_FILE_CHARS = _cfg.lines.RAG_FILE_CHARS
@@ -73,6 +86,82 @@ class SearchResult:
     score: float
     snippet: str        # most relevant excerpt (~120 chars)
     line: int = 0       # approximate line of best match
+
+
+# ── Shared per-repo index ─────────────────────────────────────────────────────
+# PERF-4: every RAGSearcher instance of this process searching the SAME
+# repo_root shares one index (arrays, corpus stats, generation counter, lock
+# and fingerprint map).  A fresh ToolRegistry / session therefore reuses the
+# existing build after a cheap walk+stat reconciliation (_ensure_index) instead
+# of re-reading and re-tokenizing the whole corpus — the multi-second first-call
+# cost is paid once per process, not once per instance.  Bounded LRU (cap 8,
+# matching the cached_repo_file_list pattern): cold repos are evicted and their
+# next instance falls back to a full build.
+
+
+class _SharedIndex:
+    """Process-wide BM25 index state for one repo_root.
+
+    The generation counter is SHARED so a mutation by ANY instance invalidates
+    every instance's per-instance search cache (see the generation checks in
+    ``find_relevant_files``).
+    """
+
+    __slots__ = (
+        "avgdl",
+        "built",
+        "df",
+        "doc_lengths",
+        "doc_texts",
+        "doc_token_counts",
+        # rel_path -> (st_mtime_ns, st_size) for every walked candidate file,
+        # captured at build/invalidate time.  The reconciliation diff in
+        # _ensure_index compares a cheap re-walk against this map to decide
+        # which files must be re-read (O(changed) instead of O(corpus)).
+        "fingerprints",
+        "index_generation",
+        "index_truncated",
+        "lock",
+        "n_docs",
+        "rel_path_to_idx",
+        "rel_paths",
+        "total_doc_len",
+    )
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.built = False
+        self.rel_paths: list[str] = []
+        self.doc_token_counts: list[dict[str, int]] = []
+        self.doc_lengths: list[int] = []
+        self.doc_texts: list[str] = []
+        self.rel_path_to_idx: dict[str, int] = {}
+        self.df: dict[str, int] = {}
+        self.avgdl: float = 0.0
+        self.n_docs: int = 0
+        self.total_doc_len: int = 0
+        self.index_generation: int = 0
+        self.index_truncated: bool = False
+        self.fingerprints: dict[str, tuple[int, int]] = {}
+
+
+_SHARED_INDEXES: OrderedDict[str, _SharedIndex] = OrderedDict()
+_SHARED_INDEXES_LOCK = threading.Lock()
+_SHARED_INDEXES_MAX = 8  # bound (LRU eviction) — match cached_repo_file_list cap
+
+
+def _get_shared_index(repo_root: str) -> _SharedIndex:
+    """Return the process-wide shared index for ``repo_root`` (LRU-capped)."""
+    with _SHARED_INDEXES_LOCK:
+        si = _SHARED_INDEXES.get(repo_root)
+        if si is not None:
+            _SHARED_INDEXES.move_to_end(repo_root)
+            return si
+        si = _SharedIndex()
+        _SHARED_INDEXES[repo_root] = si
+        if len(_SHARED_INDEXES) > _SHARED_INDEXES_MAX:
+            _SHARED_INDEXES.popitem(last=False)
+        return si
 
 
 # ── Tokenizer ─────────────────────────────────────────────────────────────────
@@ -154,6 +243,14 @@ class RAGSearcher:
 
     Index is built lazily on first search and cached in memory.
     Call invalidate_files() to update incrementally after edits.
+
+    All instances of this process searching the same repo_root SHARE one index
+    (see ``_SharedIndex``).  A fresh instance reuses the shared build after a
+    cheap walk+stat reconciliation against the fingerprint map
+    (``_ensure_index``), so the full corpus re-read only happens once per
+    process — or when files actually changed.  Externally-modified files (edits
+    outside this process's write funnel) are picked up by the next instance's
+    reconciliation.
     """
 
     def __init__(
@@ -164,7 +261,22 @@ class RAGSearcher:
         config: Any = None,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
-        self._built = False
+        # Shared per-repo index (see _SharedIndex): every instance of this
+        # process searching the SAME repo_root shares one BM25 index, one lock,
+        # one generation counter and the fingerprint map.  A fresh ToolRegistry
+        # / session therefore reuses the existing build after a cheap walk+stat
+        # reconciliation (_ensure_index) instead of re-reading and
+        # re-tokenizing the whole corpus — the multi-second first-call cost is
+        # paid once per process, not once per instance.
+        self._s = _get_shared_index(str(self.repo_root))
+        # The index lock is SHARED: array mutations from any instance serialize
+        # against every instance's readers (subagent clones share by reference
+        # via ToolRegistry.clone_for_subagent).
+        self._index_lock = self._s.lock
+        # True once this instance has either built the index or verified the
+        # shared index against disk.  Read lock-free in the _ensure_index fast
+        # path (benign race — worst case a redundant reconciliation).
+        self._reconciled = False
         # Cooperative cancel: hold config (NOT the event value) and read
         # config.cancel_event FRESH in _build_index via _get_cancel_event.
         # The design-chat REPL mutates config.cancel_event PER TURN (asi.py)
@@ -174,59 +286,128 @@ class RAGSearcher:
         # protect. An explicit cancel_event arg (tests / direct callers) wins.
         self._cancel_event = cancel_event
         self._config = config
-        self._index_lock = threading.Lock()
         self.vector_cache_enabled = vector_cache_enabled
         self.vector_cache_manager = None
         if vector_cache_enabled:
-            try:
-                from .vector_cache import HAS_FAISS, HAS_NUMPY, HAS_SENTENCE_TRANSFORMERS, VectorCacheManager
-                if HAS_SENTENCE_TRANSFORMERS and HAS_NUMPY and HAS_FAISS:
-                    self.vector_cache_manager = VectorCacheManager(str(self.repo_root / ".asicode" / "vector_cache"))
-                else:
-                    logger.warning("Vector cache dependencies not fully installed, disabling")
-                    self.vector_cache_enabled = False
-                    self.vector_cache_manager = None
-            except ImportError as e:
-                logger.warning(f"Vector cache import failed: {e}, disabling")
+            # vector_cache owns its optional-dependency degradation (HAS_* flags);
+            # the module itself always imports, so the old try/except ImportError
+            # fallback was dead code.
+            if HAS_SENTENCE_TRANSFORMERS and HAS_NUMPY and HAS_FAISS:
+                self.vector_cache_manager = VectorCacheManager(str(self.repo_root / ".asicode" / "vector_cache"))
+            else:
+                logger.warning("Vector cache dependencies not fully installed, disabling")
                 self.vector_cache_enabled = False
                 self.vector_cache_manager = None
-        # Per-document data
-        self._rel_paths: list[str] = []
-        self._doc_token_counts: list[dict[str, int]] = []
-        self._doc_lengths: list[int] = []
-        self._doc_texts: list[str] = []
-        # {rel_path: idx} mirror of ``_rel_paths`` → O(1) lookup in the read
-        # hot-path (_vector_search resolves each result's doc text by path).
-        # Rebuilt in _build_index and at the end of each invalidate_files batch
-        # (under _index_lock, alongside the parallel arrays). Maintaining it
-        # incrementally during a removal batch is unsafe (``list.pop`` shifts
-        # every later index), so it is rebuilt wholesale once per batch instead.
-        self._rel_path_to_idx: dict[str, int] = {}
-        # Corpus-level stats
-        self._df: dict[str, int] = {}
-        self._avgdl: float = 0.0
-        self._n_docs: int = 0
-        # True when the corpus walk hit _MAX_FILES and is therefore incomplete
-        # (some source files are invisible to search). Surfaced via the
-        # ``index_truncated`` property and a build-time warning so the agent
-        # can tell "no relevant docs" from "index truncated, may be missing".
-        self._index_truncated: bool = False
-        # Running total of doc lengths → O(1) avgdl. Maintained under
-        # ``_index_lock`` alongside the parallel arrays; replaces the per-file
-        # ``sum(self._doc_lengths)`` O(n) recompute in invalidate_files.
-        self._total_doc_len: int = 0
-        # Monotonic generation counter, bumped under ``_index_lock`` on every
-        # invalidate_files mutation. A searcher captures it at cache-miss start
-        # and, before writing its result to _search_cache, checks it is
-        # unchanged — if an invalidation raced in between (the searcher read the
-        # OLD index but finishes after the cache was cleared), the write is
-        # discarded so a stale result can never be re-cached for the 5-min TTL.
-        self._index_generation: int = 0
-        # Search cache: key -> (timestamp, results). Bounded LRU + TTL,
-        # thread-safe (matches ToolResultCache / run_scoped_graph_cache pattern).
-        self._search_cache: "OrderedDict[str, tuple[float, list[SearchResult]]]" = OrderedDict()
+        # Search cache: per-INSTANCE (query results are instance-specific —
+        # vector-cache availability differs), bounded LRU + TTL, thread-safe.
+        # Entries store the index generation at write time; a hit is served
+        # only when that generation still matches, so a mutation by ANY
+        # instance (which bumps the SHARED generation) cannot leave a stale
+        # entry alive for the 5-min TTL in a sibling instance's cache.
+        self._search_cache: "OrderedDict[str, tuple[float, int, list[SearchResult]]]" = OrderedDict()
         self._search_cache_lock = threading.Lock()
         self._search_cache_max = 256  # bound (LRU eviction) — match ToolResultCache
+
+    # ── shared-index property delegation ──────────────────────────────────────
+    # All corpus data lives on the process-wide ``_SharedIndex`` (``self._s``).
+    # These properties keep the historical ``self._<attr>`` access pattern
+    # working unchanged while making the state shared across instances.
+
+    @property
+    def _built(self) -> bool:
+        return self._s.built
+
+    @_built.setter
+    def _built(self, value: bool) -> None:
+        self._s.built = value
+
+    @property
+    def _rel_paths(self) -> list[str]:
+        return self._s.rel_paths
+
+    @_rel_paths.setter
+    def _rel_paths(self, value: list[str]) -> None:
+        self._s.rel_paths = value
+
+    @property
+    def _doc_token_counts(self) -> list[dict[str, int]]:
+        return self._s.doc_token_counts
+
+    @_doc_token_counts.setter
+    def _doc_token_counts(self, value: list[dict[str, int]]) -> None:
+        self._s.doc_token_counts = value
+
+    @property
+    def _doc_lengths(self) -> list[int]:
+        return self._s.doc_lengths
+
+    @_doc_lengths.setter
+    def _doc_lengths(self, value: list[int]) -> None:
+        self._s.doc_lengths = value
+
+    @property
+    def _doc_texts(self) -> list[str]:
+        return self._s.doc_texts
+
+    @_doc_texts.setter
+    def _doc_texts(self, value: list[str]) -> None:
+        self._s.doc_texts = value
+
+    @property
+    def _rel_path_to_idx(self) -> dict[str, int]:
+        return self._s.rel_path_to_idx
+
+    @_rel_path_to_idx.setter
+    def _rel_path_to_idx(self, value: dict[str, int]) -> None:
+        self._s.rel_path_to_idx = value
+
+    @property
+    def _df(self) -> dict[str, int]:
+        return self._s.df
+
+    @_df.setter
+    def _df(self, value: dict[str, int]) -> None:
+        self._s.df = value
+
+    @property
+    def _avgdl(self) -> float:
+        return self._s.avgdl
+
+    @_avgdl.setter
+    def _avgdl(self, value: float) -> None:
+        self._s.avgdl = value
+
+    @property
+    def _n_docs(self) -> int:
+        return self._s.n_docs
+
+    @_n_docs.setter
+    def _n_docs(self, value: int) -> None:
+        self._s.n_docs = value
+
+    @property
+    def _total_doc_len(self) -> int:
+        return self._s.total_doc_len
+
+    @_total_doc_len.setter
+    def _total_doc_len(self, value: int) -> None:
+        self._s.total_doc_len = value
+
+    @property
+    def _index_generation(self) -> int:
+        return self._s.index_generation
+
+    @_index_generation.setter
+    def _index_generation(self, value: int) -> None:
+        self._s.index_generation = value
+
+    @property
+    def _index_truncated(self) -> bool:
+        return self._s.index_truncated
+
+    @_index_truncated.setter
+    def _index_truncated(self, value: bool) -> None:
+        self._s.index_truncated = value
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -253,12 +434,12 @@ class RAGSearcher:
         _cached = None
         with self._search_cache_lock:
             if cache_key in self._search_cache:
-                timestamp, results = self._search_cache[cache_key]
-                if now - timestamp < 300:  # 5 minute TTL
+                timestamp, entry_gen, results = self._search_cache[cache_key]
+                if now - timestamp < 300 and entry_gen == self._index_generation:
                     self._search_cache.move_to_end(cache_key)  # refresh LRU position
                     _cached = results
                 else:
-                    del self._search_cache[cache_key]  # expired
+                    del self._search_cache[cache_key]  # expired, or stale (index changed since store)
         if _cached is not None:
             # Cache hit. Return a shallow copy so a caller mutating the returned
             # list (sort/append/clear/slice-assign) cannot poison the shared cache
@@ -300,7 +481,7 @@ class RAGSearcher:
         # the searcher then records a stale result that survives the 5-min TTL.)
         with self._search_cache_lock:
             if _gen == self._index_generation:
-                self._search_cache[cache_key] = (time.monotonic(), results)
+                self._search_cache[cache_key] = (time.monotonic(), self._index_generation, results)
                 if len(self._search_cache) >= self._search_cache_max:
                     self._search_cache.popitem(last=False)
 
@@ -314,28 +495,30 @@ class RAGSearcher:
         """Incrementally update index for changed/new/deleted files only.
 
         Updates only affected docs while keeping the rest of the index intact.
+        Also refreshes the shared fingerprint map so a later instance's
+        reconciliation does not re-read files already reflected here.
 
         Thread-safety / critical-section discipline: split into two phases so a
         bulk invalidation (branch switch / large patch touching dozens of files)
         never blocks parallel subagents' searches on disk + tokenize work.
 
-          * **Phase 1 (outside ``_index_lock``)** — read each changed file and
-            tokenize it. This is pure filesystem + CPU work and is by far the
-            expensive part; running it under the lock would stall every
-            concurrent ``_bm25_search`` / ``_vector_search`` for the whole
-            duration. The result is staged in a ``norm_path -> (text, tokens)``
-            map keyed only by path (no array index), so phase 2 can re-resolve
-            the index under the lock.
+          * **Phase 1 (outside ``_index_lock``)** — stat + read + tokenize each
+            changed file (``_prepare_files``).  This is pure filesystem + CPU
+            work and is by far the expensive part; running it under the lock
+            would stall every concurrent ``_bm25_search`` / ``_vector_search``
+            for the whole duration.  The result is staged in a
+            ``norm_path -> (text, tokens)`` map keyed only by path (no array
+            index), so phase 2 can re-resolve the index under the lock.
           * **Phase 2 (inside ``_index_lock``)** — only the parallel-array
-            mutations: locate each existing entry (``list.index`` races with a
-            concurrent ``_remove_doc_at`` otherwise), subtract/add df
-            contributions, and append/replace/remove. This instance is shared
-            across in-process parallel subagents
-            (``ToolRegistry.clone_for_subagent`` shares it by reference), so a
-            subagent's write-success callback invoking invalidate_files while a
-            sibling searches would otherwise corrupt the arrays (IndexError, or
-            worse, a silent path↔document misalignment as ``_remove_doc_at``'s
-            ``pop`` shifts indices).
+            mutations (``_apply_changes_locked``): locate each existing entry
+            (``list.index`` races with a concurrent ``_remove_doc_at``
+            otherwise), subtract/add df contributions, and append/replace/
+            remove. This instance is shared across in-process parallel
+            subagents (``ToolRegistry.clone_for_subagent`` shares it by
+            reference), so a subagent's write-success callback invoking
+            invalidate_files while a sibling searches would otherwise corrupt
+            the arrays (IndexError, or worse, a silent path↔document
+            misalignment as ``_remove_doc_at``'s ``pop`` shifts indices).
 
         The read/reflection split is safe because phase 2 bumps
         ``_index_generation`` under the lock: an in-flight searcher that
@@ -348,122 +531,19 @@ class RAGSearcher:
         Args:
             changed_paths: List of relative file paths that were modified.
         """
-        # Phase 1 (outside the lock): read + tokenize each changed file. Files
-        # that no longer exist, are not indexable, are unreadable, or yield no
-        # tokens are simply absent from `prepared` — phase 2 then treats them as
-        # removals (if previously indexed) or no-ops (if never indexed),
-        # matching the previous in-lock semantics exactly.
-        prepared: dict[str, tuple[str, list[str]]] = {}
-        for rel_path in changed_paths:
-            norm_path = rel_path.strip().lstrip("/")
-            abs_path = self.repo_root / norm_path
+        # Phase 1 (outside the lock): stat + read + tokenize each changed file.
+        # Files that no longer exist, are not indexable, are unreadable, or
+        # yield no tokens are simply absent from `prepared` — phase 2 then
+        # treats them as removals (if previously indexed) or no-ops (if never
+        # indexed), matching the previous in-lock semantics exactly.
+        prepared, fp_map = self._prepare_files(changed_paths)
 
-            file_exists = abs_path.is_file()
-            is_indexable = (
-                file_exists
-                and abs_path.suffix.lower() in _INDEXED_EXTS
-                and not any(
-                    part.startswith(".") or part in _SKIP_DIRS
-                    for part in Path(norm_path).parts
-                )
-            )
-            if not is_indexable:
-                continue
-            try:
-                text = abs_path.read_text(encoding="utf-8", errors="replace")
-                if len(text) > _MAX_FILE_CHARS:
-                    text = text[:_MAX_FILE_CHARS].rsplit("\n", 1)[0]
-                path_text = norm_path.replace("/", " ").replace("\\", " ").replace(".", " ")
-                tokens = _TOKENIZER.tokenize(text + " " + path_text)
-                if tokens:
-                    prepared[norm_path] = (text, tokens)
-            except Exception:
-                pass  # non-critical — never block execution; treated as unindexable
-
-        # Defer vector-cache updates until after releasing the index lock.
-        vc_updates: list[tuple[str, str]] = []
         # Phase 2 (inside the lock): apply only the array mutations.
         with self._index_lock:
             if not self._built:
                 # Index not built yet, nothing to incrementally update.
                 return
-
-            for rel_path in changed_paths:
-                norm_path = rel_path.strip().lstrip("/")
-                prep = prepared.get(norm_path)
-
-                # Check if this file is in our index (resolved under the lock —
-                # list.index races with a concurrent _remove_doc_at otherwise).
-                try:
-                    existing_idx = self._rel_paths.index(norm_path)
-                except ValueError:
-                    existing_idx = -1
-
-                if existing_idx >= 0:
-                    # File was in index — remove old contribution from df.
-                    old_tc = self._doc_token_counts[existing_idx]
-                    for token in set(old_tc):
-                        if token in self._df:
-                            self._df[token] -= 1
-                            if self._df[token] <= 0:
-                                del self._df[token]
-
-                    if prep is not None:
-                        # UPDATE: replace in-place with the pre-tokenized text.
-                        text, tokens = prep
-                        tc: dict[str, int] = {}
-                        for t in tokens:
-                            tc[t] = tc.get(t, 0) + 1
-
-                        old_len = self._doc_lengths[existing_idx]
-                        self._doc_token_counts[existing_idx] = tc
-                        self._doc_lengths[existing_idx] = len(tokens)
-                        self._doc_texts[existing_idx] = text
-                        # avgdl via running total (O(1)) instead of
-                        # per-file sum(self._doc_lengths) (O(n)).
-                        self._total_doc_len += len(tokens) - old_len
-
-                        for t in set(tc):
-                            self._df[t] = self._df.get(t, 0) + 1
-
-                        self._avgdl = self._total_doc_len / max(self._n_docs, 1)
-
-                        vc_updates.append((norm_path, text))
-                    else:
-                        # File deleted / no longer indexable / no tokens — remove.
-                        self._remove_doc_at(existing_idx)
-
-                elif prep is not None and self._n_docs < _MAX_FILES:
-                    # NEW file — append to index.
-                    text, tokens = prep
-                    tc = {}
-                    for t in tokens:
-                        tc[t] = tc.get(t, 0) + 1
-
-                    self._rel_paths.append(norm_path)
-                    self._doc_token_counts.append(tc)
-                    self._doc_lengths.append(len(tokens))
-                    self._doc_texts.append(text)
-                    self._n_docs += 1
-                    self._total_doc_len += len(tokens)
-
-                    for t in set(tc):
-                        self._df[t] = self._df.get(t, 0) + 1
-
-                    self._avgdl = self._total_doc_len / max(self._n_docs, 1)
-
-                    vc_updates.append((norm_path, text))
-
-            n_after = self._n_docs
-            # Bump the generation so an in-flight searcher that already read the
-            # pre-mutation index discards its (now-stale) result rather than
-            # re-caching it after the clear below. Rebuild the path→idx mirror to
-            # match the mutated arrays (rebuilt wholesale — list.pop shifts every
-            # later index, so incremental maintenance within the loop is unsafe).
-            self._index_generation += 1
-            self._rel_path_to_idx = {
-                _p: _i for _i, _p in enumerate(self._rel_paths)
-            }
+            vc_updates = self._apply_changes_locked(changed_paths, prepared, fp_map)
 
         # Clear search cache AFTER the index mutation completes (and outside the
         # index lock). This alone is NOT sufficient: a searcher that already read
@@ -475,15 +555,198 @@ class RAGSearcher:
             self._search_cache.clear()
 
         # Flush deferred vector-cache updates outside the index lock (embedding
-        # I/O must not block concurrent searches).
-        if self.vector_cache_enabled and self.vector_cache_manager is not None:
-            for vc_path, vc_text in vc_updates:
-                try:
-                    self.vector_cache_manager.add_document(vc_path, vc_text)
-                except Exception:
-                    pass  # non-critical — never block execution
+        # I/O must not block concurrent searches).  ONE batched encode() pass
+        # instead of N per-file calls — 1.6x-2.2x faster on large updates,
+        # mirroring the cold-start flush in _build_index.
+        if vc_updates and self.vector_cache_enabled and self.vector_cache_manager is not None:
+            try:
+                self.vector_cache_manager.add_documents(vc_updates)
+            except Exception as e:
+                logger.debug("RAG vector-cache update failed: %s", e)
 
-        logger.debug("RAG incremental update: %d files, index now %d docs", len(changed_paths), n_after)
+        logger.debug("RAG incremental update: %d files, index now %d docs", len(changed_paths), self._n_docs)
+
+    def _prepare_files(self, paths: list[str]) -> tuple[dict[str, tuple[str, list[str]]], dict[str, tuple[int, int]]]:
+        """Phase 1 of an incremental update (call OUTSIDE ``_index_lock``).
+
+        For every candidate path: stat it, and if it exists / is indexable /
+        yields tokens, read + tokenize it.  Returns:
+          * ``prepared``: norm_path -> (text, tokens) for files that were read
+            and tokenized successfully (absent for deleted / unindexable /
+            tokenless files — the caller treats their absence as removal).
+          * ``fp_map``: norm_path -> (st_mtime_ns, st_size) for every existing
+            indexable candidate (tokenless ones included — their fingerprint is
+            stored so reconciliation does not re-read them every time).
+        """
+        prepared: dict[str, tuple[str, list[str]]] = {}
+        fp_map: dict[str, tuple[int, int]] = {}
+        for rel_path in paths:
+            norm_path = rel_path.strip().lstrip("/")
+            abs_path = self.repo_root / norm_path
+
+            file_exists = abs_path.is_file()
+            is_indexable = (
+                file_exists
+                and abs_path.suffix.lower() in _INDEXED_EXTS
+                and not Path(norm_path).name.endswith(_WALK_SKIP_FILE_SUFFIXES)
+                and not any(
+                    _rag_should_skip_dir(part)
+                    for part in Path(norm_path).parts[:-1]
+                )
+            )
+            if not is_indexable:
+                continue
+            try:
+                st = abs_path.stat()
+            except OSError:
+                logger.debug("RAG prepare: stat failed for %s", norm_path)
+                continue
+            fp_map[norm_path] = (st.st_mtime_ns, st.st_size)
+            try:
+                text = abs_path.read_text(encoding="utf-8", errors="replace")
+                if len(text) > _MAX_FILE_CHARS:
+                    text = text[:_MAX_FILE_CHARS].rsplit("\n", 1)[0]
+                path_text = norm_path.replace("/", " ").replace("\\", " ").replace(".", " ")
+                tokens = _TOKENIZER.tokenize(text + " " + path_text)
+                if tokens:
+                    prepared[norm_path] = (text, tokens)
+            except Exception:
+                logger.debug("RAG prepare: read/tokenize failed for %s", norm_path)
+                # non-critical — never block execution; treated as unindexable
+        return prepared, fp_map
+
+    def _apply_changes_locked(
+        self,
+        changed_paths: list[str],
+        prepared: dict[str, tuple[str, list[str]]],
+        fp_map: dict[str, tuple[int, int]],
+    ) -> list[tuple[str, str]]:
+        """Phase 2 of an incremental update. Caller MUST hold ``_index_lock``.
+
+        Applies only the parallel-array mutations for ``changed_paths`` using
+        the pre-tokenized ``prepared`` map (locating each existing entry with
+        ``list.index`` under the lock — it races with a concurrent
+        ``_remove_doc_at`` otherwise), subtracts/adds df contributions, and
+        refreshes the shared fingerprint map.  Returns the deferred vector-cache
+        updates for the caller to flush OUTSIDE the lock (embedding I/O must
+        not block concurrent searches).
+        """
+        vc_updates: list[tuple[str, str]] = []
+        for rel_path in changed_paths:
+            norm_path = rel_path.strip().lstrip("/")
+            prep = prepared.get(norm_path)
+
+            # Check if this file is in our index (resolved under the lock —
+            # list.index races with a concurrent _remove_doc_at otherwise).
+            try:
+                existing_idx = self._rel_paths.index(norm_path)
+            except ValueError:
+                existing_idx = -1
+
+            if existing_idx >= 0:
+                # File was in index — remove old contribution from df.
+                old_tc = self._doc_token_counts[existing_idx]
+                for token in set(old_tc):
+                    if token in self._df:
+                        self._df[token] -= 1
+                        if self._df[token] <= 0:
+                            del self._df[token]
+
+                if prep is not None:
+                    # UPDATE: replace in-place with the pre-tokenized text.
+                    text, tokens = prep
+                    tc: dict[str, int] = {}
+                    for t in tokens:
+                        tc[t] = tc.get(t, 0) + 1
+
+                    old_len = self._doc_lengths[existing_idx]
+                    self._doc_token_counts[existing_idx] = tc
+                    self._doc_lengths[existing_idx] = len(tokens)
+                    self._doc_texts[existing_idx] = text
+                    # avgdl via running total (O(1)) instead of
+                    # per-file sum(self._doc_lengths) (O(n)).
+                    self._total_doc_len += len(tokens) - old_len
+
+                    for t in set(tc):
+                        self._df[t] = self._df.get(t, 0) + 1
+
+                    self._avgdl = self._total_doc_len / max(self._n_docs, 1)
+
+                    vc_updates.append((norm_path, text))
+                else:
+                    # File deleted / no longer indexable / no tokens — remove.
+                    self._remove_doc_at(existing_idx)
+
+            elif prep is not None and self._n_docs < _MAX_FILES:
+                # NEW file — append to index.
+                text, tokens = prep
+                tc = {}
+                for t in tokens:
+                    tc[t] = tc.get(t, 0) + 1
+
+                self._rel_paths.append(norm_path)
+                self._doc_token_counts.append(tc)
+                self._doc_lengths.append(len(tokens))
+                self._doc_texts.append(text)
+                self._n_docs += 1
+                self._total_doc_len += len(tokens)
+
+                for t in set(tc):
+                    self._df[t] = self._df.get(t, 0) + 1
+
+                self._avgdl = self._total_doc_len / max(self._n_docs, 1)
+
+                vc_updates.append((norm_path, text))
+
+            # Fingerprint maintenance: store the stat captured in phase 1 for
+            # existing candidates, drop it for deleted/unindexable ones — a
+            # later instance's reconciliation must not re-read files that are
+            # already reflected here.
+            if norm_path in fp_map:
+                self._s.fingerprints[norm_path] = fp_map[norm_path]
+            else:
+                self._s.fingerprints.pop(norm_path, None)
+
+        # Bump the generation so an in-flight searcher that already read the
+        # pre-mutation index discards its (now-stale) result rather than
+        # re-caching it after the clear below. Rebuild the path→idx mirror to
+        # match the mutated arrays (rebuilt wholesale — list.pop shifts every
+        # later index, so incremental maintenance within the loop is unsafe).
+        self._index_generation += 1
+        self._rel_path_to_idx = {
+            _p: _i for _i, _p in enumerate(self._rel_paths)
+        }
+        return vc_updates
+
+    def _fingerprint_diff_locked(self) -> tuple[list[str], list[str], list[str], bool]:
+        """Diff the corpus against the shared fingerprint map.
+
+        Caller MUST hold ``_index_lock`` (the walk mutates the shared
+        ``index_truncated`` flag).  Walk + stat costs ~1-4% of a full build and
+        replaces the full re-read + re-tokenize for unchanged files.  Returns
+        (added, changed, deleted, truncated) where:
+          * added    — walked candidates with no stored fingerprint
+          * changed  — walked candidates whose (mtime_ns, size) differs
+          * deleted  — previously fingerprinted files no longer in the walk
+          * truncated— the walk hit _MAX_FILES (the caller must fall back to a
+            full rebuild: under a cap the walk itself is incomplete, so an
+            incremental diff could drift from a fresh build)
+        """
+        walked = self._walk_files()
+        current: dict[str, tuple[int, int]] = {}
+        for fpath in walked:
+            try:
+                st = fpath.stat()
+            except OSError:
+                logger.debug("RAG reconcile: stat failed for %s", fpath)
+                continue  # vanished between walk and stat — shows up as deleted
+            rel = str(fpath.relative_to(self.repo_root))
+            current[rel] = (st.st_mtime_ns, st.st_size)
+        old = self._s.fingerprints
+        added = sorted(k for k in current if k not in old)
+        changed = sorted(k for k in old if k in current and old[k] != current[k])
+        deleted = sorted(k for k in old if k not in current)
+        return added, changed, deleted, self._index_truncated
 
     def _remove_doc_at(self, idx: int) -> None:
         """Remove document at given index from all parallel arrays.
@@ -660,31 +923,82 @@ class RAGSearcher:
         return hashlib.md5(key_data.encode(), usedforsecurity=False).hexdigest()
 
     def _ensure_index(self) -> None:
+        # Fast path: the shared index is built AND this instance already
+        # reconciled it against disk — no lock, no walk.  (Benign race: a
+        # concurrent mutation only makes the data fresher.)
+        if self._built and self._reconciled:
+            return
         with self._index_lock:
-            if self._built:
+            if not self._built:
+                t0 = time.monotonic()
+                completed = self._build_index()
+                if not completed:
+                    # Cancelled mid-build: leave _built False so the next query
+                    # retries.  _build_index accumulates into *local* lists/dicts
+                    # and only commits to self._* at the very end, so instance
+                    # state is pristine on cancel (no half-populated arrays to
+                    # reset).  (Side note: vector_cache_manager.add_document is a
+                    # per-file side-effect inside the loop and may be partially
+                    # written on cancel; it is incremental/idempotent and
+                    # decoupled from the BM25 path, so this is safe.)
+                    return
+                elapsed = time.monotonic() - t0
+                logger.debug("RAG index built: %d docs in %.2fs", self._n_docs, elapsed)
+                if self._index_truncated:
+                    logger.warning(
+                        "RAG index for %s TRUNCATED at %d files (cap %d) — files beyond "
+                        "the cap are INVISIBLE to find_relevant_files. Raise "
+                        "RAG_MAX_FILES if the repo is larger.",
+                        self.repo_root, self._n_docs, _MAX_FILES,
+                    )
+                self._built = True
+                self._reconciled = True
                 return
-            t0 = time.monotonic()
-            completed = self._build_index()
-            if not completed:
-                # Cancelled mid-build: leave _built False so the next query
-                # retries.  _build_index accumulates into *local* lists/dicts
-                # and only commits to self._* at the very end, so instance state
-                # is pristine on cancel (no half-populated arrays to reset).
-                # (Side note: vector_cache_manager.add_document is a per-file
-                # side-effect inside the loop and may be partially written on
-                # cancel; it is incremental/idempotent and decoupled from the
-                # BM25 path, so this is safe.)
-                return
-            elapsed = time.monotonic() - t0
-            logger.debug("RAG index built: %d docs in %.2fs", self._n_docs, elapsed)
-            if self._index_truncated:
-                logger.warning(
-                    "RAG index for %s TRUNCATED at %d files (cap %d) — files beyond "
-                    "the cap are INVISIBLE to find_relevant_files. Raise "
-                    "RAG_MAX_FILES if the repo is larger.",
-                    self.repo_root, self._n_docs, _MAX_FILES,
+
+            # The shared index was built by an earlier instance of this
+            # process.  Reconcile it against disk: walk + stat (cheap), diff
+            # against the stored fingerprints, then re-read ONLY the differing
+            # files (O(changed)) — a new ToolRegistry / session on the same
+            # repo no longer pays the full re-read + re-tokenize cost.
+            added, changed, deleted, truncated = self._fingerprint_diff_locked()
+            if truncated:
+                # Cap-mode repo: the walk itself is incomplete, so an
+                # incremental diff could drift from a fresh build (files
+                # entering/leaving the cap window).  Fall back to the full
+                # rebuild — the rare, already-expensive case.
+                t0 = time.monotonic()
+                completed = self._build_index()
+                if not completed:
+                    return
+                logger.debug(
+                    "RAG index rebuilt (cap-mode): %d docs in %.2fs",
+                    self._n_docs, time.monotonic() - t0,
                 )
-            self._built = True
+                self._built = True
+                self._reconciled = True
+                return
+
+        # Outside the lock: read + tokenize only the differing files.  This is
+        # pure filesystem + CPU work (the expensive part) and must not run
+        # under the shared index lock, mirroring invalidate_files' phase split.
+        if added or changed:
+            prepared, fp_map = self._prepare_files(added + changed)
+        else:
+            prepared, fp_map = {}, {}
+        if added or changed or deleted:
+            with self._index_lock:
+                vc_updates = self._apply_changes_locked(added + changed + deleted, prepared, fp_map)
+            with self._search_cache_lock:
+                self._search_cache.clear()
+            # Flush deferred vector-cache updates outside the index lock
+            # (embedding I/O must not block concurrent searches).  ONE batched
+            # encode() pass instead of N per-file calls (see _build_index).
+            if vc_updates and self.vector_cache_enabled and self.vector_cache_manager is not None:
+                try:
+                    self.vector_cache_manager.add_documents(vc_updates)
+                except Exception as e:
+                    logger.debug("RAG vector-cache update failed: %s", e)
+        self._reconciled = True
 
     def _get_cancel_event(self) -> Optional[threading.Event]:
         """Return the live cooperative-cancel event.
@@ -713,6 +1027,11 @@ class RAGSearcher:
         the staged list is discarded (next rebuild re-adds everything).  Hold
         ``_index_lock`` for the whole build (the caller does) so no reader
         races the final commit.
+
+        Also captures a (st_mtime_ns, st_size) fingerprint for every walked
+        candidate file and commits it with the index: a later instance's
+        reconciliation diffs a cheap re-walk against this map instead of
+        re-reading the whole corpus.
         """
         rel_paths: list[str] = []
         doc_tcs: list[dict[str, int]] = []
@@ -720,6 +1039,7 @@ class RAGSearcher:
         doc_texts: list[str] = []
         df: dict[str, int] = {}
         total_len = 0
+        fingerprints: dict[str, tuple[int, int]] = {}
         # Staged vector-cache additions — flushed as one batched encode() after
         # the loop (see add_documents). Left empty on cancel, so nothing is
         # written to the vector cache for a partial build.
@@ -735,10 +1055,14 @@ class RAGSearcher:
                 logger.debug("RAG index build cancelled")
                 return False
             try:
+                # Capture the fingerprint BEFORE reading: it records the exact
+                # bytes this build consumed (reconciliation diffs against it).
+                st = fpath.stat()
+                rel = str(fpath.relative_to(self.repo_root))
+                fingerprints[rel] = (st.st_mtime_ns, st.st_size)
                 text = fpath.read_text(encoding="utf-8", errors="replace")
                 if len(text) > _MAX_FILE_CHARS:
                     text = text[:_MAX_FILE_CHARS].rsplit("\n", 1)[0]
-                rel = str(fpath.relative_to(self.repo_root))
                 # Augment with path tokens (filename + parent dirs carry signal)
                 path_text = rel.replace("/", " ").replace("\\", " ").replace(".", " ")
                 tokens = _TOKENIZER.tokenize(text + " " + path_text)
@@ -762,7 +1086,8 @@ class RAGSearcher:
                 # everything, so no data is lost in steady state.
                 if self.vector_cache_enabled and self.vector_cache_manager is not None:
                     vc_updates.append((rel, text))
-            except (AttributeError, TypeError):
+            except (AttributeError, TypeError, OSError):
+                logger.debug("rag add_document failed for file", exc_info=True)
                 continue
 
         n = len(rel_paths)
@@ -775,13 +1100,14 @@ class RAGSearcher:
         self._total_doc_len = total_len
         self._avgdl = total_len / max(n, 1)
         self._rel_path_to_idx = {p: i for i, p in enumerate(rel_paths)}
+        self._s.fingerprints = fingerprints
 
         # Flush staged vector-cache additions in one batched encode pass.
         if vc_updates and self.vector_cache_enabled and self.vector_cache_manager is not None:
             try:
                 self.vector_cache_manager.add_documents(vc_updates)
             except Exception as e:
-                logger.debug(f"Failed to batch-add {len(vc_updates)} documents to vector cache: {e}")
+                logger.debug("Failed to batch-add %s documents to vector cache: %s", len(vc_updates), e)
         return True
 
     def _walk_files(self) -> list[Path]:
@@ -799,11 +1125,13 @@ class RAGSearcher:
             # this very repo the first 600 hits were all tests/ and
             # external_llm/ got ZERO coverage).
             dirs[:] = sorted(
-                [d for d in dirs if not d.startswith(".") and d not in _SKIP_DIRS],
+                [d for d in dirs if not _rag_should_skip_dir(d)],
                 key=_walk_dir_sort_key,
             )
             files.sort()
             for fname in files:
+                if fname.endswith(_WALK_SKIP_FILE_SUFFIXES):
+                    continue
                 p = Path(root) / fname
                 if p.suffix.lower() not in _INDEXED_EXTS:
                     continue

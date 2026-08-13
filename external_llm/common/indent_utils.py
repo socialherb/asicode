@@ -125,9 +125,7 @@ def _continuation_rows(text: str, lines: Optional[list[str]] = None) -> set[int]
                 continue
             if c == "\\" and i == n - 1:
                 backslash_cont = True
-            elif c == "#":
-                break
-            elif c == "/" and i + 1 < n and line[i + 1] == "/":
+            elif c == "#" or (c == "/" and i + 1 < n and line[i + 1] == "/"):
                 break
             elif c == "/" and i + 1 < n and line[i + 1] == "*":
                 in_block_comment = True
@@ -137,9 +135,8 @@ def _continuation_rows(text: str, lines: Optional[list[str]] = None) -> set[int]
                 in_str = c
             elif c in "([":
                 depth += 1
-            elif c in ")]":
-                if depth > 0:
-                    depth -= 1
+            elif c in ")]" and depth > 0:
+                depth -= 1
             i += 1
         in_str = None  # strings don't span physical lines (snippet-safe)
     return rows
@@ -225,6 +222,7 @@ def _analyze_logical_lines(snippet: str) -> Optional[tuple[dict, set]]:
             for r in range(sr + 1, er + 1):
                 owner.setdefault(r, cur)
     except (_tok.TokenError, IndentationError, SyntaxError):
+        logger.debug("indent_utils: tokenize failed in _analyze_logical_lines", exc_info=True)
         return None
     return owner, logical_rows
 
@@ -295,10 +293,7 @@ def shift_block(
         else:
             stripped = s.lstrip()
             leading = len(s) - len(stripped)
-            if indent_ratio is None:
-                new_indent = max(0, leading + before_min)
-            else:
-                new_indent = max(0, round(leading * indent_ratio))
+            new_indent = max(0, leading + before_min) if indent_ratio is None else max(0, round(leading * indent_ratio))
             fixed.append(indent_char * new_indent + stripped)
     return fixed
 
@@ -370,6 +365,7 @@ def _first_logical_indent(text: str) -> Optional[str]:
                 first_logical_row = t.start[0]
                 break
     except (_tok.TokenError, IndentationError, SyntaxError):
+        logger.debug("indent_utils: tokenize failed in _first_logical_indent", exc_info=True)
         return None
     if first_logical_row is None:
         return None
@@ -392,7 +388,7 @@ def _match_site_unit(
     that shows only one logical level it returns that level's full width (e.g. a
     body all at 8 spaces → 8), not the file's true per-level unit — which is
     simply *undetectable* from a single level.  Dividing a ratio by that bogus
-    "unit" re-explodes the indent (8/4 = 2× deeper).  So:
+    "unit" re-explodes the indent (8/4 = 2x deeper).  So:
 
     * a tab site is always 1 char/level;
     * a space site's unit is trusted only when it shows >1 *logical* depth
@@ -799,12 +795,11 @@ def reindent_to_anchor(
                 result.append(anchor_indent + "\t" * level + stripped)
             else:
                 result.append(anchor_indent + " " * (level * space_unit) + stripped)
+        # Preserve empty / whitespace-only lines as-is (but ensure \n)
+        elif not ln.endswith("\n"):
+            result.append(ln + "\n")
         else:
-            # Preserve empty / whitespace-only lines as-is (but ensure \n)
-            if not ln.endswith("\n"):
-                result.append(ln + "\n")
-            else:
-                result.append(ln)
+            result.append(ln)
     return result
 
 
@@ -854,9 +849,6 @@ def reindent_block(text: str, base_indent: str, dest_unit: Optional[int] = None)
             continue
         rel = (len(ln) - len(stripped)) - min_count
         level = round(rel / unit) if rel > 0 else 0
-        if base_char == "\t":
-            new_indent = base_indent + "\t" * level
-        else:
-            new_indent = base_indent + " " * (level * space_unit)
+        new_indent = base_indent + "\t" * level if base_char == "\t" else base_indent + " " * (level * space_unit)
         out.append(new_indent + stripped + "\n")
     return "".join(out)

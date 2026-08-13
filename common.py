@@ -29,7 +29,7 @@ def safe_filename(name: str, max_len: int = 128) -> str:
     truncates to max_len, and returns 'unnamed' if the result is empty.
     """
     # Replace invalid characters with underscore
-    result = name.translate(str.maketrans({c: '_' for c in '\\/:*?"<>|'}))
+    result = name.translate(str.maketrans(dict.fromkeys('\\/:*?"<>|', "_")))
     # Compress consecutive underscores
     while '__' in result:
         result = result.replace('__', '_')
@@ -82,5 +82,4 @@ def normalize_rel_path_fast(rel_path: str) -> str:
     # (lstrip("./") would turn .gitignore into gitignore)
     while p.startswith("./"):
         p = p[2:]
-    p = p.lstrip("/")
-    return p
+    return p.lstrip("/")

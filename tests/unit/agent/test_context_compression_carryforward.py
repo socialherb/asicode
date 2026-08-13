@@ -242,3 +242,38 @@ def test_anthropic_tool_result_unmapped_id_falls_back():
     assert other is not None and "orphan body" in other, (
         f"unmapped tool_result not summarised\n{msg.content}"
     )
+
+
+def test_anthropic_tool_result_files_read_bucket():
+    """A ``read_file`` Anthropic result must land under 'Files read'.
+
+    The files_read category used to be dead — declared and labelled but never
+    populated by any classifier, so the section never rendered. read-only tools
+    now classify like changes/search do.
+    """
+    dropped = _anthropic_tool_pair("read_file", "toolu_04D", ok=True, body="def foo(): ...")
+    msg = _compress(None, dropped)
+    files = _anthropic_section(msg.content, "Files read")
+    assert files is not None and "read_file" in files, (
+        f"read_file not in Files read section\n{msg.content}"
+    )
+    other = _anthropic_section(msg.content, "Other tool calls")
+    assert other is None or "read_file" not in other, (
+        f"read_file mis-bucketed into Other tool calls\n{msg.content}"
+    )
+
+
+def test_role_tool_files_read_bucket():
+    """Standard role='tool' path: read-only tool results land under 'Files read'
+    (read_file / read_symbol / get_file_outline); mixed tools stay elsewhere."""
+    dropped = [
+        LLMMessage(role="tool", name="read_symbol", content=_json.dumps(
+            {"ok": True, "content": "def target(): ..."})),
+        LLMMessage(role="tool", name="get_file_outline", content=_json.dumps(
+            {"ok": True, "content": "classes: A, B"})),
+    ]
+    msg = _compress(None, dropped)
+    files = _anthropic_section(msg.content, "Files read")
+    assert files is not None and "read_symbol" in files and "get_file_outline" in files, (
+        f"read tools not in Files read section\n{msg.content}"
+    )

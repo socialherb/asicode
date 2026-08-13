@@ -14,6 +14,7 @@ The filtering has two layers, both exercised here:
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from external_llm.agent.tool_handlers.analysis_tools import AnalysisToolsMixin
@@ -200,3 +201,227 @@ class TestStructuralScanCancelPreCheck:
 
         assert result["ok"] is True
         assert result["content"]
+
+
+# ── Scanner source-freshness banner (R12-2) ──────────────────────────────────
+
+
+class TestStructuralScanFreshnessBanner:
+    """A scanner module changed on disk after load must be surfaced in the tool
+    result, not silently scanned with pre-fix in-memory code."""
+
+    def test_stale_scanner_modules_emit_banner(self, tmp_path, monkeypatch):
+        from external_llm.agent import scanner_registry as sr_mod
+
+        repo = str(tmp_path)
+        tools = _FakeAnalysisTools(repo, ["main.go"])
+        stale_file = os.path.join(
+            repo, "external_llm/analysis/_dead_block_shared.py",
+        )
+        monkeypatch.setattr(
+            sr_mod.ScannerRegistry,
+            "verify_loaded_sources",
+            lambda self: [stale_file],
+        )
+
+        result = tools._tool_run_structural_scan({"scanner": "all", "path": ""})
+
+        assert result["ok"] is True
+        assert "STALE SCANNER CODE DETECTED" in result["content"]
+
+
+class _RealWalkHost(AnalysisToolsMixin):
+    """Host using the REAL _walk_scan_files (filesystem-backed), unlike
+    _FakeAnalysisTools which overrides it with a fixed list."""
+
+    def __init__(self, repo_root: str):
+        self.repo_root = repo_root
+        self._call_graph = None
+
+
+def test_walk_scan_files_is_deterministic_and_sorted(tmp_path):
+    """BUG-6: _walk_scan_files must traverse directories in sorted order so the
+    file set under _SCAN_FILE_CAP is identical across processes (readdir order
+    is nondeterministic)."""
+    (tmp_path / "z_dir").mkdir()
+    (tmp_path / "a_dir").mkdir()
+    (tmp_path / "z_dir" / "z.py").write_text("")
+    (tmp_path / "z_dir" / "a.py").write_text("")
+    (tmp_path / "a_dir" / "m.py").write_text("")
+    (tmp_path / "root_zz.py").write_text("")
+    (tmp_path / "root_aa.py").write_text("")
+
+    tools = _RealWalkHost(str(tmp_path))
+    first = tools._walk_scan_files(str(tmp_path))
+    second = tools._walk_scan_files(str(tmp_path))
+
+    assert first == second, "same tree must produce the same scan file set"
+    assert first == [
+        "root_aa.py", "root_zz.py",
+        "a_dir/m.py",
+        "z_dir/a.py", "z_dir/z.py",
+    ]
+
+
+def test_mixin_walk_delegates_to_shared_single_source(tmp_path):
+    """The mixin no longer carries its own _SCAN_EXTS/_SCAN_SKIP_DIRS/
+    _SCAN_FILE_CAP mirror — it delegates to
+    external_llm/analysis/scan_walk.py, the single scan-walk source shared
+    with the structural gate (scripts/check_structural_scanners.py)."""
+    from external_llm.analysis.scan_walk import walk_scan_files
+
+    assert not hasattr(AnalysisToolsMixin, "_SCAN_EXTS")
+    assert not hasattr(AnalysisToolsMixin, "_SCAN_SKIP_DIRS")
+    assert not hasattr(AnalysisToolsMixin, "_SCAN_FILE_CAP")
+
+    (tmp_path / "a.py").write_text("")
+    (tmp_path / "b.go").write_text("")
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "c.py").write_text("")
+    tools = _RealWalkHost(str(tmp_path))
+    assert tools._walk_scan_files(str(tmp_path)) == walk_scan_files(str(tmp_path))
+    assert tools._walk_scan_files(str(tmp_path)) == ["a.py", "b.go"]
+
+
+def test_mixin_subdir_scan_yields_repo_relative_paths(tmp_path):
+    """A subdir *root* must still yield repo-relative paths (scanners open
+    ``repo_root + path``): the shared walk's ``base=repo_root`` preserves the
+    pre-unification semantics."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text("")
+    (tmp_path / "top.py").write_text("")
+    tools = _RealWalkHost(str(tmp_path))
+    assert tools._walk_scan_files(os.path.join(str(tmp_path), "pkg")) == ["pkg/a.py"]
+
+
+class TestStructuralScanAutoReload:
+    """P3-1 opt-in: with registry.auto_reload_stale, the handler reloads stale
+    scanner modules in place instead of only emitting the restart banner."""
+
+    def _run(self, tmp_path, monkeypatch, stale_file, *, auto_reload, verify, reload_fn):
+        # The handler imports get_registry() inside the function, so the
+        # singleton it returns is patched directly (monkeypatch restores it).
+        from external_llm.agent import scanner_registry as sr_mod
+
+        reg = sr_mod.get_registry()
+        monkeypatch.setattr(reg, "auto_reload_stale", auto_reload)
+        monkeypatch.setattr(reg, "verify_loaded_sources", verify)
+        monkeypatch.setattr(reg, "reload_stale_sources", reload_fn)
+        repo = str(tmp_path)
+        tools = _FakeAnalysisTools(repo, ["main.go"])
+        return tools._tool_run_structural_scan({"scanner": "all", "path": ""})
+
+    def test_auto_reload_replaces_banner_when_reload_succeeds(self, tmp_path, monkeypatch):
+        stale_file = os.path.join(
+            str(tmp_path), "external_llm/analysis/_dead_block_shared.py",
+        )
+        verifies = {"n": 0}
+
+        def fake_verify():
+            verifies["n"] += 1
+            return [stale_file] if verifies["n"] == 1 else []
+
+        result = self._run(
+            tmp_path, monkeypatch, stale_file,
+            auto_reload=True, verify=fake_verify, reload_fn=lambda: [stale_file],
+        )
+
+        assert verifies["n"] == 2  # stale check + post-reload re-check
+        assert result["ok"] is True
+        assert "STALE SCANNER CODE DETECTED" not in result["content"]
+
+    def test_auto_reload_keeps_banner_for_unreloadable_remainder(self, tmp_path, monkeypatch):
+        stale_file = os.path.join(
+            str(tmp_path), "external_llm/analysis/_dead_block_shared.py",
+        )
+        result = self._run(
+            tmp_path, monkeypatch, stale_file,
+            auto_reload=True,
+            verify=lambda: [stale_file],
+            reload_fn=lambda: [],  # reload failed for all
+        )
+
+        assert result["ok"] is True
+        assert "STALE SCANNER CODE DETECTED" in result["content"]
+
+    def test_warning_only_when_flag_off(self, tmp_path, monkeypatch):
+        """Default (flag off) keeps the restart notice — no reload attempted."""
+        stale_file = os.path.join(
+            str(tmp_path), "external_llm/analysis/_dead_block_shared.py",
+        )
+        reload_calls = []
+        result = self._run(
+            tmp_path, monkeypatch, stale_file,
+            auto_reload=False,
+            verify=lambda: [stale_file],
+            reload_fn=lambda: reload_calls.append(1) or [],
+        )
+
+        assert reload_calls == []
+        assert "STALE SCANNER CODE DETECTED" in result["content"]
+
+
+class TestStructuralScanCrossRefsUnion:
+    """The tool's cross-file-ref input unions the graph's UNCAPPED py list.
+
+    Mirrors the structural gate's contract (scripts/check_structural_scanners
+    .py, 2026-08-11): the scan walk truncates at SCAN_FILE_CAP while the
+    graph build never does, so a name referenced only from a file beyond the
+    cap would otherwise be judged dead.  Capture the candidate list the
+    handler hands to ``compute_cross_file_referenced_names_light``: it must
+    be the scan list UNION graph.py_files, never the capped scan list alone.
+    """
+
+    def test_ref_input_unions_facade_py_files(self, tmp_path, monkeypatch):
+        for name in ("a.py", "b.py"):
+            (tmp_path / name).write_text("def f():\n    return 1\n")
+
+        class _FakeGraph:
+            # c.py is beyond the (capped) scan walk — only the graph knows it.
+            py_files: list = ["a.py", "b.py", "c.py"]  # noqa: RUF012
+
+        captured: dict = {}
+
+        def _fake_light(graph, repo_root, candidate_files, imported_names=None):
+            captured["files"] = candidate_files
+            return {"x"}
+
+        monkeypatch.setattr(
+            "external_llm.analysis.cross_file_refs.compute_cross_file_referenced_names_light",
+            _fake_light,
+        )
+        tools = _FakeAnalysisTools(str(tmp_path), ["a.py", "b.py"])
+        tools._call_graph = _FakeGraph()
+
+        result = tools._tool_run_structural_scan(
+            {"scanner": "public_dead_code_scanner", "path": ""}
+        )
+
+        assert result["ok"] is True
+        assert captured["files"] == ["a.py", "b.py", "c.py"]  # union, not capped
+
+    def test_standalone_without_graph_keeps_plain_scan_list(self, tmp_path, monkeypatch):
+        """No graph (or graph without py_files) → the scan list is passed
+        unchanged — the standalone conservative mode keeps its contract."""
+        for name in ("a.py", "b.py"):
+            (tmp_path / name).write_text("def f():\n    return 1\n")
+
+        captured: dict = {}
+
+        def _fake_light(graph, repo_root, candidate_files, imported_names=None):
+            captured["files"] = candidate_files
+            return {"x"}
+
+        monkeypatch.setattr(
+            "external_llm.analysis.cross_file_refs.compute_cross_file_referenced_names_light",
+            _fake_light,
+        )
+        tools = _FakeAnalysisTools(str(tmp_path), ["a.py", "b.py"])
+        # _FakeAnalysisTools.__init__ leaves _call_graph = None
+
+        result = tools._tool_run_structural_scan(
+            {"scanner": "public_dead_code_scanner", "path": ""}
+        )
+
+        assert result["ok"] is True
+        assert captured["files"] == ["a.py", "b.py"]

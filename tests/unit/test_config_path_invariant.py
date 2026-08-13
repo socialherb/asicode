@@ -20,11 +20,10 @@ from unittest.mock import patch
 
 from asi import (
     _resolve_repo_root,
-    _terminal_config_path,
-    _save_key_to_dotenv,
     _restart_cli,
+    _save_key_to_dotenv,
+    _terminal_config_path,
 )
-
 
 # ── #1: config read/write path invariant under subdir launch ─────────────────
 
@@ -38,10 +37,8 @@ class TestConfigPathSubdirInvariant:
         subdir = os.path.join(root, "pkg", "deep")
         os.makedirs(os.path.join(subdir, ".asicode"))
         os.makedirs(os.path.join(root, ".asicode"))
-        json.dump(
-            {"provider": "openai", "model": "gpt-5.6"},
-            open(os.path.join(root, ".asicode", "config.json"), "w"),
-        )
+        with open(os.path.join(root, ".asicode", "config.json"), "w") as fh:
+            json.dump({"provider": "openai", "model": "gpt-5.6"}, fh)
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         subprocess.run(["git", "add", "-A"], cwd=root, check=True)
         subprocess.run(
@@ -82,7 +79,7 @@ class TestConfigPathSubdirInvariant:
     def test_terminal_config_path_uses_toplevel(self, monkeypatch):
         """Per-terminal isolation config also resolves from toplevel so its
         read (main) and write (run_repl) paths agree."""
-        root, subdir = self._make_git_repo_with_subdir()
+        _root, subdir = self._make_git_repo_with_subdir()
         monkeypatch.chdir(subdir)
         repo_root = _resolve_repo_root(None)
         # main() reads:  _terminal_config_path(_repo_root)
@@ -98,11 +95,12 @@ class TestConfigPathSubdirInvariant:
 
     def test_saved_model_resolvable_from_read_path(self, monkeypatch):
         """End-to-end: the model run_repl persists is visible to main()'s read."""
-        root, subdir = self._make_git_repo_with_subdir()
+        _root, subdir = self._make_git_repo_with_subdir()
         monkeypatch.chdir(subdir)
         repo_root = _resolve_repo_root(None)
         read_path = os.path.join(repo_root, ".asicode", "config.json")
-        cfg = json.load(open(read_path))
+        with open(read_path) as fh:
+            cfg = json.load(fh)
         assert cfg["model"] == "gpt-5.6"
 
 
@@ -115,7 +113,8 @@ class TestSaveKeyToDotenvBestEffort:
     def test_oserror_on_replace_does_not_raise(self, tmp_path, capsys):
         repo_root = str(tmp_path)
         # pre-existing .env so the read branch is exercised
-        open(os.path.join(repo_root, ".env"), "w").write('OLD="x"\n')
+        with open(os.path.join(repo_root, ".env"), "w") as fh:
+            fh.write('OLD="x"\n')
         with patch("asi.os.replace", side_effect=OSError("Read-only file system")):
             # Must return None normally — NOT propagate OSError.
             _save_key_to_dotenv(repo_root, "OPENAI_API_KEY", "sk-test")
@@ -126,7 +125,8 @@ class TestSaveKeyToDotenvBestEffort:
     def test_tmp_cleaned_up_on_failure(self, tmp_path):
         repo_root = str(tmp_path)
         dotenv = os.path.join(repo_root, ".env")
-        open(dotenv, "w").write('OLD="x"\n')
+        with open(dotenv, "w") as fh:
+            fh.write('OLD="x"\n')
         tmp = dotenv + ".tmp"
         with patch("asi.os.replace", side_effect=OSError("denied")):
             _save_key_to_dotenv(repo_root, "KEY", "v")
@@ -137,7 +137,8 @@ class TestSaveKeyToDotenvBestEffort:
         repo_root = str(tmp_path)
         _save_key_to_dotenv(repo_root, "OPENAI_API_KEY", "sk-real")
         dotenv = os.path.join(repo_root, ".env")
-        assert 'OPENAI_API_KEY="sk-real"' in open(dotenv).read()
+        with open(dotenv) as fh:
+            assert 'OPENAI_API_KEY="sk-real"' in fh.read()
         assert "saved to" in capsys.readouterr().out
 
 

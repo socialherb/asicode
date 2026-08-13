@@ -253,7 +253,7 @@ def test_flush_left_into_tab_file_no_explosion():
 # pin individual fixes, but every past indent fix spawned the next edge case
 # (see git log: consolidate engines → reindent content-map → indent-explosion).
 # These invariants kill the *class* of regressions across a generated matrix of
-# (indent char × unit width × nesting depth × match-site base) rather than one
+# (indent char x unit width x nesting depth x match-site base) rather than one
 # example at a time.  Generated with stdlib only — no hypothesis dependency.
 
 def _max_indent_levels(text: str) -> float:
@@ -323,7 +323,7 @@ def test_property_no_indent_explosion():
     A direct assertion that indent cannot *explode*: re-indenting can shift a
     block to the file's base and rescale its unit, but the deepest line must stay
     within ``input_levels + base_levels`` (+1 level slack for rounding at unit
-    boundaries).  The pre-fix flush-left-into-tabs bug overshot this by 3–6
+    boundaries).  The pre-fix flush-left-into-tabs bug overshot this by 3-6
     levels; legitimate re-indents land at or under it.  Restricted to nested
     sites, where the level measurement (via ``indent_unit``) is trustworthy.
     """
@@ -361,7 +361,7 @@ def test_flush_left_flat_continuation_site_no_explosion():
 
     Regression (advisor-found): the match-site unit detector saw the raw depths
     ``{8, 21}`` (8 = base, 21 = a bracket-continuation alignment) and read a bogus
-    unit of 8, so a nested 4-space ``after`` ratio-scaled to 8/4 = 2× — exploding
+    unit of 8, so a nested 4-space ``after`` ratio-scaled to 8/4 = 2x — exploding
     a one-level body to 16 spaces.  The unit detector now excludes continuation
     rows (agreeing with ``indent_unit``), so the body lands one real level in.
     """
@@ -496,7 +496,7 @@ def test_reindent_block_anchor_level_char_invariant():
     Both delegate to the shared ``_block_levels`` / ``_resolve_space_unit`` core;
     this matrix test is the regression guard for the B2 bug class (the two paths
     drifted on space_unit — tab→space hardcoded to 4 in one, detected-unit in
-    the other). Across source styles × destinations × dest_unit hints, every
+    the other). Across source styles x destinations x dest_unit hints, every
     output line's (leading-whitespace, stripped-content) must match.
     """
     sources = {

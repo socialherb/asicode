@@ -213,6 +213,32 @@ class TestFieldSpecificSearchP2:
         )
         assert "No compressed summary available" in result
 
+    def test_decisions_summary_search_skips_archive_load(self, populated_session_mgr, monkeypatch):
+        """P27-1: decisions/summary field searches must NOT load the turn archive.
+
+        The archive (archive.jsonl) is only needed for content/all searches —
+        decisions/summary are session-level docs. Loading it on those fields
+        pays a full file read + JSON parse for nothing.
+        """
+        loop = _make_loop(populated_session_mgr, "test-session-1")
+        calls: list[str] = []
+        orig = populated_session_mgr.load_archived_turns
+
+        def _counting(sid):
+            calls.append(sid)
+            return orig(sid)
+
+        monkeypatch.setattr(populated_session_mgr, "load_archived_turns", _counting)
+
+        loop._search_design_history("validation", search_field="decisions")
+        assert calls == [], "decisions search must not touch the archive"
+
+        loop._search_design_history("logging", search_field="summary")
+        assert calls == [], "summary search must not touch the archive"
+
+        loop._search_design_history("validation", search_field="content")
+        assert calls == ["test-session-1"], "content search loads the archive once"
+
 
 class TestCrossSessionSearch:
     """Cross-session search with search_field."""
@@ -306,3 +332,86 @@ class TestToolSchema:
         assert "summary" in sf["enum"]
         assert "all" in sf["enum"]
         assert sf.get("default") == "content"
+
+
+class TestSemanticRerankCorpusGate:
+    """Pin the corpus-size gate that skips the embedding-model load on small corpora.
+
+    Below ``_SEMANTIC_RERANK_MIN_CORPUS`` the searcher runs BM25-only
+    (``vector_cache=None``), so the ~8s sentence-transformers import/load is
+    never triggered.  Verified by asserting the VCM factory
+    (``_get_session_vcm``) is NOT called for small corpora and IS called once
+    for a corpus at/above the threshold.
+    """
+
+    def test_small_corpus_skips_vcm(self, session_mgr, monkeypatch):
+        """Few turns → VCM factory never invoked → no model load."""
+        import external_llm.agent.design_chat_loop as _dcl
+
+        monkeypatch.setattr(_dcl, "_HAS_VECTOR_CACHE", True)
+        calls = []
+        monkeypatch.setattr(_dcl, "_get_session_vcm", lambda: calls.append(1))
+
+        session = session_mgr.get_or_create("small")
+        session.turns = [
+            {"role": "user", "content": f"turn {i} about topic", "timestamp": float(i)}
+            for i in range(6)
+        ]
+        session.compressed_up_to = 6
+        session_mgr._save(session)
+
+        loop = _make_loop(session_mgr, "small")
+        loop._search_design_history("topic")
+        assert calls == [], "small corpus must not touch the VCM (no model load)"
+
+    def test_large_corpus_uses_vcm(self, session_mgr, monkeypatch):
+        """≥ threshold turns → VCM factory invoked exactly once."""
+        import external_llm.agent.design_chat_loop as _dcl
+
+        monkeypatch.setattr(_dcl, "_HAS_VECTOR_CACHE", True)
+        calls = []
+        # Return a TRUTHY VCM stub so _SessionSearcher uses the cached value
+        # directly.  A None return (e.g. ``lambda: calls.append(1)``) would make
+        # _get_shared_vcm cache None, and the constructor's vector_cache=None
+        # branch would then call _get_session_vcm() AGAIN (auto-create fallback),
+        # inflating the count to 2.  .search → [] keeps RRF fusion exception-free.
+        _stub_vcm = MagicMock()
+        _stub_vcm.search.return_value = []
+
+        def _factory():
+            calls.append(1)
+            return _stub_vcm
+
+        monkeypatch.setattr(_dcl, "_get_session_vcm", _factory)
+
+        n = _dcl._SEMANTIC_RERANK_MIN_CORPUS + 5
+        session = session_mgr.get_or_create("large")
+        session.turns = [
+            {"role": "user", "content": f"turn {i} about topic keyword", "timestamp": float(i)}
+            for i in range(n)
+        ]
+        session.compressed_up_to = n
+        session_mgr._save(session)
+
+        loop = _make_loop(session_mgr, "large")
+        loop._search_design_history("topic")
+        assert len(calls) == 1, "large corpus must engage the VCM exactly once"
+
+    def test_decisions_field_typical_skips_vcm(self, session_mgr, monkeypatch):
+        """decisions field with a handful of items → VCM not loaded (typical case)."""
+        import external_llm.agent.design_chat_loop as _dcl
+
+        monkeypatch.setattr(_dcl, "_HAS_VECTOR_CACHE", True)
+        calls = []
+        monkeypatch.setattr(_dcl, "_get_session_vcm", lambda: calls.append(1))
+
+        session = session_mgr.get_or_create("dec")
+        session.turns = [{"role": "user", "content": "x", "timestamp": 1.0}]
+        session.decisions = ["decision alpha", "decision beta", "decision gamma"]
+        session.compressed_up_to = 1
+        session_mgr._save(session)
+
+        loop = _make_loop(session_mgr, "dec")
+        loop._search_design_history("decision", search_field="decisions")
+        assert calls == [], "typical decisions corpus (3 items) must stay BM25-only"
+

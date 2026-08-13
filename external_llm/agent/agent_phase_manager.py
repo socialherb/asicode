@@ -10,19 +10,15 @@ Moved here:
       _build_tool_hint()
       _build_phase_state_message()
       _advance_phase_after_success()
-      _llm_call_simple()
       _run_self_review()
       _auto_test_and_inject()
 """
 from __future__ import annotations
 
-import logging
-from typing import Any, Optional
+import os
+from typing import Any
 
-from ..client import LLMConnectionError, LLMRateLimitError, effective_content
 from .tool_handlers.shell_policy import is_verification_command
-
-logger = logging.getLogger(__name__)
 
 
 class PhaseManagerMixin:
@@ -37,7 +33,8 @@ class PhaseManagerMixin:
       - self._agent_phase     (str: DISCOVER/READ/EDIT/VERIFY/FINISH)
       - self._phase_target_file   (Optional[str])
       - self._phase_target_symbol (Optional[str])
-      - self._tool_success_memory (dict)
+      - self._tool_success_memory (dict[str, tuple[str, int]]: key → (tool_name, count))
+      - self._tool_fail_memory    (dict[str, tuple[str, int]]: key → (tool_name, count))
       - self._cb(event, data)
       - self._build_tool_result_message(...)
       - self._llm_call_with_tools(messages)
@@ -50,22 +47,40 @@ class PhaseManagerMixin:
 
     def _build_tool_hint(self) -> str:
         """
-        Provide adaptive tool usage hints based on recent successes.
+        Provide adaptive tool usage hints based on recent successes and failures.
+
+        Shows up to 3 most-recently-touched successes and up to 3 most-recently-
+        touched failures. Touched = inserted or re-inserted: _remember_tool
+        moves re-touched keys to the end (true LRU), so these are the tools used
+        most recently, not the ones first seen earliest. Values are (tool_name,
+        count); the dict keys are sha256 digests (see make_tool_signature) and
+        must never be surfaced to the model.
         """
         try:
-            if not getattr(self, "_tool_success_memory", None):
+            success = getattr(self, "_tool_success_memory", None) or {}
+            fail = getattr(self, "_tool_fail_memory", None) or {}
+            if not success and not fail:
                 return ""
 
-            # show up to 3 recent successful tools
-            tools = list(self._tool_success_memory.keys())[-3:]
-
-            hint = "[TOOL USAGE HINT]\nRecently successful tools:\n"
-            for t in tools:
-                hint += f"- {t}\n"
-
-            return hint
-        except Exception:
+            hint = "[TOOL USAGE HINT]\n"
+            if success:
+                hint += "Recently successful tools:\n"
+                for _key, val in list(success.items())[-3:]:
+                    if not isinstance(val, tuple):
+                        continue  # legacy scalar value (no name recorded) — skip silently
+                    name, count = val
+                    hint += f"- {name} (x{count})\n"
+            if fail:
+                hint += "Recently failed tools:\n"
+                for _key, val in list(fail.items())[-3:]:
+                    if not isinstance(val, tuple):
+                        continue  # legacy scalar value (no name recorded) — skip silently
+                    name, count = val
+                    hint += f"- {name} (x{count})\n"
+        except (ValueError, TypeError, KeyError):  # malformed tool-state entries
             return ""  # non-critical — never block execution
+        else:
+            return hint
 
     # ------------------------------------------------------------------
     # Phase state machine
@@ -103,7 +118,6 @@ class PhaseManagerMixin:
         tool_name: str,
         tool_args: dict[str, Any],
         result: Any,
-        read_only_request: bool,
     ) -> None:
         """Advance the internal phase machine after a successful tool call."""
         if not result or not getattr(result, "ok", False):
@@ -155,139 +169,12 @@ class PhaseManagerMixin:
     # The phase machine is advisory only: it shapes the [AGENT STATE] hint and
     # nothing else.
 
-    # ------------------------------------------------------------------
-    # Simple (no-tool) LLM call — used by planner and reviewer
-    # ------------------------------------------------------------------
-
-    def _llm_call_simple(self, messages: list, json_mode: bool = False) -> str:
-        """Single LLM call without tools; returns plain text content.
-
-        In AgentLoop context (primary), delegates to _retry_on_rate_limit
-        for the same retry/telemetry/error behavior as _llm_call_with_tools.
-        On retry exhaustion, raises LLMConnectionError/LLMRateLimitError
-        so the caller can classify it as an API connection failure.
-
-        In non-AgentLoop context (planning/review), keeps existing fallback
-        with bare try/except returning ``""``.
-
-        json_mode: pass response_format={"type":"json_object"} to constrain output
-        to valid JSON.  Use only when the call is guaranteed to return a JSON object
-        (surgical_edit, ast_op, replace_symbol_body, ast_direct_body).
-
-        Truncation retry: when ``json_mode=True`` and the response is truncated
-        (finish_reason=length/truncated), retries up to 2 times with increasing
-        max_tokens (8K → 16K) so structured JSON output fits within the budget.
-        """
-        from ..client import LLMMessage  # noqa: F401 — needed for type context
-
-        # ── helper: perform one LLM call with optional max_tokens override ──
-        def _do_call(max_tokens: Optional[int] = None) -> dict[str, Any]:
-            # ── Reasoning A/B control (developer-scoped) ────────────────────
-            # Default: model default (reasoning ON). Set ASICODE_DEVELOPER_REASONING=off
-            # to inject a suppression fragment into the DeepSeek payload.
-            from .reasoning_utils import reasoning_ab_kwargs
-            _reasoning_kwargs = reasoning_ab_kwargs("ASICODE_DEVELOPER_REASONING")
-
-            _call_kw: dict[str, Any] = dict(_extra)  # shallow copy (response_format etc.)
-            if max_tokens is not None:
-                _call_kw["max_tokens"] = max_tokens
-            if hasattr(self.llm_client, "chat_with_tools"):
-                resp = self.llm_client.chat_with_tools(
-                    messages=messages,
-                    tools=[],
-                    model=self.model,
-                    thinking_mode=self.config.thinking_mode,
-                    reasoning_effort=getattr(self.config, "reasoning_effort", None),
-                    reasoning_callback=(
-                        (lambda text: self.config.stream_callback("reasoning", {"text": text, "append": True}))
-                        if self.config.stream_callback else None
-                    ),
-                    **_reasoning_kwargs,
-                    **_call_kw,
-                )
-            elif hasattr(self.llm_client, "chat"):
-                resp = self.llm_client.chat(
-                    messages=messages,
-                    model=self.model,
-                    thinking_mode=self.config.thinking_mode,
-                    reasoning_effort=getattr(self.config, "reasoning_effort", None),
-                    reasoning_callback=(
-                        (lambda text: self.config.stream_callback("reasoning", {"text": text, "append": True}))
-                        if self.config.stream_callback else None
-                    ),
-                    **_reasoning_kwargs,
-                    **_call_kw,
-                )
-            else:
-                return {"content": ""}
-            return {
-                "content": effective_content(resp),
-                "finish_reason": getattr(resp, "finish_reason", None),
-                "prompt_tokens": getattr(resp, "prompt_tokens", None),
-                "completion_tokens": getattr(resp, "completion_tokens", None),
-                "tokens_used": getattr(resp, "tokens_used", None),
-                "reasoning_tokens": getattr(resp, "reasoning_tokens", None),
-            }
-
-        _extra: dict[str, Any] = {}
-        if json_mode:
-            _extra["response_format"] = {"type": "json_object"}
-
-        # ── AgentLoop context: same retry/telemetry as _llm_call_with_tools ──
-        retry_wrapper = getattr(self, "_retry_on_rate_limit", None)
-        if retry_wrapper is not None:
-            try:
-                result = retry_wrapper(lambda: _do_call(), "_llm_call_simple")
-                content = result.get("content", "")
-                finish_reason = result.get("finish_reason")
-            except (LLMConnectionError, LLMRateLimitError):
-                # Retry exhausted, telemetry already recorded, SSE event sent.
-                raise
-        else:
-            # ── Non-AgentLoop context: keep existing fallback ──
-            try:
-                result = _do_call()
-                content = result.get("content", "")
-                finish_reason = result.get("finish_reason")
-            except Exception as e:
-                logger.warning("_llm_call_simple failed: %s", e)
-                return ""
-
-        # ── Truncation retry for JSON mode ──
-        # finish_reason=length/truncated + content structurally incomplete → retry
-        if json_mode and finish_reason in ("length", "truncated", None):
-            _needs_retry = not content.rstrip().endswith(('}', ']'))
-            if _needs_retry:
-                for _attempt in range(2):  # max 2 retries
-                    _retry_max_tokens = 8192 * (1 << _attempt)  # 8192 → 16384
-                    _retry_result = _do_call(max_tokens=_retry_max_tokens)
-                    content = _retry_result.get("content", "")
-                    finish_reason = _retry_result.get("finish_reason")
-                    logger.warning(
-                        "[TRUNCATION_RETRY] finish_reason=%r max_tokens=%d retry (%d/2)",
-                        finish_reason, _retry_max_tokens, _attempt + 1,
-                    )
-                    if finish_reason not in ("length", "truncated", None):
-                        break  # retry succeeded (any non-truncated reason)
-                    if content.rstrip().endswith(('}', ']')):
-                        break  # content appears structurally complete
-                else:
-                    logger.warning(
-                        "[TRUNCATION_RETRY] all 2 retries exhausted — using partial content (%d chars)",
-                        len(content),
-                    )
-
-        return content
 
     # ------------------------------------------------------------------
     # Self-review phase
     # ------------------------------------------------------------------
 
-    def _run_self_review(
-        self,
-        messages: list,
-        has_native_tools: bool,
-    ) -> str:
+    def _run_self_review(self) -> str:
         """
         Post-execution self-review mini-loop.
         Gets git diff, asks LLM to review for bugs, optionally applies fixes.
@@ -323,7 +210,20 @@ class PhaseManagerMixin:
         # Build pytest args: user-specified paths + TDD-optimised flags
         # -x: stop on first failure (faster feedback loop)
         tdd_paths = list(self.config.test_paths)
-        tdd_args = [*tdd_paths, "-x", "--tb=short", "-q", "--ignore=tests/test_intelligent_llm.py", "--ignore=tests/test_indices_selection.py"]
+        # Legacy --ignore flags from an older repo layout. pytest silently
+        # tolerates nonexistent --ignore paths, so in a repo that no longer
+        # ships these files the flags were dead weight on every TDD run — pass
+        # them only when the target exists (keeps the historical behavior for
+        # repos that still have them).
+        _repo_root = getattr(self.registry, "repo_root", None)
+        _legacy_ignores = [
+            _p for _p in ("tests/test_intelligent_llm.py", "tests/test_indices_selection.py")
+            if _repo_root and os.path.exists(os.path.join(_repo_root, _p))
+        ]
+        tdd_args = [
+            *tdd_paths, "-x", "--tb=short", "-q",
+            *[f"--ignore={_p}" for _p in _legacy_ignores],
+        ]
         test_result = self.registry.dispatch(
             "run_tests", {"args": tdd_args}
         )

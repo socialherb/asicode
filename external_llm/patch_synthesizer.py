@@ -14,6 +14,12 @@ from .output_modes import OutputMode
 
 logger = logging.getLogger(__name__)
 
+# P23-1: cap on target-file reads during synthesis. Mirrors
+# patch_engine._MAX_FILE_CHARS (250_000) so the LLM-edit paths stay
+# consistent — a whole-file rewrite of a huge file must not trigger an
+# unbounded read here just because patch_engine's other gates were bypassed.
+_MAX_SYNTHESIZE_FILE_CHARS = 250_000
+
 
 class PatchSynthesizer:
     """Convert parse result to Unified Diff"""
@@ -48,23 +54,42 @@ class PatchSynthesizer:
             #already diff form
             return str(parse_result.diff or "")
 
-        elif parse_result.mode == OutputMode.ASICODE_BLOCK:
+        if parse_result.mode == OutputMode.ASICODE_BLOCK:
             return self._from_asicode_block(parse_result, target_file)
 
-        elif parse_result.mode == OutputMode.TARGETED_BLOCK:
+        if parse_result.mode == OutputMode.TARGETED_BLOCK:
             return self._from_targeted_block(parse_result, target_file)
 
-        elif parse_result.mode == OutputMode.FULL_FILE:
+        if parse_result.mode == OutputMode.FULL_FILE:
             return self._from_full_file(parse_result, target_file)
 
-        else:
-            raise ValueError(f"Unknown mode: {parse_result.mode}")
+        raise ValueError(f"Unknown mode: {parse_result.mode}")
+    def _read_target_text(self, target_file: str, *, missing_ok: bool) -> str:
+            """Read the target file for synthesis — size-gated and lossy-safe.
+
+            P23-1: all three synthesis paths previously read the file unbounded
+            (memory/CPU blowup when the LLM rewrites a huge file) and with
+            errors="ignore" (invalid UTF-8 bytes silently deleted, so the diff
+            was computed against corrupted old_content). Byte size is a
+            conservative proxy for chars, matching patch_engine's stat gate;
+            oversized targets raise so callers fall back to their existing
+            repair/retry contracts.
+            """
+            file_path = self.repo_root / target_file
+            if not file_path.exists():
+                if missing_ok:
+                    return ""
+                raise ValueError("target_file_missing_for_targeted_block")
+            if file_path.stat().st_size > _MAX_SYNTHESIZE_FILE_CHARS:
+                raise ValueError(
+                    f"file_too_large: {target_file} exceeds {_MAX_SYNTHESIZE_FILE_CHARS} bytes"
+                )
+            return file_path.read_text(encoding="utf-8", errors="replace")
 
     def _from_asicode_block(self, result: ParseResult, target_file: str) -> str:
         """Convert ASICODE_BLOCK to unified diff"""
 
-        file_path = self.repo_root / target_file
-        old_content = file_path.read_text(encoding="utf-8", errors="ignore") if file_path.exists() else ""
+        old_content = self._read_target_text(target_file, missing_ok=True)
         new_content = old_content
 
         #each block apply
@@ -156,10 +181,7 @@ class PatchSynthesizer:
     def _from_targeted_block(self, result: ParseResult, target_file: str) -> str:
         """Convert TARGETED_BLOCK to unified diff"""
 
-        file_path = self.repo_root / target_file
-        if not file_path.exists():
-            raise ValueError("target_file_missing_for_targeted_block")
-        old_content = file_path.read_text(encoding="utf-8", errors="ignore")
+        old_content = self._read_target_text(target_file, missing_ok=False)
         old_lines = old_content.split('\n')
 
         # Find insertion position
@@ -198,12 +220,7 @@ class PatchSynthesizer:
     def _from_full_file(self, result: ParseResult, target_file: str) -> str:
         """Convert FULL_FILE to unified diff"""
 
-        file_path = self.repo_root / target_file
-
-        if file_path.exists():
-            old_content = file_path.read_text(encoding="utf-8", errors="ignore")
-        else:
-            old_content = ""
+        old_content = self._read_target_text(target_file, missing_ok=True)
 
         new_content = result.content
 

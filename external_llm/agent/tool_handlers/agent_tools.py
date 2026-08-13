@@ -4,6 +4,8 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .constants import ASK_USER_DEFAULT_TIMEOUT  # leaf module — avoids tool_registry circular import
@@ -12,6 +14,33 @@ if TYPE_CHECKING:
     from ..tool_registry import ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+# Retained-window budget for the delegate-to-helper local snippet: at most
+# ~80 numbered lines, capped as whole lines so a minified 10 MB single line
+# cannot blow up the model context (the previous read_text+splitlines path
+# included such a line in full).
+_SNIPPET_RETAIN_CHARS = 16 * 1024
+
+
+def _read_local_snippet(abs_fp: "Path", start_line: int, end_line: int) -> str:
+    """Numbered lines ``[start_line, end_line]`` of *abs_fp*, streamed and bounded.
+
+    The helper context asks for at most ~80 lines; reading the whole file to
+    answer that (``read_text`` + ``splitlines``) is the same bug class as the
+    old ``_word_in_files`` hotspot. Reuses ``read_tools._stream_split_window``
+    so splitlines() semantics (line numbers must not silently shift on files
+    containing ``\\v \\f \\x85 \\u2028 ...``) and its verified chunk-boundary
+    handling are shared; ``stop_after_last`` bounds I/O to the requested
+    window, and ``_SNIPPET_RETAIN_CHARS`` bounds the retained window itself.
+    """
+    from .read_tools import _stream_split_window
+
+    with abs_fp.open("rb") as fh:
+        _total, lines = _stream_split_window(
+            fh, b"", start_line, end_line, _SNIPPET_RETAIN_CHARS, stop_after_last=True
+        )
+    return "\n".join(f"{i}: {line}" for i, line in enumerate(lines, start=start_line))
 
 
 class AgentToolsMixin:
@@ -75,10 +104,7 @@ class AgentToolsMixin:
             os.makedirs(memory_dir, exist_ok=True)
             self._ensure_asicode_gitignored()
             timestamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-            if section:
-                entry = f"\n### {section} ({timestamp})\n{note}\n"
-            else:
-                entry = f"\n<!-- {timestamp} -->\n{note}\n"
+            entry = f"\n### {section} ({timestamp})\n{note}\n" if section else f"\n<!-- {timestamp} -->\n{note}\n"
             with open(memory_path, "a", encoding="utf-8") as fh:
                 fh.write(entry)
             return self._make_result(
@@ -118,49 +144,38 @@ class AgentToolsMixin:
 
         if not function_signature or not context_code:
             try:
-                from external_llm.agent.symbol_search import SymbolSearcher
+                from external_llm.agent.symbol_search import get_symbol_searcher
                 from external_llm.context.context_packs import HelperContextBuilder
 
                 builder = HelperContextBuilder(self.repo_root)
 
                 if not function_signature and target_symbol:
-                    try:
-                        searcher = SymbolSearcher(str(self.repo_root))
+                    with suppress(AttributeError, TypeError):
+                        searcher = get_symbol_searcher(str(self.repo_root))
                         symbol_info = searcher.get_symbol_info(target_symbol, file_path=file_path)
                         if symbol_info and symbol_info.get("signature"):
                             function_signature = str(symbol_info.get("signature") or "").strip()
-                    except (AttributeError, TypeError):
-                        pass
 
                 local_snippet = context_code
                 if not local_snippet and file_path:
-                    try:
+                    with suppress(OSError, AttributeError):
                         start_line = 1
                         end_line = 80
 
                         if target_symbol:
-                            try:
-                                searcher = SymbolSearcher(str(self.repo_root))
+                            with suppress(AttributeError, TypeError):
+                                searcher = get_symbol_searcher(str(self.repo_root))
                                 symbol_info = searcher.get_symbol_info(target_symbol, file_path=file_path)
                                 if symbol_info and symbol_info.get("line"):
                                     line_no = int(symbol_info.get("line"))
                                     start_line = max(1, line_no - 12)
                                     end_line = line_no + 28
-                            except (AttributeError, TypeError):
-                                pass
 
-                        from pathlib import Path
                         abs_fp = Path(self.repo_root) / file_path if not Path(file_path).is_absolute() else Path(file_path)
                         try:
-                            content = abs_fp.read_text(encoding="utf-8", errors="replace")
-                            c_lines = content.splitlines()
-                            s = max(0, start_line - 1)
-                            e = min(end_line, len(c_lines))
-                            local_snippet = "\n".join(f"{i}: {line}" for i, line in enumerate(c_lines[s:e], start=s + 1))
+                            local_snippet = _read_local_snippet(abs_fp, start_line, end_line)
                         except Exception:
                             local_snippet = ""
-                    except (OSError, AttributeError):
-                        pass
 
                 helper_pack = builder.build(
                     task=instruction,
@@ -173,7 +188,7 @@ class AgentToolsMixin:
                     context_code = helper_pack.content
 
             except Exception as e:
-                logger.debug(f"Helper context build failed: {e}")
+                logger.debug("Helper context build failed: %s", e)
 
         try:
             result = self.local_assistant.delegate_single_task(
@@ -196,13 +211,12 @@ class AgentToolsMixin:
                     content=content,
                     metadata={"role": role, "validation": result.get("validation"), "issues": result.get("issues")},
                 )
-            else:
-                error_msg = result.get("error", "Local model generation failed")
-                return self._make_result(
-                    ok=False,
-                    content="",
-                    error=f"Local model delegation failed: {error_msg}",
-                )
+            error_msg = result.get("error", "Local model generation failed")
+            return self._make_result(
+                ok=False,
+                content="",
+                error=f"Local model delegation failed: {error_msg}",
+            )
         except Exception as e:
             logger.exception("Local assistant delegation failed")
             return self._make_result(

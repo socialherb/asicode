@@ -14,10 +14,8 @@ Conservative scope (Phase 3 launch):
   - skips definitions nested inside conditional blocks (``if``/``try``/etc.)
 
 Each name with ≥ 2 qualifying occurrences becomes a
-``DuplicateDefinitionCandidate``.  Adapter
-(``StructuralWorkset.from_duplicate_definition_candidate``) maps these to
-``kind="duplicate_definition"`` worksets that DPB dispatches to a
-deterministic ``DELETE_SYMBOL_RANGE`` op targeting the second occurrence.
+``DuplicateDefinitionCandidate``, which DPB dispatches to a deterministic
+``DELETE_SYMBOL_RANGE`` op targeting the second occurrence.
 """
 
 from __future__ import annotations
@@ -31,6 +29,12 @@ from typing import Optional
 from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.languages import LanguageId as _LanguageId
 
+from ..languages.tree_sitter_utils import (
+    get_node_text as _ts_get_text,
+)
+from ..languages.tree_sitter_utils import (
+    parse_to_tree as _ts_parse_to_tree,
+)
 from . import parse_cache
 from ._dead_block_shared import _has_overload, _ts_child_by_type
 
@@ -60,16 +64,9 @@ class DuplicateDefinitionCandidate:
 
 
 # ── Tree-sitter availability ─────────────────────────────────────────────
-try:
-    from ..languages.tree_sitter_utils import (
-        get_node_text as _ts_get_text,
-    )
-    from ..languages.tree_sitter_utils import (  # type: ignore
-        parse_to_tree as _ts_parse_to_tree,
-    )
-    _HAS_TS = True
-except ImportError:
-    _HAS_TS = False
+# tree_sitter_utils guards its own optional tree-sitter import, so this
+# module always imports — the old try/except ImportError was dead code.
+_HAS_TS = True
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
@@ -81,18 +78,28 @@ _LANG_TOP_LEVEL_NODES: dict[str, set] = {
     # Python grammars (standalone tree-sitter-python wraps, the
     # tree-sitter-language-pack bundle does not); only the pack is a declared
     # dependency, so both shapes must be listed.
+    # "annotated_assignment" (``x: T = ...``) is the same dual-shape story and is
+    # emitted by the AST fallback path (ast.AnnAssign) — the TS path skipping it
+    # was a silent parity gap, now pinned by the node-level contract in
+    # test_duplicate_definition_lang_keys_match_registry.
     "python": {"function_definition", "async_function_definition", "class_definition",
-               "expression_statement", "assignment"},
+               "expression_statement", "assignment", "annotated_assignment"},
     "typescript": {"function_declaration", "class_declaration", "interface_declaration",
                    "type_alias_declaration", "enum_declaration", "lexical_declaration",
                    "variable_declaration", "module_declaration"},
     "javascript": {"function_declaration", "class_declaration", "lexical_declaration",
                    "variable_declaration"},
     "go": {"function_declaration", "method_declaration", "type_declaration", "type_spec"},
+    # method/field_declaration never appear at program root under the standard
+    # java grammar (they live inside class bodies) but are kept for
+    # grammar-variant coverage — the same reasoning as the python dual listing.
     "java": {"class_declaration", "interface_declaration", "enum_declaration",
              "method_declaration", "field_declaration"},
+    # fwcd kotlin grammar (language-pack AND standalone) emits
+    # function_declaration — "fun_declaration" was a stale fork variant that
+    # silently skipped every top-level kotlin function.
     "kotlin": {"class_declaration", "object_declaration", "companion_object",
-               "interface_declaration", "enum_declaration", "fun_declaration",
+               "interface_declaration", "enum_declaration", "function_declaration",
                "property_declaration"},
 }
 
@@ -104,6 +111,7 @@ _LANG_KIND_MAP: dict[str, str] = {
     "class_definition": "class",
     "expression_statement": "assignment",
     "assignment": "assignment",  # wrapper-less form (language-pack grammar)
+    "annotated_assignment": "assignment",  # x: T = ... (both grammar shapes)
     # TS/JS
     "function_declaration": "function",
     "class_declaration": "class",
@@ -119,13 +127,44 @@ _LANG_KIND_MAP: dict[str, str] = {
     "type_spec": "assignment",
     # Java
     "field_declaration": "assignment",
-    "constructor_declaration": "function",
     # Kotlin
     "object_declaration": "class",
     "companion_object": "class",
-    "fun_declaration": "function",
     "property_declaration": "assignment",
 }
+
+
+# ── Import-time judge-map validation ────────────────────────────────────────
+# The two maps above are hand-maintained per-language node types (grammar
+# facts — not derivable), so their internal consistency is enforced at import:
+#   - a node type the walk CAN emit without a kind would be silently misjudged
+#     as "assignment" by the old get(ct, ...) fallback;
+#   - a kind entry nothing emits is a stale leftover that hides a node-type
+#     removal (constructor_declaration was exactly that — java constructors
+#     live inside class bodies, never at program root).
+_SYMBOL_KINDS = frozenset({"function", "class", "assignment"})
+
+
+def _validate_judge_maps() -> None:
+    emitted = set().union(*_LANG_TOP_LEVEL_NODES.values())
+    unkinded = emitted - set(_LANG_KIND_MAP)
+    if unkinded:
+        raise ValueError(
+            "_LANG_KIND_MAP is missing kinds for emitted node types: "
+            f"{sorted(unkinded)}"
+        )
+    stale = set(_LANG_KIND_MAP) - emitted
+    if stale:
+        raise ValueError(
+            "_LANG_KIND_MAP entries are never emitted by any _LANG_TOP_LEVEL_NODES "
+            f"set (stale after a node-type removal): {sorted(stale)}"
+        )
+    bad = {ct: kind for ct, kind in _LANG_KIND_MAP.items() if kind not in _SYMBOL_KINDS}
+    if bad:
+        raise ValueError(f"_LANG_KIND_MAP kinds must be in {sorted(_SYMBOL_KINDS)}, got: {bad}")
+
+
+_validate_judge_maps()
 
 
 def _ts_collect_top_level_definitions(source: str, language: str = "python") -> list[tuple[str, str, int, int, Optional[str]]]:
@@ -181,8 +220,8 @@ def _ts_collect_top_level_definitions(source: str, language: str = "python") -> 
 
         # ── Extract name node(s) ──────────────────────────────────────
         name_nodes = []
-        if ct in ("expression_statement", "assignment"):  # Python assignment, ±wrapper
-            assign_node = node if ct == "assignment" else _ts_child_by_type(node, ("assignment",))
+        if ct in ("expression_statement", "assignment", "annotated_assignment"):  # Python assignment, ±wrapper
+            assign_node = node if ct in ("assignment", "annotated_assignment") else _ts_child_by_type(node, ("assignment", "annotated_assignment"))
             if assign_node is None:
                 continue
             left = assign_node.child_by_field_name("left")
@@ -205,14 +244,27 @@ def _ts_collect_top_level_definitions(source: str, language: str = "python") -> 
         else:
             nn = node.child_by_field_name("name")
             if nn is None:
+                # kotlin fwcd grammar names bindings via unnamed children
+                # (simple_identifier / type_identifier), never a `name` field.
                 for c in node.children:
-                    if c.type == "identifier":
+                    if c.type in ("identifier", "simple_identifier", "type_identifier"):
                         nn = c
                         break
+                if nn is None and language == "kotlin" and ct == "property_declaration":
+                    # property names nest one level deeper:
+                    # property_declaration → variable_declaration →
+                    # simple_identifier (binding_pattern_kind holds only the
+                    # val/var keyword).  Destructuring (`val (a, b) = ...`)
+                    # emits multi_variable_declaration instead and is
+                    # deliberately skipped — mirroring the python
+                    # multi-target exclusion.
+                    vd = _ts_child_by_type(node, ("variable_declaration",))
+                    if vd is not None:
+                        nn = _ts_child_by_type(vd, ("simple_identifier",))
             if nn is not None:
                 name_nodes.append(nn)
 
-        kind = _LANG_KIND_MAP.get(ct, "assignment")
+        kind = _LANG_KIND_MAP[ct]  # presence guaranteed by _validate_judge_maps at import
         # ── Receiver type for Go methods (dedup disambiguation) ──────────
         # ``func (a *A) Render()`` and ``func (b *B) Render()`` are distinct
         # symbols that would collide without the receiver in the dedup key.
@@ -229,8 +281,7 @@ def _ts_collect_top_level_definitions(source: str, language: str = "python") -> 
         # remove the decorator lines together with the definition.
         start = child.start_point[0] + 1
         end = child.end_point[0] + 1
-        for nn in name_nodes:
-            out.append((_ts_get_text(source_bytes, nn), kind, start, end, receiver))
+        out.extend((_ts_get_text(source_bytes, nn), kind, start, end, receiver) for nn in name_nodes)
     return out
 
 
@@ -347,7 +398,8 @@ def scan_duplicate_definitions(
     if candidates:
         logger.info(
             "[DUPLICATE_DEF] %d duplicate name(s) across %d file(s)",
-            len(candidates), len(set(c.file for c in candidates)),
+            len(candidates),
+            len({c.file for c in candidates}),
         )
 
     if _truncated_total:

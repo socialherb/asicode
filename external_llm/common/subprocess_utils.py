@@ -6,6 +6,7 @@ helper was duplicated (and at risk of drift) in ``intelligent_service.py`` and
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
@@ -72,18 +73,26 @@ def run_bounded_subprocess(
     )
     try:
         stdout, stderr = proc.communicate(input=input, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         # Kill the whole process group (start_new_session created one) so
-        # grandchildren are terminated too, not orphaned.
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, OSError):
-            pass
+        # grandchildren are terminated too, not orphaned. The child is a
+        # session leader, so its pgid == its pid; do NOT re-resolve the group
+        # via os.getpgid() here — `communicate()` reaps a direct child that
+        # exited early (e.g. `bash -c "sleep 45 & ..."`), and a dead leader
+        # makes getpgid() raise ProcessLookupError, which the suppress() below
+        # would swallow: the kill is silently skipped and the grandchildren
+        # survive as orphans. killpg() on the stored pid targets the GROUP,
+        # which outlives its leader while any member is still alive.
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
         # Reap the killed process and drain partial output to avoid zombies.
         try:
             stdout, stderr = proc.communicate(timeout=5)
         except Exception:
-            stdout, stderr = "", ""
+            # Preserve the partial output buffered before the timeout rather
+            # than blanking it: half a traceback is still evidence, and losing
+            # it turns a timeout into a misleading empty result.
+            stdout, stderr = exc.stdout or "", exc.stderr or ""
         _note = f"\n[aborted: exceeded {timeout}s timeout]"
         return subprocess.CompletedProcess(
             args=cmd, returncode=-9,

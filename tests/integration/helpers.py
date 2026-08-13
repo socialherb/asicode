@@ -48,7 +48,8 @@ def apply_patch_and_verify(repo_root: str, patch_content: str, expected_changes:
             ["git", "apply", "--verbose", patch_file],
             cwd=repo_root,
             capture_output=True,
-            text=True
+            text=True,
+            check=False,
         )
 
         if result.returncode != 0:
@@ -57,7 +58,8 @@ def apply_patch_and_verify(repo_root: str, patch_content: str, expected_changes:
                 ["git", "apply", "--3way", "--verbose", patch_file],
                 cwd=repo_root,
                 capture_output=True,
-                text=True
+                text=True,
+                check=False,
             )
             if result.returncode != 0:
                 return False
@@ -69,7 +71,8 @@ def apply_patch_and_verify(repo_root: str, patch_content: str, expected_changes:
                 ["git", "diff", "HEAD"],
                 cwd=repo_root,
                 capture_output=True,
-                text=True
+                text=True,
+                check=False,
             )
             if not re.search(pattern, diff_result.stdout, re.MULTILINE | re.DOTALL):
                 return False

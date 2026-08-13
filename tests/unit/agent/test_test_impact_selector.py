@@ -6,11 +6,10 @@ from types import SimpleNamespace
 import pytest
 
 from external_llm.agent.test_impact_selector import (
-    select_affected_tests,
     _defined_names,
     is_test_file,
+    select_affected_tests,
 )
-
 
 # ── _defined_names ───────────────────────────────────────────────────────────
 
@@ -86,14 +85,14 @@ def test_import_graph_matches_full_module_path(tmp_path):
 
 
 def test_naming_convention_maps_source_to_test(tmp_path):
-    src, test = _make_repo(tmp_path)
+    _src, _test = _make_repo(tmp_path)
     result = select_affected_tests(str(tmp_path), ["external_llm/agent/tool_safety.py"])
     assert "tests/unit/test_tool_safety.py" in result
     assert "tests/unit/test_orchestrator.py" not in result
 
 
 def test_editing_a_test_file_runs_it_directly(tmp_path):
-    src, test = _make_repo(tmp_path)
+    _src, _test = _make_repo(tmp_path)
     result = select_affected_tests(
         str(tmp_path), ["tests/unit/test_tool_safety.py"]
     )
@@ -124,7 +123,7 @@ def test_empty_when_no_matching_test(tmp_path):
 
 
 def test_leading_slash_normalized(tmp_path):
-    src, test = _make_repo(tmp_path)
+    _src, _test = _make_repo(tmp_path)
     # Callers sometimes pass absolute or slash-prefixed paths.
     result = select_affected_tests(str(tmp_path), ["/external_llm/agent/tool_safety.py"])
     assert "tests/unit/test_tool_safety.py" in result
@@ -143,17 +142,12 @@ class _FakeCallGraph:
         self._map = callers_map
 
     def get_callers(self, symbol):
-        edges = []
-        for entry in self._map.get(symbol, []):
-            edges.append(
-                _FakeEdge(caller_file=entry["caller_file"],
-                          caller_symbol=entry.get("caller_symbol"))
-            )
-        return edges
+        return [_FakeEdge(caller_file=entry["caller_file"],
+                          caller_symbol=entry.get("caller_symbol")) for entry in self._map.get(symbol, [])]
 
 
 def test_call_graph_adds_cross_module_test(tmp_path):
-    src, test = _make_repo(tmp_path)
+    _src, _test = _make_repo(tmp_path)
     # A test in a NON-matching name calls repair() — naming convention alone
     # would miss it, but the call graph must surface it.
     (tmp_path / "tests" / "test_repair_flow.py").write_text(
@@ -173,7 +167,7 @@ def test_call_graph_adds_cross_module_test(tmp_path):
 
 
 def test_call_graph_non_test_callers_ignored(tmp_path):
-    src, test = _make_repo(tmp_path)
+    _src, _test = _make_repo(tmp_path)
     cg = _FakeCallGraph({
         "repair": [{"caller_file": "external_llm/agent/other.py",
                     "caller_symbol": "caller_fn"}],
@@ -186,7 +180,7 @@ def test_call_graph_non_test_callers_ignored(tmp_path):
 
 
 def test_call_graph_exception_does_not_break_selection(tmp_path):
-    src, test = _make_repo(tmp_path)
+    _src, _test = _make_repo(tmp_path)
 
     class _Boom:
         def get_callers(self, symbol):
@@ -218,7 +212,7 @@ def test_result_capped(tmp_path):
 
 
 def test_dedup(tmp_path):
-    src, test = _make_repo(tmp_path)
+    _src, _test = _make_repo(tmp_path)
     # Same file touched twice → no duplicate entries.
     result = select_affected_tests(
         str(tmp_path), ["external_llm/agent/tool_safety.py"] * 3

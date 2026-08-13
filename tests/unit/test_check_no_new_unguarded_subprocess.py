@@ -13,6 +13,7 @@ binary's absence crashed the tool.
 """
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -115,6 +116,63 @@ def test_scan_passes_nested_outer_try_catches_oserror():
     assert g._scan_source(src, "m.py") == []
 
 
+# --- precision: contextlib.suppress is an equivalent guard --------------------
+# The silent-except program converts try/except/pass into suppress (SIM105 is
+# selected repo-wide), so the subprocess guard must accept both shapes or the
+# two gates fight each other: a suppress-wrapped call would look "unguarded".
+@pytest.mark.parametrize(
+    "suppress_args",
+    [
+        "OSError",
+        "OSError, subprocess.SubprocessError",   # the FIX shape as suppress
+        "Exception",                             # OSError supertype
+        "BaseException",
+    ],
+    ids=["OSError", "tuple-with-OSError", "Exception", "BaseException"],
+)
+def test_scan_passes_suppress_guarded(suppress_args):
+    src = (
+        "import subprocess\n"
+        "import contextlib\n"
+        "def f():\n"
+        f"    with contextlib.suppress({suppress_args}):\n"
+        "        subprocess.run(['rg'])\n"
+    )
+    assert g._scan_source(src, "m.py") == []
+
+
+@pytest.mark.parametrize(
+    "suppress_args",
+    [
+        "ValueError",                             # misses OSError entirely
+        "subprocess.SubprocessError",             # timeout-only, not OSError
+    ],
+    ids=["ValueError", "SubprocessError"],
+)
+def test_scan_flags_suppress_missing_oserror(suppress_args):
+    # suppress without OSError (or a supertype) is the same defect as the
+    # original rg crash: a missing binary's FileNotFoundError escapes.
+    src = (
+        "import subprocess\n"
+        "import contextlib\n"
+        "def f():\n"
+        f"    with contextlib.suppress({suppress_args}):\n"
+        "        subprocess.run(['rg'])\n"
+    )
+    assert g._scan_source(src, "m.py") == ["m.py::<module>::f::0"], src
+
+
+def test_scan_flags_bare_with_is_not_a_guard():
+    # A plain `with open(...)` is NOT an exception guard — only suppress counts.
+    src = (
+        "import subprocess\n"
+        "def f():\n"
+        "    with open('x', 'w') as fh:\n"
+        "        subprocess.run(['rg'], stdout=fh)\n"
+    )
+    assert g._scan_source(src, "m.py") == ["m.py::<module>::f::0"], src
+
+
 def test_scan_flags_nested_when_no_ancestor_catches_oserror():
     # Both inner and outer miss OSError → still unguarded. Counter-weight to the
     # above: the walk-up must not give up early at the inner try.
@@ -200,6 +258,7 @@ def test_main_returns_nonzero_on_net_new(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "BASELINE", tmp_path / "b.txt")
     # Only call 'a' is baselined; 'b' is NET-NEW.
     (tmp_path / "b.txt").write_text("ext/mod.py::<module>::a::0\n")
+    monkeypatch.setattr(sys, "argv", ["check"])  # main() parses file args from argv
     assert g.main() == 1
 
 
@@ -214,6 +273,7 @@ def test_main_returns_zero_when_in_sync(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "_SCAN_ROOTS", ("ext",))
     monkeypatch.setattr(g, "BASELINE", tmp_path / "b.txt")
     (tmp_path / "b.txt").write_text("ext/mod.py::<module>::a::0\n")
+    monkeypatch.setattr(sys, "argv", ["check"])  # main() parses file args from argv
     assert g.main() == 0
 
 
@@ -257,6 +317,7 @@ def test_root_module_unguarded_call_is_flagged(tmp_path, monkeypatch):
         "    except subprocess.SubprocessError:\n"
         "        pass\n"
     )
+    monkeypatch.setattr(sys, "argv", ["check"])  # main() parses file args from argv
     assert g.main() == 1
 
 
@@ -272,3 +333,48 @@ def test_no_new_unguarded_subprocess_beyond_baseline():
         f"{len(new)} new unguarded subprocess call(s) beyond baseline:\n"
         + "\n".join(sorted(new))
     )
+
+
+# --- per-file mode: explicit paths scope the scan (parallel-write race fix) ---
+def test_iter_repo_py_filters_paths_to_scan_scope(tmp_path, monkeypatch):
+    prod = tmp_path / "ext"
+    prod.mkdir()
+    (prod / "mod.py").write_text("x = 1\n")
+    (tmp_path / "asi.py").write_text("x = 1\n")
+    (tmp_path / "rootmod.py").write_text("x = 1\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "t.py").write_text("x = 1\n")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "s.py").write_text("x = 1\n")
+    monkeypatch.setattr(g, "REPO", tmp_path)
+    monkeypatch.setattr(g, "_SCAN_ROOTS", ("ext",))
+    paths = g._resolve_scan_paths([
+        str(prod / "mod.py"),
+        str(tmp_path / "asi.py"),
+        str(tmp_path / "rootmod.py"),
+        str(tmp_path / "tests" / "t.py"),
+        str(tmp_path / "scripts" / "s.py"),
+    ])
+    scanned = g._iter_repo_py(paths)
+    assert scanned == [
+        prod / "mod.py",
+        tmp_path / "asi.py",
+        tmp_path / "rootmod.py",
+    ], scanned
+
+
+def test_main_with_explicit_paths_scopes_scan(tmp_path, monkeypatch):
+    root = tmp_path / "rootmod.py"
+    root.write_text("import subprocess\nsubprocess.run(['x'])\n")
+    monkeypatch.setattr(g, "REPO", tmp_path)
+    monkeypatch.setattr(g, "_SCAN_ROOTS", ("ext",))
+    monkeypatch.setattr(g, "BASELINE", tmp_path / "b.txt")
+    (tmp_path / "b.txt").write_text("")
+    # unguarded call in a root-level module → in scope → FAIL (net-new)
+    monkeypatch.setattr(sys, "argv", ["check", str(root)])
+    assert g.main() == 1
+    # the same call under tests/ → out of scope → PASS
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "t.py").write_text("import subprocess\nsubprocess.run(['x'])\n")
+    monkeypatch.setattr(sys, "argv", ["check", str(tmp_path / "tests" / "t.py")])
+    assert g.main() == 0

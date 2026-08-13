@@ -3,7 +3,7 @@
 Bug: clone_for_subagent() built the clone via object.__new__ (bypassing
 __init__) and set _applied_patches/_search_cache as "fresh mutable state,"
 but never set _text_edited_files or _agent_profile — unlike its sibling
-clone_with_filter(), which sets both (tool_registry.py:568/562).
+clone_for_subagent(), which sets both.
 
 Impact:
   * _text_edited_files: write_tools._tool_apply_patch unconditionally reads
@@ -101,7 +101,6 @@ def _init_attrs(registry) -> frozenset:
 # clone is correct without the attribute; both are empty because both clones
 # currently mirror every field.
 _CLONE_SUBAGENT_MISSING_OK: frozenset[str] = frozenset()
-_CLONE_FILTER_MISSING_OK: frozenset[str] = frozenset()
 
 
 def test_clone_for_subagent_has_all_init_attrs(tmp_path):
@@ -115,24 +114,6 @@ def test_clone_for_subagent_has_all_init_attrs(tmp_path):
     assert missing == set(), (
         f"clone_for_subagent missing attrs: {sorted(missing)}. "
         f"Add them to clone_for_subagent(), or add to _CLONE_SUBAGENT_MISSING_OK "
-        f"with a comment."
-    )
-
-
-def test_clone_with_filter_has_all_init_attrs(tmp_path):
-    """clone_with_filter() must set every attribute that __init__ sets."""
-    from external_llm.agent.tool_chain import ScopedToolFilter
-
-    repo_root = _init_git_repo(tmp_path)
-    registry = ToolRegistry(repo_root, AgentConfig())
-    flt = ScopedToolFilter(allowed_write={repo_root})
-    clone = registry.clone_with_filter(flt)
-
-    clone_attrs = frozenset(vars(clone).keys())
-    missing = (_init_attrs(registry) - _CLONE_FILTER_MISSING_OK) - clone_attrs
-    assert missing == set(), (
-        f"clone_with_filter missing attrs: {sorted(missing)}. "
-        f"Add them to clone_with_filter(), or add to _CLONE_FILTER_MISSING_OK "
         f"with a comment."
     )
 
@@ -160,31 +141,46 @@ def test_clone_for_subagent_sets_semantic_coalesce_fields(tmp_path):
     assert "parent.txt" not in clone._semantic_pending
 
 
-def test_clone_with_filter_has_repo_language(tmp_path):
-    """Regression: clone_with_filter() was missing _repo_language, so
-    agent_loop.py:2770 (self.registry.repo_language) raised AttributeError
-    for scoped-delegation / filtered-clone dispatch."""
-    from external_llm.agent.tool_chain import ScopedToolFilter
-    from external_llm.languages.models import LanguageId
+def test_clone_for_subagent_sub_config_profile_takes_precedence(tmp_path):
+    """B1 regression: sub_config.agent_profile must win over the parent's.
+
+    clone_for_subagent() unconditionally inherited the parent's
+    _agent_profile, so a profile carried by sub_config (orchestrator's
+    replace() copies base.agent_profile into it) was silently ignored and the
+    dispatch gate enforced the parent's restrictions instead of the sub's.
+    """
+    from external_llm.agent.agent_profile import AgentProfile
 
     repo_root = _init_git_repo(tmp_path)
     registry = ToolRegistry(repo_root, AgentConfig())
-    flt = ScopedToolFilter(allowed_write={repo_root})
-    clone = registry.clone_with_filter(flt)
+    registry._agent_profile = object()  # parent sentinel — must NOT leak into the clone
 
-    assert hasattr(clone, "_repo_language"), (
-        "_repo_language missing — repo_language property raises AttributeError"
-    )
-    # Reading the property is the actual failure the delegate loop hit
-    # (agent_loop builds tool schemas with registry.repo_language, on a line
-    # no try covers), so exercise it rather than only the underlying field.
-    assert clone.repo_language == registry.repo_language
+    sub_profile = AgentProfile(name="tester", allowed_tools=["find_symbol"])
+    sub_config = AgentConfig(agent_profile=sub_profile)
 
-    # Comparing the two straight out of a Python-only fixture repo asserts
-    # None == None, which stays true even if the copy is deleted. Give the
-    # parent a real value first, so the assertion is about the copy.
-    registry._repo_language = LanguageId.TYPESCRIPT
-    clone2 = registry.clone_with_filter(ScopedToolFilter(allowed_write={repo_root}))
-    assert clone2._repo_language is LanguageId.TYPESCRIPT, (
-        "clone_with_filter dropped a non-default _repo_language"
-    )
+    clone = registry.clone_for_subagent(sub_config)
+
+    assert clone._agent_profile is sub_profile
+    assert clone._agent_profile is not registry._agent_profile
+
+    # The dispatch gate must enforce the SUB profile, not the parent's.
+    result = clone.dispatch("bash", {"command": "echo hi"})
+    assert not result.ok
+    assert "not in allowed_tools" in result.error
+    assert result.metadata.get("profile") == "tester"
+
+
+def test_clone_for_subagent_inherits_parent_profile_gate(tmp_path):
+    """A sub_config without its own profile inherits the parent's restrictions."""
+    from external_llm.agent.agent_profile import AgentProfile
+
+    repo_root = _init_git_repo(tmp_path)
+    registry = ToolRegistry(repo_root, AgentConfig())
+    registry._agent_profile = AgentProfile(name="reviewer", allowed_tools=["find_symbol"])
+
+    clone = registry.clone_for_subagent(AgentConfig())
+
+    assert clone._agent_profile is registry._agent_profile
+    result = clone.dispatch("bash", {"command": "echo hi"})
+    assert not result.ok
+    assert "not in allowed_tools" in result.error

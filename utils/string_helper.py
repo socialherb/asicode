@@ -3,6 +3,7 @@ String utility functions for asicode.
 
 Provides common string manipulation functions that can be used across the project.
 """
+
 from __future__ import annotations
 
 from typing import Optional
@@ -48,15 +49,36 @@ def utf8_trailing_incomplete_len(raw: bytes) -> int:
         return 0
     lead = raw[i]
     if lead < 0x80:
-        expected = 1          # ASCII
+        expected = 1  # ASCII
     elif lead < 0xE0:
-        expected = 2          # 2-byte
+        expected = 2  # 2-byte
     elif lead < 0xF0:
-        expected = 3          # 3-byte (most CJK, incl. Korean)
+        expected = 3  # 3-byte (most CJK, incl. Korean)
     else:
-        expected = 4          # 4-byte (emoji / astral plane)
+        expected = 4  # 4-byte (emoji / astral plane)
     have = n - i
     return have if have < expected else 0
+
+
+def utf8_leading_incomplete_len(raw: bytes) -> int:
+    """Number of LEADING bytes in ``raw`` that are orphan UTF-8 continuation
+    bytes (0b10xxxxxx) — i.e. the buffer starts mid-character.
+
+    A valid UTF-8 stream never begins with a continuation byte, so skipping
+    them removes only the garbage produced by a mid-char cut (e.g. the byte
+    window of a tail read whose start offset is not aligned to a character
+    boundary). Returns 0 when the buffer starts on a clean boundary.
+
+    Used by the tail-window snippet reader (P20-5) — the first line would
+    otherwise be prefixed with one U+FFFD per orphan continuation byte.
+    """
+    n = 0
+    for b in raw:
+        if (b & 0xC0) == 0x80:
+            n += 1
+        else:
+            break
+    return n
 
 
 def reverse_string(s: str) -> str:
@@ -81,6 +103,8 @@ def reverse_string(s: str) -> str:
         'a'
     """
     return s[::-1]
+
+
 def count_vowels(s: str) -> int:
     """
     Count the number of vowels in a string (case-insensitive).
@@ -107,8 +131,10 @@ def count_vowels(s: str) -> int:
         return 0
 
     # Count vowels (case-insensitive)
-    vowels = set('aeiou')
+    vowels = set("aeiou")
     return sum(1 for char in s.lower() if char in vowels)
+
+
 def is_palindrome(s: str) -> bool:
     """
     Check if a string is a palindrome (case-insensitive, ignoring non-alphanumeric characters).
@@ -134,31 +160,8 @@ def is_palindrome(s: str) -> bool:
     """
     if not s:
         return True
-    cleaned = ''.join(c.lower() for c in s if c.isalnum())
+    cleaned = "".join(c.lower() for c in s if c.isalnum())
     return cleaned == cleaned[::-1]
-
-
-def has_exact_word(text: str, word: str) -> bool:
-    """Check if `word` appears as a standalone word in `text` (no regex).
-
-    Word boundary characters: space, punctuation, brackets, operators.
-    Replaces patterns like ``re.search(r'\\b' + re.escape(k) + r'\\b', text)``.
-    """
-    if not text or not word:
-        return False
-    idx = text.find(word)
-    wlen = len(word)
-    _boundary_chars = frozenset(
-        " \t\n\r()[]{}.,;:'\"!@#$%^&*+-=<>?/`~"
-    )
-    while idx != -1:
-        before_ok = idx == 0 or text[idx - 1] in _boundary_chars
-        after_ok = (idx + wlen >= len(text)
-                    or text[idx + wlen] in _boundary_chars)
-        if before_ok and after_ok:
-            return True
-        idx = text.find(word, idx + 1)
-    return False
 
 
 def extract_json(text: str) -> Optional[dict]:
@@ -168,10 +171,11 @@ def extract_json(text: str) -> Optional[dict]:
     Replaces patterns like ``re.search(r'```(?:json)?\\s*(\\{.*?\\})\\s*```', text, re.DOTALL)``.
     """
     import json as _json
+
     # Strategy 1: code fence with json
     if "```" in text:
         parts = text.split("```")
-        for i, part in enumerate(parts):
+        for _, part in enumerate(parts):
             part = part.strip()
             if part.startswith("json"):
                 part = part[4:].strip()
@@ -188,13 +192,13 @@ def extract_json(text: str) -> Optional[dict]:
         if esc:
             esc = False
             continue
-        if ch == '\\' and in_str:
+        if ch == "\\" and in_str:
             esc = True
             continue
         if ch == '"':
             in_str = not in_str
             continue
-        if not in_str and ch == '{':
+        if not in_str and ch == "{":
             start = i
             break
     if start != -1:
@@ -206,27 +210,29 @@ def extract_json(text: str) -> Optional[dict]:
             if esc:
                 esc = False
                 continue
-            if ch == '\\' and in_str:
+            if ch == "\\" and in_str:
                 esc = True
                 continue
             if ch == '"':
                 in_str = not in_str
                 continue
             if not in_str:
-                if ch == '{':
+                if ch == "{":
                     depth += 1
-                elif ch == '}':
+                elif ch == "}":
                     depth -= 1
                     if depth == 0:
                         try:
-                            return _json.loads(text[start:i + 1])
+                            return _json.loads(text[start : i + 1])
                         except _json.JSONDecodeError:
                             return None
+    return None
 
 
 def parse_json(text: str) -> Optional[dict]:
     """Alias for extract_json. Thin wrapper for renamed import compatibility."""
     return extract_json(text)
+
 
 if __name__ == "__main__":
     # Simple test cases

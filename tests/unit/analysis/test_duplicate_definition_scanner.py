@@ -104,6 +104,36 @@ class TestGoReceiverDisambiguation:
 
 # ── duplicate_definition_scanner: Python regression (no receiver) ──────────
 
+
+@pytest.mark.skipif(not _HAS_TS, reason="tree-sitter not installed")
+class TestKotlinPropertyExtraction:
+    """kotlin module-level ``val``/``var`` names nest one level deeper than the
+    direct-children scan looks (property_declaration → variable_declaration →
+    simple_identifier, with binding_pattern_kind holding only the val/var
+    keyword) — they were silently skipped, so duplicate properties were never
+    flagged."""
+
+    def test_duplicate_properties_caught(self):
+        cands = _scan("val x = 1\nval x = 2\n", "dup.kt")
+        assert len(cands) == 1
+        assert cands[0].name == "x"
+        assert cands[0].symbol_kind == "assignment"
+        assert len(cands[0].occurrences) == 2
+
+    def test_typed_and_var_properties_caught(self):
+        cands = _scan("var y: Int = 1\nval y: Int = 2\n", "dup.kt")
+        assert len(cands) == 1
+        assert cands[0].name == "y"
+        assert len(cands[0].occurrences) == 2
+
+    def test_destructuring_skipped_like_python_multi_target(self):
+        # ``val (a, b) = ...`` emits multi_variable_declaration (not
+        # variable_declaration) — skipped, mirroring the python
+        # multi-target exclusion.
+        cands = _scan("val (a, b) = Pair(1, 2)\nval (a, c) = Pair(1, 2)\n", "multi.kt")
+        assert cands == []
+
+
 class TestPythonDuplicateRegression:
     """Python path (receiver always None) must keep working after the
     tuple-shape change from 4- to 5-tuple."""

@@ -244,3 +244,73 @@ class TestZombieInProgressReap:
         mgr_b.add_turn(SID, "user", "trigger reap 2")
         turns = mgr_b.get_or_create(SID).turns
         assert not any(t.get("in_progress") for t in turns)
+
+
+class TestFailedSaveMerge:
+    """Merge safety after a failed save: a turn that exists only in the local
+    cache must survive the next _adopt_from_disk merge, even when another
+    process has since written newer turns to disk."""
+
+    def test_unsaved_turn_survives_concurrent_adopt(self, mgr_a, mgr_b):
+        mgr_b.add_turn(SID, "user", "u1")
+
+        # B's next save fails (transient disk error) — u2 exists only in B's cache
+        orig_write = mgr_b._write_session
+        def _fail(_session):
+            raise OSError("simulated disk failure")
+        mgr_b._write_session = _fail
+        mgr_b.add_turn(SID, "user", "u2")
+        mgr_b._write_session = orig_write
+
+        # A writes a newer turn in between (timestamp past u2's)
+        mgr_a.add_turn(SID, "assistant", "a1")
+
+        # B's next add_turn merges disk state — u2 must not be dropped
+        mgr_b.add_turn(SID, "user", "u3")
+        contents = _turn_contents(mgr_b)
+        assert contents == ["u1", "a1", "u2", "u3"], contents
+
+        # The merged state is persisted: a fresh manager sees u2 from disk too
+        fresh = DesignSessionManager(str(mgr_a.repo_root))
+        assert _turn_contents(fresh) == ["u1", "a1", "u2", "u3"]
+
+
+class TestLegacyMigrationSafety:
+    """The preserve→exclude_from_compression migration must be applied at the
+    disk-read choke point so _adopt_from_disk cannot reintroduce the legacy key."""
+
+    def test_legacy_preserve_not_reintroduced_by_adopt(self, tmp_path):
+        import json
+        _seed_session_file(tmp_path, "legacy", [
+            {"role": "user", "content": "old1", "timestamp": 1.0},
+            {"role": "assistant", "content": "old2", "preserve": True, "timestamp": 2.0},
+        ])
+        m = _mgr(tmp_path, "pid:A")
+        s = m.get_or_create("legacy")
+        assert all("preserve" not in t for t in s.turns)
+        assert s.turns[1].get("exclude_from_compression") is True
+
+        # add_turn adopts raw disk state — the legacy key must not come back
+        m.add_turn("legacy", "user", "new1")
+        s = m.get_or_create("legacy")
+        assert all("preserve" not in t for t in s.turns)
+
+        # and the rewritten file is clean as well
+        raw = json.loads(
+            (tmp_path / ".asicode" / "design_sessions" / "legacy.json")
+            .read_text(encoding="utf-8")
+        )
+        assert all("preserve" not in t for t in raw["turns"])
+
+
+class TestDeleteSafety:
+    def test_delete_session_keeps_lock_file(self, tmp_path):
+        """cross_process_flock contract: lock files are never unlinked (an
+        unlink+recreate lets two processes hold 'the lock' on different inodes)."""
+        m = _mgr(tmp_path, "pid:A")
+        m.add_turn("s1", "user", "x")  # creates the session file
+        lock = tmp_path / ".asicode" / "design_sessions" / "s1.lock"
+        lock.touch()
+        assert m.delete_session("s1") is True
+        assert lock.exists()
+        assert not (tmp_path / ".asicode" / "design_sessions" / "s1.json").exists()

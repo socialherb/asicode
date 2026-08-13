@@ -22,7 +22,7 @@ class CollaborationVerdict:
             "insufficient_info".
         summary: One-line summary of what was accomplished.
         details: Full explanation with evidence.
-        confidence: Confidence level 0.0–1.0.
+        confidence: Confidence level 0.0-1.0.
         suggestions: Actionable follow-up suggestions.
         plan: Optional structured plan (dict) for asicode to execute.
         metadata: Arbitrary extra data (tool calls, tokens, timing).

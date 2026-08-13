@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-import external_llm.agent.tool_handlers.browser_tools as browser_tools
+from external_llm.agent.tool_handlers import browser_tools
 from external_llm.agent.tool_handlers.browser_tools import (
     PLAYWRIGHT_BROWSER_AVAILABLE,
     BrowserActionToolsMixin,

@@ -139,7 +139,7 @@ def test_stop_emitted_exactly_once_per_respond():
         return result
 
     loop = _make_loop()
-    result, events = _capture_events(loop, _impl)
+    _result, events = _capture_events(loop, _impl)
     stop_count = sum(1 for name, _ in events if name == "design_thinking_stop")
     assert stop_count == 1, (
         f"design_thinking_stop must be emitted exactly once by the finally, "

@@ -1,10 +1,13 @@
 """Analysis and exploration tool handlers for ToolRegistry."""
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+from collections import deque
 from typing import TYPE_CHECKING, Any, Optional
 
+from ...analysis.scan_walk import SCAN_FILE_CAP, walk_scan_files
 from ...languages import LanguageId
 
 if TYPE_CHECKING:
@@ -79,13 +82,11 @@ class AnalysisToolsMixin:
             return self._make_result(ok=False, content="", error="'symbol' is required")
 
         if file_path:
-            try:
+            with contextlib.suppress(ValueError, TypeError):  # path outside root / non-str
                 from pathlib import Path as _Path
                 fp = _Path(file_path)
                 if fp.is_absolute():
                     file_path = str(fp.relative_to(self.repo_root))
-            except (ValueError, Exception):
-                pass
 
         lines: list[str] = [f"## Impact analysis for `{symbol}`"]
         metadata: dict[str, Any] = {"symbol": symbol}
@@ -146,25 +147,25 @@ class AnalysisToolsMixin:
                 if sym_file:
                     try:
                         importers = self._call_graph.get_importers(sym_file)
+                    except Exception as _exc:  # enrichment is best-effort
+                        logger.debug("impact analysis: get_importers failed for %s: %s", sym_file, _exc)
+                    else:
                         if importers:
                             lines.append(f"\n### Importers ({len(importers)})")
-                            for imp in sorted(importers)[:limit]:
-                                lines.append(f"  - `{imp}`")
+                            lines.extend(f"  - `{imp}`" for imp in sorted(importers)[:limit])
                             metadata["importer_count"] = len(importers)
                             metadata["importer_files"] = sorted(importers)[:limit]
-                    except Exception:
-                        pass
 
             # 4. File dependencies
             if include_importers and sym_file:
                 try:
                     deps = self._call_graph.get_file_dependencies(sym_file)
+                except Exception as _exc:  # enrichment is best-effort
+                    logger.debug("impact analysis: get_file_dependencies failed for %s: %s", sym_file, _exc)
+                else:
                     if deps:
                         lines.append(f"\n### File dependencies ({len(deps)})")
-                        for d in deps[:limit]:
-                            lines.append(f"  - `{d.imported}` ({d.import_type})")
-                except Exception:
-                    pass
+                        lines.extend(f"  - `{d.imported}` ({d.import_type})" for d in deps[:limit])
 
             # 5. Summary
             total_files = len(metadata.get("caller_files", [])) + len(metadata.get("callee_files", [])) + len(metadata.get("importer_files", []))
@@ -175,36 +176,27 @@ class AnalysisToolsMixin:
             return self._make_result(ok=True, content="\n".join(lines), metadata=metadata)
 
         except Exception as e:
-            logger.warning(f"analyze_change_impact error for {symbol!r}: {e}")
+            logger.warning("analyze_change_impact error for %r: %s", symbol, e)
             return self._make_result(ok=False, content="", error=f"analyze_change_impact error: {e}")
 
-    # Scan target extensions — languages supported by scanners via tree-sitter
-    _SCAN_EXTS = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".kt")
-    _SCAN_SKIP_DIRS = frozenset({
-        ".git", ".venv", "venv", "node_modules", "__pycache__",
-        ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build",
-    })
-    _SCAN_FILE_CAP = 4000
-
     def _walk_scan_files(self, root: str) -> list:
-        """Collect scannable source files under *root* (repo-relative paths)."""
-        out: list = []
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in self._SCAN_SKIP_DIRS and not d.startswith(".")
-            ]
-            for fn in sorted(filenames):
-                if not fn.endswith(self._SCAN_EXTS):
-                    continue
-                rel = os.path.relpath(os.path.join(dirpath, fn), self.repo_root)
-                out.append(rel)
-                if len(out) >= self._SCAN_FILE_CAP:
-                    logger.warning(
-                        "[STRUCTURAL_SCAN] file cap %d reached under %s — truncating",
-                        self._SCAN_FILE_CAP, root,
-                    )
-                    return out
+        """Collect scannable source files under *root* (repo-relative paths).
+
+        Single-source walk: external_llm/analysis/scan_walk.py (shared with
+        the structural gate, scripts/check_structural_scanners.py — this
+        mixin carries no mirror, pinned by
+        test_mixin_walk_delegates_to_shared_source).  Paths are returned
+        relative to ``repo_root`` (scanners open ``repo_root + path``, so a
+        subdir *root* still yields repo-relative paths).  Deterministic
+        sorted traversal truncated at ``SCAN_FILE_CAP`` (BUG-6, pinned by
+        test_walk_scan_files_is_deterministic_and_sorted).
+        """
+        out = walk_scan_files(root, base=self.repo_root)
+        if len(out) >= SCAN_FILE_CAP:
+            logger.warning(
+                "[STRUCTURAL_SCAN] file cap %d reached under %s — truncating",
+                SCAN_FILE_CAP, root,
+            )
         return out
 
     def _tool_run_structural_scan(self, args: dict[str, Any]) -> "ToolResult":
@@ -234,6 +226,58 @@ class AnalysisToolsMixin:
             registry = get_registry()
         except Exception as e:
             return self._make_result(ok=False, content="", error=f"Failed to load scanner registry: {e}")
+
+        # ── Scanner source-freshness self-check (R12-2) ──────────────────────
+        # The registry fingerprints scanner modules at load time.  If any of
+        # those files changed on disk after this process imported them, every
+        # scan result silently reflects the OLD logic — surface a restart
+        # notice instead of letting the caller chase phantom regressions.
+        # P3-1: when the registry's ``auto_reload_stale`` opt-in is on (env
+        # ``ASICODE_SCANNER_AUTO_RELOAD=1`` or attribute flip), reload the
+        # stale modules in place instead; only modules that still fail to
+        # reload fall through to the restart warning.
+        _stale_modules: list[str] = []
+        try:
+            _stale_modules = [
+                os.path.relpath(p, self.repo_root)
+                for p in registry.verify_loaded_sources()
+            ]
+        except Exception:
+            logger.debug(
+                "[STRUCTURAL_SCAN] scanner freshness check unavailable",
+                exc_info=True,
+            )
+        if _stale_modules and getattr(registry, "auto_reload_stale", False):
+            try:
+                _reloaded = registry.reload_stale_sources()
+            except Exception:
+                _reloaded = []
+                logger.debug(
+                    "[STRUCTURAL_SCAN] scanner auto-reload unavailable",
+                    exc_info=True,
+                )
+            if _reloaded:
+                logger.info(
+                    "[STRUCTURAL_SCAN] auto-reloaded %d stale scanner "
+                    "module(s): %s",
+                    len(_reloaded),
+                    ", ".join(sorted(
+                        os.path.relpath(p, self.repo_root) for p in _reloaded
+                    )),
+                )
+            try:
+                _stale_modules = [
+                    os.path.relpath(p, self.repo_root)
+                    for p in registry.verify_loaded_sources()
+                ]
+            except Exception:
+                _stale_modules = []
+        if _stale_modules:
+            logger.warning(
+                "[STRUCTURAL_SCAN] loaded scanner code is stale vs on-disk "
+                "source (restart the server to pick up changes): %s",
+                ", ".join(sorted(_stale_modules)),
+            )
 
         if not scanner_name or scanner_name == "all":
             scanners_to_run = [
@@ -270,13 +314,24 @@ class AnalysisToolsMixin:
         # Cross-file reachability: same signal the planner's RUN_SCANNER path
         # injects.  Without it, dead-code scanners run in private-only mode
         # AND miss cross-file imports of private symbols (false "dead").
+        # Ref input = scan list UNION the graph's uncapped py list
+        # (facade.py_files): the scan walk truncates at SCAN_FILE_CAP while
+        # the graph build never does, so a reference living only in a file
+        # beyond the cap would otherwise judge that symbol dead — the same
+        # soundness union the structural gate applies (2026-08-11).  Absent
+        # graph or empty py list → plain scan list (standalone behavior).
         _cross_refs: "Optional[set]" = None
         try:
             from external_llm.analysis.cross_file_refs import (
                 compute_cross_file_referenced_names_light,
             )
+            _graph = getattr(self, "_call_graph", None)
+            _py_files = getattr(_graph, "py_files", []) if _graph is not None else []
+            _ref_input = (
+                sorted(set(file_paths) | set(_py_files)) if _py_files else file_paths
+            )
             _cross_refs = compute_cross_file_referenced_names_light(
-                getattr(self, "_call_graph", None), self.repo_root, file_paths,
+                _graph, self.repo_root, _ref_input,
             )
         except Exception:
             logger.debug("[STRUCTURAL_SCAN] cross-file refs unavailable — conservative mode", exc_info=True)
@@ -369,7 +424,7 @@ class AnalysisToolsMixin:
             try:
                 result = registry.run(name, repo_root=self.repo_root, file_paths=file_paths, cancel_event=_ce, **_kwargs)
             except Exception as e:
-                logger.warning(f"Scanner {name} failed: {e}")
+                logger.warning("Scanner %s failed: %s", name, e)
                 all_lines.append(f"  - {name}: ERROR — {e}")
                 continue
 
@@ -437,6 +492,12 @@ class AnalysisToolsMixin:
         if scan_path:
             header += f" on {scan_path}"
         header += f"\nTotal: {total_candidates} candidates across {len(total_affected)} files"
+        if _stale_modules:
+            header += (
+                "\nSTALE SCANNER CODE DETECTED — this process loaded these "
+                "modules before their source changed; restart the server to "
+                f"pick up the fixes: {', '.join(sorted(_stale_modules))}"
+            )
 
         metadata = {
             "scanners_run": scanners_to_run,
@@ -450,25 +511,6 @@ class AnalysisToolsMixin:
             content=header + "\n" + "\n".join(all_lines),
             metadata=metadata,
         )
-
-    def _check_import_exists(self, file_path: str, symbol_name: str) -> bool:
-        """Check if a symbol is already imported in the given file."""
-        try:
-            import ast
-            with open(file_path, encoding="utf-8", errors="replace") as f:
-                tree = ast.parse(f.read())
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        if alias.asname == symbol_name or alias.name.split(".")[-1] == symbol_name:
-                            return True
-                elif isinstance(node, ast.ImportFrom):
-                    for alias in node.names:
-                        if alias.asname == symbol_name or alias.name == symbol_name:
-                            return True
-        except Exception:
-            pass
-        return False
 
     # _tool_analyze_insertion_point and _pick_best_insertion_line removed:
     # Python-only analysis tools; LLM deciding placement directly is more efficient
@@ -496,14 +538,14 @@ class AnalysisToolsMixin:
                     error="'source' (file path) is required for subgraph mode"
                 )
             return self._query_subgraph(file_path, limit)
-        elif mode == "importers":
+        if mode == "importers":
             if not source:
                 return self._make_result(
                     ok=False, content="",
                     error="'source' (file path) is required for importers mode"
                 )
             return self._query_transitive_importers(source, max_depth, limit)
-        elif mode == "reachable":
+        if mode == "reachable":
             if not source:
                 return self._make_result(
                     ok=False, content="",
@@ -511,7 +553,7 @@ class AnalysisToolsMixin:
                 )
             direction = str(args.get("direction", "downstream")).strip().lower()
             return self._query_reachable(source, direction, max_depth, limit)
-        elif mode == "path":
+        if mode == "path":
             if not source or not target:
                 return self._make_result(
                     ok=False, content="",
@@ -519,25 +561,22 @@ class AnalysisToolsMixin:
                 )
             direction = str(args.get("direction", "downstream")).strip().lower()
             return self._query_symbol_path(source, target, direction, max_depth, limit)
-        else:
-            return self._make_result(
-                ok=False, content="",
-                error=f"Unknown mode: {mode}. Supported: importers, path, reachable, subgraph"
-            )
+        return self._make_result(
+            ok=False, content="",
+            error=f"Unknown mode: {mode}. Supported: importers, path, reachable, subgraph"
+        )
 
     def _query_subgraph(self, file_path: str, limit: int) -> "ToolResult":
         """List all symbols in a file with their edges."""
         lines: list[str] = [f"## Subgraph for `{file_path}`"]
         metadata: dict[str, Any] = {"mode": "subgraph", "file_path": file_path}
 
-        try:
+        with contextlib.suppress(ValueError, TypeError):  # path outside root / non-str
             # Normalize path
             from pathlib import Path as _Path
             fp = _Path(file_path)
             if fp.is_absolute():
                 file_path = str(fp.relative_to(self.repo_root))
-        except Exception:
-            pass
 
         # Symbols in file
         try:
@@ -566,12 +605,13 @@ class AnalysisToolsMixin:
         for sym in symbols[:limit]:
             try:
                 callees = self._call_graph.get_callees(sym.name, file_path=file_path)
+            except Exception as _exc:  # enrichment is best-effort
+                logger.debug("subgraph: get_callees failed for %s: %s", sym.name, _exc)
+            else:
                 for c in callees[:10]:
                     c_name = c.callee_symbol
                     if c_name in sym_names:
                         edges_found.append(f"  `{sym.name}` → `{c_name}` (line {c.callee_line})")
-            except Exception:
-                pass
 
         if edges_found:
             lines.append(f"\n**Internal edges** ({len(edges_found)}):")
@@ -581,13 +621,13 @@ class AnalysisToolsMixin:
         # Import edges
         try:
             deps = self._call_graph.get_file_dependencies(file_path)
+        except Exception as _exc:  # enrichment is best-effort
+            logger.debug("subgraph: get_file_dependencies failed for %s: %s", file_path, _exc)
+        else:
             if deps:
                 lines.append(f"\n**Imports** ({len(deps)}):")
-                for d in deps[:limit]:
-                    lines.append(f"  `{d.imported}` ({d.import_type})")
+                lines.extend(f"  `{d.imported}` ({d.import_type})" for d in deps[:limit])
                 metadata["imports"] = [{"imported": d.imported, "type": d.import_type} for d in deps[:limit]]
-        except Exception:
-            pass
 
         return self._make_result(ok=True, content="\n".join(lines), metadata=metadata)
 
@@ -596,20 +636,18 @@ class AnalysisToolsMixin:
         lines: list[str] = [f"## Transitive importers for `{file_path}`"]
         metadata: dict[str, Any] = {"mode": "importers", "source": file_path, "max_depth": max_depth}
 
-        try:
+        with contextlib.suppress(ValueError, TypeError):  # path outside root / non-str
             from pathlib import Path as _Path
             fp = _Path(file_path)
             if fp.is_absolute():
                 file_path = str(fp.relative_to(self.repo_root))
-        except Exception:
-            pass
 
         visited: set[str] = set()
-        queue: list[tuple[str, int]] = [(file_path, 0)]
+        queue: deque[tuple[str, int]] = deque([(file_path, 0)])
         import_chain: list[dict] = []
 
         while queue:
-            current, depth = queue.pop(0)
+            current, depth = queue.popleft()
             if current in visited or depth > max_depth:
                 continue
             visited.add(current)
@@ -648,11 +686,11 @@ class AnalysisToolsMixin:
         }
 
         visited: set[str] = {source_symbol}
-        queue: list[tuple[str, str, int]] = [(source_symbol, source_symbol, 0)]
+        queue: deque[tuple[str, str, int]] = deque([(source_symbol, source_symbol, 0)])
         reachable: list[dict[str, Any]] = []
 
         while queue:
-            current, origin, depth = queue.pop(0)
+            current, origin, depth = queue.popleft()
             # Bound is enforced at POP, but the guard is ``>=`` (not ``>``)
             # because this BFS records neighbors at DISCOVERY time — a node at
             # ``depth`` appends its children at ``depth + 1`` below. If we
@@ -674,10 +712,7 @@ class AnalysisToolsMixin:
                 edges = []
 
             for edge in edges[:limit]:
-                if direction == "upstream":
-                    neighbor = edge.caller_symbol
-                else:
-                    neighbor = edge.callee_symbol
+                neighbor = edge.caller_symbol if direction == "upstream" else edge.callee_symbol
 
                 if neighbor in visited:
                     continue
@@ -709,7 +744,6 @@ class AnalysisToolsMixin:
             "mode": "path", "source": source_sym, "target": target_sym,
             "direction": direction, "max_depth": max_depth,
         }
-        from collections import deque
 
         if direction in ("downstream", "both"):
             # BFS via callees: source → target
@@ -782,122 +816,3 @@ class AnalysisToolsMixin:
         lines.append(f"\nNo path found (depth ≤{max_depth})")
         metadata["path_found"] = False
         return self._make_result(ok=True, content="\n".join(lines), metadata=metadata)
-
-    def _tool_query_experience(self, args: dict[str, Any]) -> "ToolResult":
-        """Query historical execution records from the learning store."""
-        query_type = str(args.get("query_type", "recent")).strip().lower()
-        language = str(args.get("language", "")).strip() or None
-        strategy = str(args.get("strategy", "")).strip() or None
-        limit = int(args.get("limit", 20))
-
-        from external_llm.editor.learning.unified_store import get_unified_store
-
-        try:
-            store = get_unified_store(project_root=self.repo_root)
-        except Exception as e:
-            return self._make_result(
-                ok=True,
-                content=f"Learning store not available: {e}. Data accumulates as the system runs.",
-            )
-
-        lines: list[str] = []
-        total_count = store.count()
-
-        if query_type == "recent":
-            records = store.get_recent(language=language, limit=limit)
-            lines.append(f"## Recent Runs (total store: {total_count})")
-            if language:
-                lines.append(f"  Language: {language}")
-            if not records:
-                lines.append("  (no records found)")
-            else:
-                for r in records:
-                    status = "✓" if r.success else "✗"
-                    lang = r.language or "?"
-                    strat = r.strategy or "?"
-                    request_short = (r.request or "")[:80]
-                    lines.append(
-                        f"  {status} [{lang}] {strat} — {request_short}"
-                    )
-
-        elif query_type == "strategy_stats":
-            stats = store.get_strategy_stats(limit=limit)
-            lines.append(f"## Strategy Stats (total store: {total_count})")
-            if not stats:
-                lines.append("  (no strategy data yet)")
-            else:
-                lines.append(f"  {'Strategy':<30} {'OK':>5} {'Total':>6} {'Rate':>8}")
-                lines.append(f"  {'─'*30} {'─'*5} {'─'*6} {'─'*8}")
-                for s_name, s_data in sorted(
-                    stats.items(), key=lambda x: x[1]["ok"] / max(x[1]["total"], 1), reverse=True
-                )[:limit]:
-                    rate = s_data["ok"] / max(s_data["total"], 1)
-                    lines.append(
-                        f"  {s_name:<30} {s_data['ok']:>5} {s_data['total']:>6} {rate:>7.0%}"
-                    )
-
-        elif query_type == "strategy_runs":
-            if not strategy:
-                return self._make_result(
-                    ok=False, content="'strategy' parameter is required for strategy_runs query."
-                )
-            records = store.get_strategy_runs(strategy=strategy, language=language, limit=limit)
-            lines.append(f"## Strategy Runs: {strategy}")
-            if language:
-                lines.append(f"  Language: {language}")
-            if not records:
-                lines.append(f"  (no runs for strategy '{strategy}')")
-            else:
-                for r in records:
-                    status = "✓" if r.success else "✗"
-                    lang = r.language or "?"
-                    request_short = (r.request or "")[:80]
-                    lines.append(f"  {status} [{lang}] {request_short}")
-
-        elif query_type == "model_stats":
-            stats = store.get_model_stats()
-            lines.append(f"## Model Stats (total store: {total_count})")
-            if not stats:
-                lines.append("  (no model data yet)")
-            else:
-                for model, data in list(stats.items())[:limit]:
-                    rate = data["ok"] / max(data["total"], 1)
-                    lines.append(
-                        f"  {model:<30} ok={data['ok']:<3} total={data['total']:<4} rate={rate:.0%}"
-                    )
-
-        elif query_type == "failure_patterns":
-            # Aggregate by final_failure_class
-            failure_counts: dict[str, int] = {}
-            failure_langs: dict[str, set] = {}
-            for r in store.iter_all():
-                fc = r.final_failure_class or r.final_status or "unknown"
-                if fc:
-                    failure_counts[fc] = failure_counts.get(fc, 0) + 1
-                    if fc not in failure_langs:
-                        failure_langs[fc] = set()
-                    if r.language:
-                        failure_langs[fc].add(r.language)
-            lines.append(f"## Failure Patterns (total failures: {sum(failure_counts.values())})")
-            if not failure_counts:
-                lines.append("  (no failure data yet)")
-            else:
-                sorted_failures = sorted(failure_counts.items(), key=lambda x: x[1], reverse=True)
-                for fc, count in sorted_failures[:limit]:
-                    langs = ", ".join(sorted(failure_langs.get(fc, [])))
-                    lang_info = f"  langs={langs}" if langs else ""
-                    lines.append(f"  · {fc}: {count} occurrences {lang_info}")
-
-        else:
-            return self._make_result(
-                ok=False,
-                content=f"Unknown query_type: '{query_type}'. "
-                        "Supported: recent, strategy_stats, strategy_runs, model_stats, failure_patterns",
-            )
-
-        return self._make_result(
-            ok=True,
-            content="\n".join(lines),
-            metadata={"query_type": query_type, "total_records": total_count},
-        )
-

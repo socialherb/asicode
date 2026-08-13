@@ -10,13 +10,13 @@ from the ``_compact_insights_interactive`` closure for testability:
 These are pure deterministic functions — no mocking needed.
 """
 import pytest
+
 from asi import (
+    _dropped_entries,
     _insights_compact_is_noop,
     _size_compact_budget,
-    _dropped_entries,
 )
 from external_llm.agent.insights_manager import InsightEntry
-
 
 # ═══════════════════════════════════════════════════════════════
 # _insights_compact_is_noop
@@ -116,8 +116,7 @@ class TestSizeCompactBudget:
     def test_mixed_content(self):
         """Mixed ASCII + CJK → aggregate byte-based."""
         s = "hello world" + "안녕하세요" * 1000  # ~11 + 15000 = ~15011 bytes
-        expected = 15011 // 2 + 2048  # 7505 + 2048 = 9553
-        assert _size_compact_budget(s) == 9553
+        assert _size_compact_budget(s) == 9553  # 15011//2 + 2048
 
 
 # ═══════════════════════════════════════════════════════════════

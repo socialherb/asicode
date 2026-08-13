@@ -111,6 +111,7 @@ class GoSyntaxProvider(SyntaxProvider):
                     capture_output=True, text=True, timeout=30,
                     cwd=_cwd,
                     env=_compile_env(),
+                    check=False,
                 )
             except FileNotFoundError:
                 logger.debug("go not installed; falling back to tree-sitter")
@@ -251,6 +252,7 @@ class GoSyntaxProvider(SyntaxProvider):
                 timeout=30 + 5 * len(file_paths),
                 cwd=module_root,
                 env=_compile_env(),
+                check=False,
             )
         except FileNotFoundError:
             logger.debug("go not installed; skipping semantic validation")
@@ -374,26 +376,9 @@ class GoSyntaxProvider(SyntaxProvider):
             if result:
                 return result
 
-        return self._find_symbol_regex(file_path, symbol_name, content)
+        return self._find_symbol_regex(symbol_name, content)
 
-    def _find_symbol_regex(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
-        """Fallback: regex + brace counting (or line-based for var/const)."""
-        esc = re.escape(symbol_name)
-        for sp in self.get_symbol_patterns("any"):
-            pat = sp.regex.replace("{name}", esc)
-            for m in re.finditer(pat, content, re.MULTILINE):
-                start_offset = m.start()
-                start_line = content[:start_offset].count("\n") + 1
-                if sp.kind in ("variable", "constant"):
-                    # var/const declarations are usually single-line
-                    end_pos = content.find("\n", m.end())
-                    end_line = (content[:end_pos].count("\n") + 1) if end_pos != -1 else start_line
-                else:
-                    end_line = self._find_block_end(content, start_offset)
-                return (start_line, end_line)
-        return None
+    _LINE_BASED_KINDS = frozenset({"variable", "constant"})
 
     @staticmethod
     def _find_block_end(content: str, offset: int) -> int:
@@ -443,36 +428,35 @@ class GoSyntaxProvider(SyntaxProvider):
             results.append((m.group(1), "constant", start_line, end_line))
         return results
 
-    def _find_class_methods_regex(
-        self, content: str, class_name: str,
-    ) -> list[tuple[str, int, int]]:
-        """Regex fallback: find methods of a Go struct via receiver matching."""
-        results: list[tuple[str, int, int]] = []
-        esc = re.escape(class_name)
+    def _find_all_class_methods_regex(
+        self, content: str,
+    ) -> dict[str, list[tuple[str, int, int]]]:
+        """Regex fallback: group methods by normalized receiver type (batch).
+
+        Receiver normalization matches the tree-sitter path
+        (``tree_sitter_utils._extract_go_class_methods``): last
+        space-delimited token of the receiver clause, ``*`` stripped.
+        Grouping once also makes the fallback agree with the tree-sitter
+        receiver-type semantics instead of the old per-class ``\\b<class>\\b``
+        anywhere-in-receiver match.
+        """
+        grouped: dict[str, list[tuple[str, int, int]]] = {}
         for m in re.finditer(
-            r'^func\s+\([^)]*?\b' + esc + r'\b[^)]*?\)\s+(\w+)\s*\(',
+            r'^func\s+\(([^)]*)\)\s+(\w+)\s*\(',
             content, re.MULTILINE,
         ):
+            _recv = m.group(1).strip()
+            _parts = _recv.split()
+            _recv_type = _parts[-1] if len(_parts) >= 2 else _recv
+            _recv_type = _recv_type.replace("*", "").strip()
+            if not _recv_type:
+                continue
             start_line = content[:m.start()].count("\n") + 1
             end_line = self._find_block_end(content, m.start())
-            results.append((m.group(1), start_line, end_line))
-        return results
-
-    def _find_symbol_body_range_regex(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
-        """Regex fallback: find function body via first { after definition."""
-        esc = re.escape(symbol_name)
-        for sp in self.get_symbol_patterns("any"):
-            pat = sp.regex.replace("{name}", esc)
-            for m in re.finditer(pat, content, re.MULTILINE):
-                body_start = content.find("{", m.end())
-                if body_start == -1:
-                    continue
-                body_start_line = content[:body_start].count("\n") + 1
-                body_end_line = self._find_block_end(content, body_start)
-                return (body_start_line, body_end_line)
-        return None
+            grouped.setdefault(_recv_type, []).append(
+                (m.group(2), start_line, end_line)
+            )
+        return grouped
 
     # ── Structural query methods (tree-sitter → regex fallback) ────────────
 
@@ -488,11 +472,29 @@ class GoSyntaxProvider(SyntaxProvider):
     def find_class_methods(
         self, content: str, class_name: str,
     ) -> list[tuple[str, int, int]]:
-        from .tree_sitter_utils import extract_class_methods, is_available
-        result = extract_class_methods(content, class_name, "go") if is_available() else None
-        if result:
-            return result
-        return self._find_class_methods_regex(content, class_name)
+        """Return ``[(method_name, start_line, end_line), ...]`` for a Go struct.
+
+        Delegates to the batch :meth:`find_all_class_methods` so per-class
+        lookups share its single parse + walk (receiver-based grouping).
+        """
+        return self.find_all_class_methods(content).get(class_name, [])
+
+    def find_all_class_methods(
+        self, content: str,
+    ) -> dict[str, list[tuple[str, int, int]]]:
+        """Return ``{class_name: [(method_name, start_line, end_line), ...]}``.
+
+        Batch variant of :meth:`find_class_methods`: parses the source exactly
+        once and groups every method by receiver type, avoiding one
+        tree-sitter parse per class lookup.  Tree-sitter first, regex fallback
+        otherwise (same split as :meth:`find_class_methods`).
+        """
+        from .tree_sitter_utils import extract_all_class_methods, is_available
+        if is_available():
+            grouped = extract_all_class_methods(content, "go")
+            if grouped is not None:
+                return grouped
+        return self._find_all_class_methods_regex(content)
 
     def find_symbol_body_range(
         self, content: str, symbol_name: str,

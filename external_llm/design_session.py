@@ -18,7 +18,7 @@ import json
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -54,6 +54,15 @@ class DesignSession:
 class DesignSessionManager:
     """Manages design chat sessions with persistence and compression."""
 
+    # P28-3: cap on a session's append-only archive (<sid>.archive.jsonl).
+    # Compressed turns move there every COMPRESS_INTERVAL turns with no bound,
+    # so a long-lived session grows forever — the content-history search
+    # (load_archived_turns) reads the whole file, and the BM25 cache holds the
+    # tokenised copy.  Past this cap the OLDEST records are folded into single
+    # compacted summary records (tail preserved verbatim); the folded excerpt
+    # stays BM25-searchable.
+    _ARCHIVE_MAX_BYTES = 20 * 1024 * 1024
+
     def __init__(self, repo_root: str):
         self.repo_root = Path(repo_root)
         self.sessions_dir = self.repo_root / ".asicode" / "design_sessions"
@@ -76,6 +85,33 @@ class DesignSessionManager:
         # (Decision extractor removed — was dead code)
         # Delegate context management to SessionCompressionContext
         self._ctx = SessionCompressionContext(repo_root)
+        self._sweep_overgrown_archives()
+
+    def _sweep_overgrown_archives(self) -> None:
+        """P27-4: apply the archive cap to sessions that never get written again.
+
+        ``_compact_archive`` normally runs on the write path (``_save``), so an
+        abandoned session whose archive outgrew ``_ARCHIVE_MAX_BYTES`` stays
+        over the cap forever — the 25 MB dead-session archive this sweep exists
+        for. Compaction is idempotent (a no-op under the cap) and runs under
+        the per-session flock, so a startup sweep costs one stat per archive
+        and rewrites only the overgrown ones.
+        """
+        try:
+            candidates = [
+                p for p in self.sessions_dir.glob("*.archive.jsonl")
+                if p.stat().st_size > self._ARCHIVE_MAX_BYTES
+            ]
+        except OSError as e:
+            logger.debug("archive sweep could not stat sessions dir: %s", e)
+            return
+        for p in candidates:
+            sid = p.name[: -len(".archive.jsonl")]
+            try:
+                with self._flock(sid):
+                    self._compact_archive(sid)
+            except Exception as e:
+                logger.warning("Startup archive sweep failed for %s: %s", sid, e)
 
     def get_or_create(self, session_id: str) -> DesignSession:
         """Load existing session or create new one.
@@ -91,20 +127,10 @@ class DesignSessionManager:
 
         session = self._load_raw(session_id)
         if session is not None:
-            # Migration: preserve=True → exclude_from_compression=True
-            # (legacy key removed from codebase but may exist in old session files)
-            migrated = False
-            for t in session.turns:
-                if t.pop("preserve", None) is True:
-                    t["exclude_from_compression"] = True
-                    migrated = True
-            if migrated:
-                logger.info("Migrated preserve→exclude_from_compression in session %s", session_id)
+            # (legacy preserve→exclude_from_compression migration lives in _load_raw)
             self._cache[session_id] = session
-            try:
+            with suppress(OSError):
                 self._mtimes[session_id] = self._session_path(session_id).stat().st_mtime
-            except OSError:
-                pass
             return session
 
         session = DesignSession(session_id=session_id)
@@ -118,7 +144,7 @@ class DesignSessionManager:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return DesignSession(
+            session = DesignSession(
                 session_id=data.get("session_id", session_id),
                 created_at=data.get("created_at", time.time()),
                 updated_at=data.get("updated_at", time.time()),
@@ -129,9 +155,26 @@ class DesignSessionManager:
                 decisions=data.get("decisions", []),
                 chat_mode=data.get("chat_mode", "code"),
             )
+            # Migration: preserve=True → exclude_from_compression=True (legacy key
+            # removed from codebase but may exist in old session files). Done at this
+            # single disk-read choke point so _adopt_from_disk's raw fresh reads
+            # cannot reintroduce the legacy key after get_or_create already migrated
+            # it — previously the cache flip-flopped between the two semantics.
+            migrated = False
+            for t in session.turns:
+                if t.pop("preserve", None) is True:
+                    t["exclude_from_compression"] = True
+                    migrated = True
+            if migrated:
+                logger.info(
+                    "Migrated preserve→exclude_from_compression in session %s",
+                    session_id,
+                )
         except Exception as e:
             logger.warning("Failed to load session %s: %s", session_id, e)
             return None
+        else:
+            return session
 
     @contextmanager
     def _flock(self, session_id: str):
@@ -147,29 +190,28 @@ class DesignSessionManager:
     def _refresh_if_stale(self, session: DesignSession) -> None:
         """Absorb disk state if disk mtime differs from last sync timestamp."""
         path = self._session_path(session.session_id)
-        try:
+        with suppress(OSError):
             mtime = path.stat().st_mtime
-        except OSError:
-            return
         if mtime == self._mtimes.get(session.session_id):
             return
-        with self._save_lock:
-            with self._flock(session.session_id):
-                try:
-                    self._adopt_from_disk(session, full=True)
-                    self._mtimes[session.session_id] = path.stat().st_mtime
-                except Exception as e:
-                    logger.debug("Session refresh failed for %s: %s", session.session_id, e)
+        with self._save_lock, self._flock(session.session_id):
+            try:
+                self._adopt_from_disk(session, full=True)
+                self._mtimes[session.session_id] = path.stat().st_mtime
+            except Exception as e:
+                logger.debug("Session refresh failed for %s: %s", session.session_id, e)
 
     def _adopt_from_disk(self, session: DesignSession, full: bool = False) -> None:
         """Merge the latest disk state into the cached session object in-place (caller must hold lock).
 
         Called before every read-modify-write to avoid losing turns appended by other processes.
-        - turns: uses the side with more archive progress as base, then appends the other's
-          newer (by timestamp) turns behind. Adopts disk-side turn dicts, so in_progress
-          flags released by other processes are absorbed too.
+        - turns: uses the side with more archive progress as base, then appends the
+          other's turns absent from it (dedupe on timestamp+role+content — not a
+          timestamp threshold, which would drop unsaved turns after a failed save).
+          Adopts disk-side turn dicts, so in_progress flags released by other
+          processes are absorbed too.
         - compression/archive pointers: monotonic → adopts the more advanced value
-        - full=True: also adopts chat_mode/pending_spec/decisions from disk
+        - full=True: also adopts chat_mode/decisions from disk
           (mtime refresh path — when there are no unsaved local changes)
         In-place update (not object replacement): safe even when a background compress
         thread holds a reference to the same session object.
@@ -181,13 +223,18 @@ class DesignSessionManager:
             base_turns, base_arch, other_turns = fresh.turns, fresh.archived_count, session.turns
         else:
             base_turns, base_arch, other_turns = session.turns, session.archived_count, fresh.turns
-        # If base is empty, merge all other_turns from 0
-        # (base_arch holds the newest archive pointer, so no duplicates)
-        newest = base_turns[-1].get("timestamp", 0.0) if base_turns else 0.0
+        # Dedupe on (timestamp, role, content) instead of a pure timestamp
+        # threshold: a turn absent from the base side must survive the merge even
+        # when its timestamp ties or predates the base's newest — e.g. a locally
+        # appended turn whose save failed, followed by another process's newer
+        # write. A threshold would silently drop it (data loss). Turns already in
+        # base are skipped, so the common case is byte-identical to before.
+        seen = {
+            (t.get("timestamp"), t.get("role"), t.get("content"))
+            for t in base_turns
+        }
         merged = list(base_turns)
-        for t in other_turns:
-            if t.get("timestamp", 0.0) > newest:
-                merged.append(t)
+        merged.extend(t for t in other_turns if (t.get("timestamp"), t.get("role"), t.get("content")) not in seen)
         session.turns[:] = merged
         session.archived_count = base_arch
         if fresh.compressed_up_to > session.compressed_up_to:
@@ -199,7 +246,7 @@ class DesignSessionManager:
             session.chat_mode = fresh.chat_mode
             session.decisions = fresh.decisions
 
-    def add_turn(self, session_id: str, role: str, content: str, model: str = "", preserve: bool = False, digest: str = "", exclude_from_compression: bool = False, in_progress: bool = False, tool_results: Optional[list] = None, auto: bool = False) -> None:
+    def add_turn(self, session_id: str, role: str, content: str, model: str = "", digest: str = "", exclude_from_compression: bool = False, in_progress: bool = False, tool_results: Optional[list] = None, auto: bool = False) -> None:
         """Add a turn to the session.
 
         digest: deterministic work-state digest of the turn's tool loop
@@ -232,8 +279,6 @@ class DesignSessionManager:
         }
         if model:
             turn["model"] = model
-        if preserve:
-            turn["preserve"] = True
         if digest:
             turn["digest"] = digest
         if exclude_from_compression:
@@ -251,40 +296,39 @@ class DesignSessionManager:
         if tool_results and role == "assistant":
             turn["tool_results"] = tool_results
 
-        with self._save_lock:
-            with self._flock(session_id):
-                # Absorb other processes' turns from disk first, then append —
-                # prevents last-writer-wins overwrite from evaporating their turns
-                try:
-                    self._adopt_from_disk(session)
-                except Exception as e:
-                    logger.warning("adopt_from_disk failed for %s: %s", session_id, e)
-                # Reap zombie in_progress turns from abnormally terminated parallel
-                # terminals (or past lives of this process) — runs after adopt, before
-                # append, so both the new assistant turn and the cleanup are in one
-                # atomic write. Guarded for consistency with _save(): a corrupt
-                # timestamp (e.g. explicit null on a manually edited turn) would
-                # otherwise raise out of add_turn and abort the turn append.
-                try:
-                    self._reap_zombie_in_progress(session)
-                except Exception as e:
-                    logger.warning("reap_zombie failed for %s: %s", session_id, e)
-                if role == "assistant":
-                    self._clear_in_progress(session)
-                    # Writing a new assistant turn means the previous turn's
-                    # (whether aborted or completed) tool_results have served their purpose.
-                    # tool_results exist only for "one turn after resume", so we clear
-                    # the prior assistant turn's tool_results here. This makes ESC-aborted
-                    # turns symmetric with normal complete turns ("tool messages are
-                    # discarded at turn end"). From the next turn onward, only the
-                    # digest is persistently referenced.
-                    self._clear_prior_tool_results(session)
-                session.turns.append(turn)
-                session.updated_at = time.time()
-                try:
-                    self._write_session(session)
-                except Exception as e:
-                    logger.warning("Failed to save session %s: %s", session_id, e)
+        with self._save_lock, self._flock(session_id):
+            # Absorb other processes' turns from disk first, then append —
+            # prevents last-writer-wins overwrite from evaporating their turns
+            try:
+                self._adopt_from_disk(session)
+            except Exception as e:
+                logger.warning("adopt_from_disk failed for %s: %s", session_id, e)
+            # Reap zombie in_progress turns from abnormally terminated parallel
+            # terminals (or past lives of this process) — runs after adopt, before
+            # append, so both the new assistant turn and the cleanup are in one
+            # atomic write. Guarded for consistency with _save(): a corrupt
+            # timestamp (e.g. explicit null on a manually edited turn) would
+            # otherwise raise out of add_turn and abort the turn append.
+            try:
+                self._reap_zombie_in_progress(session)
+            except Exception as e:
+                logger.warning("reap_zombie failed for %s: %s", session_id, e)
+            if role == "assistant":
+                self._clear_in_progress(session)
+                # Writing a new assistant turn means the previous turn's
+                # (whether aborted or completed) tool_results have served their purpose.
+                # tool_results exist only for "one turn after resume", so we clear
+                # the prior assistant turn's tool_results here. This makes ESC-aborted
+                # turns symmetric with normal complete turns ("tool messages are
+                # discarded at turn end"). From the next turn onward, only the
+                # digest is persistently referenced.
+                self._clear_prior_tool_results(session)
+            session.turns.append(turn)
+            session.updated_at = time.time()
+            try:
+                self._write_session(session)
+            except Exception as e:
+                logger.warning("Failed to save session %s: %s", session_id, e)
 
     def _clear_in_progress(self, session: DesignSession) -> None:
         """Release the most recent in_progress user turn owned by this process.
@@ -324,10 +368,8 @@ class DesignSessionManager:
     def _owner_pid(owner: str) -> Optional[int]:
         """Extract PID from owner string ("pid:1234"). Non-standard owner returns None."""
         if isinstance(owner, str) and owner.startswith("pid:"):
-            try:
+            with suppress(ValueError):
                 return int(owner[4:])
-            except ValueError:
-                return None
         return None
 
     def _is_process_alive(self, pid: int) -> bool:
@@ -340,12 +382,13 @@ class DesignSessionManager:
             return False
         try:
             os.kill(pid, 0)
-            return True
         except ProcessLookupError:
             self._dead_pids.add(pid)
             return False
         except (OSError, PermissionError):
             # Signal delivery failed for permission etc. — assume alive (conservative)
+            return True
+        else:
             return True
 
     def _reap_zombie_in_progress(self, session: DesignSession) -> bool:
@@ -398,14 +441,14 @@ class DesignSessionManager:
 
     def build_context_messages(
         self, session: DesignSession, current_model: str = "",
-        system_chars: int = 0, skip_core_prompt: bool = False,
+        skip_core_prompt: bool = False,
         mode: str = "",
     ) -> list[dict[str, str]]:
         """Delegate to SessionCompressionContext. If mode is empty, uses session.chat_mode."""
         if not mode:
             mode = getattr(session, "chat_mode", "code")
         return self._ctx.build_context_messages(
-            session, current_model, system_chars, skip_core_prompt=skip_core_prompt,
+            session, current_model, skip_core_prompt=skip_core_prompt,
             mode=mode, owner=self._owner,
         )
 
@@ -416,13 +459,12 @@ class DesignSessionManager:
         session: DesignSession,
         model: str,
         llm_client,
-        system_chars: int = 0,
         force: bool = False,
         notify=None,
     ) -> None:
         """Delegate to SessionCompressionContext with persist callback."""
         self._ctx.schedule_background_compress(
-            session, model, llm_client, system_chars, force=force,
+            session, model, llm_client, force=force,
             notify=notify,
             persist=lambda: self._save(session),
         )
@@ -453,11 +495,12 @@ class DesignSessionManager:
         that predate the field, then by id as a stable tie-breaker.
         """
         sessions = []
-        try:
+        with suppress(TypeError, OSError, ValueError):  # corrupt session file shape / disk errors
             for path in self.sessions_dir.glob("*.json"):
                 try:
                     data = json.loads(path.read_text(encoding="utf-8"))
-                except Exception:
+                except Exception as e:
+                    logger.debug("Skipping unreadable session file %s: %s", path, e)
                     continue
                 updated = data.get("updated_at")
                 if not isinstance(updated, (int, float)):
@@ -475,8 +518,6 @@ class DesignSessionManager:
                     "turn_count": len(data.get("turns", [])) + data.get("archived_count", 0),
                     "has_summary": bool(data.get("compressed_summary")),
                 })
-        except Exception:
-            pass
         # Sort newest-first by updated_at (float), tie-broken by id for stability.
         sessions.sort(key=lambda s: (s.get("updated_at") or 0, s.get("session_id") or ""), reverse=True)
         return sessions[:20]  # last 20
@@ -519,10 +560,8 @@ class DesignSessionManager:
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)
-        try:
+        with suppress(OSError):
             self._mtimes[session.session_id] = path.stat().st_mtime
-        except OSError:
-            pass
 
     def _archive_compressed_turns(self, session: DesignSession) -> None:
         """Move compressed turns from active turns to archive file (caller must hold lock).
@@ -545,6 +584,9 @@ class DesignSessionManager:
         if n <= 0:
             return
         path = self._archive_path(session.session_id)
+        # P28-3: keep the archive bounded — fold the oldest records into
+        # summary records before appending (no-op while under the cap).
+        self._compact_archive(session.session_id)
         try:
             last_i = self._archive_last_index(path)
             with open(path, "a", encoding="utf-8") as f:
@@ -564,24 +606,154 @@ class DesignSessionManager:
         session.turns = session.turns[n:]
         session.archived_count += n
 
+    def _compact_archive(self, session_id: str) -> bool:
+        """Fold the OLDEST archive records into summary records when over the cap.
+
+        Runs only when the archive exceeds ``_ARCHIVE_MAX_BYTES`` (long-lived
+        sessions only) and rewrites it at half the cap, preserving the newest
+        records verbatim.  Each folded block becomes one compacted record
+        carrying the block's LAST absolute index — ``_archive_last_index``'s
+        monotonic-"i" crash-recovery invariant holds — plus the union of
+        roles, the last timestamp, and a 200-char content excerpt that stays
+        BM25-searchable (design_chat_loop indexes ``content`` only, so the
+        excerpt keeps old history partially findable).  Atomic tmp+os.replace
+        mirrors ``_write_session``.  Caller must hold the session lock.
+
+        Returns True when compaction happened.
+        """
+        path = self._archive_path(session_id)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            logger.debug("archive stat failed for compaction: %s", path)
+            return False
+        if size <= self._ARCHIVE_MAX_BYTES:
+            return False
+        target = self._ARCHIVE_MAX_BYTES // 2
+        try:
+            raw_lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            logger.debug("archive read failed for compaction: %s", path)
+            return False
+        records: list[tuple[dict, str]] = []
+        total = 0
+        for raw in raw_lines:
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                logger.debug("Corrupt archive record skipped during compaction: %.80s", raw)
+                continue  # skip corrupt lines, same as _archive_last_index
+            records.append((rec, raw))
+            total += len(raw) + 1
+        if total <= self._ARCHIVE_MAX_BYTES:
+            return False
+        budget = total - target
+        folded = 0
+        out: list[str] = []
+        block: list[dict] = []
+        block_bytes = 0
+        _BLOCK_MAX_BYTES = 64 * 1024  # at most 64 KiB of originals per summary
+        for rec, raw in records:
+            raw_bytes = len(raw) + 1
+            if folded < budget and block_bytes + raw_bytes <= _BLOCK_MAX_BYTES:
+                block.append(rec)
+                block_bytes += raw_bytes
+                folded += raw_bytes
+                continue
+            if block:
+                out.append(self._compact_summary(block))
+                block = []
+                block_bytes = 0
+            if folded < budget:
+                # Fold even an oversized single record rather than keep it.
+                block.append(rec)
+                block_bytes = raw_bytes
+                folded += raw_bytes
+            else:
+                out.append(raw)
+        if block:
+            out.append(self._compact_summary(block))
+        new_text = "\n".join(out) + "\n"
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.write_text(new_text, encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            logger.warning("Failed to compact archive for session %s", session_id)
+            return False
+        logger.info(
+            "Compacted design-session archive %s: %d -> %d bytes",
+            session_id, total, len(new_text),
+        )
+        return True
+
+    @staticmethod
+    def _compact_summary(block: list[dict]) -> str:
+        """One-line compacted record summarizing a block of old archive turns."""
+        last = block[-1]
+        excerpt = ""
+        for rec in block:
+            c = rec.get("content")
+            if isinstance(c, str) and c:
+                excerpt = c
+                break
+        roles = sorted({str(r.get("role")) for r in block if r.get("role")})
+        summary = {
+            "i": last.get("i", 0),
+            "compacted": True,
+            "count": len(block),
+            "role": ",".join(roles) or "unknown",
+            "timestamp": last.get("timestamp"),
+            "content": excerpt[:200],
+        }
+        return json.dumps(summary, ensure_ascii=False)
+
     @staticmethod
     def _archive_last_index(path: Path) -> int:
-        """Absolute index of the last archive file record. Returns -1 if absent."""
+        """Absolute index of the last archive file record. Returns -1 if absent.
+
+        Robust against two crash-recovery hazards:
+        1. A last record longer than the 64 KiB tail window (e.g. giant
+           tool_results after an ESC-interrupt): the window is extended
+           backward in chunks until the last line parses as a complete JSON
+           record, instead of yielding a truncated fragment.
+        2. A trailing partial line left by a crash mid-append: corrupt lines
+           are skipped and the scan walks back to the previous complete
+           record instead of giving up at the first parse failure.
+        """
         if not path.exists():
             return -1
         try:
             with open(path, "rb") as f:
                 f.seek(0, 2)
                 size = f.tell()
-                f.seek(max(0, size - 65536))
-                tail = f.read().decode("utf-8", errors="replace")
-            for line in reversed(tail.strip().split("\n")):
-                line = line.strip()
-                if line:
-                    return int(json.loads(line).get("i", -1))
+                if size <= 0:
+                    return -1
+                chunk = 1 << 16  # 64 KiB
+                start = max(0, size - chunk)
+                for _ in range(256):  # cap the backward scan at ~16 MiB
+                    f.seek(start)
+                    tail = f.read().decode("utf-8", errors="replace")
+                    # Walk back over trailing partial/corrupt records. The
+                    # first element may be a mid-line fragment (window not
+                    # line-aligned) — it simply fails to parse and is skipped
+                    # like any other corrupt line.
+                    for line in reversed(tail.split("\n")):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            return int(json.loads(line).get("i", -1))
+                        except (ValueError, TypeError) as e:
+                            logger.debug("Corrupt archive record skipped: %s", e)
+                            continue
+                    if start == 0:
+                        break
+                    start = max(0, start - chunk)
         except Exception:
-            pass
-        return -1
+            return -1
+        else:
+            return -1
 
     def load_archived_turns(self, session_id: str) -> list[dict[str, Any]]:
         """Load all archived old turns in chronological order (for search_design_history)."""
@@ -595,10 +767,8 @@ class DesignSessionManager:
                     line = line.strip()
                     if not line:
                         continue
-                    try:
+                    with suppress(ValueError):  # Skip corrupted lines (partial writes during crash etc.)
                         turns.append(json.loads(line))
-                    except ValueError:
-                        continue  # Skip corrupted lines (partial writes during crash etc.)
         except Exception as e:
             logger.warning("Failed to load archive for session %s: %s", session_id, e)
             return []
@@ -620,12 +790,10 @@ class DesignSessionManager:
         self._cache.pop(session_id, None)
         self._mtimes.pop(session_id, None)
         self._ctx._compress_locks.pop(session_id, None)
-        lock_path = self.sessions_dir / f"{self._safe_id(session_id)}.lock"
-        if lock_path.exists():
-            try:
-                lock_path.unlink()
-            except Exception:
-                pass
+        # The session's .lock file is intentionally left in place: cross_process_flock
+        # documents that lock files must never be unlinked — unlink+recreate lets two
+        # processes hold "the lock" on different inodes simultaneously, breaking the
+        # very mutual exclusion _flock exists to provide.
         archive = self._archive_path(session_id)
         if archive.exists():
             try:
@@ -636,9 +804,10 @@ class DesignSessionManager:
         if path.exists():
             try:
                 path.unlink()
-                return True
             except Exception as e:
                 logger.warning("Failed to delete session %s: %s", session_id, e)
+            else:
+                return True
         return False
 
     def _session_path(self, session_id: str) -> Path:

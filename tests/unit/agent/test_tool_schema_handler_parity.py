@@ -46,7 +46,7 @@ def test_the_design_chat_surface_is_the_only_one_that_advertises_them(tool_regis
     agent = _names(tool_registry.get_tool_schemas())
     design = _names(tool_registry.get_tool_schemas(design_chat=True))
     assert not (DESIGN_CHAT_ONLY_TOOL_NAMES & agent)
-    assert DESIGN_CHAT_ONLY_TOOL_NAMES <= design
+    assert design >= DESIGN_CHAT_ONLY_TOOL_NAMES
     assert design - agent == DESIGN_CHAT_ONLY_TOOL_NAMES
 
 
@@ -96,7 +96,7 @@ def test_python_only_and_design_chat_filters_compose(tool_registry):
     assert not (python_only & ts_agent)
     assert not (python_only & ts_design)
     assert not (DESIGN_CHAT_ONLY_TOOL_NAMES & ts_agent)
-    assert DESIGN_CHAT_ONLY_TOOL_NAMES <= ts_design
+    assert ts_design >= DESIGN_CHAT_ONLY_TOOL_NAMES
 
 
 # ── the other direction: a handler nothing advertises ───────────────────────
@@ -120,7 +120,6 @@ INTERNAL_ONLY_HANDLERS = frozenset({
     "run_lint",
     # Internal bookkeeping invoked by the loop, never advertised.
     "update_memory",
-    "query_experience",
 })
 
 

@@ -56,6 +56,24 @@ _KOTLINC_ERROR_RE = re.compile(
     r"^(.+?):(\d+):(\d+):\s+error:\s+(.+)$"
 )
 
+# JVM startup flags passed to every kotlinc invocation (-J passthrough).
+# kotlinc is a JVM compiler: each call pays a full JVM boot (~2.2s here vs
+# ~1.8s with these flags, measured kotlinc 2.4.0 / JRE 17). TieredStopAtLevel=1
+# skips C2 JIT warmup (irrelevant for a one-shot compile), UseSerialGC avoids
+# GC thread pool spin-up, and -Xverify:none skips bytecode verification.
+#
+# -Xverify:none is deprecated since JDK 13 and may be removed in a future JDK;
+# when that happens kotlinc simply fails to start (rc=1, no file:line:
+# diagnostic), which the error regex silently discards and the existing
+# fail-open contract turns into ok=True — the same graceful degradation as a
+# missing kotlinc. Do not let the stderr deprecation warning concern you: it
+# does not match _KOTLINC_ERROR_RE.
+KOTLINC_JVM_FLAGS = (
+    "-J-XX:TieredStopAtLevel=1",
+    "-J-XX:+UseSerialGC",
+    "-J-Xverify:none",
+)
+
 
 class KotlinSyntaxProvider(SyntaxProvider):
     """Kotlin language support (regex + tree-sitter symbols, kotlinc validation)."""
@@ -77,6 +95,18 @@ class KotlinSyntaxProvider(SyntaxProvider):
 
         Falls back to ``ok=True`` when kotlinc is not available.
         """
+        # tree-sitter prefilter — the hot path for broken code. Every kotlinc
+        # call pays JVM startup (~2s) regardless of file size, so a syntax
+        # error tree-sitter already caught must not be re-confirmed by a JVM
+        # boot. Only short-circuits when tree-sitter finds ERROR/MISSING nodes
+        # (which kotlinc would also reject); tree-sitter-clean and
+        # tree-sitter-unavailable content both fall through to kotlinc, which
+        # stays authoritative. Same error format as the kotlinc-missing
+        # fallback, so the pre-write gate sees an identical contract.
+        _ts_result = tree_sitter_syntax_fallback(content, LanguageId.KOTLIN, file_path)
+        # Never None — the fallback is fail-open (ok=True) by contract.
+        if not _ts_result.ok:
+            return _ts_result
         _suffix = os.path.splitext(file_path)[1] or ".kt"
         _tmp_path, _cleanup = _tempfile_for_content(content, _suffix)
         if not _tmp_path:
@@ -94,7 +124,8 @@ class KotlinSyntaxProvider(SyntaxProvider):
         # TemporaryDirectory via ``-d``.
         _out_dir = tempfile.TemporaryDirectory()
         _cmd = _replace_last_cmd_path(
-            ["kotlinc", "-J-Duser.language=en", "-d", _out_dir.name, file_path],
+            ["kotlinc", "-J-Duser.language=en", *KOTLINC_JVM_FLAGS,
+             "-d", _out_dir.name, file_path],
             file_path, _tmp_path,
         )
         try:
@@ -104,6 +135,7 @@ class KotlinSyntaxProvider(SyntaxProvider):
                     capture_output=True, text=True, timeout=30,
                     cwd=os.path.dirname(_tmp_path) or ".",
                     env=_compile_env(),
+                    check=False,
                 )
             except FileNotFoundError:
                 logger.debug("kotlinc not installed; falling back to tree-sitter")
@@ -210,6 +242,7 @@ class KotlinSyntaxProvider(SyntaxProvider):
             cmd = [
                 "kotlinc",
                 "-J-Duser.language=en",
+                *KOTLINC_JVM_FLAGS,
                 "-d", out_dir.name,
                 file_path,
             ]
@@ -219,6 +252,7 @@ class KotlinSyntaxProvider(SyntaxProvider):
                     capture_output=True, text=True, timeout=30,
                     cwd=project_root,
                     env=_compile_env(),
+                    check=False,
                 )
             except FileNotFoundError:
                 logger.debug("kotlinc not installed; skipping semantic validation")
@@ -331,20 +365,7 @@ class KotlinSyntaxProvider(SyntaxProvider):
             if result:
                 return result
 
-        return self._find_symbol_regex(file_path, symbol_name, content)
-
-    def _find_symbol_regex(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
-        esc = re.escape(symbol_name)
-        for sp in self.get_symbol_patterns("any"):
-            pat = sp.regex.replace("{name}", esc)
-            for m in re.finditer(pat, content, re.MULTILINE):
-                start_offset = m.start()
-                start_line = content[:start_offset].count("\n") + 1
-                end_line = self._find_block_end(content, start_offset)
-                return (start_line, end_line)
-        return None
+        return self._find_symbol_regex(symbol_name, content)
 
     @staticmethod
     def _find_block_end(content: str, offset: int) -> int:
@@ -433,22 +454,6 @@ class KotlinSyntaxProvider(SyntaxProvider):
         depth counter. See base.py for the full contract.
         """
         return find_brace_block_end_offset(content, offset)
-
-    def _find_symbol_body_range_regex(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
-        """Regex fallback: find function body via first { after definition."""
-        esc = re.escape(symbol_name)
-        for sp in self.get_symbol_patterns("any"):
-            pat = sp.regex.replace("{name}", esc)
-            for m in re.finditer(pat, content, re.MULTILINE):
-                body_start = content.find("{", m.end())
-                if body_start == -1:
-                    continue
-                body_start_line = content[:body_start].count("\n") + 1
-                body_end_line = self._find_block_end(content, body_start)
-                return (body_start_line, body_end_line)
-        return None
 
     # ── Structural query methods (tree-sitter → regex fallback) ────────────
 

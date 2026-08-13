@@ -34,9 +34,10 @@ def _env_int(name: str, default: int, *, allow_zero: bool = False) -> int:
     """
     try:
         v = int((os.getenv(name, "") or "").strip() or str(default))
-        return v if (v >= 0 if allow_zero else v > 0) else default
     except Exception:
         return default
+    else:
+        return v if (v >= 0 if allow_zero else v > 0) else default
 
 
 # ============================================================
@@ -123,7 +124,6 @@ LEARNING_ENABLED: bool = _env_flag("ASICODE_LEARNING_ENABLED", True)
 # Multi-language analysis (TS/JS symbol search, call graph, etc.)
 # ============================================================
 MULTILANG_SYMBOL_SEARCH: bool = _env_flag("ASICODE_MULTILANG_SYMBOL_SEARCH", True)
-MULTILANG_SYMBOL_SIZE: bool = _env_flag("ASICODE_MULTILANG_SYMBOL_SIZE", True)
 MULTILANG_OUTLINE: bool = _env_flag("ASICODE_MULTILANG_OUTLINE", True)
 MULTILANG_CALLGRAPH: bool = _env_flag("ASICODE_MULTILANG_CALLGRAPH", True)
 
@@ -152,6 +152,11 @@ CLAUDE_SDK_MAX_TURNS: int = _env_int("CLAUDE_SDK_MAX_TURNS", 100)
 # Prevents Claude Code from hanging indefinitely (e.g. 390s) when a tool
 # deadlocks or takes too long. Use 0 to disable (0 = no timeout).
 CLAUDE_MCP_TOOL_TIMEOUT: int = _env_int("CLAUDE_MCP_TOOL_TIMEOUT", 120, allow_zero=True)
+# Overall timeout (seconds) for a whole collaboration session query
+# (send + full response stream). Safety net against SDK receive_response()
+# hanging forever; on expiry ClaudeSession interrupts the agent subprocess
+# and returns a failure verdict. Use 0 to disable (0 = no timeout).
+CLAUDE_SESSION_TIMEOUT: int = _env_int("CLAUDE_SESSION_TIMEOUT", 1800, allow_zero=True)
 
 # ============================================================
 # Web search

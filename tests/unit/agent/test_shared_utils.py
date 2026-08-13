@@ -485,8 +485,8 @@ class TestMakeToolSignature:
             "from external_llm.agent._shared_utils import make_tool_signature;"
             "print(make_tool_signature('grep', {'pattern': 'x', 'path': 'y'}))"
         )
-        out1 = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True).stdout.strip()
-        out2 = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True).stdout.strip()
+        out1 = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False).stdout.strip()
+        out2 = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False).stdout.strip()
         assert out1 == out2
         assert out1  # non-empty
 
@@ -527,7 +527,7 @@ def test_capped_put_refreshes_existing_key_in_place():
 
 def test_archive_capped_put_bounds_archive_cache():
     """P4: the insights archive cache helper also bounds its entry count."""
-    from external_llm.agent.insights_manager import _archive_capped_put, _ARCHIVE_CACHE_MAX_ENTRIES
+    from external_llm.agent.insights_manager import _ARCHIVE_CACHE_MAX_ENTRIES, _archive_capped_put
 
     cache: dict = {}
     for i in range(_ARCHIVE_CACHE_MAX_ENTRIES + 5):
@@ -910,7 +910,9 @@ def _seed_walk(tmp_path, n: int):
 
 def test_walk_truncated_for_reports_slice_from_a_complete_cache_entry(tmp_path):
     from external_llm.agent._shared_utils import (
-        _PY_WALK_CACHE, _walk_py_files, _walk_truncated_for,
+        _PY_WALK_CACHE,
+        _walk_py_files,
+        _walk_truncated_for,
     )
 
     root = _seed_walk(tmp_path, 50)
@@ -928,7 +930,9 @@ def test_walk_truncated_for_reports_slice_from_a_complete_cache_entry(tmp_path):
 
 def test_walk_truncated_for_is_false_when_the_cap_covers_the_corpus(tmp_path):
     from external_llm.agent._shared_utils import (
-        _PY_WALK_CACHE, _walk_py_files, _walk_truncated_for,
+        _PY_WALK_CACHE,
+        _walk_py_files,
+        _walk_truncated_for,
     )
 
     root = _seed_walk(tmp_path, 50)
@@ -942,7 +946,9 @@ def test_walk_truncated_for_is_false_when_the_cap_covers_the_corpus(tmp_path):
 def test_walk_truncated_for_still_honours_the_stored_flag(tmp_path):
     """A genuinely truncated walk stays truncated for any cap."""
     from external_llm.agent._shared_utils import (
-        _PY_WALK_CACHE, _walk_py_files, _walk_truncated_for,
+        _PY_WALK_CACHE,
+        _walk_py_files,
+        _walk_truncated_for,
     )
 
     root = _seed_walk(tmp_path, 50)
@@ -975,3 +981,55 @@ def test_symbol_searcher_passes_its_own_cap(tmp_path):
         assert searcher.index_was_truncated() is False
     finally:
         ss._MAX_PY_FILES = original
+
+
+def test_discover_repo_files_is_deterministic_and_sorted(tmp_path):
+    """BUG-4: _discover_repo_files must not depend on os.walk/readdir order —
+    the first max_files entries feed project.md auto-generation, so a
+    nondeterministic slice would drift between machines/processes."""
+    from external_llm.agent import _shared_utils as su
+
+    (tmp_path / "b.py").write_text("x")
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "x.py").write_text("x")
+    (tmp_path / "c").mkdir()
+    (tmp_path / "c" / "z.py").write_text("x")
+    (tmp_path / "c" / "y.py").write_text("x")
+    (tmp_path / ".hidden.py").write_text("x")  # dotfiles skipped
+
+    first = su._discover_repo_files(str(tmp_path))
+    # os.walk visits root files first, then each sorted subdir; dotfiles skipped.
+    assert first == ["b.py", "a/x.py", "c/y.py", "c/z.py"]
+    # Determinism (BUG-4): repeated calls must yield identical order.
+    assert su._discover_repo_files(str(tmp_path)) == first
+
+
+def test_discover_repo_files_walk_failure_logs_debug_and_keeps_partial(tmp_path, caplog, monkeypatch):
+    """Silent-swallow contract: a failing subtree must not crash session start.
+    Partial results are preserved and the failure is traceable at debug level —
+    the pre-fix code (bare ``except Exception: pass``) emits no record at all."""
+    from external_llm.agent import _shared_utils as su
+
+    (tmp_path / "keep.py").write_text("x")
+    (tmp_path / "boom").mkdir()
+
+    real_walk = su.os.walk
+
+    def flaky_walk(top, *args, **kwargs):
+        """Generator: yield the top-level tuple, then raise on the next pull —
+        os.walk is lazy, so the failure must be raised at *yield* time, not
+        call time, to simulate an unreadable subtree."""
+        for _root, _dirs, _files in real_walk(top, *args, **kwargs):
+            yield _root, _dirs, _files
+            break
+        raise PermissionError(f"cannot read {top}")
+
+    monkeypatch.setattr(su.os, "walk", flaky_walk)
+    with caplog.at_level("DEBUG", logger="external_llm.agent._shared_utils"):
+        result = su._discover_repo_files(str(tmp_path))
+
+    assert "keep.py" in result  # partial results preserved (best-effort contract)
+    assert any(
+        r.levelname == "DEBUG" and "walk of" in r.getMessage() and "cannot read" in r.getMessage()
+        for r in caplog.records
+    )

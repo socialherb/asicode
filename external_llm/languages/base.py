@@ -3,16 +3,15 @@ Abstract base for language syntax providers.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
+import re
 import tempfile
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Optional
-
-if TYPE_CHECKING:
-    from external_llm.editor.primitives.code_context import CodeContext
+from collections.abc import Callable, Iterator
+from typing import Optional
 
 from .models import (
     LanguageCapabilities,
@@ -45,10 +44,8 @@ def _tempfile_for_content(content: str, suffix: str) -> tuple[str, Callable[[], 
         return "", lambda: None
 
     def _cleanup() -> None:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(_tmp_path)
-        except OSError:
-            pass
 
     return _tmp_path, _cleanup
 
@@ -96,8 +93,13 @@ def tree_sitter_syntax_fallback(
             ok=False,
             errors=[SyntaxError_(
                 file="",
-                line=n.line,
-                col=n.column,
+                # find_error_nodes reports 0-based positions; SyntaxError_
+                # consumers (tool_safety / write-tool diagnostics, tool_registry
+                # "file:line:col:" parsing) expect 1-based — the convention of
+                # kotlinc/javac/ast producers. Off-by-one here misled repair
+                # prompts about the error location.
+                line=n.line + 1,
+                col=n.column + 1,
                 message=(
                     f"syntax error (tree-sitter): expected '{n.missing_token}'"
                     if n.missing_token
@@ -402,9 +404,7 @@ def _is_verbatim_string_start(content: str, i: int) -> bool:
     if i >= 1 and content[i - 1] == "@":
         return True
     # @$" form (interpolated verbatim): '$' immediately precedes '"', '@' before it
-    if i >= 2 and content[i - 1] == "$" and content[i - 2] == "@":
-        return True
-    return False
+    return bool(i >= 2 and content[i - 1] == "$" and content[i - 2] == "@")
 
 
 def _skip_verbatim_string(content: str, start: int, length: int) -> int:
@@ -609,7 +609,7 @@ def _iter_brace_tokens(content: str, offset: int = 0, *, js_lexing: bool = False
                 i = end + 1
                 continue
         # ── brace token ───────────────────────────────────────────────
-        if ch == "{" or ch == "}":
+        if ch in {"{", "}"}:
             yield (ch, i)
         i += 1
 
@@ -820,6 +820,58 @@ class SyntaxProvider(ABC):
         """
         ...
 
+    def _iter_symbol_matches(
+        self, content: str, symbol_name: str,
+    ) -> Iterator[tuple[SymbolPattern, re.Match[str]]]:
+        """Yield ``(pattern, match)`` for every regex pattern matching *symbol_name*.
+
+        Shared scaffold for the ``_find_symbol_*_regex`` fallback methods:
+        escapes *symbol_name*, substitutes it into each ``{name}`` pattern and
+        scans *content* (``re.MULTILINE``). The caller decides per-match what
+        counts as a hit — e.g. line-based end for ``macro``/``variable`` kinds
+        vs brace-counted block end.
+        """
+        esc = re.escape(symbol_name)
+        for sp in self.get_symbol_patterns("any"):
+            pat = sp.regex.replace("{name}", esc)
+            for m in re.finditer(pat, content, re.MULTILINE):
+                yield sp, m
+
+    _LINE_BASED_KINDS: frozenset[str] = frozenset()
+
+    def _find_symbol_regex(
+        self, symbol_name: str, content: str,
+    ) -> Optional[tuple[int, int]]:
+        """Fallback: regex match + brace counting for block end.
+
+        Pattern kinds listed in :attr:`_LINE_BASED_KINDS` (C ``macro``/
+        ``typedef``, Go ``variable``/``constant``) end at the first newline
+        instead of a matching brace.
+        """
+        for sp, m in self._iter_symbol_matches(content, symbol_name):
+            start_offset = m.start()
+            start_line = content[:start_offset].count("\n") + 1
+            if sp.kind in self._LINE_BASED_KINDS:
+                end_pos = content.find("\n", m.end())
+                end_line = (content[:end_pos].count("\n") + 1) if end_pos != -1 else start_line
+            else:
+                end_line = find_brace_block_end(content, start_offset)
+            return (start_line, end_line)
+        return None
+
+    def _find_symbol_body_range_regex(
+        self, content: str, symbol_name: str,
+    ) -> Optional[tuple[int, int]]:
+        """Regex fallback: find function body via first { after definition."""
+        for _, m in self._iter_symbol_matches(content, symbol_name):
+            body_start = content.find("{", m.end())
+            if body_start == -1:
+                continue
+            body_start_line = content[:body_start].count("\n") + 1
+            body_end_line = find_brace_block_end(content, body_start)
+            return (body_start_line, body_end_line)
+        return None
+
     @abstractmethod
     def get_file_globs(self) -> list[str]:
         """Glob patterns that match files of this language (e.g. ``["*.py"]``)."""
@@ -984,23 +1036,3 @@ class SyntaxProvider(ABC):
     def get_definition_keywords(self) -> list[str]:
         """Return keyword prefixes used to define symbols (e.g. ``["def ", "class "]``)."""
         ...
-
-    # ── Primitive execution support ───────────────────────────────────────
-
-    def build_code_context(self, code: str, file_path: str) -> "CodeContext":
-        """Build a language-agnostic CodeContext for primitive operations.
-
-        The default implementation uses tree-sitter (or regex fallback) via
-        ``CodeContext.from_file_path()``. Language providers may override to
-        provide a faster or more precise implementation.
-
-        Args:
-            code: Source code string.
-            file_path: File path (used for language inference).
-
-        Returns:
-            A ``CodeContext`` instance ready for primitive execution.
-        """
-        from external_llm.editor.primitives.code_context import CodeContext as _CC
-
-        return _CC.from_file_path(code, file_path)

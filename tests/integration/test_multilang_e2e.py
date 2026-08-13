@@ -14,7 +14,6 @@ from unittest.mock import Mock
 
 import pytest
 
-from external_llm.agent.execution_spec import ResolvedExecutionSpec
 from external_llm.agent.lint_runner import LintRunner
 from external_llm.agent.symbol_search import SymbolSearcher
 from external_llm.agent.task_router import Lane, TaskRouter
@@ -43,7 +42,7 @@ def _make_router(repo_root: str | None = None) -> TaskRouter:
     response.completion_tokens = 0
     client.chat.return_value = response
     client.chat_with_tools.return_value = response
-    return TaskRouter(llm_client=client, model="test-model", repo_root=repo_root)
+    return TaskRouter(llm_client=client, model="test-model")
 
 # ── Fixture: multi-language project ──────────────────────────────────────────
 
@@ -216,11 +215,11 @@ def multilang_project():
     tmpdir = tempfile.mkdtemp(prefix="multilang-e2e-")
     try:
         import subprocess
-        subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True)
+        subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=False)
         subprocess.run(["git", "config", "user.email", "test@test.com"],
-                       cwd=tmpdir, capture_output=True)
+                       cwd=tmpdir, capture_output=True, check=False)
         subprocess.run(["git", "config", "user.name", "Test"],
-                       cwd=tmpdir, capture_output=True)
+                       cwd=tmpdir, capture_output=True, check=False)
 
         # Python
         svc_dir = Path(tmpdir) / "service"
@@ -257,9 +256,9 @@ def multilang_project():
         (Path(tmpdir) / "config.json").write_text('{"version": "1.0"}')
         (Path(tmpdir) / "styles.css").write_text("body { margin: 0; }")
 
-        subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=False)
         subprocess.run(["git", "commit", "-m", "init multilang"],
-                       cwd=tmpdir, capture_output=True)
+                       cwd=tmpdir, capture_output=True, check=False)
 
         yield tmpdir
     finally:
@@ -981,43 +980,7 @@ class TestLintRunner:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 9. Execution Spec Serialization
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestExecutionSpec:
-    """Verify language field round-trips through serialization."""
-
-    def test_language_in_to_dict(self):
-        spec = ResolvedExecutionSpec(
-            original_request="edit user.ts",
-            intent="edit",
-            request_type="edit",
-            language="typescript",
-        )
-        d = spec.to_dict()
-        assert d["language"] == "typescript"
-
-    def test_language_from_dict(self):
-        d = {
-            "original_request": "edit",
-            "intent": "edit",
-            "request_type": "edit",
-            "language": "javascript",
-        }
-        spec = ResolvedExecutionSpec.from_dict(d)
-        assert spec.language == "javascript"
-
-    def test_language_none_default(self):
-        spec = ResolvedExecutionSpec(
-            original_request="test",
-            intent="edit",
-            request_type="edit",
-        )
-        assert spec.language is None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 10. Go Provider
+# 9. Go Provider
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestGoProvider:
@@ -1098,7 +1061,7 @@ class TestGoProvider:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 11. Java Provider
+# 10. Java Provider
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestJavaProvider:
@@ -1183,7 +1146,7 @@ class TestJavaProvider:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 12. Tree-sitter Integration
+# 11. Tree-sitter Integration
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestTreeSitter:

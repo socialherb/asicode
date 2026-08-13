@@ -2,7 +2,7 @@
 
 Mirrors the ``RAGSearcher`` race fixed earlier. ``CallGraphIndexer`` is shared
 **by reference** across in-process parallel subagents
-(``ToolRegistry.clone_for_subagent`` / ``clone_with_filter`` both assign
+(``ToolRegistry.clone_for_subagent`` assigns
 ``clone._call_graph = self._call_graph``). A subagent's write-success callback
 (``_invalidate_cache_after_write`` -> ``CallGraphIndexer.invalidate``) clears the
 index dicts (``_nodes`` / ``_forward`` / ``_reverse``) while a *sibling*
@@ -91,7 +91,7 @@ def test_concurrent_read_and_invalidate_no_crash(tmp_path: Path) -> None:
                 idx.get_callees(f"method_{k}")
                 idx.get_callers(f"helper_{k}")
                 idx.get_related_symbols(f"method_{k}_b")
-            except BaseException as e:  # noqa: BLE001 — surface any failure
+            except BaseException as e:  # surface any failure
                 errors.append(e)
                 stop.set()
                 return
@@ -102,7 +102,7 @@ def test_concurrent_read_and_invalidate_no_crash(tmp_path: Path) -> None:
         while not stop.is_set() and i < 300:
             try:
                 idx.invalidate()  # clears _nodes/_forward/_reverse
-            except BaseException as e:  # noqa: BLE001
+            except BaseException as e:
                 errors.append(e)
                 stop.set()
                 return
@@ -212,13 +212,16 @@ def test_build_mid_cancel_discards_partial_index(tmp_path: Path) -> None:
     """Cancelling mid-build (after some files were indexed into the dicts) must
     discard the partial index so the in-flight query never sees a torn ``_forward``.
 
-    Deterministic via an ``_index_file`` wrapper that sets the event after the
-    3rd file is indexed — guaranteeing the dicts are non-empty at the checkpoint.
+    Deterministic via a ``_process_file_cached`` wrapper that sets the event
+    after the 3rd file is indexed — guaranteeing the dicts are non-empty at
+    the checkpoint.  (P2: build() routes per-file work through
+    ``_process_file_cached``, the cache-tier entry point — ``_index_file`` is
+    now only the compute half used by ``invalidate_files``.)
     """
     _seed_repo(tmp_path, n=10)
     ev = threading.Event()
     idx = CallGraphIndexer(str(tmp_path), cancel_event=ev)
-    orig = idx._index_file
+    orig = idx._process_file_cached
     count = [0]
 
     def _count_then_cancel(path):
@@ -227,17 +230,17 @@ def test_build_mid_cancel_discards_partial_index(tmp_path: Path) -> None:
         if count[0] >= 3:
             ev.set()
 
-    idx._index_file = _count_then_cancel
+    idx._process_file_cached = _count_then_cancel
     idx.build()
     assert count[0] >= 3, "wrapper must index >=3 files before tripping cancel"
     assert idx._built is False
     assert len(idx._nodes) == 0, "partial index must be discarded on cancel"
     assert len(idx._forward) == 0
     assert len(idx._reverse) == 0
-    # Retry after clearing cancel: restore the real _index_file (the wrapper
-    # would otherwise keep re-tripping cancel since count[0] is already >=3),
-    # then full-build succeeds (no stuck/half state).
-    idx._index_file = orig
+    # Retry after clearing cancel: restore the real _process_file_cached (the
+    # wrapper would otherwise keep re-tripping cancel since count[0] is
+    # already >=3), then full-build succeeds (no stuck/half state).
+    idx._process_file_cached = orig
     ev.clear()
     idx.build()
     assert idx._built is True
@@ -299,3 +302,37 @@ def test_build_with_config_no_event_builds_normally(tmp_path: Path) -> None:
     idx.build()
     assert idx._built is True
     assert len(idx._nodes) > 0
+
+
+def test_cancelled_build_releases_rg_snapshot(tmp_path: Path, monkeypatch) -> None:
+    """P2 (2026-08-12): an ESC-cancelled build must release the RG snapshot.
+
+    The RG snapshot payload (~209MB in memory for the 42MB JSON) was only
+    released on the normal build exit; the two ESC early-returns leaked it
+    for the indexer's lifetime.  Deterministic via a ``_process_file_cached``
+    wrapper that sets the event after the first file — the second file's
+    checkpoint then cancels with the payload already loaded.
+    """
+    from external_llm.graph.repository_graph import RepositoryGraph
+
+    repo = tmp_path
+    for rel, src in (
+        ("a.py", "def fa():\n    pass\n"),
+        ("b.py", "def fb():\n    pass\n"),
+    ):
+        (repo / rel).write_text(src, encoding="utf-8")
+    RepositoryGraph(str(repo)).build(collect_imported_names=True)  # write snapshot
+
+    ev = threading.Event()
+    idx = CallGraphIndexer(str(repo), cancel_event=ev)
+    orig = CallGraphIndexer._process_file_cached
+
+    def wrapper(self, path):
+        orig(self, path)
+        ev.set()  # cancel at the NEXT checkpoint, after the tier loaded
+
+    monkeypatch.setattr(CallGraphIndexer, "_process_file_cached", wrapper)
+    idx.build()
+    assert not idx._built
+    assert idx._rg_cache is None, "cancelled build must release the RG snapshot payload"
+    assert idx._rg_cache_mtime_ns == 0

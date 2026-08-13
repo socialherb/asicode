@@ -6,12 +6,14 @@ cache hit rates, and other performance metrics for profiling and optimization.
 
 Thread-safe cache hit rate tracking with comprehensive metrics collection.
 """
+import bisect
 import logging
 import threading
 import time
 import uuid
 import weakref
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -20,33 +22,39 @@ from .config.thresholds import config as _threshold_config
 logger = logging.getLogger(__name__)
 
 
-def _percentile(samples: "deque", pct: float) -> float:
-    """Single linear-interpolated percentile (0.0 when empty). Thin wrapper over
-    ``_percentiles``; kept as the public single-value API used by
-    ``ToolMetrics.percentile`` / ``LLMMetrics.percentile`` (and their unit tests).
-    """
-    return _percentiles(samples, (pct,))[0]
-
-
 def _percentiles(samples: "deque", pcts: tuple[float, ...]) -> tuple[float, ...]:
     """Linear-interpolated percentiles from a SINGLE sort of ``samples``.
 
     Pure: snapshots the deque and sorts a copy (does not mutate it). Returns one
-    value per requested percentile, in input order. Computing p50+p95 (the
-    summary's two reads) via ONE ``sorted()`` halves the work vs two separate
-    ``_percentile`` calls — ``get_summary()`` is polled every ~2s by the SSE
-    broadcaster, once per tool AND once per provider, so the saved sort per
-    entity per poll adds up across a long run with many tools/providers.
+    value per requested percentile, in input order.
+
+    NOTE (delta cache): ``get_summary()`` no longer goes through this function —
+    per-entity reads come from ``ToolMetrics.percentiles`` /
+    ``LLMMetrics.percentiles``, which compute from the incrementally-maintained
+    ``_latency_sorted`` mirror (O(1) per percentile, no sort). This sort-based
+    path remains the REFERENCE implementation: it backs the ``percentile``
+    single-value API and the unit tests, and the delta cache is parity-tested
+    against it.
+    """
+    return _percentiles_from_sorted(sorted(samples), pcts)
+
+
+def _percentiles_from_sorted(s: list, pcts: tuple[float, ...]) -> tuple[float, ...]:
+    """Linear-interpolated percentiles over an ALREADY-SORTED sample list.
+
+    Shared interpolation math for BOTH percentile paths — ``_percentiles``
+    (sort + delegate) and the delta-cache reads (``ToolMetrics.percentiles`` /
+    ``LLMMetrics.percentiles`` on the ``_latency_sorted`` mirror) — so the
+    cached read and the reference sort path cannot drift.
 
     Linear interpolation between the two closest ranks (matches numpy's default
     'linear' method); for a single sample every pct returns that sample. 0.0 for
     every requested pct when the window is empty so the summary reads "no data"
     honestly rather than raising.
     """
-    n = len(samples)
+    n = len(s)
     if n == 0:
         return tuple(0.0 for _ in pcts)
-    s = sorted(samples)
     if n == 1:
         _only = float(s[0])
         return tuple(_only for _ in pcts)
@@ -58,6 +66,33 @@ def _percentiles(samples: "deque", pcts: tuple[float, ...]) -> tuple[float, ...]
         frac = k - lo
         out.append(float(s[lo] + (s[hi] - s[lo]) * frac))
     return tuple(out)
+
+
+def _append_latency(samples: "deque", sorted_samples: list, value: float) -> None:
+    """Append one SUCCESS latency sample to the bounded sliding window, keeping the
+    sorted mirror (``sorted_samples``) in lockstep with the FIFO deque.
+
+    This is the delta-cache update: O(K) worst case (list insert/pop shift,
+    K ≤ LATENCY_SAMPLE_WINDOW) at RECORD time, so ``get_summary()`` percentile
+    reads are O(1) per entity instead of O(K log K) per poll. ``get_summary()``
+    is polled every ~2s by the SSE broadcaster across every tool AND provider;
+    the sort-per-read cost is what pushed test_metrics_export_performance over
+    its 50ms budget under full-suite CPU contention (the regression this
+    replaces).
+
+    The deque is the FIFO authority (eviction order); the sorted list mirrors
+    its MULTISET (duplicates retained). Eviction: when the deque is at maxlen
+    the leftmost (oldest) value is about to be dropped — remove one occurrence
+    of it from the mirror via ``bisect_left`` (any equal occurrence is
+    multiset-equivalent, so the percentile result is unchanged). Caller holds
+    the collector's guard lock (same contract as ``record`` / ``percentile``).
+    """
+    _cap = samples.maxlen
+    _evicted = samples[0] if _cap and len(samples) == _cap else None
+    samples.append(value)
+    bisect.insort(sorted_samples, value)
+    if _evicted is not None:
+        sorted_samples.pop(bisect.bisect_left(sorted_samples, _evicted))
 
 
 class CacheHitRateMetrics:
@@ -175,6 +210,12 @@ class ToolMetrics:
     _latency_samples: deque = field(
         default_factory=lambda: deque(maxlen=_threshold_config.scores.LATENCY_SAMPLE_WINDOW)
     )
+    # Sorted mirror of ``_latency_samples`` (same multiset, kept in lockstep by
+    # ``_append_latency`` at RECORD time) — the p50/p95 DELTA CACHE. Percentile
+    # reads (``percentile`` / ``percentiles``, i.e. every get_summary() poll)
+    # are O(1) index math on this list instead of an O(K log K) sort per read.
+    # Constant memory: length == len(_latency_samples) ≤ LATENCY_SAMPLE_WINDOW.
+    _latency_sorted: list = field(default_factory=list)
 
     @property
     def latency_samples_count(self) -> int:
@@ -216,12 +257,10 @@ class ToolMetrics:
         """
         self.total_calls += 1
         self._time_sum += execution_time
-        if execution_time < self._time_min:
-            self._time_min = execution_time
-        if execution_time > self._time_max:
-            self._time_max = execution_time
+        self._time_min = min(self._time_min, execution_time)
+        self._time_max = max(self._time_max, execution_time)
         if not failed:
-            self._latency_samples.append(execution_time)
+            _append_latency(self._latency_samples, self._latency_sorted, execution_time)
 
     @property
     def avg_execution_time(self) -> float:
@@ -275,27 +314,29 @@ class ToolMetrics:
     def percentile(self, pct: float) -> float:
         """Linear-interpolated percentile over the RECENT-latency window.
 
-        50 → median, 95 → p95 tail. Reads ``_latency_samples`` (a bounded sliding
-        window, NOT a uniform reservoir — see the field comment) so the tail
-        reflects CURRENT behavior, not a lifetime estimate diluted toward early
-        fast calls on a long run. 0.0 when no samples yet. Caller is expected to
-        hold the collector's guard lock (same contract as ``record()`` /
-        ``recent_failure_rate``) since this reads the deque without its own lock.
-        O(K log K) with K ≤ LATENCY_SAMPLE_WINDOW.
+        50 → median, 95 → p95 tail. Reads the ``_latency_sorted`` mirror (a
+        bounded sliding window, NOT a uniform reservoir — see the field comment)
+        so the tail reflects CURRENT behavior, not a lifetime estimate diluted
+        toward early fast calls on a long run. 0.0 when no samples yet. O(1) —
+        the sort work moved to RECORD time (``_append_latency`` delta cache),
+        so every get_summary() poll is cheap. Caller is expected to hold the
+        collector's guard lock (same contract as ``record()`` /
+        ``recent_failure_rate``) since this reads shared state without its own
+        lock.
         """
-        return _percentile(self._latency_samples, pct)
+        return _percentiles_from_sorted(self._latency_sorted, (pct,))[0]
 
     def percentiles(self, pcts: tuple[float, ...]) -> tuple[float, ...]:
-        """Multi-percentile read over the RECENT-latency window from a SINGLE sort.
+        """Multi-percentile read over the RECENT-latency window.
 
         Same semantics as ``percentile`` (raw stored units — tool latency is
         stored in SECONDS; ``get_summary`` converts to ms at emit, matching the
-        avg/min/max keys) but computes every requested pct from one ``sorted()``
-        snapshot instead of one sort per pct. Used by ``get_summary()`` to read
-        p50+p95 together; same lock contract as ``percentile`` (caller holds the
-        collector's guard lock).
+        avg/min/max keys). Computes every requested pct from the
+        ``_latency_sorted`` delta-cache mirror — O(len(pcts)) with O(1) per pct,
+        no sort. Used by ``get_summary()`` to read p50+p95 together; same lock
+        contract as ``percentile`` (caller holds the collector's guard lock).
         """
-        return _percentiles(self._latency_samples, pcts)
+        return _percentiles_from_sorted(self._latency_sorted, pcts)
 
 
 @dataclass
@@ -339,6 +380,10 @@ class LLMMetrics:
     _latency_samples: deque = field(
         default_factory=lambda: deque(maxlen=_threshold_config.scores.LATENCY_SAMPLE_WINDOW)
     )
+    # Sorted mirror of ``_latency_samples`` — symmetric with ToolMetrics's
+    # p50/p95 delta cache (``_append_latency`` keeps it in lockstep at record
+    # time; percentile reads are O(1) per provider per get_summary() poll).
+    _latency_sorted: list = field(default_factory=list)
 
     @property
     def latency_samples_count(self) -> int:
@@ -373,24 +418,92 @@ class LLMMetrics:
         """Linear-interpolated percentile over the RECENT-latency window.
 
         Mirrors ``ToolMetrics.percentile``: 50 → median, 95 → p95 tail; reads the
-        bounded sliding window so the tail reflects CURRENT provider latency, not
-        a lifetime estimate diluted toward early fast calls. 0.0 when no calls
-        yet. Caller holds the collector's guard lock (same contract as
-        ``record_llm_call``).
+        ``_latency_sorted`` delta-cache mirror so the tail reflects CURRENT
+        provider latency, not a lifetime estimate diluted toward early fast
+        calls. 0.0 when no calls yet. O(1). Caller holds the collector's guard
+        lock (same contract as ``record_llm_call``).
         """
-        return _percentile(self._latency_samples, pct)
+        return _percentiles_from_sorted(self._latency_sorted, (pct,))[0]
 
     def percentiles(self, pcts: tuple[float, ...]) -> tuple[float, ...]:
-        """Multi-percentile read over the RECENT-latency window from a SINGLE sort.
+        """Multi-percentile read over the RECENT-latency window.
 
         Same semantics as ``percentile`` (raw stored units — LLM latency is
         already in MILLISECONDS, so ``get_summary`` emits these as-is for the
-        p50_ms/p95_ms keys) but computes every requested pct from one ``sorted()``
-        snapshot instead of one sort per pct. Used by ``get_summary()`` to read
-        p50+p95 together; same lock contract as ``percentile`` (caller holds the
-        collector's guard lock).
+        p50_ms/p95_ms keys). Computes every requested pct from the
+        ``_latency_sorted`` delta-cache mirror — O(len(pcts)) with O(1) per pct,
+        no sort. Used by ``get_summary()`` to read p50+p95 together; same lock
+        contract as ``percentile`` (caller holds the collector's guard lock).
         """
-        return _percentiles(self._latency_samples, pcts)
+        return _percentiles_from_sorted(self._latency_sorted, pcts)
+
+
+@dataclass
+class AgentResultMetrics:
+    """Turn-outcome metrics for agent runs.
+
+    Mirrors ``ToolMetrics``/``LLMMetrics``: cumulative counters plus a bounded
+    recent-outcomes window (``TOOL_FAILURE_RATE_WINDOW``), so both the
+    cumulative and the live-health reads come from one source. Constant memory.
+
+    This is the ONLY channel that can surface **truncation storms**: when a
+    turn's LLM response exhausts its max_tokens budget after retries
+    (``finish_reason`` in ``("length", "truncated")`` 3x — agent_loop clears
+    the tool calls and continues with the partial text), the LLM call itself
+    "succeeded", so ``record_llm_call`` never sees ``failed=True`` and
+    ``llm_metrics`` reads healthy. ``truncated_turns`` counts those events so
+    a run being silently cut off shows up in the metrics instead of reading
+    as normal traffic.
+    """
+    turns: int = 0
+    failed_turns: int = 0
+    truncated_turns: int = 0
+    total_time_ms: float = 0.0
+    # Bounded recent-outcome window, symmetric with ToolMetrics._recent_outcomes
+    # — same live-health rationale (the cumulative failed_turns/turns rate is
+    # diluted over a long run). 3-value encoding: a truncated turn must NOT read
+    # as success in the live window (that bug made truncation storms invisible
+    # to recent_failure_rate while cumulative truncation_rate climbed).
+    _OUTCOME_SUCCESS = 0
+    _OUTCOME_FAILED = 1
+    _OUTCOME_TRUNCATED = 2
+    _recent_outcomes: deque = field(
+        default_factory=lambda: deque(maxlen=_threshold_config.scores.TOOL_FAILURE_RATE_WINDOW)
+    )
+
+    @property
+    def failure_rate(self) -> float:
+        return self.failed_turns / self.turns if self.turns > 0 else 0.0
+
+    @property
+    def truncation_rate(self) -> float:
+        return self.truncated_turns / self.turns if self.turns > 0 else 0.0
+
+    @property
+    def avg_time_ms(self) -> float:
+        return self.total_time_ms / self.turns if self.turns > 0 else 0.0
+
+    @property
+    def recent_turns(self) -> int:
+        return len(self._recent_outcomes)
+
+    @property
+    def recent_failed_turns(self) -> int:
+        return sum(1 for o in self._recent_outcomes if o == self._OUTCOME_FAILED)
+
+    @property
+    def recent_failure_rate(self) -> float:
+        n = len(self._recent_outcomes)
+        return self.recent_failed_turns / n if n > 0 else 0.0
+
+    @property
+    def recent_truncated_turns(self) -> int:
+        return sum(1 for o in self._recent_outcomes if o == self._OUTCOME_TRUNCATED)
+
+    @property
+    def recent_truncation_rate(self) -> float:
+        n = len(self._recent_outcomes)
+        return self.recent_truncated_turns / n if n > 0 else 0.0
 
 
 class PerformanceCollector:
@@ -425,6 +538,10 @@ class PerformanceCollector:
         self.rag_searches: int = 0
         self.rag_search_time_ms: float = 0
 
+        # Turn-level agent result metrics — the ONLY channel that can surface
+        # truncation storms (see record_agent_result / AgentResultMetrics).
+        self.agent_result_metrics = AgentResultMetrics()
+
         # Optional live references to registered ToolResultCache(s), wired up via
         # register_tool_result_cache() so their hit/miss/size stats surface in
         # get_summary() — each cache tracks its own stats internally (get_stats(),
@@ -439,7 +556,7 @@ class PerformanceCollector:
     def register_tool_result_cache(self, cache: Optional[Any]) -> None:
         """Wire up a ToolResultCache instance so its stats appear in get_summary().
 
-        Each clone (clone_for_subagent / clone_with_filter) gets its own isolated
+        Each clone (clone_for_subagent) gets its own isolated
         cache and registers it here; get_summary() aggregates stats across ALL
         live registered caches. Held by WeakSet so a collected clone's cache
         vanishes automatically — no leak, and a short-lived clone no longer masks
@@ -573,10 +690,54 @@ class PerformanceCollector:
             # feeds avg_time_ms_per_call) still records every call's time so a
             # fully-failing provider keeps avg_time_ms_per_call honest.
             if not failed:
-                m._latency_samples.append(execution_time_ms)
+                _append_latency(m._latency_samples, m._latency_sorted, execution_time_ms)
 
             if failed:
                 m.failures += 1
+
+    def record_agent_result(self, failed: bool = False, execution_time_ms: float = 0.0,
+                            truncated: bool = False) -> None:
+        """Record the outcome of an agent turn.
+
+        The turn-level result channel. Unlike :meth:`record_llm_call` /
+        :meth:`record_tool_call` (which see every call, successful or not),
+        this is an OUTCOME-EVENT channel: production wires it at the points
+        where a turn ends abnormally or is visibly degraded —
+
+        * ``truncated=True`` — the turn's LLM response exhausted its retry
+          budget (``finish_reason`` ``length``/``truncated`` 3x; agent_loop
+          cleared the tool calls and continued with partial text). The LLM
+          call itself succeeded, so no other channel ever sees this — without
+          this flag a truncation storm reads as perfectly healthy traffic.
+        * ``failed=True`` — the turn terminated with an LLM error
+          (connection / rate-limit / auth / server-unavailable / quota).
+
+        ``turns`` counts recorded outcome events (successful turns are not
+        recorded by default), so ``failure_rate`` / ``truncation_rate`` read
+        as "share of recorded outcomes" — the recent window mirrors the
+        tool/LLM live-health pattern, with a 3-value encoding so truncated
+        turns are counted as degraded (not success) in the live window.
+
+        Thread-safe (guarded by ``self._lock``, same contract as
+        :meth:`record_tool_call`).
+        """
+        with self._lock:
+            _arm = self.agent_result_metrics
+            _arm.turns += 1
+            _arm.total_time_ms += execution_time_ms
+            if failed:
+                _arm.failed_turns += 1
+            if truncated:
+                _arm.truncated_turns += 1
+            # 3-value window encoding — truncated takes precedence over failed
+            # (production wiring sites are mutually exclusive: truncation fires
+            # only when the LLM call itself succeeded).
+            _outcome = (
+                AgentResultMetrics._OUTCOME_TRUNCATED if truncated
+                else AgentResultMetrics._OUTCOME_FAILED if failed
+                else AgentResultMetrics._OUTCOME_SUCCESS
+            )
+            _arm._recent_outcomes.append(_outcome)
 
     def record_rag_search(self, search_time_ms: float):
         """Record a RAG search operation"""
@@ -608,19 +769,20 @@ class PerformanceCollector:
         # mutations. The old code read metrics.avg_execution_time /
         # metrics.cache_hit_rate (properties over mutable fields) OUTSIDE the
         # lock, a torn read (statistics-only distortion, no crash). The
-        # computation here includes one sorted() snapshot per tool / per provider
-        # (percentiles on the bounded sliding window, max LATENCY_SAMPLE_WINDOW=128
-        # elements), so it's O(K log K) per entity, not O(calls). Still bounded by
-        # the number of DISTINCT entities (small), and avoids a lock-release storm
-        # under concurrent tool calls — holding the lock for the loop is cheaper
-        # than per-cache get_stats() calls (those run outside, below).
+        # computation here is O(1) per entity — p50/p95 come from the per-tool /
+        # per-provider ``_latency_sorted`` delta-cache mirrors (updated at RECORD
+        # time by ``_append_latency``; max LATENCY_SAMPLE_WINDOW=128 elements),
+        # NOT from a sort per poll. Still bounded by the number of DISTINCT
+        # entities (small), and avoids a lock-release storm under concurrent
+        # tool calls — holding the lock for the loop is cheaper than per-cache
+        # get_stats() calls (those run outside, below).
         with self._lock:
             tool_summary = {}
             for _name, _m in self.tool_metrics.items():
                 _calls = _m.total_calls
                 _cm_total = _m.cache_hits + _m.cache_misses
-                # Both percentiles from ONE sorted() snapshot (seconds internally,
-                # → converted to ms at emit below, matching avg/min/max keys).
+                # O(1) delta-cache read (seconds internally, → converted to ms
+                # at emit below, matching avg/min/max keys).
                 _t_p50, _t_p95 = _m.percentiles((50, 95))
                 tool_summary[_name] = {
                     'call_count': _calls,
@@ -692,9 +854,9 @@ class PerformanceCollector:
                 _agg_rc += _rc
                 _agg_rf += _rf
 
-                # Both percentiles from ONE sorted() snapshot. LLM latency is
-                # stored in MILLISECONDS (record_llm_call receives execution_time_ms),
-                # so these emit as-is for p50_ms/p95_ms — no unit conversion.
+                # O(1) delta-cache read. LLM latency is stored in MILLISECONDS
+                # (record_llm_call receives execution_time_ms), so these emit
+                # as-is for p50_ms/p95_ms — no unit conversion.
                 _lp_p50, _lp_p95 = _lm.percentiles((50, 95))
                 llm_provider_summary[_prov] = {
                     'calls': _lc,
@@ -727,6 +889,25 @@ class PerformanceCollector:
             rag_searches = self.rag_searches
             rag_time_ms = self.rag_search_time_ms
 
+            # Turn-level agent result channel — the ONLY place truncation
+            # storms surface (see record_agent_result). Snapshot under the same
+            # lock as the tool/llm channels for consistency.
+            _arm = self.agent_result_metrics
+            agent_result_summary = {
+                'turns': _arm.turns,
+                'failed_turns': _arm.failed_turns,
+                'truncated_turns': _arm.truncated_turns,
+                'failure_rate': _arm.failure_rate,
+                'truncation_rate': _arm.truncation_rate,
+                'avg_time_ms': _arm.avg_time_ms,
+                'total_time_ms': _arm.total_time_ms,
+                'recent_turns': _arm.recent_turns,
+                'recent_failed_turns': _arm.recent_failed_turns,
+                'recent_failure_rate': _arm.recent_failure_rate,
+                'recent_truncated_turns': _arm.recent_truncated_turns,
+                'recent_truncation_rate': _arm.recent_truncation_rate,
+            }
+
         # Get cache metrics from CacheHitRateMetrics (independently locked)
         cache_stats = self.cache_metrics.get_all_stats()
 
@@ -750,6 +931,7 @@ class PerformanceCollector:
             try:
                 _s = _cache.get_stats()
             except Exception:
+                logger.debug("cache stats failed", exc_info=True)
                 continue
             if not _s:
                 continue
@@ -901,7 +1083,11 @@ class PerformanceCollector:
                 'searches': rag_searches,
                 'total_search_time_ms': rag_time_ms,
                 'avg_search_time_ms': avg_rag_search_time
-            }
+            },
+
+            # Turn-level agent outcome channel — see record_agent_result. All
+            # zeros until the first outcome event is recorded.
+            'agent_result': agent_result_summary,
         }
 
 
@@ -913,6 +1099,94 @@ class PerformanceCollector:
 # the embedded ``failing_tools`` summary key); ``warn_failing_tools`` is the
 # deduped server-side warning the SSE broadcaster emits so operators see a
 # degraded tool without opening the dashboard.
+
+
+def _top_by_metric(
+    entries, *, derive, sort_key, top_n=None
+) -> list[dict]:
+    """Shared skeleton of the top_* pure derivations: derive → sort → cap.
+
+    *entries*: iterable of ``(name, metrics_dict)`` pairs (``.items()`` of a
+    summary section). *derive*: ``(name, m) -> dict | None`` — returns the
+    output entry when *m* trips its gate, else ``None``. *sort_key*:
+    ``(entry) -> tuple`` for the deterministic sort (gate rate first, then raw
+    count, then name). *top_n*: result cap (``None`` = unbounded, used by
+    ``top_failing_llm`` where the provider space is naturally bounded).
+
+    The ``isinstance(m, dict)`` guard lives here for every derivation: a
+    malformed summary entry must be skipped, not crash the SSE poll — this
+    also closes the parity gap where the llm variants used to lack the guard
+    their tool siblings had.
+    """
+    out: list[dict] = []
+    for name, m in entries:
+        if not isinstance(m, dict):
+            continue
+        entry = derive(name, m)
+        if entry is not None:
+            out.append(entry)
+    out.sort(key=sort_key)
+    return out[:top_n] if top_n is not None else out
+
+
+def _derive_failing(
+    name, m, threshold: float, min_calls: int, total_key: str
+) -> dict | None:
+    """Gate + build for the failing-* derivations.
+
+    *total_key* is the cumulative-count key — ``"total_calls"`` (tool
+    summary) or ``"calls"`` (provider summary) — used both for the
+    ``min_calls`` floor and as the output key.
+    """
+    calls = m.get(total_key, 0)
+    if calls < min_calls:
+        return None
+    failures = m.get("failures", 0)
+    if failures <= 0:
+        return None
+    # THE gate: recent_failure_rate over the sliding window. Fall back to the
+    # cumulative rate only when the summary predates the recent field (older
+    # snapshot) so this stays callable against a minimal dict.
+    recent_rate = m.get("recent_failure_rate")
+    if recent_rate is None:
+        recent_rate = failures / calls if calls else 0.0
+    if recent_rate < threshold:
+        return None
+    return {
+        "name": name,
+        "failures": failures,
+        total_key: calls,
+        # Cumulative rate — kept for display context ("how bad overall").
+        "failure_rate": m.get("failure_rate", (failures / calls if calls else 0.0)),
+        "recent_calls": m.get("recent_calls", 0),
+        "recent_failures": m.get("recent_failures", 0),
+        # The live rate that tripped the gate.
+        "recent_failure_rate": recent_rate,
+    }
+
+
+def _derive_slow(
+    name, m, threshold_ms: float, min_samples: int, count_key: str
+) -> dict | None:
+    """Gate + build for the slow-* derivations.
+
+    *count_key* is the sample-count output key — ``"call_count"`` (tool
+    summary) or ``"calls"`` (provider summary).
+    """
+    p95 = m.get("p95_ms")
+    if p95 is None or p95 < threshold_ms:
+        return None
+    # Enforce min-samples floor: too few successful latency samples make p95
+    # unreliable — a single slow first call should not trip the gate.
+    # Symmetric with the failing derivations' min_calls guard.
+    if m.get("p95_n", 0) < min_samples:
+        return None
+    return {
+        "name": name,
+        "p50_ms": m.get("p50_ms", 0.0),
+        "p95_ms": p95,
+        count_key: m.get(count_key, 0),
+    }
 
 
 def top_failing_tools(
@@ -947,40 +1221,12 @@ def top_failing_tools(
     ``recent_calls ≥ min_calls`` samples, so no separate recent-sample knob is
     needed. ``threshold`` is the health gate (config.scores.TOOL_FAILURE_RATE_WARN).
     """
-    out: list[dict] = []
-    for name, m in tool_metrics.items():
-        if not isinstance(m, dict):
-            continue
-        calls = m.get("total_calls", 0)
-        if calls < min_calls:
-            continue
-        failures = m.get("failures", 0)
-        if failures <= 0:
-            continue
-        # THE gate: recent_failure_rate over the sliding window. Fall back to the
-        # cumulative rate only when the summary predates the recent field (older
-        # snapshot) so this stays callable against a minimal dict.
-        recent_rate = m.get("recent_failure_rate")
-        if recent_rate is None:
-            recent_rate = failures / calls if calls else 0.0
-        if recent_rate < threshold:
-            continue
-        out.append({
-            "name": name,
-            "failures": failures,
-            "total_calls": calls,
-            # Cumulative rate — kept for display context ("how bad overall").
-            "failure_rate": m.get("failure_rate", (failures / calls if calls else 0.0)),
-            "recent_calls": m.get("recent_calls", 0),
-            "recent_failures": m.get("recent_failures", 0),
-            # The live rate that tripped the gate.
-            "recent_failure_rate": recent_rate,
-        })
-    # Sort by the GATE rate (recent) first — the most currently-degraded tool
-    # surfaces on top; ties broken by raw failure count, then name for
-    # determinism (stable across summary recomputations).
-    out.sort(key=lambda t: (-t["recent_failure_rate"], -t["failures"], t["name"]))
-    return out[:top_n]
+    return _top_by_metric(
+        tool_metrics.items(),
+        derive=lambda name, m: _derive_failing(name, m, threshold, min_calls, "total_calls"),
+        sort_key=lambda t: (-t["recent_failure_rate"], -t["failures"], t["name"]),
+        top_n=top_n,
+    )
 
 
 def top_failing_llm(
@@ -1008,34 +1254,13 @@ def top_failing_llm(
     then name for determinism). No collector instance required — callable from tests /
     per-turn summary / self-improve.
     """
-    out = []
-    for _prov, s in (provider_summary or {}).items():
-        calls = s.get("calls", 0)
-        if calls < min_calls:
-            continue
-        failures = s.get("failures", 0)
-        if failures <= 0:
-            continue
-        # THE gate: recent_failure_rate over the sliding window. Fall back to the
-        # cumulative rate only when the summary predates the recent field.
-        recent_rate = s.get("recent_failure_rate")
-        if recent_rate is None:
-            recent_rate = failures / calls if calls else 0.0
-        if recent_rate < threshold:
-            continue
-        out.append({
-            "name": _prov,
-            "calls": calls,
-            "failures": failures,
-            # Cumulative rate — kept for display context.
-            "failure_rate": s.get("failure_rate", (failures / calls if calls else 0.0)),
-            "recent_calls": s.get("recent_calls", 0),
-            "recent_failures": s.get("recent_failures", 0),
-            # The live rate that tripped the gate.
-            "recent_failure_rate": recent_rate,
-        })
-    out.sort(key=lambda t: (-t["recent_failure_rate"], -t["failures"], t["name"]))
-    return out
+    # No top_n: the provider space is naturally bounded, so every degraded
+    # provider surfaces (the tool side caps at top_n for the dashboard card).
+    return _top_by_metric(
+        (provider_summary or {}).items(),
+        derive=lambda name, m: _derive_failing(name, m, threshold, min_calls, "calls"),
+        sort_key=lambda t: (-t["recent_failure_rate"], -t["failures"], t["name"]),
+    )
 
 
 # ── p95 latency consumers ───────────────────────────────────────────────────
@@ -1070,27 +1295,12 @@ def top_slow_tools(
     Default threshold is ``TOOL_LATENCY_P95_WARN_MS`` (5s). ``top_n`` limits the
     list to the worst offenders (dashboard card shows top 3).
     """
-    out: list[dict] = []
-    for name, m in tool_metrics.items():
-        if not isinstance(m, dict):
-            continue
-        p95 = m.get("p95_ms")
-        if p95 is None or p95 < threshold_ms:
-            continue
-        # Enforce min-samples floor: a tool with too few successful latency
-        # samples has an unreliable p95 — a single slow first call should not
-        # trip the gate. Symmetric with top_failing_tools() min_calls guard.
-        n = m.get("p95_n", 0)
-        if n < min_samples:
-            continue
-        out.append({
-            "name": name,
-            "p50_ms": m.get("p50_ms", 0.0),
-            "p95_ms": p95,
-            "call_count": m.get("call_count", 0),
-        })
-    out.sort(key=lambda t: (-t["p95_ms"], -t["call_count"], t["name"]))
-    return out[:top_n]
+    return _top_by_metric(
+        tool_metrics.items(),
+        derive=lambda name, m: _derive_slow(name, m, threshold_ms, min_samples, "call_count"),
+        sort_key=lambda t: (-t["p95_ms"], -t["call_count"], t["name"]),
+        top_n=top_n,
+    )
 
 
 def top_slow_llm(
@@ -1112,221 +1322,209 @@ def top_slow_llm(
     single slow call from tripping a false "degraded" warning. Default threshold
     is ``LLM_LATENCY_P95_WARN_MS`` (30s).
     """
-    out: list[dict] = []
-    for _prov, s in (provider_summary or {}).items():
-        p95 = s.get("p95_ms")
-        if p95 is None or p95 < threshold_ms:
-            continue
-        n = s.get("p95_n", 0)
-        if n < min_samples:
-            continue
-        out.append({
-            "name": _prov,
-            "p50_ms": s.get("p50_ms", 0.0),
-            "p95_ms": p95,
-            "calls": s.get("calls", 0),
-        })
-    out.sort(key=lambda t: (-t["p95_ms"], -t["calls"], t["name"]))
-    return out[:top_n]
+    return _top_by_metric(
+        (provider_summary or {}).items(),
+        derive=lambda name, m: _derive_slow(name, m, threshold_ms, min_samples, "calls"),
+        sort_key=lambda t: (-t["p95_ms"], -t["calls"], t["name"]),
+        top_n=top_n,
+    )
 
 
-# Module-level dedup state for warn_failing_tools(). The SSE broadcaster polls
-# get_summary() every 2s; without dedup the same degraded tool would log every
-# tick. A tool is warned ONCE per "failing streak": it re-arms (becomes
-# warnable again) the moment it drops out of the failing set, so a later
-# regression re-warns. Guarded so concurrent broadcasters (there is only one,
-# but the lock keeps the contract honest) don't double-log.
-_warned_failing_tools: set[str] = set()
-_warned_failing_tools_lock = threading.Lock()
+# ── deduped warn gates ───────────────────────────────────────────────────────
+# Shared machinery for warn_failing_tools/llm and warn_slow_tools/llm. The SSE
+# broadcaster polls get_summary() every 2s; without dedup the same degraded
+# tool/provider would log every tick. Each gate owns ONE _WarnDedup instance, so
+# a tool regression, an LLM regression, a slow tool and a slow provider are four
+# independent operator signals (separate re-arm bookkeeping).
+
+class _WarnDedup:
+    """Dedup + re-arm machinery shared by the warn_* log gates.
+
+    Re-arm semantics: ``warn()`` rebuilds the warned set from the CURRENT entry
+    set each call, so an entry that recovers (leaves the set) becomes warnable
+    again — a later regression re-warns rather than being silently suppressed.
+    The lock keeps the read-modify-write atomic for concurrent broadcasters
+    (there is only one, but the lock keeps the contract honest).
+    """
+
+    __slots__ = ("lock", "warned")
+
+    def __init__(self) -> None:
+        self.warned: set[str] = set()
+        self.lock = threading.Lock()
+
+    def reset(self) -> None:
+        """Clear the warn-dedup set (test-only: gives each test a clean slate)."""
+        with self.lock:
+            self.warned.clear()
+
+    def warn(
+        self,
+        entries: list[dict],
+        formatter: Callable[[dict], str],
+        log: Callable[[str], None],
+    ) -> int:
+        """Log once per named entry in ``entries`` that is new this streak.
+
+        Returns the count of newly-warned entries (0 when nothing new).
+        ``formatter(entry)`` is called ONLY for newly-warned entries and must
+        return a single pre-formatted ``str`` (NOT printf-style ``*args``);
+        ``log`` receives that ``str``, so any ``(str) -> None`` callable works
+        (``logger.warning``, ``list.append``, …).
+        """
+        current = {t.get("name") for t in entries if t.get("name")}
+        with self.lock:
+            newly = current - self.warned
+            # Rebuild from current: entries no longer present drop out (re-arm);
+            # entries still present stay (suppressed). The whole dedup in one line.
+            self.warned.clear()
+            self.warned.update(current)
+        for t in entries:
+            if t.get("name") in newly:
+                log(formatter(t))
+        return len(newly)
+
+
+# One gate per operator signal — a tool failure, an LLM failure, a slow tool and
+# a slow LLM provider are distinct signals and must not share re-arm bookkeeping.
+# Single-consumer contract: the SSE broadcaster (webapp/routes/stats.py) is the
+# SOLE caller of the warn_* functions; logic consumers read the pure top_* /
+# summary derivations directly.
+_warned_failing_tools = _WarnDedup()
+_warned_failing_llm = _WarnDedup()
+_warned_slow_tools = _WarnDedup()
+_warned_slow_llm = _WarnDedup()
 
 
 def _reset_warned_failing_tools() -> None:
     """Clear the warn-dedup set (test-only: gives each test a clean slate)."""
-    with _warned_failing_tools_lock:
-        _warned_failing_tools.clear()
+    _warned_failing_tools.reset()
+
+
+def _reset_warned_failing_llm() -> None:
+    """Clear the warn-dedup set (test-only: gives each test a clean slate)."""
+    _warned_failing_llm.reset()
+
+
+def _reset_warned_slow_tools() -> None:
+    """Clear the slow-tool warn-dedup set (test-only)."""
+    _warned_slow_tools.reset()
+
+
+def _reset_warned_slow_llm() -> None:
+    """Clear the slow-llm warn-dedup set (test-only)."""
+    _warned_slow_llm.reset()
+
+
+def _fmt_failing(entry_kind: str, total_key: str, t: dict) -> str:
+    """Format a failing entry: the RECENT rate (what tripped the gate) plus
+    the windowed count, so the operator sees CURRENT health, not a diluted
+    lifetime average. Falls back to the cumulative rate/total for an older
+    summary snapshot lacking the recent fields.
+
+    *entry_kind* is the display label (``"tool"`` / ``"LLM provider"``) and
+    *total_key* the cumulative-count key (``"total_calls"`` for the tool
+    summary, ``"calls"`` for the provider summary).
+    """
+    rate = t.get("recent_failure_rate")
+    if rate is None:
+        rate = t.get("failure_rate", 0.0)
+        rfail = t.get("failures", 0)
+        rtot = t.get(total_key, 0)
+    else:
+        rfail = t.get("recent_failures", t.get("failures", 0))
+        rtot = t.get("recent_calls", t.get(total_key, 0))
+    return (
+        f"{entry_kind} '{t.get('name')}' recent failure_rate "
+        f"{rate * 100.0:.0f}% ({rfail}/{rtot} recent calls) exceeds health threshold"
+    )
+
+
+def _fmt_failing_tool(t: dict) -> str:
+    """Format a failing-tool entry (see :func:`_fmt_failing`)."""
+    return _fmt_failing("tool", "total_calls", t)
 
 
 def warn_failing_tools(summary: dict, *, log=logger.warning) -> int:
     """Emit a deduped ``warning`` log for each tool in
     ``summary['failing_tools']`` not yet warned this failing streak.
 
-    Returns the count of newly-warned tools (0 when nothing new). ``log`` is
-    injectable so tests can capture without touching the root logger; it
-    receives a single pre-formatted ``str`` (NOT printf-style ``*args``), so any
-    ``(str) -> None`` callable works (``logger.warning``, ``list.append``, …).
-
-    Re-arm semantics: the dedup set is rebuilt from the CURRENT failing set each
-    call, so a tool that recovers (leaves the set) becomes warnable again — a
-    subsequent regression re-warns rather than being silently suppressed.
-
-    Single-consumer contract: the dedup state is ONE module-global set, so this
-    function is intended for the SSE broadcaster ONLY. A second caller with a
-    different summary would overwrite the re-arm bookkeeping. Logic consumers
-    (self-improve orchestrator, per-turn summary, tests) must read the PURE
+    Returns the count of newly-warned tools (0 when nothing new). Dedup +
+    re-arm machinery is shared (see ``_WarnDedup``). Single-consumer contract:
+    intended for the SSE broadcaster ONLY; logic consumers (self-improve
+    orchestrator, per-turn summary, tests) must read the PURE
     ``top_failing_tools()`` derivation (or ``summary['failing_tools']``) directly —
     those carry no state and are safe to call from anywhere.
     """
-    failing = summary.get("failing_tools") or []
-    current = {t.get("name") for t in failing if t.get("name")}
-    with _warned_failing_tools_lock:
-        newly = current - _warned_failing_tools
-        # Rebuild from current: tools no longer failing drop out (re-arm); tools
-        # still failing stay (suppressed). This is the whole dedup in one line.
-        _warned_failing_tools.clear()
-        _warned_failing_tools.update(current)
-    for t in failing:
-        name = t.get("name")
-        if name in newly:
-            # Report the RECENT rate (what tripped the gate) plus the windowed
-            # count, so the operator sees CURRENT health, not a diluted lifetime
-            # average. Falls back to the cumulative rate/total for an older
-            # summary snapshot lacking the recent fields.
-            _rate = t.get("recent_failure_rate")
-            if _rate is None:
-                _rate = t.get("failure_rate", 0.0)
-                _rfail = t.get("failures", 0)
-                _rtot = t.get("total_calls", 0)
-            else:
-                _rfail = t.get("recent_failures", t.get("failures", 0))
-                _rtot = t.get("recent_calls", t.get("total_calls", 0))
-            log(
-                "tool '%s' recent failure_rate %.0f%% (%d/%d recent calls) exceeds health threshold"
-                % (name, _rate * 100.0, _rfail, _rtot)
-            )
-    return len(newly)
+    return _warned_failing_tools.warn(
+        summary.get("failing_tools") or [], _fmt_failing_tool, log
+    )
 
 
-# Module-level dedup state for warn_failing_llm(). Symmetric with the tool dedup set
-# above but SEPARATE — a tool regression and an LLM provider regression are distinct
-# operator signals and must not share re-arm bookkeeping. Same single-consumer
-# contract (the SSE broadcaster is the sole caller).
-_warned_failing_llm: set[str] = set()
-_warned_failing_llm_lock = threading.Lock()
-
-
-def _reset_warned_failing_llm() -> None:
-    """Clear the warn-dedup set (test-only: gives each test a clean slate)."""
-    with _warned_failing_llm_lock:
-        _warned_failing_llm.clear()
+def _fmt_failing_llm(t: dict) -> str:
+    """Format a failing-LLM entry (see :func:`_fmt_failing`)."""
+    return _fmt_failing("LLM provider", "calls", t)
 
 
 def warn_failing_llm(summary: dict, *, log=logger.warning) -> int:
-    """Emit a deduped ``warning`` log when the LLM provider enters
+    """Emit a deduped ``warning`` log when an LLM provider enters
     ``summary['failing_llm']`` (its recent_failure_rate tripped the gate).
 
-    Symmetric with ``warn_failing_tools``: same dedup + re-arm machinery, a SEPARATE
-    dedup set (see above), and a provider-appropriate message. Returns the count of
-    newly-warned entries (0 or more, per-provider). ``log`` is injectable (receives a single
-    pre-formatted ``str``, same contract as the tool variant) so tests capture without
-    the root logger.
-
-    Re-arm semantics: the dedup set is rebuilt from the CURRENT failing set each call,
-    so a provider that recovers becomes warnable again — a later regression re-warns
-    rather than being silently suppressed. Single-consumer: intended for the SSE
-    broadcaster ONLY; logic consumers read ``summary['failing_llm']`` directly.
+    Symmetric with ``warn_failing_tools``: same shared dedup + re-arm machinery
+    (see ``_WarnDedup``), a SEPARATE dedup gate, and a provider-appropriate
+    message. Returns the count of newly-warned providers (0 or more,
+    per-provider). Single-consumer: intended for the SSE broadcaster ONLY; logic
+    consumers read ``summary['failing_llm']`` directly.
     """
-    failing = summary.get("failing_llm") or []
-    current = {t.get("name") for t in failing if t.get("name")}
-    with _warned_failing_llm_lock:
-        newly = current - _warned_failing_llm
-        # Rebuild from current (re-arm on recovery) — the whole dedup in one line.
-        _warned_failing_llm.clear()
-        _warned_failing_llm.update(current)
-    for t in failing:
-        name = t.get("name")
-        if name in newly:
-            _rate = t.get("recent_failure_rate")
-            if _rate is None:
-                _rate = t.get("failure_rate", 0.0)
-                _rfail = t.get("failures", 0)
-                _rtot = t.get("calls", 0)
-            else:
-                _rfail = t.get("recent_failures", t.get("failures", 0))
-                _rtot = t.get("recent_calls", t.get("calls", 0))
-            log(
-                "LLM provider '%s' recent failure_rate %.0f%% (%d/%d recent calls) exceeds health threshold"
-                % (name, _rate * 100.0, _rfail, _rtot)
-            )
-    return len(newly)
+    return _warned_failing_llm.warn(
+        summary.get("failing_llm") or [], _fmt_failing_llm, log
+    )
 
 
-# ── p95 latency warn gates ──────────────────────────────────────────────────
-# Symmetric dedup state + log gates for SLOW (high p95) tools and LLM providers.
-# Separate dedup sets from the failure gates above — a tool can be both failing
-# and slow simultaneously (two independent operator signals).
-
-_warned_slow_tools: set[str] = set()
-_warned_slow_tools_lock = threading.Lock()
-
-
-def _reset_warned_slow_tools() -> None:
-    """Clear the slow-tool warn-dedup set (test-only)."""
-    with _warned_slow_tools_lock:
-        _warned_slow_tools.clear()
+def _fmt_slow_tool(t: dict) -> str:
+    """Format a slow-tool entry (p95/p50 latency pair)."""
+    return (
+        f"tool '{t.get('name')}' p95 latency {t.get('p95_ms', 0.0):.0f}ms "
+        f"(p50={t.get('p50_ms', 0.0):.0f}ms) exceeds slow-tool threshold"
+    )
 
 
 def warn_slow_tools(summary: dict, *, log=logger.warning) -> int:
     """Emit a deduped ``warning`` log for each tool in
     ``summary['slow_tools']`` not yet warned this slow streak.
 
-    Same dedup + re-arm semantics as ``warn_failing_tools``: a tool is warned
-    ONCE per slow streak; recovery (dropping out of the list) re-arms it so a
-    later regression re-warns. Single-consumer contract (SSE broadcaster ONLY).
-    Returns the count of newly-warned tools. ``log`` receives a single
-    pre-formatted ``str``.
+    Same dedup + re-arm semantics as ``warn_failing_tools`` (shared machinery,
+    see ``_WarnDedup``): a tool is warned ONCE per slow streak; recovery
+    (dropping out of the list) re-arms it so a later regression re-warns.
+    Single-consumer contract (SSE broadcaster ONLY). Returns the count of
+    newly-warned tools.
     """
-    slow = summary.get("slow_tools") or []
-    current = {t.get("name") for t in slow if t.get("name")}
-    with _warned_slow_tools_lock:
-        newly = current - _warned_slow_tools
-        _warned_slow_tools.clear()
-        _warned_slow_tools.update(current)
-    for t in slow:
-        name = t.get("name")
-        if name in newly:
-            _p95 = t.get("p95_ms", 0.0)
-            _p50 = t.get("p50_ms", 0.0)
-            log(
-                "tool '%s' p95 latency %.0fms (p50=%.0fms) exceeds slow-tool threshold"
-                % (name, _p95, _p50)
-            )
-    return len(newly)
+    return _warned_slow_tools.warn(
+        summary.get("slow_tools") or [], _fmt_slow_tool, log
+    )
 
 
-_warned_slow_llm: set[str] = set()
-_warned_slow_llm_lock = threading.Lock()
-
-
-def _reset_warned_slow_llm() -> None:
-    """Clear the slow-llm warn-dedup set (test-only)."""
-    with _warned_slow_llm_lock:
-        _warned_slow_llm.clear()
+def _fmt_slow_llm(t: dict) -> str:
+    """Format a slow-LLM entry (p95/p50 latency pair)."""
+    return (
+        f"LLM provider '{t.get('name')}' p95 latency "
+        f"{t.get('p95_ms', 0.0):.0f}ms (p50={t.get('p50_ms', 0.0):.0f}ms) "
+        "exceeds slow-provider threshold"
+    )
 
 
 def warn_slow_llm(summary: dict, *, log=logger.warning) -> int:
     """Emit a deduped ``warning`` log for each LLM provider in
     ``summary['slow_llm']`` not yet warned this slow streak.
 
-    Symmetric with ``warn_slow_tools``: same dedup + re-arm machinery, a SEPARATE
-    dedup set, and a provider-appropriate message. Single-consumer contract (SSE
-    broadcaster ONLY). Returns the count of newly-warned providers.
+    Symmetric with ``warn_slow_tools``: same shared dedup + re-arm machinery
+    (see ``_WarnDedup``), a SEPARATE dedup gate, and a provider-appropriate
+    message. Single-consumer contract (SSE broadcaster ONLY). Returns the count
+    of newly-warned providers.
     """
-    slow = summary.get("slow_llm") or []
-    current = {t.get("name") for t in slow if t.get("name")}
-    with _warned_slow_llm_lock:
-        newly = current - _warned_slow_llm
-        _warned_slow_llm.clear()
-        _warned_slow_llm.update(current)
-    for t in slow:
-        name = t.get("name")
-        if name in newly:
-            _p95 = t.get("p95_ms", 0.0)
-            _p50 = t.get("p50_ms", 0.0)
-            log(
-                "LLM provider '%s' p95 latency %.0fms (p50=%.0fms) exceeds slow-provider threshold"
-                % (name, _p95, _p50)
-            )
-    return len(newly)
+    return _warned_slow_llm.warn(
+        summary.get("slow_llm") or [], _fmt_slow_llm, log
+    )
 
 
 # Global collector for easy access

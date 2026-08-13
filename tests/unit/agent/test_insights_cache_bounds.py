@@ -30,11 +30,15 @@ import pytest
 from external_llm.agent.insights_manager import (
     _ACTIVE_CONTENT_CACHE,
     _ACTIVE_WRITE_VERSIONS,
+    _ARCHIVE_ANALYZED_CACHE,
     _ARCHIVE_CACHE_MAX_ENTRIES,
     _ARCHIVE_PARSED_CACHE,
     _ARCHIVE_WRITE_VERSIONS,
     _INSIGHTS_THREAD_LOCKS,
     _active_invalidate,
+    _archive_analyzed_cached,
+    _archive_capped_put,
+    _archive_invalidate,
     _parsed_archive_cached,
     append_entries_to_archive,
     atomic_write_text,
@@ -51,6 +55,7 @@ def _clear_module_caches():
     """Isolation: clear all module-level caches before AND after each test."""
     for d in (
         _ARCHIVE_PARSED_CACHE,
+        _ARCHIVE_ANALYZED_CACHE,
         _ARCHIVE_WRITE_VERSIONS,
         _ACTIVE_CONTENT_CACHE,
         _ACTIVE_WRITE_VERSIONS,
@@ -59,6 +64,7 @@ def _clear_module_caches():
     yield
     for d in (
         _ARCHIVE_PARSED_CACHE,
+        _ARCHIVE_ANALYZED_CACHE,
         _ARCHIVE_WRITE_VERSIONS,
         _ACTIVE_CONTENT_CACHE,
         _ACTIVE_WRITE_VERSIONS,
@@ -73,7 +79,7 @@ def _make_repo(tmp_path, name: str) -> str:
 
 
 def _archive_entry(text: str):
-    preamble, entries = parse_insights(f"### [bug] 2025-01-15 10:00\n{text}\n\n")
+    _preamble, entries = parse_insights(f"### [bug] 2025-01-15 10:00\n{text}\n\n")
     assert entries, "fixture content must parse to at least one entry"
     return entries
 
@@ -246,6 +252,39 @@ class TestArchiveVersionLockstep:
         # leaves version absent (.get(path, 0) == 0). No stale hit possible.
         assert _ARCHIVE_WRITE_VERSIONS.get(path, 0) == 0
 
+    def test_sibling_cache_keeps_version_after_eviction(self, tmp_path):
+        """P1: a path evicted from ONE cache keeps its write version while it
+        still lives in the sibling cache, so the sibling does not false-miss
+        (full re-parse + re-tokenize) on its next request."""
+        class _Tok:
+            def tokenize(self, text):
+                return text.split()
+
+        tok = _Tok()
+        cap = _ARCHIVE_CACHE_MAX_ENTRIES
+        keep = _make_repo(tmp_path, "keep")
+        append_entries_to_archive(keep, _archive_entry("keep"))
+        _parsed_archive_cached(keep)          # PARSED: [keep]
+        _archive_analyzed_cached(keep, tok)   # ANALYZED: [keep]
+        path = insights_archive_path(keep)
+        assert path in _ARCHIVE_WRITE_VERSIONS
+
+        # Fill PARSED past cap: keep is the oldest entry → FIFO-evicted from
+        # PARSED only. ANALYZED still holds it, so the version must survive.
+        for i in range(cap):
+            other = _make_repo(tmp_path, f"s{i}")
+            append_entries_to_archive(other, _archive_entry(f"s{i}"))
+            _parsed_archive_cached(other)
+
+        assert path not in _ARCHIVE_PARSED_CACHE
+        assert path in _ARCHIVE_ANALYZED_CACHE
+        assert path in _ARCHIVE_WRITE_VERSIONS  # kept for the sibling
+
+        # Re-access via the analyzed path hits — no re-parse + re-tokenize.
+        entries, toksets, _df, _avgdl = _archive_analyzed_cached(keep, tok)
+        assert len(entries) == 1
+        assert len(toksets) == 1
+
 
 # ── _ACTIVE_WRITE_VERSIONS: lockstep eviction ────────────────────────────────
 
@@ -269,3 +308,161 @@ class TestActiveVersionLockstep:
         assert len(_ACTIVE_WRITE_VERSIONS) <= cap, (
             "_ACTIVE_WRITE_VERSIONS grew unbounded — lockstep eviction missing"
         )
+
+
+# ── C1: _archive_capped_put must be a true LRU (pop-before-reinsert) ──────────
+
+
+class TestArchiveCappedPutLRU:
+    """C1 regression: re-putting an existing key must refresh its dict position.
+
+    Without the ``cache.pop(key, None)`` before the re-insert, an ACTIVE repo
+    (whose archive changes every turn -> re-put every turn) keeps its ORIGINAL
+    position at the front of the dict and reads as the oldest entry — so it is
+    the first eviction candidate once cap+1 repos are visited, forcing a full
+    archive re-read + re-parse every turn in multi-repo sessions (the demo:
+    interleaved re-puts of A yield ``BCDEFGHI`` instead of ``CDEFGHAI``)."""
+
+    def test_reput_refreshes_position(self):
+        """Unit-level demo (C1): a re-put key must land at the BACK of the
+        dict. Without pop-before-reinsert, re-putting ``A`` leaves it at the
+        FRONT, so the cap+1-th insert evicts ``A`` (``BCDEFGHI``) instead of
+        the true LRU ``K0`` (``CDEFGHAI``)."""
+        cap = _ARCHIVE_CACHE_MAX_ENTRIES
+        cache: dict = {}
+        _archive_capped_put(cache, "A", "A")
+        for i in range(cap - 1):
+            _archive_capped_put(cache, f"K{i}", f"K{i}")
+        _archive_capped_put(cache, "A", "A-refreshed")  # re-put → must move to back
+        _archive_capped_put(cache, "K7", "K7")  # over cap → evict exactly one
+
+        assert cache.get("A") == "A-refreshed", (
+            "re-put key was evicted — insertion order not refreshed (C1)"
+        )
+        assert "K0" not in cache, "true LRU survived — eviction is FIFO (C1)"
+        assert len(cache) == cap
+
+    def test_external_edit_reinsert_keeps_active_repo(self, tmp_path):
+        """Integration path where the C1 bug actually bites: the active repo's
+        archive is edited OUTSIDE the write funnel (no ``_archive_invalidate``
+        — a hand edit), so the signature (mtime/size) miss re-reads and
+        re-PUTS over the still-present key. With the bug, that re-put keeps A
+        at the FRONT, so the 9th repo's insert evicts the active repo itself."""
+        repo_a = _make_repo(tmp_path, "A")
+        append_entries_to_archive(repo_a, _archive_entry("a-v1"))
+        _parsed_archive_cached(repo_a)  # A joins first → oldest position
+        others = []
+        for name in "BCDEFGH":
+            repo = _make_repo(tmp_path, name)
+            others.append(repo)
+            append_entries_to_archive(repo, _archive_entry(f"{name}-v1"))
+            _parsed_archive_cached(repo)
+        # 8 entries: A,B,C,D,E,F,G,H — cache is full.
+
+        # A's archive changes outside the funnel → signature miss → re-put
+        # over the still-present key (no pop beforehand).
+        atomic_write_text(
+            insights_archive_path(repo_a),
+            "### [bug] 2025-01-15 10:00\nexternally changed\n\n",
+        )
+        assert _parsed_archive_cached(repo_a)[0].body.strip() == "externally changed"
+
+        # 9th repo arrives → exactly one eviction: the true LRU (B), not A.
+        repo_i = _make_repo(tmp_path, "I")
+        append_entries_to_archive(repo_i, _archive_entry("i-v1"))
+        _parsed_archive_cached(repo_i)
+
+        assert insights_archive_path(repo_a) in _ARCHIVE_PARSED_CACHE, (
+            "active repo evicted despite fresh re-read — re-put must refresh "
+            "insertion order (C1)"
+        )
+        assert insights_archive_path(others[0]) not in _ARCHIVE_PARSED_CACHE, (
+            "true LRU survived — eviction uses stale dict positions (C1)"
+        )
+        assert len(_ARCHIVE_PARSED_CACHE) == _ARCHIVE_CACHE_MAX_ENTRIES
+
+
+# ── C2: cache keys canonicalized via canonical_repo_key ───────────────────────
+
+
+class TestCanonicalArchiveCacheKeys:
+    """C2 regression: spelling variants of one repo (macOS ``/var`` vs
+    ``/private/var``, symlinked aliases) must share ONE cache slot and ONE
+    write-version counter — otherwise the same repo occupies two of the 8
+    slots and an invalidator bumps a version the reader never checks."""
+
+    def test_symlink_alias_share_slot_and_version(self, tmp_path):
+        repo = _make_repo(tmp_path, "canon")
+        alias = repo + "_alias"
+        try:
+            os.symlink(repo, alias)
+        except OSError:
+            pytest.skip("symlink not available on this platform")
+
+        try:
+            append_entries_to_archive(repo, _archive_entry("v1"))
+            assert len(_parsed_archive_cached(repo)) == 1
+            assert len(_ARCHIVE_PARSED_CACHE) == 1
+
+            # Reading via the alias must hit the SAME slot…
+            assert len(_parsed_archive_cached(alias)) == 1
+            assert len(_ARCHIVE_PARSED_CACHE) == 1, (
+                "alias spelling occupied a second cache slot — "
+                "canonical_repo_key missing in insights_archive_path (C2)"
+            )
+            assert insights_archive_path(repo) == insights_archive_path(alias)
+            # One shared counter: the alias read sees version 1 (bumped by the
+            # single write), not 0 (a split counter would read 0).
+            assert _ARCHIVE_WRITE_VERSIONS[insights_archive_path(repo)] == 1
+        finally:
+            os.unlink(alias)
+
+    def test_invalidate_via_alias_hits_same_counter(self, tmp_path):
+        repo = _make_repo(tmp_path, "inv")
+        alias = repo + "_alias"
+        try:
+            os.symlink(repo, alias)
+        except OSError:
+            pytest.skip("symlink not available on this platform")
+
+        try:
+            append_entries_to_archive(repo, _archive_entry("v1"))
+            _parsed_archive_cached(repo)
+            key = insights_archive_path(repo)
+            before = _ARCHIVE_WRITE_VERSIONS[key]
+
+            _archive_invalidate(alias)  # invalidate via the OTHER spelling
+
+            assert _ARCHIVE_WRITE_VERSIONS[key] == before + 1, (
+                "invalidator bumped a version key the reader never checks — "
+                "spelling split (C2)"
+            )
+            assert key not in _ARCHIVE_PARSED_CACHE, "cache not dropped on invalidate"
+        finally:
+            os.unlink(alias)
+
+
+class TestCanonicalActiveCacheKeys:
+    """C2 mirror for the ACTIVE insights file cache family."""
+
+    def test_active_symlink_alias_share_slot(self, tmp_path):
+        repo = _make_repo(tmp_path, "act_canon")
+        alias = repo + "_alias"
+        try:
+            os.symlink(repo, alias)
+        except OSError:
+            pytest.skip("symlink not available on this platform")
+
+        try:
+            content = "### [bug]\nactive\n\n"
+            atomic_write_text(insights_path(repo), content)
+            _active_invalidate(repo)
+            assert load_active_insights_cached(repo) == content
+            assert load_active_insights_cached(alias) == content
+            assert len(_ACTIVE_CONTENT_CACHE) == 1, (
+                "active cache split across spellings — canonical_repo_key "
+                "missing in insights_path (C2)"
+            )
+            assert insights_path(repo) == insights_path(alias)
+        finally:
+            os.unlink(alias)

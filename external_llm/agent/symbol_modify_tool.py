@@ -109,7 +109,7 @@ def _first_significant_line(text: str, skip_decorators: bool = True) -> str:
             continue
         if skip_decorators and s.startswith("@"):
             continue
-        if s.startswith("#") or s.startswith("//"):
+        if s.startswith(("#", "//")):
             continue
         if s.startswith("/*"):
             idx = s.find("*/")
@@ -229,7 +229,7 @@ def _reindent_relative(
     GCD of leading-run widths, and alignment continuations (e.g. a line aligned
     to an open paren at column 27) collapse that GCD toward 1. Feeding such lines
     through the depth remap multiplied every line's indent (``file_unit /
-    model_unit`` ≈ ×4), producing catastrophic over-indent. Excluding them from
+    model_unit`` ≈ x4), producing catastrophic over-indent. Excluding them from
     both the unit detection and the remap fixes that while keeping normalization.
 
     Falls back to a same-char-preserving shift when the block cannot be
@@ -358,9 +358,10 @@ def _block_parses_after_dedent(lines: list[str]) -> bool:
     ]
     try:
         ast.parse("\n".join(dedented))
-        return True
     except SyntaxError:
         return False
+    else:
+        return True
 
 
 def _correct_indent_drift(
@@ -595,6 +596,7 @@ def _find_symbol_ast_node(
         try:
             tree = ast.parse(source)
         except SyntaxError:
+            logger.debug("_find_symbol_ast_node: syntax error in source")
             return None
 
     candidates: list = []
@@ -604,12 +606,9 @@ def _find_symbol_ast_node(
             continue
         if class_name:
             if isinstance(node, ast.ClassDef) and node.name == class_name:
-                for item in node.body:
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == method_name:
-                        candidates.append(item)
-        else:
-            if node.name == method_name:
-                candidates.append(node)
+                candidates.extend(item for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == method_name)
+        elif node.name == method_name:
+            candidates.append(node)
 
     if not candidates:
         return None
@@ -636,13 +635,17 @@ def _apply_ast_precise(
     if not new_body or not new_body.strip():
         return None, "skipped_no_new_body"
 
-    if source:
-        new_body = _strip_redundant_inline_imports(new_body, source)
-
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return None, "skipped_ast_error"
+
+    if source:
+        # Share the already-parsed tree: both _strip_redundant_inline_imports
+        # (here) and _strip_redundant_dataclass_decorator (body-only branch
+        # below) parse the same source text — threading the tree drops the
+        # redundant ast.parse calls (2-3 parses of the same text → 1).
+        new_body = _strip_redundant_inline_imports(new_body, source, _src_tree=tree)
 
     target = _find_symbol_ast_node(source, symbol, tree=tree)
     if target is None:
@@ -721,7 +724,7 @@ def _apply_ast_precise(
         # It only matters here, where header_lines keeps the original decorator
         # and a misclassified full block in new_body would otherwise duplicate
         # it as @dataclass\n@dataclass\nclass X:.
-        new_body = _strip_redundant_dataclass_decorator(new_body, source)
+        new_body = _strip_redundant_dataclass_decorator(new_body, source, _src_tree=tree)
         # Defense-2: detect a Python full-block misclassification. The model
         # intended a full replacement (it sent a def/class line) but the prefix
         # heuristic in _looks_like_full_symbol_block did not fire — e.g. a
@@ -822,7 +825,6 @@ def _apply_ast_precise(
 def _apply_surgical_edit(
     source: str,
     file_path: str,
-    symbol: str,
     code: str,
     sym_start_line: int,
     sym_end_line: int,
@@ -868,7 +870,7 @@ def _apply_surgical_edit(
         header_seen = False
         for i in range(sym_start_line, sym_end_line):
             stripped = lines[i].strip()
-            if not stripped or stripped.startswith("@") or stripped.startswith("#"):
+            if not stripped or stripped.startswith(("@", "#")):
                 continue
             # Count brackets outside of this row's stripped content (brackets
             # rarely appear inside comments on a signature continuation row).
@@ -1012,6 +1014,7 @@ def _find_symbol_def_line(
             try:
                 rx = re.compile(sp.regex.replace("{name}", name_re))
             except re.error:
+                logger.debug("symbol_modify: invalid provider regex for %s", file_path)
                 continue
             for i, line in enumerate(lines):
                 # Provider regexes anchor on the declaration keyword
@@ -1023,7 +1026,7 @@ def _find_symbol_def_line(
     # 2. Legacy prefix fallback (languages with no registered provider).
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if any(stripped.startswith(f"{p}{bare}") or stripped.startswith(f"{p} {bare}")
+        if any(stripped.startswith((f"{p}{bare}", f"{p} {bare}"))
                for p in ("async def ", "async function ", "def ", "class ",
                          "func ", "function ", "fun ")):
             return i
@@ -1046,18 +1049,17 @@ def _find_symbol_range_via_treesitter(
     grammar (e.g. ``tree_sitter_kotlin``) automatically enables this path with
     no code change here.
     """
-    try:
-        from ..languages.tree_sitter_utils import (
-            _LANG_MODULE_MAP as _TS_LANG_MODULE_MAP,
-        )
-        from ..languages.tree_sitter_utils import (
-            find_all_symbols as _ts_find_all_symbols,
-        )
-        from ..languages.tree_sitter_utils import (
-            is_language_available as _ts_language_available,
-        )
-    except ImportError:
-        return None
+    # tree_sitter_utils guards its own optional tree-sitter import, so this
+    # import cannot fail — the old except ImportError fallback was dead code.
+    from ..languages.tree_sitter_utils import (
+        _LANG_MODULE_MAP as _TS_LANG_MODULE_MAP,
+    )
+    from ..languages.tree_sitter_utils import (
+        find_all_symbols as _ts_find_all_symbols,
+    )
+    from ..languages.tree_sitter_utils import (
+        is_language_available as _ts_language_available,
+    )
     lang_id = LanguageId.from_path(file_path).value
     if lang_id not in _TS_LANG_MODULE_MAP or lang_id == "python":
         return None
@@ -1066,8 +1068,9 @@ def _find_symbol_range_via_treesitter(
     try:
         syms = _ts_find_all_symbols(source, lang_id)
     except Exception:
+        logger.debug("_find_symbol_range_via_treesitter: symbol extraction failed for %s", file_path)
         return None
-    bare = symbol.split(".")[-1]
+    bare = symbol.rsplit(".", maxsplit=1)[-1]
     for name, _kind, start_line, end_line in syms:
         if name == bare:
             # find_all_symbols yields 1-indexed inclusive lines; convert to
@@ -1101,7 +1104,7 @@ def _find_symbol_line_range(source: str, symbol: str, file_path: str) -> Optiona
     # Non-Python: locate the definition line via the typed provider patterns,
     # then compute its extent by brace balance / indentation.
     lines = source.splitlines()
-    bare = symbol.split(".")[-1]
+    bare = symbol.rsplit(".", maxsplit=1)[-1]
     i = _find_symbol_def_line(lines, bare, file_path)
     if i is None:
         return None
@@ -1212,7 +1215,7 @@ def _apply_diff_to_source(source: str, diff: str) -> str:
     in_hunk = False
 
     for line in diff_lines:
-        if line.startswith("--- ") or line.startswith("+++ ") or line.startswith("\\ "):
+        if line.startswith(("--- ", "+++ ", "\\ ")):
             continue
         if line.startswith("@@"):
             if in_hunk and hunk_start >= 0:
@@ -1221,10 +1224,7 @@ def _apply_diff_to_source(source: str, diff: str) -> str:
             parts = line.split(" ")
             if len(parts) >= 2:
                 new_range = parts[2]
-                if "," in new_range:
-                    hunk_start = int(new_range[1:].split(",")[0]) - 1
-                else:
-                    hunk_start = int(new_range[1:]) - 1
+                hunk_start = int(new_range[1:].split(",")[0]) - 1 if "," in new_range else int(new_range[1:]) - 1
             hunk_old_lines = []
             hunk_new_lines = []
             in_hunk = True
@@ -1304,9 +1304,10 @@ def _post_edit_syntax_ok(
     if lid is LanguageId.PYTHON:
         try:
             compile_quiet(content, path, "exec")
-            return True
         except SyntaxError:
             return False
+        else:
+            return True
     if lid in (LanguageId.JAVASCRIPT, LanguageId.TYPESCRIPT):
         node_path = shutil.which("node")
         if node_path:
@@ -1320,10 +1321,10 @@ def _post_edit_syntax_ok(
                         input=content.encode("utf-8"),
                         capture_output=True,
                         timeout=10,
+                        check=False,
                     )
                     if r.returncode == 0:
                         return True
-                return False
             except (subprocess.TimeoutExpired, OSError) as e:
                 # Fall THROUGH to the toolchain-free tiers below — do not
                 # `return True`. Returning here made an infra failure strictly
@@ -1331,6 +1332,8 @@ def _post_edit_syntax_ok(
                 # reaches those tiers and rejects an orphan brace; a timeout
                 # used to wave the same edit through).
                 logger.debug("node --check unavailable (%s) — using fallback tiers", e)
+            else:
+                return False
     if lid is LanguageId.GO:
         gofmt_path = shutil.which("gofmt")
         if gofmt_path:
@@ -1340,11 +1343,13 @@ def _post_edit_syntax_ok(
                     input=content.encode("utf-8"),
                     capture_output=True,
                     timeout=10,
+                    check=False,
                 )
-                return r.returncode == 0 and not r.stderr
             except (subprocess.TimeoutExpired, OSError) as e:
                 # Fall THROUGH, not `return True` — see the node branch above.
                 logger.debug("gofmt unavailable (%s) — using fallback tiers", e)
+            else:
+                return r.returncode == 0 and not r.stderr
     # Brace-delimited languages without an inline compiler (Kotlin/Rust/C/C++/
     # Java/Scala/Swift/C#): verify literal-aware brace balance so a symbol-range
     # scan that left an orphan `}` (or dropped a brace) is rejected before write
@@ -1379,9 +1384,8 @@ def _post_edit_syntax_ok(
         # introduced for) would be false-rejected on the file's own pre-existing
         # errors. Content is checked first so the common valid case costs one
         # parse, not two.
-        if source and _ts_syntax_valid(content, lid) is False:
-            if _ts_syntax_valid(source, lid) is True:
-                return False
+        if source and _ts_syntax_valid(content, lid) is False and _ts_syntax_valid(source, lid) is True:
+            return False
     return True
 
 
@@ -1489,7 +1493,7 @@ def modify_symbol(
     sym_range = _find_symbol_line_range(source, symbol, rel_path)
     if sym_range is not None:
         sym_start, sym_end = sym_range
-        diff = _apply_surgical_edit(source, rel_path, symbol, code, sym_start, sym_end)
+        diff = _apply_surgical_edit(source, rel_path, code, sym_start, sym_end)
         if diff is not None:
             try:
                 new_content = _apply_diff_to_source(source, diff)
@@ -1523,9 +1527,10 @@ def modify_symbol(
                 try:
                     atomic_write_text(abs_path, new_content)
                     diff = _create_unified_diff(rel_path, source, new_content)
-                    return True, diff, new_content
                 except Exception as e:
                     return False, f"Write failed after text replacement: {e}", ""
+                else:
+                    return True, diff, new_content
 
     if syntax_blocked:
         foreign = (

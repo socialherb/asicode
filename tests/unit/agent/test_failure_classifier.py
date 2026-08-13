@@ -245,6 +245,20 @@ class TestClassifyByText:
         assert result.action == RecoveryAction.RETRY_SAME
         assert result.reason == "generic failure"
 
+    def test_missing_required_arg(self):
+        # Handler arg validation returned unwrapped ("'code' is required"):
+        # the call was malformed, so the recovery is to re-issue it corrected —
+        # not blind-retry the same call (RETRY_SAME) and not switch tool.
+        result = _classify_by_text("'code' is required")
+        assert result.action == RecoveryAction.FIX_ARGS
+        assert result.reason == "missing required argument"
+
+    def test_missing_arg_with_empty_variant(self):
+        # design_chat_loop spells it "'insight' is required and must not be empty".
+        result = _classify_by_text("'insight' is required and must not be empty")
+        assert result.action == RecoveryAction.FIX_ARGS
+        assert result.reason == "missing required argument"
+
     def test_empty_string(self):
         result = _classify_by_text("")
         assert result.action == RecoveryAction.RETRY_SAME
@@ -266,27 +280,27 @@ class TestFailureClassifierClassify:
     def test_error_is_none(self):
         clf = self.make_classifier()
         result = FakeResult(error=None)
-        classification = clf.classify("some_tool", {}, result)
+        classification = clf.classify("some_tool", result)
         assert classification.action == RecoveryAction.RETRY_SAME
         assert classification.reason == "generic failure"
 
     def test_classify_by_type_file_missing(self):
         clf = self.make_classifier()
         result = FakeResult(error=FileNotFoundError("no such file"))
-        classification = clf.classify("read_file", {}, result)
+        classification = clf.classify("read_file", result)
         assert classification.action == RecoveryAction.SWITCH_TOOL
         assert classification.reason == "file missing"
 
     def test_classify_by_type_permission(self):
         clf = self.make_classifier()
         result = FakeResult(error=PermissionError("access denied"))
-        classification = clf.classify("write_file", {}, result)
+        classification = clf.classify("write_file", result)
         assert classification.action == RecoveryAction.ABORT
 
     def test_classify_by_type_transient(self):
         clf = self.make_classifier()
         result = FakeResult(error=TimeoutError("timed out"))
-        classification = clf.classify("read_file", {}, result)
+        classification = clf.classify("read_file", result)
         assert classification.action == RecoveryAction.RETRY_SAME
         assert classification.reason == "transient failure"
 
@@ -294,7 +308,7 @@ class TestFailureClassifierClassify:
         clf = self.make_classifier()
         err = FakeErrorWithAttrs(code="already_exists", msg="patch already applied")
         result = FakeResult(error=err)
-        classification = clf.classify("apply_patch", {}, result)
+        classification = clf.classify("apply_patch", result)
         assert classification.action == RecoveryAction.SKIP
         assert classification.reason == "patch already applied"
 
@@ -303,7 +317,7 @@ class TestFailureClassifierClassify:
         # Error with no type match, no code match, but text match
         err = FakeErrorWithAttrs(code="some_other_error", msg="hunk #1 does not apply")
         result = FakeResult(error=err)
-        classification = clf.classify("apply_patch", {}, result)
+        classification = clf.classify("apply_patch", result)
         assert classification.action == RecoveryAction.READ_FIRST
         assert classification.reason == "patch context mismatch"
 
@@ -311,32 +325,42 @@ class TestFailureClassifierClassify:
         clf = self.make_classifier()
         err = FakeErrorWithAttrs(code="unknown", msg="something weird happened")
         result = FakeResult(error=err)
-        classification = clf.classify("some_tool", {}, result)
+        classification = clf.classify("some_tool", result)
         assert classification.action == RecoveryAction.RETRY_SAME
         assert classification.reason == "generic failure"
+
+    def test_classify_missing_required_arg_text(self):
+        clf = self.make_classifier()
+        # Unwrapped arg-validation error: no metadata, no exception type, no
+        # code → the text tier's "is required" rule must classify it as
+        # FIX_ARGS instead of the old "generic failure" blind-retry advice.
+        result = FakeResult(error="'code' is required")
+        classification = clf.classify("modify_symbol", result)
+        assert classification.action == RecoveryAction.FIX_ARGS
+        assert classification.reason == "missing required argument"
 
     def test_classify_with_non_error_object(self):
         clf = self.make_classifier()
         # Some callers pass a string as result
         result = "plain string result"
-        classification = clf.classify("some_tool", {}, result)
+        classification = clf.classify("some_tool", result)
         assert classification.action == RecoveryAction.RETRY_SAME
 
     def test_classify_result_without_error_attr(self):
         clf = self.make_classifier()
         result = object()  # no .error attribute
-        classification = clf.classify("some_tool", {}, result)
+        classification = clf.classify("some_tool", result)
         assert classification.action == RecoveryAction.RETRY_SAME
 
     def test_type_match_priority_over_code(self):
         """Type-based classification is checked first and should win."""
         clf = self.make_classifier()
-        class MyFileNotFound(FileNotFoundError):
+        class MyFileNotFoundError(FileNotFoundError):
             def __init__(self):
                 super().__init__()
                 self.code = "timeout_error"  # would trigger transient if type was checked second
-        result = FakeResult(error=MyFileNotFound())
-        classification = clf.classify("read_file", {}, result)
+        result = FakeResult(error=MyFileNotFoundError())
+        classification = clf.classify("read_file", result)
         assert classification.action == RecoveryAction.SWITCH_TOOL  # type wins
 
     def test_code_match_priority_over_text(self):
@@ -344,7 +368,7 @@ class TestFailureClassifierClassify:
         clf = self.make_classifier()
         err = FakeErrorWithAttrs(code="already_exists", msg="hunk #1 does not apply")
         result = FakeResult(error=err)
-        classification = clf.classify("apply_patch", {}, result)
+        classification = clf.classify("apply_patch", result)
         assert classification.action == RecoveryAction.SKIP  # code wins over text
 
 
@@ -389,7 +413,7 @@ class TestFailureClassMetadata:
             error="old_string not found in external_llm/languages/base.py",
             failure_class="search_string_mismatch",
         )
-        c = clf.classify("edit_text", {}, result)
+        c = clf.classify("edit_text", result)
         assert c.action == RecoveryAction.READ_FIRST
         assert c.reason == "patch context mismatch"
 
@@ -400,14 +424,14 @@ class TestFailureClassMetadata:
             error="File not found: a.py",  # would text-classify as file missing
             failure_class="already_equal",
         )
-        c = clf.classify("edit_text", {}, result)
+        c = clf.classify("edit_text", result)
         assert c.action == RecoveryAction.SKIP
         assert c.reason == "patch already applied"
 
     def test_a_genuinely_missing_file_still_switches_tool(self):
         clf = self.make_classifier()
         result = ResultWithMetadata(error="File not found: a.py", failure_class="file_not_found")
-        c = clf.classify("edit_text", {}, result)
+        c = clf.classify("edit_text", result)
         assert c.action == RecoveryAction.SWITCH_TOOL
         assert c.reason == "file missing"
 
@@ -419,21 +443,60 @@ class TestFailureClassMetadata:
             error="hunk #1 does not apply",
             failure_class="structural_gate_violation",
         )
-        c = clf.classify("apply_patch", {}, result)
+        c = clf.classify("apply_patch", result)
         assert c.reason == "patch context mismatch"  # from text, not from the map
 
     def test_an_unknown_class_string_falls_through(self):
         clf = self.make_classifier()
         result = ResultWithMetadata(error="something odd", failure_class="not_a_real_class")
-        c = clf.classify("edit_text", {}, result)
+        c = clf.classify("edit_text", result)
         assert c.reason == "generic failure"
 
     def test_missing_or_malformed_metadata_is_ignored(self):
         clf = self.make_classifier()
         for md in (None, {}, {"failure_class": ""}, "not-a-dict", 42):
             result = ResultWithMetadata(error="File not found: a.py", metadata=md)
-            c = clf.classify("edit_text", {}, result)
+            c = clf.classify("edit_text", result)
             assert c.action == RecoveryAction.SWITCH_TOOL, md
+
+    def test_no_effective_change_normalizes_to_real_member(self):
+        """The apply_patch hard gate's spelling is a canonical FailureClass,
+        not a string that collapses to UNKNOWN before the map lookup."""
+        from external_llm.agent.operation_models import (
+            FailureClass,
+            normalize_failure_class,
+        )
+        assert FailureClass.NO_EFFECTIVE_CHANGE.value == "no_effective_change"
+        assert normalize_failure_class("no_effective_change") is FailureClass.NO_EFFECTIVE_CHANGE
+
+    def test_no_effective_change_is_skip_not_generic_retry(self):
+        """Byte-identical apply_patch → SKIP ("already applied"), the same
+        recovery as no_effect / no_op_edit — never a blind retry."""
+        clf = self.make_classifier()
+        result = ResultWithMetadata(error="already applied", failure_class="no_effective_change")
+        c = clf.classify("apply_patch", result)
+        assert c.action == RecoveryAction.SKIP
+        assert c.reason == "patch already applied"
+
+
+# ======================================================================
+# F1 — _ACTION_BY_FAILURE_CLASS ↔ FailureClass parity
+# ======================================================================
+
+class TestActionMapParity:
+    def test_action_map_keys_are_canonical_failure_classes(self):
+        """Every key in _ACTION_BY_FAILURE_CLASS must be a real FailureClass value.
+
+        normalize_failure_class collapses unknown spellings to UNKNOWN before
+        the map lookup, so a key that is not canonical can never be reached:
+        it is dead config that silently falls through to the text tiers.
+        (B1 was exactly this drift: "no_effective_change" was issued by
+        design_chat_loop but absent from the enum.)
+        """
+        from external_llm.agent.failure_classifier import _ACTION_BY_FAILURE_CLASS
+        from external_llm.agent.operation_models import FailureClass
+        canonical = {fc.value for fc in FailureClass}
+        assert set(_ACTION_BY_FAILURE_CLASS) <= canonical
 
 
 # ======================================================================
@@ -454,20 +517,20 @@ class TestNotFoundIsToolAware:
             ("edit_text", "HINT: 'before' text not found in 'asi.py'."),
             ("modify_symbol", "symbol body not found"),
         ]:
-            c = clf.classify(tool, {}, FakeResult(error=err))
+            c = clf.classify(tool, FakeResult(error=err))
             assert c.action == RecoveryAction.READ_FIRST, (tool, err)
             assert c.reason == "patch context mismatch", (tool, err)
 
     def test_explicit_filesystem_phrasing_still_wins_for_edit_tools(self):
         clf = self.make_classifier()
         for err in ("File not found: nope.py", "no such file or directory", "a.py does not exist"):
-            c = clf.classify("edit_text", {}, FakeResult(error=err))
+            c = clf.classify("edit_text", FakeResult(error=err))
             assert c.action == RecoveryAction.SWITCH_TOOL, err
             assert c.reason == "file missing", err
 
     def test_read_tools_keep_the_filesystem_reading(self):
         clf = self.make_classifier()
-        c = clf.classify("read_file", {}, FakeResult(error="Path not found or outside repo: 'nope.py'"))
+        c = clf.classify("read_file", FakeResult(error="Path not found or outside repo: 'nope.py'"))
         assert c.action == RecoveryAction.SWITCH_TOOL
         assert c.reason == "file missing"
 
@@ -476,5 +539,5 @@ class TestNotFoundIsToolAware:
         a patch mismatch; guessing either would be worse than the generic
         fallback, which the recall store excludes from hinting."""
         clf = self.make_classifier()
-        c = clf.classify("find_symbol", {}, FakeResult(error="Symbol 'x' not found."))
+        c = clf.classify("find_symbol", FakeResult(error="Symbol 'x' not found."))
         assert c.reason == "generic failure"

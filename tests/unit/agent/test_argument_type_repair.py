@@ -173,7 +173,7 @@ class TestDispatchIntegration:
         (tmp_path / "sample.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
         from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
-        return ToolRegistry(str(tmp_path), AgentConfig(planning_enabled=False, rag_enabled=False))
+        return ToolRegistry(str(tmp_path), AgentConfig(rag_enabled=False))
 
     def test_refusal_is_a_clean_tool_result(self, registry):
         r = registry.dispatch("read_file", {"path": ["a", "b"]})
@@ -203,3 +203,4 @@ class TestDispatchIntegration:
         r = registry.dispatch("read_symbol", {"name": None})
         assert r.ok is False
         assert "required" in (r.error or "").lower()
+

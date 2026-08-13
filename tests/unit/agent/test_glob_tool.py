@@ -51,6 +51,43 @@ class TestGlobToRegex:
         """Must not raise — an LLM will eventually send this."""
         assert _glob_to_regex("a[bc.py").match("a[bc.py")
 
+    @pytest.mark.parametrize("pattern", [
+        "[z-a]*.py",   # reversed range
+        "[9-0].py",    # reversed digit range
+    ])
+    def test_invalid_class_raises_value_error(self, pattern: str):
+        """A broken class must surface as ValueError in glob coordinates, not
+        as a raw re.error naming positions inside the translated regex."""
+        with pytest.raises(ValueError, match="invalid glob pattern"):
+            _glob_to_regex(pattern)
+
+    def test_invalid_class_error_names_the_class(self):
+        with pytest.raises(ValueError, match=r"\[z-a\]"):
+            _glob_to_regex("[z-a]*.py")
+
+    def test_leading_bracket_member_is_literal(self):
+        """`]` right after `[` is a member (POSIX), not the closer."""
+        assert _glob_to_regex("[]]").match("]")
+        assert not _glob_to_regex("[]]").match("a")
+        assert _glob_to_regex("[!]]").match("x")
+        assert not _glob_to_regex("[!]]").match("]")
+
+    def test_backslash_in_class_is_literal(self):
+        """A backslash inside a class is a literal member — `[\\d]` is the
+        chars backslash and 'd', not a digit class (POSIX glob)."""
+        assert _glob_to_regex("[\\d]").match("d")
+        assert _glob_to_regex("[\\d]").match("\\")
+        assert not _glob_to_regex("[\\d]").match("3")
+
+    def test_bang_only_class_is_literal(self):
+        """`[!]` has no closing bracket for its negated member — literal."""
+        assert _glob_to_regex("[!]").match("[!]")
+
+    def test_posix_named_class_is_not_a_digit_class(self):
+        """`[[:alpha:]]` must not crash; members are literal (no POSIX classes)."""
+        assert _glob_to_regex("[[:alpha:]]").match("a]")
+        assert not _glob_to_regex("[[:alpha:]]").match("b]")
+
 
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
@@ -66,7 +103,7 @@ def repo(tmp_path: Path) -> Path:
 
 
 def _registry(repo: Path) -> ToolRegistry:
-    return ToolRegistry(str(repo), AgentConfig(planning_enabled=False, rag_enabled=False))
+    return ToolRegistry(str(repo), AgentConfig(rag_enabled=False))
 
 
 def _paths(result) -> set[str]:
@@ -124,6 +161,14 @@ class TestGlobTool:
         assert result.ok is False
         assert "required" in (result.error or "")
 
+    def test_invalid_class_returns_actionable_error(self, repo: Path):
+        """The tool must answer in glob coordinates, not with a translated-
+        regex re.error that the model cannot act on."""
+        result = _registry(repo).dispatch("glob", {"pattern": "[z-a]*.py"})
+        assert result.ok is False
+        assert "invalid glob pattern" in (result.error or "")
+        assert "[z-a]" in (result.error or "")
+
     def test_max_results_truncates_and_says_so(self, repo: Path):
         result = _registry(repo).dispatch("glob", {"pattern": "*.py", "max_results": 2})
         assert result.ok
@@ -173,3 +218,4 @@ class TestGlobRegistration:
         assert reg._extract_read_scope_paths("glob", {"pattern": "*.py"}) is None
         scoped = reg._extract_read_scope_paths("glob", {"pattern": "*.py", "path": "src"})
         assert scoped is not None and len(scoped) == 1
+

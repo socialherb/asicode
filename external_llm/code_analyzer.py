@@ -85,7 +85,7 @@ class CodeAnalyzer:
             tree = ast.parse(content, filename=str(file_path))
             return self._analyze_ast(tree)
         except Exception as e:
-            logger.debug(f"Failed to analyze {file_path}: {e}")
+            logger.debug("Failed to analyze %s: %s", file_path, e)
             return None
 
     def _analyze_ast(self, tree: ast.Module) -> CodeAnalysis:
@@ -132,21 +132,17 @@ class CodeAnalyzer:
                     analysis.calls.add(call_name)
 
             # Global assignments (constants, config)
-            elif isinstance(node, ast.Assign):
-                if self._is_top_level(node, tree):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            value_str = self._node_to_string(node.value)
-                            analysis.global_vars[target.id] = value_str
+            elif isinstance(node, ast.Assign) and self._is_top_level(node, tree):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        value_str = self._node_to_string(node.value)
+                        analysis.global_vars[target.id] = value_str
 
         return analysis
 
     def _is_top_level(self, node: ast.AST, tree: ast.Module) -> bool:
         """Check if node is at module level (not nested)"""
-        for item in tree.body:
-            if item == node:
-                return True
-        return False
+        return any(item == node for item in tree.body)
 
     def _extract_function_info(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> FunctionInfo:
         """Extract function information"""
@@ -212,7 +208,7 @@ class CodeAnalyzer:
         """Get the name of a function call"""
         if isinstance(node.func, ast.Name):
             return node.func.id
-        elif isinstance(node.func, ast.Attribute):
+        if isinstance(node.func, ast.Attribute):
             return node.func.attr
         return None
 
@@ -224,18 +220,16 @@ class CodeAnalyzer:
             # Fallback for older Python
             if isinstance(node, ast.Name):
                 return node.id
-            elif isinstance(node, ast.Constant):
+            if isinstance(node, ast.Constant):
                 return repr(node.value)
-            elif isinstance(node, ast.Attribute):
+            if isinstance(node, ast.Attribute):
                 return f"{self._node_to_string(node.value)}.{node.attr}"
             return str(type(node).__name__)
 
     def format_function_signature(self, func: FunctionInfo) -> str:
         """Format function signature with types"""
         # Decorators
-        lines = []
-        for dec in func.decorators:
-            lines.append(f"@{dec}")
+        lines = [f"@{dec}" for dec in func.decorators]
 
         # Build signature
         prefix = "async def" if func.is_async else "def"
@@ -266,11 +260,9 @@ class CodeAnalyzer:
 
     def format_class_signature(self, cls: ClassInfo) -> str:
         """Format class signature"""
-        lines = []
 
         # Decorators
-        for dec in cls.decorators:
-            lines.append(f"@{dec}")
+        lines = [f"@{dec}" for dec in cls.decorators]
 
         # Class definition
         if cls.bases:

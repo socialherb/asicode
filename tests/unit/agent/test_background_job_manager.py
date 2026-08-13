@@ -12,6 +12,7 @@ These tests also guard the behavioural contract: finished jobs are evicted
 before killing a running one, the kill still happens outside the manager
 lock, and the public API (get_info / list_jobs / kill / cleanup) is intact.
 """
+import os
 import sys
 import threading
 import time
@@ -70,8 +71,7 @@ def _peak_job_count(mgr, stop):
             peak = max(peak, len(mgr._jobs))
         time.sleep(0.0003)
     with mgr._lock:
-        peak = max(peak, len(mgr._jobs))
-    return peak
+        return max(peak, len(mgr._jobs))
 
 
 @pytest.mark.parametrize("max_jobs", [1, 2, 4])
@@ -205,8 +205,17 @@ def test_pre_timeout_output_rides_the_handover_into_the_job_buffer():
     hand-over is a plain assignment rather than an excavation of CPython's
     private ``_fileobj2output`` — but the contract the CONSUMER implements is
     unchanged, and it is the consumer that had the defect. Set here the way
-    ``_tool_shell_exec`` sets it."""
-    proc = _real_proc("echo EARLY_OUT; echo EARLY_ERR >&2; sleep 30")
+    ``_tool_shell_exec`` sets it.
+
+    Production invariant the fixture must respect: by the time
+    ``_capture_bounded`` hands over, the recovered text has ALREADY been
+    consumed from the pipes, so recovered data and post-transition pipe data
+    are DISJOINT. The child therefore prints distinct text (PIPE_OUT/PIPE_ERR)
+    to the real pipes; reusing the recovered string would make the count
+    assertion below racy — a second copy can land in the pipe on either side
+    of the first drain depending on scheduling.
+    """
+    proc = _real_proc("echo PIPE_OUT; echo PIPE_ERR >&2; sleep 30")
     mgr = BackgroundJobManager(max_jobs=5, reap_interval=9999.0)
     try:
         proc._recovered_stdout = "EARLY_OUT\n"
@@ -219,6 +228,15 @@ def test_pre_timeout_output_rides_the_handover_into_the_job_buffer():
         # Recovered data is consumed exactly once — not duplicated on re-read.
         info2 = mgr.get_info(jid)
         assert info2.stdout.count("EARLY_OUT") == 1
+        # Post-transition pipe output still rides into the same buffer
+        # (disjoint from the recovered text, as in production).
+        deadline = time.monotonic() + 5
+        while True:
+            cur = mgr.get_info(jid)
+            if "PIPE_OUT" in cur.stdout and "PIPE_ERR" in cur.stderr:
+                break
+            assert time.monotonic() < deadline, "post-transition output never arrived"
+            time.sleep(0.05)
     finally:
         proc.kill()
         proc.wait()
@@ -278,7 +296,7 @@ def test_malloc_noise_stripped_from_background_job_output():
         assert "REAL_ERR" in info.stderr, "real stderr destroyed by the filter"
         assert "REAL_OUT" in info.stdout
 
-        listed = [j for j in mgr.list_jobs() if j.job_id == jid][0]
+        listed = next(j for j in mgr.list_jobs() if j.job_id == jid)
         assert "MallocStackLogging" not in listed.stderr
     finally:
         proc.kill()
@@ -491,3 +509,34 @@ def test_read_output_tolerates_a_missing_recovery_attribute():
         proc.kill()
         proc.wait()
         mgr.shutdown()
+
+
+def test_empty_nonblocking_pipe_reads_as_empty_not_typeerror():
+    """A would-block read must return "", on every supported interpreter.
+
+    Below CPython 3.14 a non-blocking TEXT-mode pipe with nothing buffered
+    signals "would block" by letting the raw layer return None; the incremental
+    decoder then rejects that with ``TypeError: can't concat NoneType to bytes``.
+    TypeError is neither OSError nor ValueError, so it escaped _read_fd's except
+    clause AND read_output()'s suppress(), propagated out of get_info(), and
+    surfaced to the model as a failed job_output tool call — on what is simply
+    an idle job. 3.14 raises BlockingIOError (an OSError subclass) for the same
+    condition, which is exactly why the dev interpreter never reproduced it, so
+    the TypeError is injected rather than provoked through a real empty pipe.
+    """
+    r_fd, w_fd = os.pipe()
+
+    class _WouldBlockPipe:
+        """Text-mode pipe that is open and empty, spelled the pre-3.14 way."""
+
+        def fileno(self):
+            return r_fd  # real fd: _read_fd toggles O_NONBLOCK on it
+
+        def read(self):
+            raise TypeError("can't concat NoneType to bytes")
+
+    try:
+        assert bjm.BackgroundJob._read_fd(_WouldBlockPipe()) == ""
+    finally:
+        os.close(r_fd)
+        os.close(w_fd)

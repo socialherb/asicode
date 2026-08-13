@@ -7,16 +7,17 @@ import json
 from types import SimpleNamespace
 
 import asi
+from external_llm.repl import repl_impl
 
 
 def _result(status="success", **kw):
     return SimpleNamespace(
         status=status,
         final_message=kw.get("final_message", ""),
-        error=kw.get("error", None),
-        metadata=kw.get("metadata", None),
-        applied_patches=kw.get("applied_patches", None),
-        turns=kw.get("turns", None),
+        error=kw.get("error"),
+        metadata=kw.get("metadata"),
+        applied_patches=kw.get("applied_patches"),
+        turns=kw.get("turns"),
     )
 
 
@@ -244,12 +245,12 @@ def test_run_once_json_blob_keeps_stdout_to_single_json_line(tmp_path, monkeypat
     """
     captured = {}
 
-    def _fake_build_engine(**kw):
-        captured["stream_cb"] = kw.get("stream_cb")
+    def _fake_build_engine(config, **kw):
+        captured["stream_cb"] = config.stream_cb
         return object()  # loop instance is opaque to the patched run path
 
-    monkeypatch.setattr(asi, "_build_engine", _fake_build_engine)
-    monkeypatch.setattr(asi, "_git_baseline", lambda root: "")
+    monkeypatch.setattr(repl_impl, "_build_engine", _fake_build_engine)
+    monkeypatch.setattr(repl_impl, "_git_baseline", lambda root: "")
 
     def _fake_run_with_cancel(loop, request, context, cancel_event, stream_callback=None):
         # Drive the callback exactly like the real engine does.
@@ -266,7 +267,7 @@ def test_run_once_json_blob_keeps_stdout_to_single_json_line(tmp_path, monkeypat
             turns=None,
         )
 
-    monkeypatch.setattr(asi, "_run_with_cancel", _fake_run_with_cancel)
+    monkeypatch.setattr(repl_impl, "_run_with_cancel", _fake_run_with_cancel)
 
     args = SimpleNamespace(
         repo=str(tmp_path), verbose=False,

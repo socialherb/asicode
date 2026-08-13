@@ -31,12 +31,12 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import os
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -47,7 +47,7 @@ import export_public  # noqa: E402  (reuse the exclusion rules verbatim)
 def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     """Run a subprocess with a 120s timeout. On timeout, abort immediately."""
     try:
-        return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=120)
+        return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=120, check=False)
     except subprocess.TimeoutExpired:
         cmd = " ".join(str(a) for a in args)
         print(
@@ -57,7 +57,10 @@ def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
         sys.exit(1)
 
 
-FIRST_PARTY_PREFIXES = ("external_llm.", "webapp.")
+# First-party packages ship in the wheel. The definition — and the memoized
+# per-file import scan — lives in export_public, which (unlike this script) is
+# not re-executed between gate invocations, so its caches survive.
+FIRST_PARTY_PREFIXES = export_public.FIRST_PARTY_PREFIXES
 
 
 def _version() -> str:
@@ -79,7 +82,9 @@ def _check_untracked_imports() -> bool:
       ``streaming_display._markdown_lines`` are both function-level).  A
       top-level-only scan passes clean on the exact bug this gate cites as its
       reason to exist, which is worse than no gate: it certifies the release.
-      Mutation guard: revert to ``iter_child_nodes`` → the
+      The traversal lives in ``export_public._first_party_imports`` (memoized
+      per path — the tree is immutable during a run), and the gate delegates
+      to it.  Mutation guard: revert to ``iter_child_nodes`` → the
       ``rich_markdown``-untracked case in test_release_untracked_import_gate
       FAILS.
     * **Scoped to what ships.**  ``is_excluded`` drops lane/, webapp/, tools/
@@ -89,8 +94,6 @@ def _check_untracked_imports() -> bool:
 
     Returns True if all imports resolve to tracked files, False otherwise.
     """
-    import ast as _ast
-
     tracked = set(export_public.tracked_files())
     shipped = [
         rel for rel in tracked
@@ -99,22 +102,13 @@ def _check_untracked_imports() -> bool:
 
     errors: list[str] = []
     for pyfile in sorted(shipped):
-        abs_path = REPO / pyfile
-        if not abs_path.is_file():
-            continue
-        try:
-            tree = _ast.parse(abs_path.read_text(encoding="utf-8", errors="replace"))
-        except SyntaxError:
-            continue  # malformed file (unlikely in tracked files)
-        for node in _ast.walk(tree):
-            if isinstance(node, _ast.Import):
-                for alias in node.names:
-                    _check_import(alias.name, pyfile, tracked, errors)
-            elif isinstance(node, _ast.ImportFrom):
-                if node.level and node.level > 0:
-                    continue  # relative import — skip
-                if node.module:
-                    _check_import(node.module, pyfile, tracked, errors)
+        # The scan is memoized in export_public (keyed by path — repo files are
+        # immutable during a run), so repeated invocations — this gate, the
+        # ignored-.py gate, the export itself — pay read/parse/walk once per
+        # file.  Missing or malformed files yield no imports (skipped, as
+        # before).
+        for module in export_public._first_party_imports(pyfile):
+            _check_import(module, pyfile, tracked, errors)
     if errors:
         print("error: release blocked — untracked first-party imports detected:", file=sys.stderr)
         for line in sorted(set(errors)):
@@ -139,7 +133,74 @@ def _check_import(module: str, importer: str, tracked: set[str], errors: list[st
     candidate_init = "/".join(parts) + "/__init__.py"
     if candidate_py in tracked or candidate_init in tracked:
         return
+    # Namespace package: a package directory WITHOUT __init__.py (e.g.
+    # external_llm/graph) still ships and imports fine as long as at least one
+    # tracked module lives under it — export copies tracked files, and Python
+    # resolves the namespace at import time.  Treat it as tracked; a package
+    # whose EVERY member is untracked stays a hard error (nothing ships).
+    prefix = "/".join(parts) + "/"
+    if any(p.startswith(prefix) for p in tracked):
+        return
     errors.append(f"{module} (imported by {importer}) → not tracked by git")
+
+
+# Root-level ignored .py files that are known personal/dev-only scripts. Root
+# .py files ship (asi.py, config.py, ...), so an ignored root module is the
+# same wheel-vanishing hazard as an ignored module under a shipping package —
+# except these, which have zero shipping references (verified 2026-07-30).
+_IGNORED_ROOT_ALLOWLIST = frozenset({"radio.py"})
+
+
+def _ignored_shipping_py(ignored_lines: list[str], shipped: list[str]) -> list[str]:
+    """Return gitignored ``.py`` files that would silently vanish from the wheel.
+
+    ``git status --porcelain`` does not report ignored files, so the clean-tree
+    check passes while a gitignored module is absent from the export (which
+    copies tracked files only) — the 0.2.6 ``version_check`` class of bug. The
+    hazard scope is: any ignored ``.py`` under a top-level directory that
+    contains shipped ``.py`` files, plus any ignored root-level ``.py`` (root
+    modules ship too), minus the documented allowlist.
+    """
+    shipped_dirs = {rel.split("/", 1)[0] for rel in shipped if "/" in rel and rel.endswith(".py")}
+    bad: list[str] = []
+    for line in ignored_lines:
+        stripped = line.strip()
+        if not stripped.startswith("!! "):
+            continue
+        rel = stripped[3:].strip().strip('"')
+        if not rel.endswith(".py"):
+            continue
+        if "/" in rel:
+            if rel.split("/", 1)[0] in shipped_dirs:
+                bad.append(rel)
+        elif rel not in _IGNORED_ROOT_ALLOWLIST:
+            # Root .py files ship too; any ignored root module is suspicious
+            # except the documented personal-script allowlist.
+            bad.append(rel)
+    return bad
+
+
+def _check_ignored_shipping_py(shipped: list[str]) -> bool:
+    """Fail-fast gate: no gitignored .py under a shipping location.
+
+    Machine-enforces the CLAUDE.md guidance ("release checks must use
+    ``git status --ignored``, not ``git status``) so the 0.2.6 class of
+    release bug cannot silently recur.
+    """
+    out = _run(["git", "status", "--porcelain", "--ignored"], REPO).stdout
+    bad = _ignored_shipping_py(out.splitlines(), shipped)
+    if bad:
+        print(
+            "error: release blocked — gitignored .py files under shipping locations:\n"
+            + "".join(f"  {rel}\n" for rel in sorted(bad))
+            + "  These are silently absent from the wheel (export copies tracked files\n"
+            "  only). Fix with: git check-ignore -v <file> → remove the rule and\n"
+            "  git add <file>, or delete the file. Known-benign root allowlist: "
+            + ", ".join(sorted(_IGNORED_ROOT_ALLOWLIST)),
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _changelog_has_version(version: str) -> bool:
@@ -211,11 +272,15 @@ def main() -> int:
     if not _check_untracked_imports():
         return 1
 
+    # ── 1b) Check: no gitignored .py under a shipping location ──────────────
+    # `git status --porcelain` is blind to ignored files; a gitignored module
+    # passes the clean-tree check and silently vanishes from the wheel.
+    shipped = [rel for rel in export_public.tracked_files()
+               if export_public.is_excluded(rel) is None]
+    if not _check_ignored_shipping_py(shipped):
+        return 1
+
     # ── 2) Export snapshot to a temp dir ───────────────────────────────────
-    shipped: list[str] = []
-    for rel in export_public.tracked_files():
-        if export_public.is_excluded(rel) is None:
-            shipped.append(rel)
     shipped_set = set(shipped)
 
     with tempfile.TemporaryDirectory(prefix="asicode-release-") as td:

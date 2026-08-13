@@ -8,9 +8,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from .config.thresholds import config as _cfg  # rendered into schema text (see C1)
 from .tool_handlers.shell_policy import (
     DANGEROUS_SHELL_COMMANDS as _DANGEROUS_SHELL_COMMANDS,
+)
+from .tool_handlers.shell_policy import (
     SHELL_TIMEOUT_DEFAULT as _SHELL_TIMEOUT_DEFAULT,
+)
+from .tool_handlers.shell_policy import (
     SHELL_TIMEOUT_MAX as _SHELL_TIMEOUT_MAX,
 )
 
@@ -27,18 +32,13 @@ SCHEMA_MODIFY_SYMBOL = {
         "name": "modify_symbol",
         "description": (
             "Modify a symbol (function, class, method) in a file. "
-            "You provide the file path, symbol name, and the new code. "
-            "The system automatically finds the symbol, calculates the correct line range "
-            "(including decorators), handles indentation, and validates syntax. "
-            "Supports Python, TypeScript, JavaScript, Go, Java, and Kotlin.\n\n"
-            "Supports two modes:\n"
-            "  • Full block: provide `def foo(...):\\n    ...` (with def/class line) — "
-            "replaces entire symbol including decorators\n"
-            "  • Body-only: provide just the body lines (without def/class) — "
-            "replaces only the body, preserving signature + decorators\n\n"
+            "Provide the file path, symbol name, and the new code; the system finds the symbol, "
+            "handles indentation, and validates syntax. "
             "★ PREFERRED over apply_patch for symbol-level changes: no line numbers, "
             "no diff syntax, automatic indentation correction, AST precision for Python. "
-            "Falls back to surgical search/replace for non-Python files."
+            "Two modes: Full block (with def/class line — replaces the whole symbol) "
+            "or Body-only (just the body — preserves signature). "
+            "Supports any language with an installed tree-sitter grammar."
         ),
         "parameters": {
             "type": "object",
@@ -70,7 +70,6 @@ SCHEMA_EDIT_AST = {
         "description": (
             "[Python only] Apply typed AST operations deterministically. "
             "Handles formatting automatically — no indentation errors, unlike text-based editing. "
-            "Use dry_run=true to preview the diff before writing. "
             "Use when adding/removing a decorator, guard, or statement inside a Python function where indentation matters."
         ),
         "parameters": {
@@ -82,21 +81,21 @@ SCHEMA_EDIT_AST = {
                 },
                 "ops": {
                     "type": "array",
-                    "description": "List of AST operations to apply sequentially. Each op is a dict with 'type' (required) and type-specific fields (see items description).",
+                    "description": (
+                        "List of AST operations to apply sequentially. Each op is a dict with 'type' (required) "
+                        "plus type-specific keys:\n"
+                        "  • replace_expr {old, new} — replaces 'old' in symbol scope (SINGLE expression, not full body)\n"
+                        "  • delete_stmt {pattern} — delete lines matching pattern\n"
+                        "  • add_import {import}\n"
+                        "  • remove_import_name {name, module?}\n"
+                        "  • add_class_field {class_name, field_name, field_type, field_default?}\n"
+                        "  • list_append / list_remove {list_name, value}\n"
+                        "  • add_guard {statement, insert_scope?, loop_variable?, loop_iterable_src?}\n"
+                        "Scoped ops (replace_expr, delete_stmt, add_guard) require the top-level 'symbol'."
+                    ),
                     "items": {
                         "type": "object",
-                        "description": (
-                            "Dict with 'type' + type-specific keys:\n"
-                              "  • replace_expr {old, new} — replace first 'old' in symbol scope. NOTE: replaces a SINGLE expression/statement (one line) — NOT the full function body.\n"
-                            "  • delete_stmt   {pattern} — delete lines matching pattern\n"
-                            "  • add_import    {import} — e.g. 'from os import path'\n"
-                            "  • remove_import_name {name, module?} — remove name from import\n"
-                            "  • add_class_field {class_name, field_name, field_type, field_default?}\n"
-                            "  • list_append / list_remove {list_name, value} — for __all__ etc.\n"
-                            "  • add_guard {statement, insert_scope?, loop_variable?,\n"
-                            "                loop_iterable_src?} — early-return guard\n"
-                            "Scoped ops (replace_expr, delete_stmt, add_guard) require the top-level 'symbol'."
-                        ),
+                        "description": "Dict with 'type' + type-specific keys (see list above)",
                     },
                 },
                 "symbol": {
@@ -116,23 +115,14 @@ SCHEMA_ANCHOR_EDIT = {
         "name": "anchor_edit",
         "description": (
             "Pattern-based file editing for precise sub-symbol insertion/deletion. "
-            "Uses an anchor_pattern (substring match first, regex fallback) to locate "
-            "the target line — no line numbers needed. Alternatively, supply "
-            "`anchor_ast_lineno` (a 1-indexed line from a fresh read_file/read_symbol) "
-            "to bypass string search entirely. Supports occurrence selection "
-            "(1=first, -1=last), context-before/after disambiguation, and fuzzy fallback "
-            "when exact match fails (string path only).\n\n"
-            "★ Use for: (1) inserting code at a specific position inside a large "
-            "function (sub-symbol edit), (2) when the anchor text is not globally "
-            "unique but can be disambiguated by occurrence or context, "
+            "Uses an anchor_pattern (substring first, regex fallback) or anchor_ast_lineno "
+            "to locate the target line.\n\n"
+            "★ Use for: (1) inserting code at a position inside a large function, "
+            "(2) disambiguating non-unique anchors by occurrence/context, "
             "(3) deleting lines matching a pattern, (4) replacing an entire line.\n\n"
             "★ Use edit_text instead for an exact unique string substitution; "
-            "use apply_patch for multi-line block edits.\n\n★ To APPEND at end-of-file, use bash `>>` or write_plan `insert_after`/`insert_after_line` instead of anchoring on the last line.\n\n"
-            "Modes:\n"
-            "  • insert_before — insert code_snippet before the matched line\n"
-            "  • insert_after  — insert code_snippet after the matched line\n"
-            "  • replace_line  — replace the entire matched line with code_snippet\n"
-            "  • delete        — delete matched line(s); no code_snippet needed"
+            "use apply_patch for multi-line block edits; to APPEND at end-of-file use bash `>>` "
+            "or write_plan insert_after/insert_after_line."
         ),
         "parameters": {
             "type": "object",
@@ -144,18 +134,12 @@ SCHEMA_ANCHOR_EDIT = {
                 "anchor_pattern": {
                     "type": "string",
                     "description": (
-                        "Pattern to locate the target line. MUST be a SINGLE LINE "
-                        "(no '\\n') — multi-line patterns are rejected at runtime. "
-                        "Substring match first (simple, safe for code with special chars), "
-                        "regex fallback if substring not found. For a multi-line block, use "
-                        "the FIRST line as anchor and disambiguate with context_before/context_after. "
-                        "E.g. 'const data = {' or 'def handle_click'. "
-                        "UNIQUENESS: if the pattern matches MORE THAN ONE line and you leave "
-                        "occurrence/context unset, the call fails with anchor_not_unique "
-                        "(default occurrence=-1 silently picks the LAST match, which is "
-                        "ambiguous). To avoid this entirely, pass `anchor_ast_lineno` "
-                        "instead. Otherwise make the pattern unique, or set `occurrence`, "
-                        "`context_before`, or `context_after` to disambiguate."
+                        "Pattern to locate the target line. Substring match first, "
+                        "regex fallback if not found. May span MULTIPLE lines ('\\n'-joined): "
+                        "the FIRST non-empty line locates the anchor, subsequent lines must "
+                        "strip-match. UNIQUENESS: matching more than one line fails with "
+                        "anchor_not_unique unless occurrence/context disambiguates. "
+                        "E.g. 'const data = {' or 'def handle_click'."
                     ),
                 },
                 "edit_mode": {
@@ -175,9 +159,9 @@ SCHEMA_ANCHOR_EDIT = {
                     "type": "integer",
                     "description": (
                         "Which match to target: 1=first, 2=second, ..., -1=last (default: -1). "
-                        "REQUIRED when anchor_pattern matches multiple lines — otherwise the "
-                        "call fails with anchor_not_unique. Prefer making the pattern unique "
-                        "instead, and use this only when uniqueness is impractical."
+                        "REQUIRED when the pattern matches multiple lines with no context — "
+                        "else anchor_not_unique. If it exceeds the match count, falls back to "
+                        "the LAST match (with a warning) rather than failing."
                     ),
                 },
                 "context_before": {
@@ -199,13 +183,11 @@ SCHEMA_ANCHOR_EDIT = {
                 "anchor_ast_lineno": {
                     "type": "integer",
                     "description": (
-                        "Optional: a 1-indexed line number (as shown by read_file/read_symbol "
-                        "line prefixes) to use DIRECTLY as the anchor, bypassing string/regex/"
-                        "fuzzy search entirely. Use this right after reading the file — it "
-                        "eliminates anchor_miss and anchor_not_unique failures. When set, "
-                        "anchor_pattern becomes optional (kept only as a readability hint). "
-                        "WARNING: line numbers are fragile — if the file was edited since you "
-                        "read it, the number may be stale and silently target the wrong line."
+                        "Optional: a 1-indexed line number (as shown by read_file/read_symbol) "
+                        "to use DIRECTLY as the anchor, bypassing string search. Use right after "
+                        "reading the file — avoids anchor_miss/anchor_not_unique. When set, "
+                        "anchor_pattern becomes optional. WARNING: numbers go stale — a stale "
+                        "number can silently target the wrong line."
                     ),
                 },
             },
@@ -217,21 +199,11 @@ SCHEMA_EDIT_TEXT = {
     "name": "edit_text",
     "description": (
         "Replaces an exact old_string with new_string in a single file. "
-        "No anchor resolution, no fuzzy matching — pure string replacement. "
-        "A blocking syntax gate refuses edits that would break Python parsing, and "
-        "non-blocking semantic diagnostics are surfaced post-write (like apply_patch). "
-        "Use when the change is a small, unique string substitution and apply_patch feels like overkill. "
-        "IMPORTANT: old_string must be UNIQUE (exactly 1 occurrence) in the file — uniqueness, not length, is enforced. "
-        "Include 2-3 lines of surrounding context ONLY when your anchor matches multiple times.\n\n"
-        "If old_string legitimately repeats elsewhere (e.g. similar methods) but is unique inside the "
-        "line range you read, pass scope_start_line + scope_end_line to restrict matching to that range — "
-        "occurrences outside the scope are ignored.\n\n"
-        "Two modes (mutually exclusive):\n"
-        "• Single: pass old_string + new_string (optionally replace_all).\n"
-        "• Batch (MultiEdit): pass `edits` — a list of {old_string, new_string, replace_all?} objects. "
-        "Edits apply in order; each later edit sees the result of earlier ones. The batch is ATOMIC: "
-        "if any edit fails to match, the file is left untouched and the failing edit's index is reported. "
-        "The file is written exactly once. Use batch mode for several unrelated substitutions in one call. To APPEND a whole block at end-of-file, use bash `>>` or write_plan `insert_after`/`insert_after_line` — old_string splicing at EOF just invites uniqueness and syntax-gate friction."
+        "Pure string replacement — no anchor resolution, no fuzzy matching. "
+        "Use for a small, unique string substitution where apply_patch feels like overkill. "
+        "old_string must be UNIQUE (exactly 1 occurrence); if it repeats, pass "
+        "scope_start_line/scope_end_line or use `edits`. "
+        "To APPEND a block at end-of-file, use bash `>>` or write_plan."
     ),
     "parameters": {
         "type": "object",
@@ -242,10 +214,7 @@ SCHEMA_EDIT_TEXT = {
             },
             "old_string": {
                 "type": "string",
-                "description": "Text to replace (must match exactly and be unique — exactly 1 occurrence in the file — unless replace_all=true). "
-                    "There is NO minimum length: uniqueness is enforced by occurrence count, not length. "
-                    "A short anchor is accepted as long as it appears exactly once. Include 2-3 lines of surrounding "
-                    "context ONLY when your anchor matches multiple times."
+                "description": "Text to replace (must match exactly and be unique — exactly 1 occurrence in the file — unless replace_all=true). Uniqueness is enforced by occurrence count, not length."
             },
             "new_string": {
                 "type": "string",
@@ -258,13 +227,9 @@ SCHEMA_EDIT_TEXT = {
             "scope_start_line": {
                     "type": "integer",
                     "description": (
-                        "1-indexed line number. When set TOGETHER with scope_end_line, match uniqueness "
-                        "is enforced WITHIN this line range only — occurrences OUTSIDE the range are "
-                        "ignored entirely. Use this to disambiguate when old_string legitimately repeats "
-                        "elsewhere in the file (e.g. similar setter methods, repeated boilerplate) but "
-                        "is unique inside the range you actually read. Pair it with the exact line range "
-                        "from your most recent read_file/read_symbol. Both scope_start_line AND "
-                        "scope_end_line must be provided together; one without the other is rejected."
+                        "1-indexed line number. Set TOGETHER with scope_end_line to restrict uniqueness "
+                        "matching to that range — occurrences OUTSIDE are ignored. Both must be provided "
+                        "together. Use when old_string repeats elsewhere but is unique inside the range you read."
                     ),
             },
             "scope_end_line": {
@@ -277,12 +242,10 @@ SCHEMA_EDIT_TEXT = {
             "edits": {
                 "type": "array",
                 "description": (
-                    "Batch (MultiEdit) mode: a list of edits to apply to the SAME file in one call. "
-                    "Each item is an object: {old_string: str, new_string: str, replace_all?: bool}. "
-                    "Edits apply sequentially; each later edit sees earlier edits' result. "
-                    "ATOMIC: if any edit fails to match, NO edits are written (file untouched). "
-                    "Cannot be combined with top-level old_string/new_string. "
-                    "Use this to make several substitutions with a single tool call instead of N round-trips."
+                    "Batch mode: a list of edits to apply to the SAME file in one call, in order. "
+                    "Each item: {old_string, new_string, replace_all?}. "
+                    "ATOMIC: any failed match leaves the file untouched. "
+                    "Cannot combine with top-level old_string/new_string."
                 ),
                 "items": {
                     "type": "object",
@@ -290,8 +253,8 @@ SCHEMA_EDIT_TEXT = {
                         "old_string": {"type": "string", "description": "Text to replace (must be unique unless replace_all)"},
                         "new_string": {"type": "string", "description": "Replacement text"},
                         "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)"},
-                                "scope_start_line": {"type": "integer", "description": "Optional: 1-indexed start line of a match scope (paired with scope_end_line). See top-level scope_start_line."},
-                                "scope_end_line": {"type": "integer", "description": "Optional: 1-indexed inclusive end line of a match scope (paired with scope_start_line)."},
+                                "scope_start_line": {"type": "integer", "description": "See top-level scope_start_line."},
+                                "scope_end_line": {"type": "integer", "description": "See top-level scope_end_line."},
                 },
                     "required": ["old_string", "new_string"],
                 },
@@ -336,21 +299,11 @@ SCHEMA_APPLY_PATCH = {
         "name": "apply_patch",
         "description": (
             "★ PREFERRED write tool for line-level edits. "
-            "Apply a unified diff patch to a single file. Uses exact line ranges and context "
+            "Apply a unified diff patch to a single file using exact line ranges and context "
             "lines, avoiding ambiguous text matches. "
-            "Line numbers must reflect the CURRENT file state — read the target range first; "
-            "stale line numbers after a previous edit are the most common failure. "
-            "IMPORTANT — dirty target files are REJECTED: if a target file already has uncommitted "
-            "working-tree edits made by a text-editing tool THIS SESSION (edit_text / modify_symbol / "
-            "edit_ast / anchor_edit), apply_patch returns ok=false. Such edits live in the working tree, "
-            "but apply_patch / diff_apply reconstructs hunk context from HEAD and, on a freshly-edited "
-            "target, reverts the file to HEAD on conflict — silently losing those session edits. Continue "
-            "editing such a file with the SAME text-editing tool instead. "
-            "(Patches touching OTHER files in the same call still apply; only the session-edited file is refused.) "
-            "Separately, for UNTRACKED files (no git blob) --3way fails with 'repository lacks the necessary blob' "
-            "— use the same alternatives. "
+            "Line numbers must reflect the CURRENT file state — read the target range first. "
             "For replacing a whole function/class use modify_symbol; for a small unique "
-            "string substitution use edit_text; to APPEND a block at end-of-file use bash `>>` or write_plan `insert_after`/`insert_after_line`."
+            "string substitution use edit_text; to append at EOF use bash `>>` or write_plan."
         ),
         "parameters": {
             "type": "object",
@@ -361,7 +314,7 @@ SCHEMA_APPLY_PATCH = {
                 },
                 "path": {
                     "type": "string",
-                    "description": "File path for hunk-only patches (omit for unified diffs with ---/+++ headers). If patch starts with '@@', server auto-wraps into unified diff.",
+                    "description": "File path for hunk-only patches (omit for unified diffs with ---/+++ headers)",
                 },
             },
             "required": ["patch"],
@@ -372,7 +325,7 @@ SCHEMA_READ_FILE = {
         "name": "read_file",
         "description": (
             "Read a file by path. 'path' is required — always pass a file path. "
-            "Without start_line/end_line: files up to 800 lines return full content; "
+            f"Without start_line/end_line: files up to {_cfg.lines.READ_FILE_FULL_LINES} lines return full content; "
             "larger files return the line count plus a symbol outline, so the follow-up "
             "call can name an exact range instead of guessing. "
             "Use start_line and end_line (1-indexed, inclusive) to read specific sections. "
@@ -392,7 +345,7 @@ SCHEMA_READ_FILE = {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path to the file within the repository. REQUIRED ('path' is required)."
+                    "description": "Relative path to a file in the repository, OR an absolute path. REQUIRED ('path' is required). Repo-external absolute paths are accepted only in the trusted local CLI (unrestricted_read); the webapp confines reads to the repo."
                 },
                 "start_line": {
                     "type": "integer",
@@ -424,7 +377,7 @@ SCHEMA_GREP = {
                 },
                 "path": {
                     "type": "string",
-                    "description": "File or directory to search in (default: repo root)"
+                    "description": "File or directory to search in (default: repo root). May be repo-relative or absolute; repo-external paths are accepted only in the trusted local CLI (unrestricted_read), the webapp confines search to the repo."
                 },
                 "include": {
                     "type": "string",
@@ -920,7 +873,10 @@ SCHEMA_SEARCH_WEB = {
                 "API references, external package info, current events, or any info "
                 "not available in the local repository. "
                 "NOT for: local code questions, repo-internal symbols, "
-                "design decisions already discussed in chat history."
+                "design decisions already discussed in chat history.\n"
+                "Results often include a page EXCERPT (real text from the page, not just a "
+                "SERP snippet) and a Published date — read those before reaching for "
+                "web_fetch, which is only needed when the excerpt is insufficient."
             ),
             "parameters": {
                 "type": "object",
@@ -1229,6 +1185,7 @@ SCHEMA_JOB = {
                 "type": "number",
                 "description": "Optional (output action only). Max seconds to wait for the job to finish. "
                 "The tool polls internally and returns only when the job completes or the timeout expires. "
+                "Values above 300 are clamped to 300; the wait is cancelled early if the user interrupts. "
                 "Default: 0 (return immediately with current output).",
             },
         },
@@ -1319,7 +1276,7 @@ def _schema_variant(*, python_only: bool, design_chat: bool) -> list[dict[str, A
     ]
 
 
-# The four (lang_filter × surface) variants, built once at import.
+# The four (lang_filter x surface) variants, built once at import.
 # Keyed ``(include_python_only, include_design_chat)``.
 #
 # Module-level rather than memoized per registry: the filtering depends only on

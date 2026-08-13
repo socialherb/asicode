@@ -16,11 +16,13 @@ from external_llm.analysis.unused_import_scanner import (
 
 def _make_py_file(source: str) -> str:
     """Write source to a temp .py file and return its absolute path."""
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, encoding="utf-8",
-    )
-    tmp.write(textwrap.dedent(source))
-    tmp.close()
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".py",
+        delete=False,
+        encoding="utf-8",
+    ) as tmp:
+        tmp.write(textwrap.dedent(source))
     return tmp.name
 
 
@@ -242,9 +244,8 @@ def test_max_per_file_enforced():
 
 def test_non_py_file_skipped():
     """Non-.py files are skipped (pre-filtered by ScannerRegistry)."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w")
-    tmp.write("import os\n")
-    tmp.close()
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w") as tmp:
+        tmp.write("import os\n")
     from external_llm.agent.scanner_registry import get_registry
     reg = get_registry()
     result = reg.run("unused_import_scanner", file_paths=[tmp.name])

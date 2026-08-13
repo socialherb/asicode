@@ -17,7 +17,6 @@ import pytest
 
 from external_llm.editor.agent.autonomous.push_manager import PushManager, get_push_manager
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 async def _consume_events_async(gen, count: int, timeout: float = 5.0) -> list[dict]:
@@ -208,6 +207,50 @@ class TestPushManagerRoundtrip:
         # One oldest item was evicted to make room for the sentinel, so the
         # total drained equals the original fill count (fill - 1 + sentinel).
         assert drained == filled
+
+    def test_cleanup_stale_keeps_live_idle_generator(self) -> None:
+        """A connected-but-idle client (generator running, no events for far
+        longer than CLIENT_TTL) must NOT be pruned: last_active is refreshed
+        only on event delivery, so liveness comes from the wake_loop binding —
+        pruning on last_active alone would silently cut a healthy tab off from
+        future broadcasts."""
+        pm = self.pm
+        client_id = "idle-client"
+
+        async def _go():
+            gen = pm.make_sse_generator(client_id)
+            try:
+                await _consume_events_async(gen, 1, timeout=2.0)  # handshake
+                # Simulate a long idle stretch: no events delivered, so
+                # last_active is stale by far more than CLIENT_TTL.
+                with pm._lock:
+                    pm._clients[client_id]["last_active"] = time.time() - pm.CLIENT_TTL - 60
+                assert pm.cleanup_stale() == 0
+                assert client_id in pm._clients
+                # Still connected: events must still arrive after the sweep.
+                assert pm.push(client_id, "still_alive", {"x": 1}) is True
+                payload = await _consume_events_async(gen, 1, timeout=2.0)
+                assert len(payload) == 1
+                assert payload[0]["event"] == "still_alive"
+            finally:
+                await gen.aclose()
+
+        asyncio.run(_go())
+
+    def test_cleanup_stale_prunes_abandoned_registration(self) -> None:
+        """A client that registered but whose generator never started (no
+        wake_loop binding) is pruned once last_active is past CLIENT_TTL."""
+        pm = self.pm
+        client_id = "abandoned-client"
+        q = pm.register(client_id)
+        with pm._lock:
+            pm._clients[client_id]["last_active"] = time.time() - pm.CLIENT_TTL - 60
+        assert pm.cleanup_stale() == 1
+        assert client_id not in pm._clients
+        # Registration is gone: pushes to the pruned id return False.
+        assert pm.push(client_id, "noop", {}) is False
+        # The orphaned queue object is inert — nothing else references it.
+        assert q is not None
 
 
 

@@ -15,13 +15,14 @@ def _reset_context_overrides():
     """Clear runtime context-override state before every test.
 
     This is an autouse fixture — it runs automatically for every test in the
-    tests/unit/agent/ directory, regardless of the test class.
+    tests/unit/agent/ directory, regardless of the test class. ``_override_dirty``
+    is reset too so the dirty-guard / merge-on-write behaviour starts from a
+    known clean baseline each test (a leftover dirty flag from one test would
+    make a clean-flush test in another unexpectedly write).
     """
-    from external_llm.agent.context_budget import (
-        _context_window_overrides,
-        _override_meta,
-    )
-    _context_window_overrides.clear()
-    _override_meta.clear()
+    import external_llm.agent.context_budget as _cb
+    _cb._context_window_overrides.clear()
+    _cb._override_meta.clear()
+    _cb._override_dirty = False
     yield
     # Teardown: noop — the clear is done at setup time.

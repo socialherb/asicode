@@ -35,11 +35,11 @@ not raise it on a single passing run.
 """
 from __future__ import annotations
 
-import tomllib
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import pytest
+import tomllib
 
 try:
     from packaging.requirements import Requirement

@@ -1,6 +1,10 @@
 """Unit tests for scanner_registry.py — 100% coverage."""
 from __future__ import annotations
 
+import hashlib
+import os
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,7 +27,6 @@ def registry() -> ScannerRegistry:
             name="test_scanner",
             description="A test scanner",
             input_schema={"limit": "int"},
-            produces_workset_kinds=["test_cluster"],
             file_filter=".py",
         ),
         MagicMock(return_value=[]),
@@ -382,7 +385,7 @@ class TestRun:
 class TestVultureScannerRegistration:
     """Verify vulture_dead_code_scanner is registered and graph-gated correctly.
 
-    These run before TestAutoRegisterImportErrors (which reloads the module and
+    These run before TestAutoRegisterFailFast (which reloads the module and
     resets registry state), so they see the real auto-registered global registry.
     """
 
@@ -454,13 +457,21 @@ class TestVultureScannerRegistration:
 # ── _auto_register import error blocks (lines 227-228, 246-247, etc.) ────────
 # Run LAST (after all other tests) because importlib.reload resets module state.
 
-class TestAutoRegisterImportErrors:
-    """Cover all except ImportError blocks in _auto_register."""
+class TestAutoRegisterFailFast:
+    """_auto_register imports every first-party scanner module unconditionally.
 
-    def test_all_scanners_fail_import(self):
-        """When all scanner modules are unavailable, except blocks are exercised."""
+    P26-6 gate: no try/except ImportError fallbacks around first-party imports
+    (they can never fail in a proper install — each analysis module imports
+    only stdlib + first-party code, verified at cleanup time). If a scanner
+    module EVER fails to import (e.g. a syntax error), the failure must
+    PROPAGATE: silent degradation hid missing scanners and let the fallback
+    tails rot (P26-1: the content-ratio guard wired only to a legacy branch).
+    """
+
+    def test_scanner_import_failure_propagates(self):
+        """A broken/unavailable scanner module aborts _auto_register instead
+        of silently skipping the scanner."""
         import importlib
-        import sys
 
         from external_llm.agent import scanner_registry as sr_mod
 
@@ -483,11 +494,11 @@ class TestAutoRegisterImportErrors:
                 saved[mod_name] = sys.modules.pop(mod_name)
 
         try:
-            # Patch sys.modules with None for scanner modules so imports raise ImportError
-            with patch.dict(sys.modules, {m: None for m in scanner_modules}, clear=False):
+            # Patch sys.modules with None for scanner modules so imports raise
+            # ModuleNotFoundError — the failure must propagate, not degrade.
+            with patch.dict(sys.modules, dict.fromkeys(scanner_modules), clear=False), \
+                    pytest.raises(ModuleNotFoundError):
                 importlib.reload(sr_mod)
-            # After reload with all imports failing, no scanners should be registered
-            assert sr_mod.get_registry().list_names() == []
         finally:
             # Restore original modules
             sys.modules.update(saved)
@@ -660,3 +671,241 @@ class TestSupportedLanguages:
         from external_llm.agent.scanner_registry import get_registry
         spec = get_registry().get_spec("unused_import_scanner")
         assert spec.file_filter == ".py"
+
+
+# ── Scanner source freshness (R12-2) ─────────────────────────────────────────
+
+
+class TestSourceFreshness:
+    """Loaded-code-vs-disk staleness detection for scanner modules.
+
+    A long-lived server imports scanner modules once and keeps executing that
+    in-memory code; when a scanner source file changes on disk afterwards, the
+    fingerprint recorded at registration must detect the mismatch.
+    """
+
+    def _register_fake(
+        self, tmp_path, monkeypatch, mod_name, file_name, source,
+    ) -> tuple[str, ScannerRegistry]:
+        """Register a scanner whose __module__ resolves to a real tmp file."""
+        src = tmp_path / file_name
+        src.write_text(source, encoding="utf-8")
+        monkeypatch.setitem(
+            sys.modules, mod_name,
+            types.SimpleNamespace(__file__=str(src)),
+        )
+        reg = ScannerRegistry()
+        reg.register(
+            ScannerSpec(name=mod_name, description="d"),
+            types.SimpleNamespace(__module__=mod_name),
+        )
+        return str(src), reg
+
+    def test_register_records_fingerprint_and_detects_disk_change(
+        self, tmp_path, monkeypatch,
+    ):
+        src_path, reg = self._register_fake(
+            tmp_path, monkeypatch,
+            "_r12_fake_mod", "fake_scanner_mod.py", "VALUE = 1\n",
+        )
+        # Loaded code matches disk → clean.
+        assert src_path not in reg.verify_loaded_sources()
+        # On-disk change after load → stale (loaded code is pre-edit).
+        with open(src_path, "w", encoding="utf-8") as fh:
+            fh.write("VALUE = 2\n")
+        assert src_path in reg.verify_loaded_sources()
+
+    def test_verify_reports_deleted_source(self, tmp_path, monkeypatch):
+        src_path, reg = self._register_fake(
+            tmp_path, monkeypatch,
+            "_r12_fake_mod2", "fake_scanner_mod2.py", "VALUE = 1\n",
+        )
+        os.remove(src_path)
+        assert src_path in reg.verify_loaded_sources()
+
+    def test_pyc_file_resolves_to_sibling_py(self, tmp_path, monkeypatch):
+        py = tmp_path / "mod.py"
+        py.write_text("X = 1\n", encoding="utf-8")
+        monkeypatch.setitem(
+            sys.modules, "_r12_fake_pyc_mod",
+            types.SimpleNamespace(__file__=str(tmp_path / "mod.pyc")),
+        )
+        reg = ScannerRegistry()
+        reg.register(
+            ScannerSpec(name="_r12_fake_pyc_mod", description="d"),
+            types.SimpleNamespace(__module__="_r12_fake_pyc_mod"),
+        )
+        assert str(py) in reg.source_versions()
+        py.write_text("X = 2\n", encoding="utf-8")
+        assert str(py) in reg.verify_loaded_sources()
+
+    def test_unresolvable_source_skipped(self, tmp_path, monkeypatch):
+        """.so suffix and nonexistent .py are not fingerprinted — no crash."""
+        monkeypatch.setitem(
+            sys.modules, "_r12_fake_so_mod",
+            types.SimpleNamespace(__file__=str(tmp_path / "m.so")),
+        )
+        monkeypatch.setitem(
+            sys.modules, "_r12_fake_missing_mod",
+            types.SimpleNamespace(__file__=str(tmp_path / "missing.py")),
+        )
+        monkeypatch.setitem(
+            sys.modules, "_r12_fake_nofile_mod",
+            types.SimpleNamespace(__file__=None),
+        )
+        reg = ScannerRegistry()
+        reg.register(
+            ScannerSpec(name="_r12_fake_so_mod", description="d"),
+            types.SimpleNamespace(__module__="_r12_fake_so_mod"),
+        )
+        reg.register(
+            ScannerSpec(name="_r12_fake_nofile_mod", description="d"),
+            types.SimpleNamespace(__module__="_r12_fake_nofile_mod"),
+        )
+        versions = reg.source_versions()
+        assert not any(
+            k.endswith(("m.so", "missing.py")) for k in versions
+        )
+
+    def test_mock_fn_registration_does_not_crash(self):
+        """fn.__module__ being a Mock (non-string) is skipped silently."""
+        reg = ScannerRegistry()
+        fn = MagicMock(return_value=[])
+        reg.register(ScannerSpec(name="mock_scanner", description="d"), fn)
+        assert reg.get("mock_scanner") is fn
+
+    def test_unknown_module_name_skipped(self):
+        """fn.__module__ naming a module NOT in sys.modules is skipped."""
+        reg = ScannerRegistry()
+        reg.register(
+            ScannerSpec(name="_r12_ghost_mod", description="d"),
+            types.SimpleNamespace(__module__="_r12_ghost_mod"),
+        )
+        assert reg.get("_r12_ghost_mod") is not None
+        assert "_r12_ghost_mod" not in reg.source_versions()
+
+    def test_source_versions_expose_short_hash(self, tmp_path, monkeypatch):
+        src_path, reg = self._register_fake(
+            tmp_path, monkeypatch,
+            "_r12_fake_mod3", "fake_scanner_mod3.py", "VALUE = 42\n",
+        )
+        expected = hashlib.sha256(b"VALUE = 42\n").hexdigest()[:8]
+        assert reg.source_versions()[src_path] == expected
+
+
+# ── P3-1 opt-in auto-reload of stale scanner modules ─────────────────────────
+
+
+class TestSourceAutoReload:
+    """reload_stale_sources() reloads modules whose on-disk source changed.
+
+    Unlike the freshness tests above (fake SimpleNamespace modules), these
+    register REAL modules imported from tmp_path, because importlib.reload is
+    the mechanism under test.
+    """
+
+    def _register_real_module(self, tmp_path, monkeypatch, name, source):
+        """Import a real module from tmp_path and register its ``scan`` fn."""
+        mod_dir = tmp_path / "scanner_pkg"
+        mod_dir.mkdir(exist_ok=True)
+        mod_file = mod_dir / f"{name}.py"
+        mod_file.write_text(source, encoding="utf-8")
+        monkeypatch.syspath_prepend(str(mod_dir))
+        mod = __import__(name)
+        reg = ScannerRegistry()
+        reg.register(ScannerSpec(name=name, description="d"), mod.scan)
+        return mod_file, reg
+
+    def test_reload_stale_sources_reregisters_fresh_function(
+        self, tmp_path, monkeypatch,
+    ):
+        mod_file, reg = self._register_real_module(
+            tmp_path, monkeypatch, "_p31_reload_mod",
+            "def scan(repo_root='', file_paths=None, **kw):\n    return ['v1']\n",
+        )
+        old_fn = reg.get("_p31_reload_mod")
+
+        # On-disk change after load → stale; reload → fresh function object.
+        mod_file.write_text(
+            "def scan(repo_root='', file_paths=None, **kw):\n    return ['v2']\n",
+            encoding="utf-8",
+        )
+        assert str(mod_file) in reg.verify_loaded_sources()
+
+        reloaded = reg.reload_stale_sources()
+
+        assert str(mod_file) in reloaded
+        assert str(mod_file) not in reg.verify_loaded_sources()  # re-snapshotted
+        new_fn = reg.get("_p31_reload_mod")
+        assert new_fn is not old_fn  # run() dispatches to the NEW code
+        assert new_fn() == ["v2"]
+
+    def test_reload_noop_when_clean(self, tmp_path, monkeypatch):
+        mod_file, reg = self._register_real_module(
+            tmp_path, monkeypatch, "_p31_clean_mod",
+            "def scan(repo_root='', file_paths=None, **kw):\n    return []\n",
+        )
+        assert reg.reload_stale_sources() == []
+        assert str(mod_file) not in reg.verify_loaded_sources()
+
+    def test_reload_failure_keeps_old_code_and_reports_stale(
+        self, tmp_path, monkeypatch,
+    ):
+        mod_file, reg = self._register_real_module(
+            tmp_path, monkeypatch, "_p31_bad_mod",
+            "def scan(repo_root='', file_paths=None, **kw):\n    return ['v1']\n",
+        )
+        mod_file.write_text("this is not valid python !!!\n", encoding="utf-8")
+        old_fn = reg.get("_p31_bad_mod")
+
+        reloaded = reg.reload_stale_sources()
+
+        assert reloaded == []  # nothing reloaded
+        assert str(mod_file) in reg.verify_loaded_sources()  # still stale
+        assert reg.get("_p31_bad_mod") is old_fn  # old code keeps serving
+
+    def test_reload_sibling_before_entry_module(self, tmp_path, monkeypatch):
+        """A shared helper must be reloaded before the module importing it."""
+        mod_dir = tmp_path / "scanner_pkg"
+        mod_dir.mkdir(exist_ok=True)
+        (mod_dir / "_p31_sibling.py").write_text("SHARED = 1\n", encoding="utf-8")
+        (mod_dir / "_p31_entry.py").write_text(
+            "from _p31_sibling import SHARED\n"
+            "def scan(repo_root='', file_paths=None, **kw):\n"
+            "    return [SHARED]\n",
+            encoding="utf-8",
+        )
+        monkeypatch.syspath_prepend(str(mod_dir))
+        entry = __import__("_p31_entry")
+        __import__("_p31_sibling")
+        reg = ScannerRegistry()
+        reg.register(ScannerSpec(name="_p31_entry", description="d"), entry.scan)
+        # (b)-path fingerprint: sibling impl modules are recorded the same way
+        # the registry records real siblings under the analysis package.
+        reg._record_module_source("_p31_sibling")
+
+        # Both files change on disk (entry keeps importing the sibling value).
+        (mod_dir / "_p31_sibling.py").write_text("SHARED = 2\n", encoding="utf-8")
+        (mod_dir / "_p31_entry.py").write_text(
+            "from _p31_sibling import SHARED\n"
+            "def scan(repo_root='', file_paths=None, **kw):\n"
+            "    return [SHARED]\n"
+            "# touched after load\n",
+            encoding="utf-8",
+        )
+        assert len(reg.verify_loaded_sources()) == 2
+
+        reloaded = reg.reload_stale_sources()
+
+        assert len(reloaded) == 2
+        # The entry module's reload re-executed its import, which hit
+        # sys.modules and saw the ALREADY-reloaded sibling → new value.
+        assert reg.get("_p31_entry")() == [2]
+
+    def test_auto_reload_flag_from_env(self, monkeypatch):
+        monkeypatch.setenv("ASICODE_SCANNER_AUTO_RELOAD", "1")
+        assert ScannerRegistry().auto_reload_stale is True
+        monkeypatch.setenv("ASICODE_SCANNER_AUTO_RELOAD", "0")
+        assert ScannerRegistry().auto_reload_stale is False
+        monkeypatch.setenv("ASICODE_SCANNER_AUTO_RELOAD", "yes")
+        assert ScannerRegistry().auto_reload_stale is True

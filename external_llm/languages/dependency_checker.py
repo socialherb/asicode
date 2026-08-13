@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Optional
 
@@ -248,17 +249,16 @@ def _detect_version(cmd: str) -> str:
 
     Most tools support ``<cmd> --version``, but Go requires ``go version``.
     """
-    try:
+    with suppress(OSError, subprocess.SubprocessError):
         # Go uses "go version", not "go --version"
         version_cmd = [cmd, "version"] if cmd == "go" else [cmd, "--version"]
         proc = subprocess.run(
             version_cmd,
             capture_output=True, text=True, timeout=5,
+            check=False,
         )
         if proc.returncode == 0:
             return proc.stdout.strip() or proc.stderr.strip()
-    except (OSError, subprocess.SubprocessError):
-        pass
     return ""
 
 
@@ -299,6 +299,7 @@ def _npm_install(package: str) -> bool:
         proc = subprocess.run(
             ["npm", "install", "-g", package],
             capture_output=True, text=True, timeout=120,
+            check=False,
         )
     except FileNotFoundError:
         print("    \u2717 npm not found \u2014 cannot install")
@@ -329,6 +330,7 @@ def _pip_install(package: str) -> bool:
         proc = subprocess.run(
             [sys.executable, "-m", "pip", "install", package],
             capture_output=True, text=True, timeout=120,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         print("    \u2717 pip install timed out (120s)")
@@ -358,6 +360,7 @@ def _pip_install(package: str) -> bool:
                     [sys.executable, "-m", "pip", "install",
                      "--break-system-packages", package],
                     capture_output=True, text=True, timeout=120,
+                     check=False,
                 )
             except (OSError, subprocess.SubprocessError) as e2:
                 print(f"    \u2717 retry failed: {e2}")
@@ -436,9 +439,7 @@ def _resolve_tool(t: _Tool) -> bool:
     """
     if shutil.which(t.cmd):
         return True
-    if t.use_npx and shutil.which("npx"):
-        return True
-    return False
+    return bool(t.use_npx and shutil.which("npx"))
 
 
 def _check_tools(tools: list[_Tool]) -> None:
@@ -537,9 +538,9 @@ def _sync_tool_state(tools: list[_Tool], baseline: dict[str, str]) -> None:
     # Preserve dismissals for tools whose language is absent from this repo.
     # The global state spans all repos; only the tools we actually examined
     # this run may be re-derived.
-    for cmd, dec in baseline.items():
-        if cmd not in examined:
-            decisions[cmd] = dec
+    decisions.update(
+        {cmd: dec for cmd, dec in baseline.items() if cmd not in examined}
+    )
     if decisions != baseline:
         _save_tool_state(decisions)
 def _check_tools_with_state(
@@ -619,11 +620,10 @@ def _check_tools_with_state(
 
     # 5. Re-check after installs (npx-aware)
     for t in wanted:
-        if not t.found and not t.skipped:
-            if _resolve_tool(t):
-                t.found = True
-                if not t.use_npx:
-                    t.version = _detect_version(t.cmd)
+        if not t.found and not t.skipped and _resolve_tool(t):
+            t.found = True
+            if not t.use_npx:
+                t.version = _detect_version(t.cmd)
 
     # 6. Persist dismissal decisions (incl. new ones from the prompt loop).
     _sync_tool_state(wanted, persisted)
@@ -690,11 +690,10 @@ def check_and_install_all(
 
     # 4. Re-check after installs (npx-aware)
     for t in tools:
-        if not t.found and not t.skipped:
-            if _resolve_tool(t):
-                t.found = True
-                if not t.use_npx:
-                    t.version = _detect_version(t.cmd)
+        if not t.found and not t.skipped and _resolve_tool(t):
+            t.found = True
+            if not t.use_npx:
+                t.version = _detect_version(t.cmd)
 
     return {t.cmd: t.found for t in tools}
 
@@ -732,16 +731,15 @@ def _prompt_and_install(t: _Tool) -> None:
     if t.pip_package:
         methods.append(("pip", t.pip_package, "pip"))
 
-    if t.manual_hint:
-        if not methods:
-            print("    Auto-install not available.")
-            print(textwrap.indent(t.manual_hint, "    "))
-            if _ask_yes_no("    Mark as done (pretend installed)", default=False):
-                t.found = True
-                t.pretend_installed = True
-            else:
-                t.skipped = True
-            return
+    if t.manual_hint and not methods:
+        print("    Auto-install not available.")
+        print(textwrap.indent(t.manual_hint, "    "))
+        if _ask_yes_no("    Mark as done (pretend installed)", default=False):
+            t.found = True
+            t.pretend_installed = True
+        else:
+            t.skipped = True
+        return
 
     if not methods:
         t.skipped = True

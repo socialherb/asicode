@@ -6,6 +6,7 @@ Gracefully degrades when ``tsc`` is not installed.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -127,6 +128,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                     _cmd,
                     capture_output=True, text=True, timeout=30,
                     cwd=os.path.dirname(_tmp_path) or ".",
+                    check=False,
                 )
             except FileNotFoundError:
                 logger.debug("tsc not installed; falling back to tree-sitter")
@@ -352,6 +354,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                     # budget still covers the common small batch.
                     timeout=30 + 5 * len(file_paths),
                     cwd=project_root,
+                    check=False,
                 )
             except FileNotFoundError:
                 logger.debug("tsc not installed; skipping semantic validation")
@@ -406,6 +409,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 try:
                     num = int(_code[2:])
                 except ValueError:
+                    logger.debug("tsc diagnostic code not numeric: %r", _code)
                     continue
                 if not (2000 <= num <= 2999):
                     continue
@@ -426,10 +430,8 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 for p in file_paths
             }
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_config)
-            except OSError:
-                pass
 
     # ── Symbol patterns ───────────────────────────────────────────────────
 
@@ -438,7 +440,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         if kind in ("function", "any"):
             patterns.append(SymbolPattern(
                 kind="function",
-                regex=r"(?:export\s+)?(?:async\s+)?function\s+{name}\s*[\(<]",
+                regex=r"(?:export\s+)?(?:async\s+)?function\s*\*?\s*{name}\s*[\(<]",
                 description="TS/JS function declaration",
             ))
             patterns.append(SymbolPattern(
@@ -501,12 +503,14 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 with open(full, encoding="utf-8", errors="replace") as f:
                     text = f.read()
             except OSError:
+                logger.debug("could not read test config %s", full)
                 return None
             # Try JSON (jest.config.json, package.json)
             if path.endswith(".json"):
                 try:
                     return json.loads(text)
                 except json.JSONDecodeError:
+                    logger.debug("test config %s is not valid JSON", full)
                     return None
             # For .js/.ts config files, try to extract the config object
             # by looking for common export patterns
@@ -560,9 +564,8 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         # ── 3. package.json (scripts or jest config) ───────────────────
         pkg_path = os.path.join(repo_root, "package.json")
         if os.path.isfile(pkg_path):
-            try:
-                with open(pkg_path, encoding="utf-8") as f:
-                    pkg = json.load(f)
+            with contextlib.suppress(json.JSONDecodeError, OSError), open(pkg_path, encoding="utf-8") as f:
+                pkg = json.load(f)
                 # Inline jest config: { "jest": { "roots": [...] } }
                 jest_cfg = pkg.get("jest")
                 if isinstance(jest_cfg, dict):
@@ -578,8 +581,6 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                     _found = _m.group(1) or _m.group(0)
                     if "test" in _found.lower():
                         return _found.strip("./")
-            except (json.JSONDecodeError, OSError):
-                pass
 
         # ── 4. Convention: check if __tests__ or tests exists ──────────
         for _candidate in ("__tests__", "tests", "spec", "test"):
@@ -596,14 +597,11 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         pkg_path = os.path.join(repo_root, "package.json")
         runner = "jest"  # default
         if os.path.isfile(pkg_path):
-            try:
-                with open(pkg_path, encoding="utf-8") as f:
-                    pkg = json.load(f)
+            with contextlib.suppress(OSError, ValueError), open(pkg_path, encoding="utf-8") as f:  # missing/unparseable package.json
+                pkg = json.load(f)
                 deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
                 if "vitest" in deps:
                     runner = "vitest"
-            except Exception:
-                pass
         return ["npx", runner, "--passWithNoTests"] + (test_args or [])
 
     # ── Symbol finder (regex + brace counting) ────────────────────────────
@@ -619,21 +617,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
             if result:
                 return result
 
-        return self._find_symbol_regex(file_path, symbol_name, content)
-
-    def _find_symbol_regex(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> tuple[int, int] | None:
-        """Fallback: regex match + brace counting for block end."""
-        esc = re.escape(symbol_name)
-        for sp in self.get_symbol_patterns("any"):
-            pat = sp.regex.replace("{name}", esc)
-            for m in re.finditer(pat, content, re.MULTILINE):
-                start_offset = m.start()
-                start_line = content[:start_offset].count("\n") + 1
-                end_line = self._find_block_end(content, start_offset)
-                return (start_line, end_line)
-        return None
+        return self._find_symbol_regex(symbol_name, content)
 
     @staticmethod
     def _find_block_end(content: str, offset: int) -> int:
@@ -654,9 +638,11 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
     ) -> list[tuple[str, str, int, int]]:
         """Regex fallback: find all top-level TS/JS definitions via pattern + brace counting."""
         results: list[tuple[str, str, int, int]] = []
-        # Functions: function Name(  or async function Name(
+        # Functions: function Name( / async function Name( / generator
+        # function* Name( (the * is optional — a generator declaration was
+        # previously invisible to the fallback).
         for m in re.finditer(
-            r'^(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(',
+            r'^(?:export\s+)?(?:async\s+)?function\s*\*?\s+(\w+)\s*\(',
             content, re.MULTILINE,
         ):
             start_line = content[:m.start()].count("\n") + 1
@@ -721,22 +707,6 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 method_end = self._find_block_end(content, method_start)
                 results.append((_name, method_line, method_end))
         return results
-
-    def _find_symbol_body_range_regex(
-        self, content: str, symbol_name: str,
-    ) -> tuple[int, int] | None:
-        """Regex fallback: find function body via first { after definition."""
-        esc = re.escape(symbol_name)
-        for sp in self.get_symbol_patterns("any"):
-            pat = sp.regex.replace("{name}", esc)
-            for m in re.finditer(pat, content, re.MULTILINE):
-                body_start = content.find("{", m.end())
-                if body_start == -1:
-                    continue
-                body_start_line = content[:body_start].count("\n") + 1
-                body_end_line = self._find_block_end(content, body_start)
-                return (body_start_line, body_end_line)
-        return None
 
     # ── Structural query methods (tree-sitter → regex fallback) ────────────
 

@@ -2,8 +2,9 @@
 # Install:  pipx install pre-commit && pre-commit install
 #
 # This gate mirrors .github/workflows/lint.yml EXACTLY: three ruff
-# baseline-diff checks (F821/F401/F811) plus one zero-tolerance check (F823),
-# AND one AST-based baseline-diff check (no-new-silent-except) that freezes the
+# baseline-diff checks (F821/F401/F811), three zero-tolerance checks (F823,
+# full default rule set, open-encoding), AND one AST-based baseline-diff check
+# (no-new-silent-except) that freezes the
 # ~1.4k pre-existing silent-except handlers and blocks only NET-NEW ones — the
 # documented fail-open incident class (0.2.6 version_check). It catches lint- and
 # observability-baseline drift (e.g. the F811 line-scoped key shifting when a
@@ -12,7 +13,7 @@
 # "EXACTLY" was aspirational until 2026-07-27: no-new-silent-except lived HERE
 # ONLY and had no lint.yml step, so it gated nothing for anyone who had not run
 # `pre-commit install` — and lint.yml is the only workflow that actually runs
-# (p11-ci.yml is excluded from the public export). Keep the two lists in sync;
+# on every push/PR. Keep the two lists in sync;
 # a hook without a matching CI step is indistinguishable from no gate at all.
 #
 # no-new-unguarded-subprocess freezes the 2 intentional unguarded subprocess
@@ -24,12 +25,40 @@
 # rule has no legitimate use (it is always a missing `global`/`nonlocal`). See
 # scripts/check_f823_none.py for the production bug that motivated it.
 #
-# Why not full `ruff` / `ruff-format` / `pyright`? pyproject selects
-# E/F/I/N/UP/W/B/ASYNC/RUF but ~1377 un-baselined lint violations and ~982
-# format violations remain (see the staged `ignore` list in pyproject.toml).
-# Re-enable those hooks only after that backlog is cleared. `language: system`
-# uses the host `python3`/`ruff` — the same binaries the check scripts call via
-# subprocess — so the result is identical to `python3 scripts/check_*.py`.
+# Why not full `ruff` until now? pyproject selects E/F/I/N/UP/W/B/ASYNC/RUF
+# + PT011/TRY004/PLW1510, but a ~1377-violation backlog made a full-scan gate
+# impossible (see the staged `ignore` list in pyproject.toml). That backlog was
+# cleared rule-by-rule; on 2026-08-07 only 2 violations remained and both were
+# fixed, so `ruff check .` is now gated (full-lint hook / check_lint_full.py,
+# zero-tolerance, no baseline). `ruff format` (~982 violations) and pyright
+# remain ungated — re-enable those only after their backlogs are cleared.
+# `language: system` uses the host `python3`/`ruff` — the same binaries the
+# check scripts call via subprocess — so the result is identical to
+# `python3 scripts/check_*.py`.
+#
+# Incremental, not always_run — why
+# ---------------------------------
+# pre-commit compares the full-tree `git diff` captured at run start against
+# the diff after each hook (run.py: files_modified = diff_before != diff_after).
+# The previous always_run full-repo scans (7 hooks, ~6s) left a window where a
+# PARALLEL session writing any tracked file tripped a false "files were
+# modified by this hook" failure on every hook. Each hook now scans only the
+# commit's changed .py files (pre-commit passes them as args; the check scripts
+# normalize to repo-relative paths, so baseline keys are identical to a full
+# scan) — the window shrinks from ~6s to a few hundred ms. The full-repo scan
+# still runs in lint.yml, which invokes the same scripts with NO args: the
+# local gate is incremental, CI is exhaustive (see the mirror note above).
+# #
+# # The remaining race (~few hundred ms window) is closed at the hook layer by
+# # scripts/git_commit_wrapper.py, installed as .git/hooks/pre-commit via:
+# #     python3 scripts/git_commit_wrapper.py --install-hook
+# # It runs the real pre-commit gate; on a "files were modified by this hook"
+# # failure it compares only the OUT-OF-SCOPE diff (files outside this
+# # commit's staged set): changed (or a stash/pop "Rolling back" conflict
+# # notice) → parallel session is writing → wait for the tree to settle and
+# # retry ONCE (strictly bounded); unchanged → genuine hook modification →
+# # report as-is. NOTE: `pre-commit install` overwrites the hook — re-run
+# # --install-hook afterwards.
 repos:
   - repo: local
     hooks:
@@ -37,41 +66,116 @@ repos:
         name: F821 (undefined name) baseline-diff
         language: system
         entry: python3 scripts/check_f821_no_new.py
-        pass_filenames: false
-        always_run: true
+        types: [python]
       - id: baseline-f401
         name: F401 (unused import) baseline-diff
         language: system
         entry: python3 scripts/check_f401_no_new.py
-        pass_filenames: false
-        always_run: true
+        types: [python]
       - id: baseline-f811
         name: F811 (redefinition of unused) baseline-diff
         language: system
         entry: python3 scripts/check_f811_no_new.py
-        pass_filenames: false
-        always_run: true
+        types: [python]
       - id: no-f823
         name: F823 (referenced before assignment) zero-tolerance
         language: system
         entry: python3 scripts/check_f823_none.py
-        pass_filenames: false
-        always_run: true
+        types: [python]
+      # The other half of no-f823: F823 needs the name to be READ before the
+      # assignment, so a write-only `x = ...` that forgot `global` produces no
+      # ruff diagnostic at all and the write is silently discarded. Both shapes
+      # shipped here (webapp _rg_dirty froze a counter file at all-zeros;
+      # repl_impl _completer_provider pinned /think to the startup model).
+      - id: missing-global
+        name: undeclared write to a module global zero-tolerance
+        language: system
+        entry: python3 scripts/check_missing_global.py
+        types: [python]
       - id: no-new-silent-except
         name: silent-except (no log/raise) baseline-diff
         language: system
-        entry: python3 scripts/check_no_new_silent_except.py
-        pass_filenames: false
-        always_run: true
+        # --index-only: scan the HEAD+index snapshot (what the commit ships),
+        # NOT the working tree — pre-commit's unstaged-stash would otherwise
+        # desync baseline vs scanned tree (see scripts/check_no_new_silent_except.py).
+        entry: python3 scripts/check_no_new_silent_except.py --index-only
+        types: [python]
       - id: open-encoding
         name: open() without encoding= zero-tolerance
         language: system
         entry: python3 scripts/check_open_encoding.py
-        pass_filenames: false
-        always_run: true
+        types: [python]
       - id: no-new-unguarded-subprocess
         name: unguarded subprocess (no OSError catch) baseline-diff
         language: system
         entry: python3 scripts/check_no_new_unguarded_subprocess.py
-        pass_filenames: false
-        always_run: true
+        types: [python]
+      - id: standalone-imports
+        name: standalone import (fresh interpreter) baseline-diff
+        language: system
+        # Incremental per-file mode here (imports only the commit's changed
+        # .py modules in fresh interpreters); lint.yml runs the same script
+        # with --index-only = full-repo snapshot scan. Mirrors lint.yml.
+        entry: python3 scripts/check_standalone_imports.py
+        types: [python]
+      - id: no-new-first-party-import-fallback
+        name: first-party ImportError fallback baseline-diff
+        language: system
+        # A first-party module (pyproject py-modules / packages.find, or any
+        # relative import) can never fail to import at runtime — an
+        # except ImportError around it is a dead fallback whose tail rots
+        # silently (P26-1: the content-ratio guard was wired only to a legacy
+        # branch nobody reached). Baseline freezes the 39 pre-existing ones;
+        # only net-new fallbacks fail. Mirrors lint.yml.
+        entry: python3 scripts/check_no_new_first_party_import_fallback.py --index-only
+        types: [python]
+      - id: discarded-signal
+        name: computed-and-dropped signal (message-only f-string) baseline-diff
+        language: system
+        # `x = <Call>` immediately followed by `raise ... f"...{x}..."` with x
+        # used ONLY in the message f-string (never passed as structured data)
+        # is a dropped signal — the Ollama retry_after P0. The 1 baselined
+        # entry is a display-only message string. Mirrors lint.yml.
+        entry: python3 scripts/check_discarded_signal.py
+        types: [python]
+      - id: dead-params
+        name: unused function/method parameters baseline-diff
+        language: system
+        # A parameter the body never reads is usually a bug (a caller-computed
+        # setting silently ignored — v8 context_level, system_chars, etc.) or
+        # signature noise. 29 baselined entries are documented interface
+        # uniformity exceptions. Mirrors lint.yml.
+        entry: python3 scripts/check_dead_params.py
+        types: [python]
+      - id: full-lint
+        name: ruff check . (full default rule set) zero-tolerance
+        language: system
+        entry: python3 scripts/check_lint_full.py
+        types: [python]
+      # select entries must each prove a real behavior change: a per-rule entry
+      # already covered by a prefix in select (e.g. "B904" under "B") is a
+      # no-op activation round — the P-9 B904 commit added exactly such a
+      # redundant line. Config-only gate; mirrors lint.yml.
+      - id: select-not-redundant
+        name: no redundant [tool.ruff.lint] select entries
+        language: system
+        entry: python3 scripts/check_select_not_redundant.py
+        types: [python]
+      # Deterministic structural scanners (contradictory_logic / duplicate_definition
+      # / unused_import / dead_block / public_dead_code / vulture / broken_contract)
+      # — zero-tolerance, no baseline: they were at ZERO candidates repo-wide when
+      # gated (first three 2026-08-07, remaining four 2026-08-08 after the gate
+      # script started building the call graph once and injecting
+      # cross_file_referenced_names + repo_graph — the standalone no-graph counts
+      # that kept them out (dead_block 43, public_dead_code 43, vulture 35) were
+      # cross-file false positives, and broken_contract always skipped without a
+      # graph; vulture's framework-dispatch FPs are suppressed structurally in
+      # vulture_scanner._framework_live_for_file). Remaining report-only:
+      # ast_similarity / container. See scripts/check_structural_scanners.py.
+      # Per-file mode here (changed files only); lint.yml runs the same script with
+      # NO args = full-repo scan including report-only counts.
+      - id: structural-scan
+        name: deterministic structural scanners zero-tolerance
+        language: system
+        entry: python3 scripts/check_structural_scanners.py
+        types_or: [python, ts, tsx, javascript, go, java, kotlin]

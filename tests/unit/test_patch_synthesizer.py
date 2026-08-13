@@ -84,7 +84,7 @@ def test_no_match_emits_empty_diff_and_warns(caplog):
 def test_mode_none_raises():
     with tempfile.TemporaryDirectory() as td:
         pr = ParseResult(success=True, mode=None)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="mode is None"):
             PatchSynthesizer(td).synthesize(pr, "m.py")
 
 
@@ -97,3 +97,45 @@ def test_full_file_mode_creates_diff():
         diff = PatchSynthesizer(td).synthesize(pr, "m.py")
         assert "-a = 1" in diff
         assert "+a = 2" in diff
+
+
+# ---------------------------------------------------------------------------
+# P23-1: size gate + errors="replace" on synthesis target reads
+# ---------------------------------------------------------------------------
+
+def test_oversized_file_raises_file_too_large_full_file():
+    """FULL_FILE synthesis of an oversized target must raise, not read unbounded."""
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "big.py")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("x = 0\n" * 50_000)  # ~350 KB > _MAX_SYNTHESIZE_FILE_CHARS
+        pr = ParseResult(success=True, mode=OutputMode.FULL_FILE, content="y = 1\n")
+        with pytest.raises(ValueError, match="file_too_large"):
+            PatchSynthesizer(td).synthesize(pr, "big.py")
+
+
+def test_oversized_file_raises_file_too_large_asicode_block():
+    """ASICODE_BLOCK synthesis of an oversized target must raise likewise."""
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "big.py")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("x = 0\n" * 50_000)
+        pr = ParseResult(
+            success=True,
+            mode=OutputMode.ASICODE_BLOCK,
+            blocks=[{"before": "x = 0\n", "after": "x = 1\n"}],
+        )
+        with pytest.raises(ValueError, match="file_too_large"):
+            PatchSynthesizer(td).synthesize(pr, "big.py")
+
+
+def test_invalid_utf8_replaced_not_dropped():
+    """errors='replace' (not 'ignore'): invalid bytes become U+FFFD in the diff
+    instead of being silently deleted from old_content (P23-1)."""
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "m.py")
+        with open(path, "wb") as fh:
+            fh.write(b"x = \xff\xfe\n")  # invalid UTF-8 bytes
+        pr = ParseResult(success=True, mode=OutputMode.FULL_FILE, content="y = 1\n")
+        diff = PatchSynthesizer(td).synthesize(pr, "m.py")
+        assert "\ufffd" in diff

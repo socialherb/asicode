@@ -50,7 +50,7 @@ class ContradictoryCandidate:
     lineno: int
     end_lineno: int
     detail: str               # human-readable description
-    confidence: float         # 0.0–1.0
+    confidence: float         # 0.0-1.0
     node_kind: str = ""       # AST node type at lineno: "If" | "While" | "Assert"
     condition_dump: str = ""  # ast.dump(condition, annotate_fields=False) for If/While
 
@@ -115,9 +115,8 @@ def _collect_pos_neg_names(node: ast.BoolOp) -> tuple[set[str], set[str]]:
     for val in node.values:
         if isinstance(val, ast.Name) and isinstance(val.ctx, ast.Load):
             pos_names.add(val.id)
-        elif isinstance(val, ast.UnaryOp) and isinstance(val.op, ast.Not):
-            if isinstance(val.operand, ast.Name):
-                neg_names.add(val.operand.id)
+        elif isinstance(val, ast.UnaryOp) and isinstance(val.op, ast.Not) and isinstance(val.operand, ast.Name):
+            neg_names.add(val.operand.id)
     return pos_names, neg_names
 
 
@@ -125,10 +124,10 @@ def _check_boolop_tautology(node: ast.BoolOp) -> list[tuple[str, str]]:
     """Detect contradictory (``x and not x``) or redundant (``x or not x``) patterns.
 
     Returns a list of (kind, message) tuples. Empty list if no pattern detected.
-    
+
     For And: detects ``x and not x`` (contradictory, always False).
     For Or: detects ``x or not x`` (redundant, always True).
-    
+
     Requires the same name in both positive (``x``) and negative (``not x``)
     form as *direct children* of the BoolOp.  ``not x and y > 0`` is NOT flagged
     because ``x`` only appears in negative form.
@@ -268,9 +267,12 @@ def _has_name_mutation(
                     return True
                 # Method call on a condition name (e.g. _allowed.add()) is an
                 # in-place mutation even when has_attr_access is False.
-                if isinstance(node.func, ast.Attribute):
-                    if isinstance(node.func.value, ast.Name) and node.func.value.id in names:
-                        return True
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in names
+                ):
+                    return True
     return False
 
 
@@ -550,7 +552,7 @@ def _check_body_stmts(
     # seen[dump_str] = (prev_lineno, prev_chain_id, prev_flat_idx, prev_body)
     # Always advances to the nearest occurrence so distance is to the closest prior.
     seen: dict = {}
-    for dump_str, lineno, branch_end, chain_id, flat_idx, cond_node, body, node_kind in scope_conditions:
+    for dump_str, lineno, branch_end, chain_id, flat_idx, cond_node, dup_body, node_kind in scope_conditions:
         if dump_str in seen:
             prev_lineno, prev_chain_id, prev_flat_idx, prev_body = seen[dump_str]
             is_dup = False
@@ -563,38 +565,36 @@ def _check_body_stmts(
                 # Cross-chain: check mutation barrier first
                 intervening = flat_stmts[prev_flat_idx + 1 : flat_idx]
                 cond_names, has_attr = _extract_condition_names(cond_node)
-                if not _has_name_mutation(intervening, cond_names, has_attr):
+                if not _has_name_mutation(intervening, cond_names, has_attr) and flat_idx == prev_flat_idx + 1:
                     # Adjacency gate: only directly consecutive `if x: A` /
                     # `if x: B` statements are merge candidates.  A repeated
                     # guard further apart is almost always an intentional
                     # phase boundary in a long function — sample verification
                     # (2026-06-12, 8 candidates at 12-46 lines apart) found
                     # 0 true positives under the distance-based gate.
-                    if flat_idx == prev_flat_idx + 1:
-                        is_dup = True
+                    is_dup = True
 
                 if is_dup:
                     cond_names_chk, has_attr_chk = _extract_condition_names(cond_node)
                     # Check 1: if the first block's own body mutates the condition
                     # variable, the second check is testing the post-mutation value
                     # (e.g. fallback assignment then re-check) — not a dup.
-                    if _has_name_mutation(prev_body, cond_names_chk, has_attr_chk):
-                        is_dup = False
-                    # Check 2: if the two bodies write to completely disjoint targets
-                    # they serve independent purposes — not a removable dup.
-                    elif not _bodies_have_overlapping_writes(prev_body, body):
-                        is_dup = False
-                    # Check 3: when write-target overlap is inconclusive (both bodies
-                    # are side-effect-only), fall back to non-trivial call overlap.
-                    # Bodies calling disjoint non-trivial functions are independent
-                    # sequential guards under the same flag — not a removable dup.
-                    elif not _bodies_have_overlapping_calls(prev_body, body):
-                        is_dup = False
-                    # Check 4: asymmetric exit profile — exactly one body ends with
-                    # return/raise while the other does not.  This signals "side-effect
-                    # accumulation" (first block) vs "early-exit decision" (second block)
-                    # — two structurally distinct roles that must not be merged.
-                    elif _body_has_early_exit(prev_body) != _body_has_early_exit(body):
+                    if (
+                        _has_name_mutation(prev_body, cond_names_chk, has_attr_chk)
+                        # Check 2: if the two bodies write to completely disjoint targets
+                        # they serve independent purposes — not a removable dup.
+                        or not _bodies_have_overlapping_writes(prev_body, dup_body)
+                        # Check 3: when write-target overlap is inconclusive (both bodies
+                        # are side-effect-only), fall back to non-trivial call overlap.
+                        # Bodies calling disjoint non-trivial functions are independent
+                        # sequential guards under the same flag — not a removable dup.
+                        or not _bodies_have_overlapping_calls(prev_body, dup_body)
+                        # Check 4: asymmetric exit profile — exactly one body ends with
+                        # return/raise while the other does not. This signals "side-effect
+                        # accumulation" (first block) vs "early-exit decision" (second block)
+                        # — two structurally distinct roles that must not be merged.
+                        or _body_has_early_exit(prev_body) != _body_has_early_exit(dup_body)
+                    ):
                         is_dup = False
 
             if is_dup:
@@ -627,7 +627,7 @@ def _check_body_stmts(
                 ))
 
         # Always track the nearest prior occurrence for future distance checks
-        seen[dump_str] = (lineno, chain_id, flat_idx, body)
+        seen[dump_str] = (lineno, chain_id, flat_idx, dup_body)
 
     return candidates
 
@@ -660,13 +660,11 @@ def scan_contradictory_logic(
         if tree is None:
             continue
 
-        emitted = 0
         file_candidates = _check_body_stmts(
             list(tree.body), "<module>", rel_path, max_dup_distance,
         )
-        for c in file_candidates:
+        for emitted, c in enumerate(file_candidates, start=1):
             candidates.append(c)
-            emitted += 1
             if emitted >= max_per_file:
                 _truncated_total += len(file_candidates) - emitted
                 logger.warning(

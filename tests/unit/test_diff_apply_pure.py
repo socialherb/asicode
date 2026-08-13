@@ -476,7 +476,7 @@ class TestCountHunkBodyEmptyLines:
         ]
         result = diff_apply._count_hunk_body(lines, 0)
         assert result is not None
-        end, actual_old, actual_new, claimed_old, claimed_new = result
+        end, actual_old, actual_new, _claimed_old, _claimed_new = result
         # old: ' a' + '' + ' b' = 3 ; new: ' a' + '' + '+new' + ' b' = 4
         assert actual_old == 3
         assert actual_new == 4

@@ -142,6 +142,7 @@ class JavaSyntaxProvider(SyntaxProvider):
                     capture_output=True, text=True, timeout=30,
                     cwd=os.path.dirname(_tmp_path) or ".",
                     env=_compile_env(),
+                    check=False,
                 )
             except FileNotFoundError:
                 logger.debug("javac not installed; falling back to tree-sitter")
@@ -241,6 +242,7 @@ class JavaSyntaxProvider(SyntaxProvider):
                     capture_output=True, text=True, timeout=30,
                     cwd=project_root,
                     env=_compile_env(),
+                    check=False,
                 )
             except FileNotFoundError:
                 logger.debug("javac not installed; skipping semantic validation")
@@ -345,21 +347,7 @@ class JavaSyntaxProvider(SyntaxProvider):
             if result:
                 return result
 
-        return self._find_symbol_regex(file_path, symbol_name, content)
-
-    def _find_symbol_regex(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
-        """Fallback: regex + brace counting."""
-        esc = re.escape(symbol_name)
-        for sp in self.get_symbol_patterns("any"):
-            pat = sp.regex.replace("{name}", esc)
-            for m in re.finditer(pat, content, re.MULTILINE):
-                start_offset = m.start()
-                start_line = content[:start_offset].count("\n") + 1
-                end_line = self._find_block_end(content, start_offset)
-                return (start_line, end_line)
-        return None
+        return self._find_symbol_regex(symbol_name, content)
 
     @staticmethod
     def _find_block_end(content: str, offset: int) -> int:
@@ -432,22 +420,6 @@ class JavaSyntaxProvider(SyntaxProvider):
         depth counter. See base.py for the full contract.
         """
         return find_brace_block_end_offset(content, offset)
-
-    def _find_symbol_body_range_regex(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
-        """Regex fallback: find function body via first { after definition."""
-        esc = re.escape(symbol_name)
-        for sp in self.get_symbol_patterns("any"):
-            pat = sp.regex.replace("{name}", esc)
-            for m in re.finditer(pat, content, re.MULTILINE):
-                body_start = content.find("{", m.end())
-                if body_start == -1:
-                    continue
-                body_start_line = content[:body_start].count("\n") + 1
-                body_end_line = self._find_block_end(content, body_start)
-                return (body_start_line, body_end_line)
-        return None
 
     # ── Structural query methods (tree-sitter → regex fallback) ────────────
 

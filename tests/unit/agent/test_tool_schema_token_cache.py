@@ -59,5 +59,34 @@ def test_openai_style_function_name_wrappers():
     _clear_cache()
     su.estimate_tokens_from_tool_schemas(
         [{"function": {"name": "wrapped"}}, {"name": "flat"}])
-    fp = list(su._tool_schema_token_cache.keys())[0]
+    fp = next(iter(su._tool_schema_token_cache.keys()))
     assert fp[1] == ("wrapped", "flat")
+
+
+def test_capped_put_refreshes_insertion_order_lru():
+    """_shared_utils._capped_put (walk caches + git snapshot cache) must treat
+    a re-inserted key as recently-used; before the fix a hot repo refreshed
+    past its TTL stayed at the front of the dict and was the first eviction
+    candidate once the cap was exceeded."""
+    cache: dict = {}
+    for i in range(4):
+        su._capped_put(cache, f"r{i}", i, cap=4)
+    for _ in range(50):
+        su._capped_put(cache, "r0", 0, cap=4)
+    su._capped_put(cache, "new", 99, cap=4)
+    assert "r0" in cache and len(cache) == 4
+    assert "r1" not in cache
+
+
+def test_cjk_description_not_undercounted():
+    """Tool-schema descriptions must be counted by the CJK-aware byte
+    estimator: the old chars/3 formula counted a 3-byte Korean char as ~1/3
+    token — the exact under-count this subsystem exists to prevent."""
+    _clear_cache()
+    _text = "한국어 설명" * 10
+    # Distinct names: the content fingerprint keys on names only, so same-name
+    # schemas would share a cache entry and mask the estimator difference.
+    cjk = su.estimate_tokens_from_tool_schemas([{"name": "t_cjk", "description": _text}])
+    ascii_ = su.estimate_tokens_from_tool_schemas(
+        [{"name": "t_ascii", "description": "x" * len(_text)}])
+    assert cjk > ascii_, "CJK (3 bytes/char) must cost MORE than same-length ASCII"

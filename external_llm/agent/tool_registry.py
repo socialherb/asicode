@@ -7,9 +7,12 @@ Security: all file operations are bounded by repo_root.
 """
 from __future__ import annotations
 
+import contextlib
+import functools
 import logging
 import os
 import re
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -22,23 +25,24 @@ if TYPE_CHECKING:
     from .agent_profile import AgentProfile
 
 import subprocess
+from concurrent.futures import TimeoutError as _FutureTimeoutError
 
 from external_llm.common.indent_utils import reindent_text
+from external_llm.common.walk_policy import _walk_should_skip_dir
 
 from ..graph.graph_facade import RepositoryGraphFacade
 
 # ── Extracted modules ────────────────────────────────────────────────────
 from ..languages import LanguageId
-from ._thread_pool import shared_pool
+from ._thread_pool import CANCEL_POLL_INTERVAL, shared_pool
+from .agent_loop_types import WRITE_TOOL_NAMES, AgentCancelled
 from .argument_repairer import ArgumentRepairer
 from .call_graph import CallGraphIndexer
 from .config.thresholds import config as _cfg
 from .lint_runner import LintRunner
 from .performance_metrics import get_global_collector
 from .rag_searcher import RAGSearcher
-from .symbol_search import SymbolSearcher
-from .tool_chain import ScopedToolFilter
-from .tool_dependency_graph import ToolDependencyGraph
+from .symbol_search import get_symbol_searcher
 from .tool_handlers.agent_tools import AgentToolsMixin
 from .tool_handlers.analysis_tools import AnalysisToolsMixin
 from .tool_handlers.browser_tools import BrowserActionToolsMixin
@@ -53,8 +57,10 @@ from .tool_handlers.read_tools import ReadToolsMixin
 from .tool_handlers.test_tools import TestToolsMixin
 from .tool_handlers.web_search_tools import WebSearchToolsMixin
 from .tool_handlers.write_tools import WriteToolsMixin
+from .tool_result_cache import _path_sig
 from .tool_safety import WriteSafetyManager
 from .tool_schemas import TOOL_NAME_VARIANTS, TOOL_SCHEMA_VARIANTS
+from .write_targets import write_target_paths
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +88,10 @@ class AgentConfig:
     auto_test_on_patch: bool = False   # Automatically run pytest after patch apply
     max_tdd_cycles: int = 3            # Maximum retry count after consecutive failures
     test_paths: list[str] = field(default_factory=list)  # pytest paths/arguments
-    # Planner-Executor
-    planning_enabled: bool = False     # Enable pre-execution planning phase
+    # Timeout budget (seconds) for the run_tests tool. Default 300, not 120:
+    # with an empty test_paths the TDD gate runs the FULL suite, and 120 s was
+    # smaller than it (~150-180 s here) — the gate timed out on every green run.
+    test_timeout_sec: int = 300
     # Self-Review
     self_review_enabled: bool = False  # Enable post-execution self-review phase
     max_review_turns: int = 3          # Maximum review turns for self-review corrections
@@ -122,8 +130,9 @@ class AgentConfig:
     auto_observation_enabled: bool = False
 
     # Parallel tool execution: run independent tools concurrently
+    # (concurrency is governed by the process-wide _thread_pool.shared_pool —
+    # there is no per-session worker-count knob)
     parallel_tool_execution_enabled: bool = True
-    max_parallel_workers: int = 5
 
     model_name: str = ""
     # ── Helper configuration (canonical) ─────────────────────────────────────
@@ -178,36 +187,27 @@ class AgentConfig:
     # Disables small-model complexity gating (orchestrator already scoped the task).
     is_subagent: bool = False
 
-    # Planner model: primary LLM client/model (merged UI: Planner IS the main model).
-    # Always set to user's selected planner. Cross-provider: separate client per provider.
-    planner_llm_client: Optional[Any] = None
-    planner_model: str = ""
+    # NO planner_llm_client / planner_model here. They carried the separate LLM
+    # client PlannerAgent used, and PlannerAgent went with the PLANNER lane on
+    # 2026-08-03 — after which every reference in the tree was an assignment or
+    # a guard around one, with zero readers. Confirmed by running an AgentLoop
+    # with a tripwire object in each field: zero accesses across a
+    # read/grep/write turn, while the same probe on a field that IS read
+    # (helper_enabled) fired immediately. The webapp still accepts the matching
+    # planner_* request params and warns that they are inert; see agent_stream.
 
-    # Post-read replan: max operations allowed in replan_from_phase1_results.
-    # read_symbol ops are now allowed, so a slightly higher budget may be useful.
-    post_read_max_ops: int = 6
-
-    # Developer model: separate LLM for OperationExecutor edit instruction generation
+    # Developer model: the client/model the AgentLoop itself runs on when the
+    # caller overrides it (webapp resolves this into AgentLoop's llm_client).
     developer_llm_client: Optional[Any] = None
     developer_model: str = ""
 
 
-    # Self-planning: PlannerAgent critique + refine loop (2 extra LLM calls)
-    self_planning_enabled: bool = True
-
-    # Candidate selection: generate multiple plan candidates and pick the best one
-    candidate_selection_enabled: bool = True
-
     # Design chat mode: write tools disabled, no early-finish, LLM synthesizes full response
     design_chat_mode: bool = False
 
-    # Pre-built spec from design-chat analysis (implementation_spec).
-    # When set, _run_planner_lane skips SpecResolver and uses this spec directly.
-    prebuilt_spec_for_planner: Optional[Any] = None
-
     # ── Token continuity (cross-phase) ──────────────────────────────────────
     # Token offset from prior phases (e.g., Design Chat, main agent loop).
-    # Applied by _run_planner_lane to PlannerAgent so token_usage events
+    # Applied to the agent loop so token_usage events
     # show cumulative totals across phase boundaries. Cleared after apply.
     _token_offset_prompt_tokens: int = 0
     _token_offset_completion_tokens: int = 0
@@ -215,7 +215,7 @@ class AgentConfig:
 
     # Phase 7.1: Conversation layer integration (opt-in)
     # When True, routes requests through ConversationRouter → DesignStateManager →
-    # FreezeManager → HandoffManager before SpecResolver.
+    # FreezeManager → HandoffManager before the planner lane.
     conversation_layer_enabled: bool = False
 
     # ── Context budget management ─────────────────────────────────────────
@@ -225,12 +225,6 @@ class AgentConfig:
     # Load via: AgentProfile.load(name, repo_root) or load_profile(name, repo_root)
     # None = no profile, all defaults apply.
     agent_profile: Optional[Any] = None  # AgentProfile instance
-    semantic_fit_divergence_threshold: float = 0.70
-    planner_fallthrough_enabled: bool = True
-    # Phase 7.2: When True, clarification_needed from planner
-    # is re-routed to Design Chat instead of returning raw AgentResult.
-    # Design Chat refines implementation_spec with user help → re-runs planner.
-    design_chat_reroute_enabled: bool = True
 
     # ── Cross-repo read boundary (trust-scoped) ───────────────────────────
     # When False (default), read tools (read_file / get_file_outline /
@@ -350,6 +344,72 @@ def _ensure_asicode_gitignored(repo_root: str) -> None:
         logger.warning("Could not update .gitignore: %s", e)
 
 
+def _bias_matched_candidate(match) -> str:
+    """The path token of a bias-correction match — group(0) minus the leading
+    whitespace/tilde prefix, an optional ``cd `` verb, and the trailing subpath.
+    """
+    _candidate = match.group(0)[len(match.group(1)):]
+    _candidate = re.sub(r"^cd\s+", "", _candidate)
+    _sub = match.group(3) or ""
+    if _sub:
+        _candidate = _candidate[: -len(_sub)]
+    return _candidate
+
+
+def _bias_matched_path_is_real(match) -> bool:
+    """True if the path matched by a bias-correction regex (up to and
+    including the bias token) actually exists on disk.
+
+    Training-data bias paths are VIRTUAL roots — they never existed on this
+    machine (/workspace, /home/ubuntu/..., ...). A matched path that EXISTS is
+    real user data: rewriting it would silently redirect a live command into
+    the repo (reading/writing the wrong file). Real paths are therefore never
+    rewritten; only nonexistent (virtual) ones are corrected.
+    """
+    _candidate = _bias_matched_candidate(match)
+    return bool(_candidate) and os.path.exists(os.path.expanduser(_candidate))
+
+
+# Bias tokens are virtual roots from LLM training data — never real machine
+# paths. /repo is included: some models emit /repo as the workdir root.
+_BIAS_PATHS: frozenset[str] = frozenset({"/workspace", "/app", "/project", "/code", "/repo"})
+
+# Scratch/temp roots are REAL machine roots — a path under one of them is a
+# user-intended destination (often not yet created: ``mkdir -p /tmp/<name>``,
+# ``tar -C /tmp/<name>``, ``git worktree add /tmp/<name>``), NEVER a
+# training-data virtual root. ``os.path.exists()`` alone cannot tell the two
+# apart because the scratch destination legitimately does not exist yet — pass
+# 2's basename regex would otherwise rewrite ``/tmp/<basename>`` → repo_root
+# and run the command against the real repository. Live bug class 2026-08-05:
+# ``ls /tmp/asicode/files`` / ``rm -rf /tmp/asicode`` were rewritten, and
+# ``tar -C /tmp/<basename>`` is a silent destructive overwrite because
+# tar/cp/mv/rsync have no approval gate.
+_SCRATCH_ROOTS: frozenset[str] = frozenset(
+    {
+        tempfile.gettempdir(),
+        "/tmp",
+        "/private/tmp",
+        "/var/tmp",
+        "/var/folders",
+        "/private/var/folders",
+    }
+)
+
+
+def _under_scratch_root(candidate: str) -> bool:
+    """True if *candidate* (~-expanded, symlink-resolved) lies under a scratch
+    root. Symlink resolution keeps macOS (/tmp → /private/tmp) and Linux (/tmp)
+    consistent. An empty candidate is never scratch.
+    """
+    if not candidate:
+        return False
+    c = os.path.realpath(os.path.expanduser(candidate))
+    return any(
+        c == r or c.startswith(r.rstrip("/") + "/")
+        for r in (os.path.realpath(x) for x in _SCRATCH_ROOTS)
+    )
+
+
 class ToolRegistry(
     ReadToolsMixin,
     WriteToolsMixin,
@@ -376,7 +436,7 @@ class ToolRegistry(
       ShellToolsMixin     — shell_exec (bash)
       TestToolsMixin    — run_tests, run_lint
       AgentToolsMixin   — update_memory, delegate_to_helper
-      WebSearchToolsMixin — search_web (SearXNG/Brave/DuckDuckGo/Naver-browser)
+      WebSearchToolsMixin — search_web (SearXNG/Startpage/Exa merged; Brave/DDG/Naver fallback)
     """
 
     # Directories pruned when counting source files for language detection.
@@ -435,7 +495,6 @@ class ToolRegistry(
         "delegate_to_helper": "_tool_delegate_to_helper",
         "delegate_to_local_model": "_tool_delegate_to_helper",
         "ask_user": "_tool_ask_user",
-        "query_experience": "_tool_query_experience",
         "search_web": "_tool_search_web",
         "web_fetch": "_tool_web_fetch",
         "browser_action": "_tool_browser_action",
@@ -478,6 +537,7 @@ class ToolRegistry(
                     ["git", "rev-parse", "--show-toplevel"],
                     capture_output=True, text=True, timeout=5,
                     cwd=repo_root,
+                    check=False,
                 )
                 if _result.returncode != 0:
                     ToolRegistry._LANGUAGE_DETECTION_CACHE[_norm] = None
@@ -494,8 +554,17 @@ class ToolRegistry(
 
         counts: dict[str, int] = {}  # LanguageId name -> file count
         for _root, dirs, files in os.walk(repo_root):
-            dirs[:] = [d for d in dirs if d not in ToolRegistry._COUNT_SKIP_DIRS]
-            for _f in files:
+            # _COUNT_SKIP_DIRS is a language-detection superset (build-output /
+            # IDE dirs that never indicate the primary language), used with EXACT
+            # match — but that misses venv* prefixes, *.egg-info and
+            # site-packages dirs (vendored deps that distort the count).  Union
+            # the shared walk_policy predicate on top so vendored trees are
+            # excluded here just as they are from every other walker (F7).
+            dirs[:] = sorted(
+                d for d in dirs
+                if d not in ToolRegistry._COUNT_SKIP_DIRS and not _walk_should_skip_dir(d)
+            )
+            for _f in sorted(files):
                 ext = os.path.splitext(_f)[1].lower()
                 if ext not in family_exts:
                     continue
@@ -526,13 +595,20 @@ class ToolRegistry(
     def __init__(self, repo_root: str, config: AgentConfig, local_assistant: Optional[Any] = None, agent_profile: Optional['AgentProfile'] = None):
         self.repo_root = str(Path(repo_root).resolve())
         self._repo_root_override: Optional[str] = None
+        # Resolved-root memo for _secure_path. The effective root is a session
+        # constant (repo_root frozen above; override set at most once), so
+        # re-resolving it on every read/write tool call was pure filesystem I/O
+        # on the hottest tool path. Keyed by the effective-root STRING so an
+        # override change simply misses and re-resolves. Clones get their own
+        # dict (clone_for_subagent bypasses __init__ via object.__new__).
+        self._secure_root_resolve_cache: dict[str, Path] = {}
         # Detect dominant code language by counting source files
         # (_LANGUAGE_EXTENSION_GROUPS — single source of truth). Used by
         # get_tool_schemas() to mask Python-only tools in pure non-Python repos.
         self._repo_language: Optional[LanguageId] = self._detect_repo_language(self.repo_root)
         self.config = config
         self._lint_runner = LintRunner(repo_root)
-        self._symbol_searcher = SymbolSearcher(repo_root)
+        self._symbol_searcher = get_symbol_searcher(repo_root)
         # Pass the live config (NOT a captured cancel_event value) so these
         # indexers read config.cancel_event FRESH at build() time. The design-
         # chat REPL mutates config.cancel_event PER TURN (asi.py) AFTER this
@@ -554,12 +630,13 @@ class ToolRegistry(
         # Write safety manager (snapshot/verify/rollback + approval gating)
         self._safety_manager = WriteSafetyManager(self.repo_root)
 
-        # Parallel execution support
-        self.async_executor = None
-        if config.parallel_tool_execution_enabled:
-            from .async_tool_executor import AsyncToolExecutor
-            self.async_executor = AsyncToolExecutor(self, max_workers=config.max_parallel_workers)
-        self.dependency_graph = ToolDependencyGraph() if config.parallel_tool_execution_enabled else None
+        # Parallel execution support — read-only batches dispatch through the
+        # process-wide ``_thread_pool.shared_pool`` inside ``dispatch_parallel``.
+        # The former asyncio layer (AsyncToolExecutor + ToolDependencyGraph) was
+        # deleted: its workflow edges serialized independent read-only tools
+        # (find_symbol -> find_references) while 3/4 edges were unreachable
+        # behind the write-tool gate, and the remaining asyncio dispatch was
+        # semantically identical to the thread-pool fallback.
         # Failure prediction database
         # Collected patches from apply_patch calls (for result tracking)
         self._applied_patches: list[str] = []
@@ -567,11 +644,25 @@ class ToolRegistry(
         # edit_ast / anchor_edit). apply_patch consults this (Opt D) to refuse clobbering
         # a working-tree edit it cannot safely merge — see _tool_apply_patch guard.
         self._text_edited_files: set[str] = set()
-        # Callbacks invoked after any successful write tool (apply_patch, write_file, etc.)
-        # Used to propagate invalidation to dependent caches (e.g. RepositoryGraph).
-        self._write_success_callbacks: list = []
-        # Scoped write filter (None = unrestricted); set via clone_with_filter()
-        self._write_filter: Optional[ScopedToolFilter] = None
+        # Pre-write checkpoint gate (Undo), shared by reference with subagent
+        # clones so one run yields one undoable checkpoint.
+        #
+        # Built EAGERLY, which is the whole point. It used to be built lazily on
+        # the first write, and the clone paths — which copy this attribute by
+        # value under a "SHARED (not reset)" comment — therefore copied None:
+        # OrchestratorAgent clones ``_registry_proto``, a registry it only ever
+        # reads repo_root/config from, so at clone time no write had happened
+        # and every subagent built its OWN gate. A multi-agent run produced one
+        # checkpoint per subagent instead of one per run, and since
+        # ``agent_loop`` stamps the id from the PARENT registry, a run whose
+        # writes all happened in subagents reported no checkpoint_id at all.
+        #
+        # The read-only-run guarantee the laziness existed for is preserved by
+        # the gate itself: constructing it only resolves the env var, and
+        # ``RunCheckpointGate._get_store`` still defers CheckpointStore (and so
+        # the .asicode/checkpoints/ mkdir) to the first captured write.
+        from external_llm.agent.run_checkpoint import RunCheckpointGate
+        self._run_checkpoint_gate = RunCheckpointGate(self.repo_root)
         # Semantic-lint coalescing (see begin_semantic_turn). Files written
         # during the current turn, awaiting ONE validate_semantics run at turn
         # end. Empty + inactive means "run inline", which is what every caller
@@ -586,8 +677,8 @@ class ToolRegistry(
         self._tool_result_cache = self._make_tool_result_cache(config)
         if self._tool_result_cache is not None:
             logger.info(
-                f"Tool result cache initialized (max={config.tool_result_cache_max_entries}, "
-                f"TTL={config.tool_result_cache_ttl}s)"
+                "Tool result cache initialized (max=%s, "
+                "TTL=%ss)", config.tool_result_cache_max_entries, config.tool_result_cache_ttl
             )
         self._search_cache: dict[str, ToolResult] = {}
 
@@ -598,9 +689,65 @@ class ToolRegistry(
         if self._agent_profile is not None:
             logger.debug("Active agent profile: %s", self._agent_profile.name)
 
-    def add_write_success_callback(self, cb) -> None:
-        """Register a callback to be invoked after any successful write tool."""
-        self._write_success_callbacks.append(cb)
+    def _checkpoint_before_write(self, tool_name: str, args: dict) -> None:
+        """Capture pre-write state of this call's targets into the run checkpoint."""
+        gate = self._run_checkpoint_gate
+        if gate is None:
+            # Unreachable via __init__ (which builds it) or either clone path
+            # (which copy it). Reaching here means a registry was constructed
+            # some third way and this run's writes are about to land in a
+            # checkpoint of their own, splitting the run's Undo point — the
+            # exact failure the eager construction removed. Recovered from, but
+            # loudly: silently building one here is what hid it last time.
+            from external_llm.agent.run_checkpoint import RunCheckpointGate
+            logger.warning(
+                "checkpoint gate missing on %s — building a detached one; this "
+                "run's Undo point may be split across agents",
+                type(self).__name__,
+            )
+            gate = RunCheckpointGate(str(self.repo_root))
+            self._run_checkpoint_gate = gate
+        if not gate.enabled:
+            return
+        # Target resolution sits INSIDE the try, not just inside before_write's.
+        # The gate documents that it must never raise — a checkpoint is a
+        # convenience, and failing to take one must not fail the user's edit —
+        # but the resolution ran before that guarantee started, so a plan whose
+        # ops were not dicts raised AttributeError straight out of dispatch and
+        # replaced the handler's "each op must be a JSON object" guidance with a
+        # raw traceback. write_target_paths no longer raises for that input; the
+        # try makes the contract structural rather than a property of one callee.
+        try:
+            targets = self._extract_write_target_paths(tool_name, args)
+        except Exception:
+            logger.warning("checkpoint target resolution failed", exc_info=True)
+            return
+        gate.before_write(targets)
+
+    def _checkpoint_after_write(self, tool_name: str, args: dict) -> None:
+        """Confirm which pre-write absences the run actually turned into files.
+
+        The gate has to fire BEFORE the handler, so at capture time "this path
+        does not exist" does not yet mean "the run created it" — the write may
+        be refused by the post-edit syntax gate, a scoped write filter or a bad
+        argument. Confirming here keeps a refused write from leaving a tombstone
+        that Undo would later act on by DELETING a file the user created by hand.
+        """
+        gate = self._run_checkpoint_gate
+        if gate is None or not gate.enabled:
+            return
+        try:
+            targets = self._extract_write_target_paths(tool_name, args)
+        except Exception:
+            logger.warning("checkpoint target resolution failed", exc_info=True)
+            return
+        gate.confirm_writes(targets)
+
+    @property
+    def run_checkpoint_id(self):
+        """Id of this run's Undo checkpoint, or None if nothing was captured."""
+        gate = self._run_checkpoint_gate
+        return gate.checkpoint_id if gate is not None else None
 
     def begin_semantic_turn(self) -> None:
         """Start coalescing per-file semantic checks for one agent turn.
@@ -695,7 +842,7 @@ class ToolRegistry(
                 if provider is None or not provider.capabilities().has_semantic_validator:
                     continue
                 by_provider.setdefault(id(provider), (provider, []))[1].append(abs_path)
-            except Exception as exc:  # noqa: BLE001 — advisory, never blocks
+            except Exception as exc:  # advisory, never blocks
                 logger.debug("Provider lookup failed for %s: %s", abs_path, exc)
                 out[abs_path] = SemanticOutcome(
                     skip_reason="the language provider could not be loaded",
@@ -730,14 +877,41 @@ class ToolRegistry(
                 _pending_futures.append((_provider, _paths, None))
         _first = [(p, paths, None) for p, paths in _groups[:1]]
 
+        # Cancel-aware collection: poll instead of blocking on a bare
+        # future.result() so ESC (cancel_event) is honored while a slow
+        # toolchain is still running — the drain is advisory and must never
+        # block the turn end. On cancel, the still-pending groups are marked
+        # skipped (same shape as every other "no verdict" reason) and the
+        # drain returns early; raising here would convert an advisory
+        # diagnostic into a turn-end failure.
+        _ce = getattr(self.config, "cancel_event", None)
+        _cancelled = False
         for provider, paths, future in [*_first, *_pending_futures]:
+            if _cancelled:
+                for abs_path in paths:
+                    out[abs_path] = SemanticOutcome(
+                        skip_reason="cancelled before the semantic check ran",
+                    )
+                continue
             try:
-                results = (
-                    provider.validate_semantics_batch(paths)
-                    if future is None
-                    else future.result()
-                )
-            except Exception as exc:  # noqa: BLE001 — advisory, never blocks
+                if future is None:
+                    results = provider.validate_semantics_batch(paths)
+                else:
+                    while True:
+                        try:
+                            results = future.result(timeout=CANCEL_POLL_INTERVAL)
+                            break
+                        except _FutureTimeoutError:
+                            if _ce is not None and _ce.is_set():
+                                _cancelled = True
+                                for abs_path in paths:
+                                    out[abs_path] = SemanticOutcome(
+                                        skip_reason="cancelled before the semantic check ran",
+                                    )
+                                break
+                    if _cancelled:
+                        continue
+            except Exception as exc:  # advisory, never blocks
                 # One provider's failure must not cost the others their
                 # diagnostics, so this is caught per group, not per drain.
                 logger.debug("Deferred semantic checks failed for %s: %s", paths, exc)
@@ -788,9 +962,8 @@ class ToolRegistry(
     def _make_tool_result_cache(config: "AgentConfig") -> Optional[Any]:
         """Build a fresh, ISOLATED ToolResultCache from ``config`` (or None).
 
-        Shared by ``__init__`` and both clone paths (``clone_for_subagent``,
-        ``clone_with_filter``) so every registry instance that opts in gets its
-        OWN cache. Sharing a single cache across the parent and concurrent
+        Shared by ``__init__`` and ``clone_for_subagent`` so every registry
+        instance that opts in gets its OWN cache. Sharing a single cache across the parent and concurrent
         in-process subagents would let their LRU/TTL state race (one subagent's
         read evicts another's entry); nulling it (the previous clone behavior)
         threw away the most common subagent win — repeated ``read_file`` of the
@@ -816,10 +989,11 @@ class ToolRegistry(
                 default_ttl=getattr(config, "tool_result_cache_ttl", 120),
             )
             get_global_collector().register_tool_result_cache(cache)
-            return cache
         except Exception as e:
-            logger.warning(f"Failed to initialize tool result cache: {e}")
+            logger.warning("Failed to initialize tool result cache: %s", e)
             return None
+        else:
+            return cache
 
     def clone_for_subagent(self, sub_config: "AgentConfig") -> "ToolRegistry":
         """Create a lightweight clone sharing expensive resources.
@@ -827,7 +1001,7 @@ class ToolRegistry(
         Shared (immutable/thread-safe): SymbolSearcher, RAGSearcher,
         CallGraphIndexer, LintRunner.
         Fresh (per-subagent mutable state): _applied_patches,
-        _search_cache, config, tool_chain/async/watcher (disabled for subagents).
+        _search_cache, config, async/watcher (disabled for subagents).
         """
         clone = object.__new__(ToolRegistry)
         clone.repo_root = self.repo_root
@@ -846,22 +1020,21 @@ class ToolRegistry(
         clone._applied_patches: list[str] = []
         clone._search_cache: dict[str, Any] = {}
 
-        # Subagents don't need these expensive resources
-        clone.async_executor = None
-        clone.dependency_graph = None
         # Fresh, ISOLATED cache (NOT shared with the parent, NOT None). A null
         # cache threw away the most common subagent win — repeated read_file of
         # the same path. Each clone gets its own cache via the shared helper so
         # concurrent subagents don't race on LRU/TTL state.
         clone._tool_result_cache = self._make_tool_result_cache(sub_config)
         clone.local_assistant = None
-        clone._write_filter = None
 
-        # Fresh callback list — subagents should not inherit parent callbacks
-        clone._write_success_callbacks: list = []
+        # SHARED (not reset): the checkpoint gate is per-run, not per-agent. A
+        # subagent's writes belong to the same Undo point as the parent's.
+        clone._run_checkpoint_gate = self._run_checkpoint_gate
 
         # Copy override state (if any); __init__ is bypassed via object.__new__
         clone._repo_root_override = getattr(self, "_repo_root_override", None)
+        # Fresh resolved-root memo (per-instance, NOT shared with the parent)
+        clone._secure_root_resolve_cache = {}
 
         # Fresh mutable state, ISOLATED from the parent (NOT shared). In-process
         # subagents run concurrently via ThreadPoolExecutor (_run_parallel_batch),
@@ -873,7 +1046,16 @@ class ToolRegistry(
         # test_clone_for_subagent_sets_text_edited_files (must be a fresh set,
         # not the parent's object).
         clone._text_edited_files = set()
-        clone._agent_profile = getattr(self, "_agent_profile", None)
+        # Agent profile: sub_config's explicit profile wins (mirrors __init__'s
+        # "explicit param > config" contract). Orchestrator's replace() copies
+        # base.agent_profile into sub_config, so an unmodified sub_config simply
+        # re-copies the parent's — but a subagent-specific profile set on the
+        # config was previously SILENTLY IGNORED and the parent's enforced.
+        # `is not None` (not truthiness): matches __init__ L672 fallback rule.
+        sub_profile = getattr(sub_config, "agent_profile", None)
+        clone._agent_profile = (
+            sub_profile if sub_profile is not None else getattr(self, "_agent_profile", None)
+        )
         # Semantic-lint coalescing — FRESH per clone (never shared — concurrent
         # subagent writes must NOT co-accumulate into the parent's batch).
         clone._semantic_pending = {}
@@ -881,73 +1063,63 @@ class ToolRegistry(
 
         return clone
 
-    def clone_with_filter(self, write_filter: "ScopedToolFilter") -> "ToolRegistry":
-        """Create a lightweight clone sharing expensive resources but with fresh
-        mutable state (read cache, search cache) and a write filter applied.
-
-        Used for scoped delegation — restricts file write access.
-        """
-        clone = object.__new__(ToolRegistry)
-        # Share thread-safe resources
-        clone.repo_root = self.repo_root
-        clone.config = self.config
-        clone._lint_runner = getattr(self, "_lint_runner", None)
-        clone._symbol_searcher = getattr(self, "_symbol_searcher", None)
-        clone._rag_searcher = getattr(self, "_rag_searcher", None)
-        clone._call_graph = getattr(self, "_call_graph", None)
-        # Safety/repair: shared (thread-safe, stateless-per-call)
-        clone._arg_repairer = getattr(self, "_arg_repairer", None)
-        clone._safety_manager = getattr(self, "_safety_manager", None)
-        # Staging override (usually None; share as-is)
-        clone._repo_root_override = getattr(self, "_repo_root_override", None)
-        # Agent profile — shared read-only
-        clone._agent_profile = getattr(self, "_agent_profile", None)
-        # Repo language (needed by get_tool_schemas/get_tool_names)
-        clone._repo_language = getattr(self, "_repo_language", None)
-        # Fresh semantic-lint coalescing state — ISOLATED per clone.
-        clone._semantic_pending = {}
-        clone._semantic_turn_active = False
-        # Parallel execution graph not used in filtered clones
-        clone.dependency_graph = None
-        # Fresh mutable state — not shared with original
-        clone._search_cache = {}
-        clone._applied_patches = []
-        clone._text_edited_files = set()
-        clone._write_success_callbacks = []
-        # Apply the write filter
-        clone._write_filter = write_filter
-        # Shared convenience — subagents don't need these
-        clone.async_executor = getattr(self, "async_executor", None)
-        clone.local_assistant = getattr(self, "local_assistant", None)
-        # Fresh, ISOLATED cache (NOT shared with the parent, NOT None). A null
-        # cache meant scoped delegation / sub-agent execution had zero read
-        # caching; a fresh cache keeps isolation while caching repeated reads.
-        # Filtering only changes the write whitelist, so there is no staleness
-        # concern (the cache starts empty — parent-cached results are not
-        # inherited). Stays compatible with path-scoped invalidation.
-        clone._tool_result_cache = self._make_tool_result_cache(self.config)
-        return clone
-
-    @property
-    def write_filter(self) -> Optional["ScopedToolFilter"]:
-        """Current write filter (None if unrestricted)."""
-        return self._write_filter
-
     def _invalidate_cache_after_write(self, touched_paths: list[str]) -> None:
         """Invalidate call graph, RAG, and graph caches for touched paths (called after patch apply)."""
-        # Invalidate call graph index if any supported language file was touched
+        # Normalize every touched path to repo-relative form ONCE, up front.
+        # Callers disagree on form: _snapshot_target_files (the semantic-write
+        # snapshotter) builds ABSOLUTE paths via os.path.join(repo_root,
+        # target), while the patch mixin's touched/written lists are
+        # repo-relative. The three incremental invalidators below
+        # (CallGraphIndexer, RAGSearcher, GraphFacade) all assume relative —
+        # each does its own strip().lstrip("/") and then re-joins against the
+        # repo root — so an absolute path survives that lstrip as
+        # "Users/.../foo.py" and the re-join points at a path that does not
+        # exist: the invalidation silently no-ops and the index keeps
+        # answering with pre-write state (regression introduced when the
+        # semantic-write path moved from the path-agnostic invalidate() to
+        # invalidate_files(touched_paths)). Paths outside the repo are kept
+        # as-is so consumers' isfile checks treat them as no-ops instead of
+        # mis-resolving them into the repo.
+        _root = os.path.realpath(self._effective_repo_root)
+        _normalized: list[str] = []
+        for _p in touched_paths:
+            _p = str(_p).strip()
+            if not _p:
+                continue
+            if os.path.isabs(_p):
+                try:
+                    # realpath BOTH sides: on macOS repo_root is resolved to
+                    # /private/var/... while a caller-supplied path can still
+                    # read /var/... — relpath across that alias yields a
+                    # ".."-prefixed junk path, which would wrongly fall
+                    # through to the keep-as-is branch below.
+                    _rel = os.path.relpath(os.path.realpath(_p), _root)
+                except ValueError:  # different drive (Windows)
+                    _rel = _p
+                _normalized.append(_rel if not _rel.startswith("..") else _p)
+            else:
+                _normalized.append(_p.lstrip("/"))
+        touched_paths = _normalized
+
+        # Incrementally update the call graph index for touched files (much
+        # faster than full rebuild — only the changed files are re-parsed;
+        # node ownership reassignment follows the same first-definition-wins
+        # rule as a full build).  The unknown-scope bash-mutation path below
+        # keeps the wholesale invalidate(): parsing arbitrary shell for
+        # target paths is the classifier trap, so a full clear is the only
+        # safe choice there.
         from ..languages import LanguageId as _LId
         if any(_LId.from_path(p) != _LId.UNKNOWN for p in touched_paths) and hasattr(self, '_call_graph'):
             cgi = getattr(self._call_graph, 'call_graph_indexer', None)
             if cgi is not None:
-                cgi.invalidate()
+                cgi.invalidate_files(touched_paths)
 
         # Incrementally update RAG index for touched files (much faster than full rebuild)
         if hasattr(self, '_rag_searcher') and self._rag_searcher:
             try:
                 self._rag_searcher.invalidate_files(touched_paths)
             except Exception as e:
-                logger.debug(f"Failed to incrementally update RAG index: {e}")
+                logger.debug("Failed to incrementally update RAG index: %s", e)
 
         # Incrementally update GSG graph for touched Python files
         if hasattr(self, '_call_graph') and self._call_graph:
@@ -970,12 +1142,19 @@ class ToolRegistry(
         # Same reason, for the repo file LISTING (git ls-files). It backs the
         # `glob` tool and the "Did you mean:" path suggester, and was TTL-only:
         # a file created this turn stayed invisible to glob for a full 60 s
-        # while find_symbol — fixed above — already saw it.
+        # while find_symbol — fixed above — already saw it. Scope IS known here
+        # (unlike _invalidate_caches_unknown_scope), so invalidate per touched
+        # path instead of dropping the whole index: atomic writers
+        # (edit_text/edit_file/anchor_edit/write_plan/...) already popped and
+        # gen-bumped via the atomic funnel (atomic_io -> invalidate_for_written_path),
+        # making this a cheap no-op for them, while the per-path call still
+        # covers the non-atomic writer (apply_patch's git-apply subprocess),
+        # which bypasses the funnel entirely.
         try:
-            from external_llm.agent.tool_handlers.write_tools import (
-                invalidate_repo_file_index,
-            )
-            invalidate_repo_file_index(self._effective_repo_root)
+            from external_llm.common.repo_files import invalidate_for_written_path
+            for _p in touched_paths:
+                _abs = _p if os.path.isabs(_p) else os.path.join(self._effective_repo_root, _p)
+                invalidate_for_written_path(_abs)
         except Exception as e:
             logger.debug("post-write invalidation: repo file index failed: %s", e)
 
@@ -1006,15 +1185,17 @@ class ToolRegistry(
         except Exception as e:
             logger.debug("post-write invalidation: Python prefilter memo failed: %s", e)
 
-        # Invalidate run-scoped graph cache for touched files
+        # The per-file symbol maps (_py_file_cache / _ts_file_cache). Unlike the
+        # two blocks above these are path-keyed, so they are dropped for exactly
+        # the touched files and need no language scoping. They were absent from
+        # this method entirely: both key on a (mtime_ns, size) signature, which
+        # detects a change only where the filesystem records one — a coarse-mtime
+        # mount or an mtime-preserving restore (tar, rsync -t, cp -p) collides and
+        # find_symbol then reports pre-edit LINE NUMBERS for a file just written.
         try:
-            from external_llm.graph.run_scoped_graph_cache import get_global_graph_cache
-            graph_cache = get_global_graph_cache()
-            graph_cache.invalidate_for_files(touched_paths)
+            self._symbol_searcher.invalidate_file_caches(touched_paths)
         except Exception as e:
-            # Non-critical — never block execution. Matches the logging every
-            # other step in this method already does.
-            logger.debug("post-write invalidation: run-scoped graph cache failed: %s", e)
+            logger.debug("post-write invalidation: per-file symbol maps failed: %s", e)
 
     def _invalidate_caches_unknown_scope(self) -> None:
         """Post-write invalidation for a mutating call whose targets are unknown.
@@ -1033,11 +1214,25 @@ class ToolRegistry(
         choice the tool-result cache already makes for bash one level up
         ("falls back to a full clear — safer than guessing scope").
 
-        RAG and the run-scoped graph cache are path-keyed with no clear-all and
-        are deliberately left alone: they rank relevance rather than answer
-        "does this symbol exist", so staleness there degrades ordering, not
-        correctness.
+        RAG caches are path-keyed with no clear-all and are deliberately left
+        alone: they rank relevance rather than answer "does this symbol exist",
+        so staleness there degrades ordering, not correctness.
+
+        The facade's own RG graph is NOT covered by the CGI invalidate above:
+        ``cgi.invalidate()`` drops the CallGraphIndexer, but the RepositoryGraph
+        held inside the facade (``_graph``) is a separate build serving
+        get_symbol / get_importers / get_file_dependencies / get_symbols_in_file.
+        Without dropping it, a bash-created file is invisible to those queries
+        until the next lazy rebuild — the same "cannot find a symbol in code it
+        just wrote" class this method exists for. The write-tool path already
+        covers the facade (``_call_graph.invalidate_files``), so this is the
+        missing mirror for unknown scope.
         """
+        try:
+            if hasattr(self, "_call_graph") and self._call_graph:
+                self._call_graph.invalidate()
+        except Exception as e:
+            logger.debug("unknown-scope invalidation: facade graph invalidate failed: %s", e)
         try:
             cgi = getattr(getattr(self, "_call_graph", None), "call_graph_indexer", None)
             if cgi is not None:
@@ -1061,6 +1256,13 @@ class ToolRegistry(
             invalidate_py_prefilter_cache()
         except Exception as e:
             logger.debug("unknown-scope invalidation: Python prefilter memo failed: %s", e)
+        try:
+            # No paths to scope by here, so this clears both per-file symbol
+            # maps wholesale — the same wholesale choice the rest of this
+            # method makes, and cheap because they refill per file on demand.
+            self._symbol_searcher.invalidate_file_caches()
+        except Exception as e:
+            logger.debug("unknown-scope invalidation: per-file symbol maps failed: %s", e)
         try:
             from external_llm.agent.tool_handlers.write_tools import (
                 invalidate_repo_file_index,
@@ -1099,9 +1301,13 @@ class ToolRegistry(
             metadata=rejection["metadata"],
         )
 
-    # Tools that write to files — need per-file locking in multi-agent mode
-    # All write tools get snapshot + syntax verify + rollback safety wrapper
-    _WRITE_TOOLS: ClassVar[set[str]] = {"apply_patch", "write_plan", "edit_ast", "edit_file", "edit_text", "modify_symbol", "anchor_edit"}
+    # Tools that write to files — need per-file locking in multi-agent mode.
+    # All write tools get snapshot + syntax verify + rollback safety wrapper.
+    # Derived from the WRITE_TOOL_NAMES SSOT (agent_loop_types) so this stays
+    # in lockstep with TurnContext.write_tools across all six mechanisms
+    # (locking, failure-logging, cache invalidation, reads_since_last_edit
+    # reset, write_tool_used detection, test-impact invalidation).
+    _WRITE_TOOLS: ClassVar[set[str]] = set(WRITE_TOOL_NAMES)
     # Tools that must NEVER run concurrently. ask_user blocks on human input and
     # relies on one-question-at-a-time invariants — a unique question_id
     # (millisecond timestamp) and an atomic question-count limit. Running two in
@@ -1123,8 +1329,6 @@ class ToolRegistry(
         "analyze_change_impact",
         "query_dependency_graph",
         "run_structural_scan",
-        # Experience query
-        "query_experience",
         # Symbol / file read / search
         "read_symbol",
         "read_file",
@@ -1132,8 +1336,9 @@ class ToolRegistry(
         "glob",
         "read_image",
         # Web search/fetch — read-only network lookups; cached under the same TTL/LRU
-        # as the others. Scope is None (network result), so a write-tool success drops
-        # them conservatively, but repeated identical queries within a turn still hit.
+        # as the others. Scope is frozenset() (no repo-file dependency), so a
+        # write-tool success does NOT drop them — only TTL/LRU/clear do. Repeated
+        # identical queries within a turn still hit.
         "search_web", "web_fetch",
     }
 
@@ -1265,7 +1470,7 @@ class ToolRegistry(
                 i += 1
                 continue
             # Outside any quote:
-            if c == "'" or c == '"':
+            if c in {"'", '"'}:
                 quote = c
             elif c == "\\":
                 i += 1  # skip the escaped char (loop's i += 1 handles the 2nd)
@@ -1312,12 +1517,76 @@ class ToolRegistry(
             return bool(rest) and (rest[0].isdigit() or rest[0] == "-")
         # Known null/fd sinks — stderr discard, stdout/stderr redirection, fd
         # pass-through.  These touch no real file on disk.
-        if after in ("/dev/null", "/dev/stdout", "/dev/stderr") or after.startswith("/dev/fd/"):
-            return True
-        return False
+        return bool(after in ("/dev/null", "/dev/stdout", "/dev/stderr") or after.startswith("/dev/fd/"))
 
     @classmethod
-    def _has_file_redirect_via_ts(cls, command: str):
+    def _parse_bash_tree(cls, command: str):
+        """Parse *command* with tree-sitter-bash — shared bootstrap for the
+        structural bash classifiers.
+
+        Returns the parse tree, or None when tree-sitter-bash is unavailable or
+        *command* does not parse cleanly (``root_node.has_error``). Callers treat
+        None as "fall back to the conservative text heuristic", so keeping the
+        availability/parse contract in ONE place guarantees both classifiers
+        agree on when the structural path is usable.
+        """
+        try:
+            from ..languages import tree_sitter_utils as _ts_utils
+
+            if not _ts_utils.is_available():
+                return None
+            _parser = _ts_utils.get_parser("bash")
+        except Exception as _e:
+            logger.debug("tree-sitter-bash bootstrap failed: %s", _e)
+            return None
+        if _parser is None:
+            return None
+        try:
+            _tree = _parser.parse(bytes(command, "utf8"))
+        except Exception as _e:
+            logger.debug("tree-sitter-bash parse failed (%.100r): %s", command, _e)
+            return None
+        if _tree is None or _tree.root_node.has_error:
+            return None
+        return _tree
+
+    @classmethod
+    def _walk_bash_nodes(cls, command: str, node_type: str, _tree=None) -> Optional[list]:
+        """Return the text of every tree-sitter-bash node of *node_type* in *command*.
+
+        Shares the bootstrap/parse contract of :meth:`_parse_bash_tree` and the
+        always-descend DFS traversal used by both structural classifiers:
+        matching nodes may be nested inside command substitution / a subshell
+        / a loop body, so every child is visited regardless of depth.
+
+        Returns ``None`` when tree-sitter-bash is unavailable or *command*
+        does not parse cleanly (callers fall back to their conservative text
+        path), ``[]`` when the tree is fine but no node of *node_type* exists,
+        and the list of node texts otherwise.
+
+        ``_tree`` — optional pre-parsed tree from :meth:`_parse_bash_tree`,
+        supplied by :meth:`_bash_command_mutates_files` so one command is
+        parsed exactly once per classification. When supplied it MUST have
+        been parsed from *command* itself (never a stripped copy) — node byte
+        offsets slice into *command* below. ``None`` (default) re-parses,
+        keeping standalone callers working.
+        """
+        if _tree is None:
+            _tree = cls._parse_bash_tree(command)
+        if _tree is None:
+            return None
+        _texts: list[str] = []
+        _stack = [_tree.root_node]
+        while _stack:
+            _node = _stack.pop()
+            if _node.type == node_type:
+                _texts.append(command[_node.start_byte:_node.end_byte])
+            if _node.children:
+                _stack.extend(reversed(_node.children))
+        return _texts
+
+    @classmethod
+    def _has_file_redirect_via_ts(cls, command: str, _tree=None):
         """Detect a real file-writing redirection via tree-sitter-bash.
 
         Returns True iff *command* redirects stdout/stderr to a FILE (``>``,
@@ -1333,36 +1602,14 @@ class ToolRegistry(
         read-only ``cmd 2>&1 | head``. tree-sitter exposes the redirect nodes
         directly and the fd-dup vs file distinction is decided on the parsed
         node body (:meth:`_redirect_is_fd_dup`), with no quote tracking.
-        """
-        try:
-            from ..languages import tree_sitter_utils as _ts_utils
 
-            if not _ts_utils.is_available():
-                return None
-            _parser = _ts_utils.get_parser("bash")
-        except Exception:
+        ``_tree`` — optional pre-parsed tree from :meth:`_parse_bash_tree`
+        (see :meth:`_walk_bash_nodes` for the parse-once contract).
+        """
+        _nodes = cls._walk_bash_nodes(command, "file_redirect", _tree)
+        if _nodes is None:
             return None
-        if _parser is None:
-            return None
-        try:
-            _tree = _parser.parse(bytes(command, "utf8"))
-        except Exception:
-            return None
-        if _tree is None or _tree.root_node.has_error:
-            return None
-        _stack = [_tree.root_node]
-        while _stack:
-            _node = _stack.pop()
-            if _node.type == "file_redirect":
-                if not cls._redirect_is_fd_dup(
-                    command[_node.start_byte:_node.end_byte]
-                ):
-                    return True
-            # Always descend — a redirect may be nested inside command
-            # substitution / a subshell / a loop body.
-            if _node.children:
-                _stack.extend(reversed(_node.children))
-        return False
+        return any(not cls._redirect_is_fd_dup(_text) for _text in _nodes)
 
     @classmethod
     def _bash_segment_is_readonly(cls, segment: str) -> bool:
@@ -1379,7 +1626,7 @@ class ToolRegistry(
         """
         if segment == "git stash" or segment.startswith("git stash "):
             rest = segment[len("git stash"):].strip()
-            return rest.startswith("list") or rest.startswith("show")
+            return rest.startswith(("list", "show"))
         if segment == "git branch" or segment.startswith("git branch "):
             rest = segment[len("git branch"):].strip()
             return rest == "" or any(rest.startswith(a) for a in cls._GIT_BRANCH_READONLY_ARGS)
@@ -1391,13 +1638,10 @@ class ToolRegistry(
             # and only costs a cache miss.
             rest = segment[len("env"):].strip()
             return all("=" in tok for tok in rest.split()) if rest else True
-        for prefix in cls._BASH_READONLY_PREFIXES:
-            if segment.startswith(prefix) or segment == prefix.rstrip():
-                return True
-        return False
+        return any(segment.startswith(prefix) or segment == prefix.rstrip() for prefix in cls._BASH_READONLY_PREFIXES)
 
     @classmethod
-    def _bash_command_segments_via_ts(cls, command: str):
+    def _bash_command_segments_via_ts(cls, command: str, _tree=None):
         """Structurally split *command* into its constituent command segments via
         tree-sitter-bash.
 
@@ -1422,42 +1666,19 @@ class ToolRegistry(
         Output redirection is detected separately (quote-aware) by
         :meth:`_has_redirect_outside_quotes`, so this method only decomposes
         commands — it does not interpret redirects.
+
+        ``_tree`` — optional pre-parsed tree from :meth:`_parse_bash_tree`
+        (see :meth:`_walk_bash_nodes` for the parse-once contract).
         """
-        try:
-            from ..languages import tree_sitter_utils as _ts_utils
-
-            if not _ts_utils.is_available():
-                return None
-            _parser = _ts_utils.get_parser("bash")
-        except Exception:
-            return None
-        if _parser is None:
-            return None
-        try:
-            _tree = _parser.parse(bytes(command, "utf8"))
-        except Exception:
-            return None
-        if _tree is None or _tree.root_node.has_error:
-            return None
-
-        _segments: list[str] = []
-        _stack = [_tree.root_node]
-        while _stack:
-            _node = _stack.pop()
-            if _node.type == "command":
-                _segments.append(command[_node.start_byte:_node.end_byte])
-            # Always descend: a command's arguments may contain command
-            # substitution (``ls $(...)``), and pipelines/lists/loops contain
-            # further command nodes that must each be classified individually.
-            if _node.children:
-                _stack.extend(reversed(_node.children))
-        # No command node at all (bare comment / env-only assignment) → defer to
-        # the fallback rather than treating it as "all read-only".
+        _segments = cls._walk_bash_nodes(command, "command", _tree)
+        # No command node at all (bare comment / env-only assignment) → defer
+        # to the fallback rather than treating it as "all read-only".
         if not _segments:
             return None
         return _segments
 
     @classmethod
+    @functools.lru_cache(maxsize=256)
     def _bash_command_mutates_files(cls, command: str) -> bool:
         """Does this bash command change filesystem / source state?
 
@@ -1483,6 +1704,13 @@ class ToolRegistry(
            wholesale. When tree-sitter-bash is unavailable or the command does
            not parse, falls back to the conservative regex splitter (which still
            bails out on ``$(...)``/backticks and quoted pipelines).
+
+           Pure text classifier over immutable class constants — results are cached
+           (``functools.lru_cache(maxsize=256)``): the same command string is
+           re-classified on every dispatch (read-only bash like ``git status`` runs
+           between edits), and tree-sitter parsing is the dominant cost. Tests that
+           monkeypatch a sub-classifier must clear the cache first via
+           ``ToolRegistry._bash_command_mutates_files.cache_clear()``.
         """
         if not command:
             return False
@@ -1491,7 +1719,12 @@ class ToolRegistry(
         # 1. Redirect / write-token scan on the WHOLE command — unconditionally
         #    first, so a mutating suffix/chain/redirect is never masked by a
         #    read-only-looking prefix or subcommand earlier in the string.
-        _ts_redirect = cls._has_file_redirect_via_ts(stripped)
+        # Parse ONCE and share the tree between the two structural classifiers
+        # (N1: the tree MUST be built from the ORIGINAL `command`, not `stripped`
+        # — both classifiers slice node byte offsets into the string the tree
+        # was parsed from; a stripped-based tree would mis-slice every node).
+        _tree = cls._parse_bash_tree(command)
+        _ts_redirect = cls._has_file_redirect_via_ts(command, _tree=_tree)
         if _ts_redirect is None:
             # tree-sitter-bash unavailable / parse failed → conservative
             # quote-aware scan (treats fd-dups like 2>&1 as redirects too —
@@ -1507,7 +1740,7 @@ class ToolRegistry(
         # 2. Per-segment read-only classification. tree-sitter-bash yields
         #    correct segments; otherwise the conservative regex fallback (which
         #    bails out on $(...)/backticks and on quoted pipelines).
-        segments = cls._bash_command_segments_via_ts(command)
+        segments = cls._bash_command_segments_via_ts(command, _tree=_tree)
         if segments is None:
             if "$(" in stripped or "`" in stripped:
                 return True
@@ -1544,9 +1777,8 @@ class ToolRegistry(
             return True
         if tool_name == "bash":
             return self._bash_command_mutates_files((args or {}).get("command", ""))
-        if tool_name == "job" and (args or {}).get("action") == "kill":
-            return True  # kill mutates process state; can race with concurrent job output
-        return False
+        # kill mutates process state; can race with concurrent job output
+        return tool_name == "job" and (args or {}).get("action") == "kill"
 
     def _tool_call_is_serial(self, tool_name: str, args: dict) -> bool:
         """Must this call run strictly alone, never batched with other calls?
@@ -1638,6 +1870,13 @@ class ToolRegistry(
             if tool_name == "find_symbol" and args.get("include_inheritance"):
                 return None
             return self._resolve_repo_scope(args.get("search_path"))
+        # Network lookups (search_web/web_fetch) depend on NO repo file — a
+        # file write cannot make them stale. Report an EMPTY scope (not None):
+        # invalidate_paths() keeps empty-scope entries (any() over no paths is
+        # False) while unknown-scope (None) entries are still conservatively
+        # dropped on every write.
+        if tool_name in ("search_web", "web_fetch"):
+            return frozenset()
         return None
 
     def _extract_write_target_paths(self, tool_name: str, args: dict) -> Optional[frozenset]:
@@ -1645,39 +1884,13 @@ class ToolRegistry(
         invalidation can drop only overlapping entries. Returns None when the
         target can't be determined (caller should fall back to a full clear()).
 
-        Path-only (no file I/O) mirror of SafetyManager.snapshot_target_files's
-        target-resolution logic (patch headers → plan ops → explicit file_path/
-        path arg) — cheap enough to run for every write-tool call, including
-        edit_text/edit_ast/anchor_edit which skip the I/O snapshot entirely.
+        Path-only (no file I/O). Extraction itself is delegated to
+        ``write_targets.write_target_paths``, the single source of truth shared
+        with the rollback snapshot, the approval gate and the file-lock manager
+        — see that module for why four private copies of this logic drifted and
+        what each of them missed.
         """
-        args = args or {}
-        targets: list = []
-        if tool_name in ("apply_patch", "write_plan"):
-            raw_plan = args.get("patch") or args.get("plan") or ""
-            patch = raw_plan if isinstance(raw_plan, str) else ""
-            for line in patch.splitlines():
-                if line.startswith("--- a/") or line.startswith("--- b/"):
-                    p = line[6:].strip()
-                    if p and p != "/dev/null":
-                        targets.append(p)
-                elif line.startswith("+++ b/"):
-                    p = line[6:].strip()
-                    if p and p != "/dev/null":
-                        targets.append(p)
-            if not targets and isinstance(raw_plan, dict):
-                plan_ops = raw_plan.get("ops") or raw_plan.get("operations") or []
-                if not plan_ops and "path" in raw_plan:
-                    plan_ops = [raw_plan]
-                targets = [str(op["path"]) for op in plan_ops if op.get("path")]
-            if not targets:
-                explicit = args.get("file_path") or args.get("path") or ""
-                if explicit and isinstance(explicit, str):
-                    targets = [explicit]
-        else:
-            target = args.get("file_path") or args.get("path") or ""
-            if target and isinstance(target, str):
-                targets = [target]
-
+        targets = write_target_paths(tool_name, args)
         if not targets:
             return None  # unknown scope → caller falls back to full clear()
 
@@ -1745,6 +1958,7 @@ class ToolRegistry(
                 with open(path, encoding="utf-8", errors="replace") as f:
                     current_code = f.read()
             except OSError:
+                logger.debug("write safety: could not read %s after patch", path)
                 continue
 
             # Re-validate to get structured errors
@@ -1757,6 +1971,7 @@ class ToolRegistry(
             try:
                 classifier = create_failure_classifier(lang)
             except ValueError:
+                logger.debug("write safety: no failure classifier for %s", lang)
                 continue
 
             # Convert SyntaxError_ → VerifyError
@@ -1795,6 +2010,7 @@ class ToolRegistry(
                     with open(path, "w", encoding="utf-8") as f:
                         f.write(repaired_code)
                 except OSError:
+                    logger.debug("write safety: could not write repaired %s", path)
                     continue
 
                 # Re-verify
@@ -1808,13 +2024,9 @@ class ToolRegistry(
                     )
                     # Code is now clean — stop processing this file
                     break
-                else:
-                    # Restore current_code on failure
-                    try:
-                        with open(path, "w", encoding="utf-8") as f:
-                            f.write(current_code)
-                    except OSError:
-                        pass
+                # Restore current_code on failure
+                with contextlib.suppress(OSError), open(path, "w", encoding="utf-8") as f:
+                    f.write(current_code)
 
         # ── All-files contract gate ───────────────────────────────────────
         # Per-file repair success is necessary but NOT sufficient: a True return
@@ -1912,13 +2124,10 @@ class ToolRegistry(
             VerifyError(message=verify_detail, line=0, column=0),
         ])
 
-        # SYNTAX_ERROR and UNKNOWN are hard failures — always rollback
-        if ftype in (FailureType.SYNTAX_ERROR, FailureType.UNKNOWN):
-            return False
-
-        # All other recognizable errors (ARGUMENT_MISMATCH, TYPE_MISMATCH,
+        # SYNTAX_ERROR and UNKNOWN are hard failures — always rollback;
+        # all other recognizable errors (ARGUMENT_MISMATCH, TYPE_MISMATCH,
         # MISSING_RETURN, MISSING_VARIABLE, etc.) are cross-op fixable
-        return True
+        return ftype not in (FailureType.SYNTAX_ERROR, FailureType.UNKNOWN)
 
     # _reindent_text → imported from external_llm.common.indent_utils.reindent_text
 
@@ -1987,6 +2196,157 @@ class ToolRegistry(
 
         return fixed if fixed != original_content else None
 
+    def _after_write_success(
+        self, tool_name: str, args: dict, result: "ToolResult", snapshots: dict
+    ) -> None:
+        """Central post-success processing for a call whose changes are on disk.
+
+        Runs semantic auto-repair, post-write cache invalidation
+        (file/walk/symbol/RAG/graph + tool-result), Undo-checkpoint
+        confirmation and git-snapshot clearing in ONE place so every
+        disk-changing success path in :meth:`_dispatch_impl` — the normal tail
+        AND the repair/soft-fail early returns — obeys the same post-success
+        contract. The early returns were the gap: the edit_file indent-repair
+        success, the argument-mismatch repair success and the soft-fail
+        keep-changes return all wrote to disk before returning while skipping
+        this block entirely — the same stale-cache class as the apply_patch
+        incident documented below, plus a skipped checkpoint confirmation that
+        left run-created files without an Undo tombstone.
+
+        The rollback path (``ok=False``, disk restored) must NOT call this:
+        the restored state is the pre-write state the caches already hold, and
+        a refused write must not leave a tombstone behind for Undo to act on.
+        """
+        # ── Phase 1: expose the run's Undo checkpoint id to callers ──
+        # Lets MCP/webapp callers learn "this turn's writes can be Undone"
+        # without reaching into the registry (run_checkpoint_id property).
+        # Set on EVERY disk-changing success path — the normal tail AND the
+        # repair/soft-fail early returns all funnel through here — while the
+        # rollback path never reaches this function, so a refused write
+        # carries no checkpoint metadata.
+        try:
+            result.metadata = dict(result.metadata or {})
+            _cid = self.run_checkpoint_id
+            if _cid is not None:
+                result.metadata["checkpoint_id"] = _cid
+        except Exception:
+            logger.debug("checkpoint_id metadata failed", exc_info=True)
+
+        # ── Phase 2: deterministic semantic auto-repair (F401/F821) ──
+        # Runs after syntax verify passes (or after soft-fail preserves changes).
+        # Auto-fixes undefined names (F821 via project-wide import search;
+        # F401 unused-import auto-fix is intentionally disabled — surfaced as a
+        # soft warning only). Non-fatal: any failure here degrades gracefully.
+        # Self-validating tools (edit_text/edit_ast/anchor_edit) skip the
+        # syntax-verify snapshot in dispatch (redundant I/O), but they can
+        # still *introduce* undefined names (F821) — e.g. edit_ast inserting a
+        # reference to a symbol whose import is missing. Semantic auto-repair
+        # is orthogonal to syntax verify, so build an on-demand snapshot here
+        # when the verify-path snapshot was skipped.
+        if result.ok and tool_name in self._WRITE_TOOLS:
+            _sem_snapshots = snapshots
+            if not _sem_snapshots:
+                try:
+                    _sem_snapshots = self._snapshot_target_files(tool_name, args)
+                except Exception:
+                    _sem_snapshots = {}
+            if _sem_snapshots:
+                try:
+                    _sem_repaired = self._safety_manager.auto_repair_semantic(
+                        _sem_snapshots
+                    )
+                    if _sem_repaired > 0:
+                        logger.info(
+                            "[AUTO-REPAIR] Write safety: auto-repaired %d semantic finding(s)",
+                            _sem_repaired,
+                        )
+                        result.metadata["semantic_repaired"] = _sem_repaired
+                except Exception as _sem_exc:
+                    logger.debug(
+                        "Semantic auto-repair error: %s", _sem_exc, exc_info=True
+                    )
+
+                # ── Post-write cache invalidation (PARITY across write tools) ──
+                # _invalidate_cache_after_write was reachable from exactly TWO
+                # handler-internal call sites (write_plan, and one apply_patch
+                # branch guarded by `if touched:`), while _WRITE_TOOLS has seven
+                # members. Measured: a successful apply_patch — new file AND
+                # existing file — invoked it ZERO times, so the file cache, call
+                # graph, RAG index and per-root walk caches all kept serving
+                # pre-write state until their TTLs expired. The agent then could
+                # not find a symbol in code it had just written (find_symbol
+                # answered "No definitions found" for a function on disk).
+                #
+                # Invalidating HERE, at the same central post-success point the
+                # semantic auto-repair above already uses for the same parity
+                # reason, makes it structurally impossible for a write tool to
+                # skip it — including the three self-validating tools
+                # (edit_text/edit_ast/anchor_edit) that never had a call at all.
+                # The two handler-internal calls remain and are harmless: every
+                # step of _invalidate_cache_after_write is idempotent.
+                try:
+                    self._invalidate_cache_after_write(sorted(_sem_snapshots))
+                except Exception as _inv_exc:
+                    logger.debug(
+                        "Post-write cache invalidation failed for %s: %s",
+                        tool_name, _inv_exc, exc_info=True,
+                    )
+
+        # ── Tool-result cache + Undo + git-snapshot invalidation ──
+        # For bash, only invalidate when the command actually mutates
+        # files/git state — read-only bash (ls, git status, grep, …) leaving
+        # the cache intact greatly improves hit rate because the model
+        # interleaves such commands between edits.
+        _should_invalidate = result.ok and self._tool_call_mutates(tool_name, args)
+        if _should_invalidate:
+            if self._tool_result_cache is not None:
+                # Write tools know their target file(s) → drop only overlapping
+                # cache entries. bash (and anything else with an unknown target)
+                # falls back to a full clear — safer than guessing scope.
+                _write_paths = (
+                    self._extract_write_target_paths(tool_name, args)
+                    if tool_name in self._WRITE_TOOLS else None
+                )
+                if _write_paths:
+                    _n = self._tool_result_cache.invalidate_paths(_write_paths)
+                    logger.debug(
+                        "Tool result cache scoped-invalidated %d entr(y/ies) for %s -> %s",
+                        _n, tool_name, _write_paths,
+                    )
+                else:
+                    self._tool_result_cache.clear()
+                    logger.debug(
+                        "Tool result cache cleared due to successful write tool: %s",
+                        tool_name,
+                    )
+            # Write tools already ran _invalidate_cache_after_write with their
+            # known target paths above. A mutating NON-write tool (bash) never
+            # reaches that, so its file / walk / symbol caches kept serving
+            # pre-write state — see _invalidate_caches_unknown_scope.
+            if tool_name not in self._WRITE_TOOLS:
+                self._invalidate_caches_unknown_scope()
+            # Promote this run's confirmed file CREATIONS to tombstones.
+            # Sits on the success branch, so a refused write leaves nothing
+            # behind for Undo to delete.
+            if tool_name in self._WRITE_TOOLS:
+                self._checkpoint_after_write(tool_name, args)
+            # The git snapshot is module-global and keyed by repo_root, so a
+            # subagent writing to the same root must invalidate it too — which
+            # is why this lives at the central mutation point rather than on a
+            # callback list (both clone paths reset per-registry callbacks, and
+            # the callback machinery was removed after this call site replaced
+            # its only consumer). It also covers mutating bash (git commit, rm),
+            # which changes git state without going through a write tool.
+            try:
+                from .agent_context_manager import _clear_git_cache
+                # Pass the registry's own root so only that repo's entry is
+                # stamped dirty (coalesced invalidation); the no-arg fallback
+                # still covers any caller that cannot name a root.
+                _clear_git_cache(self.repo_root)
+            except Exception:
+                logger.debug("git snapshot invalidation failed", exc_info=True)
+
+
     def dispatch(self, tool_name: str, args: dict[str, Any]) -> ToolResult:
         """Public entry: dispatch a tool call and record metrics.
 
@@ -1997,8 +2357,8 @@ class ToolRegistry(
         by a separate collector (``agent_turn_pipeline`` records tool calls
         there).  These are distinct sinks — no double-counting.
 
-        Serial, parallel (dispatch_parallel calls self.dispatch) and async
-        (shared_pool.submit(self.dispatch)) execution all pass through this
+        Serial and parallel (dispatch_parallel submits to the shared thread
+        pool, which calls self.dispatch) execution all pass through this
         single wrapper.
         """
         result = self._dispatch_impl(tool_name, args)
@@ -2096,8 +2456,9 @@ class ToolRegistry(
             return gate_result
 
 
-        # Tool result cache lookup (read-only tools only)
-        cache_hit = False
+        # Tool result cache lookup (read-only tools only). A hit returns
+        # immediately below, so no `cache_hit` flag is needed downstream — the
+        # cache-store condition at the tail just checks `result.ok`.
         if (self._tool_result_cache is not None and
             tool_name in self._READ_ONLY_TOOLS):
             cached = self._tool_result_cache.get(tool_name, args)
@@ -2119,6 +2480,22 @@ class ToolRegistry(
                 result.metadata["cache_hit"] = True
                 logger.debug("Tool result cache HIT: %s (cached) (args: %s)", tool_name, args)
                 return result
+
+        # ── Pre-capture read scope BEFORE the handler runs (cache-miss path
+        # only — a hit returned above). The signature stored in the cache must
+        # describe the file state the handler SAW, not the state at set() time:
+        # a write landing mid-read (background job, user editor, parallel
+        # session) would otherwise be baked in as "fresh" next to the stale
+        # content it raced with (TOCTOU — see ToolResultCache.set(file_sigs=)).
+        # Pre-capture adds one os.stat per scoped path per read-only dispatch;
+        # the tail's set() then reuses these instead of re-stating.
+        _cache_paths: Optional[frozenset[str]] = None
+        _cache_sigs: Optional[dict[str, Optional[tuple[int, int]]]] = None
+        if (self._tool_result_cache is not None and
+                tool_name in self._READ_ONLY_TOOLS):
+            _cache_paths = self._extract_read_scope_paths(tool_name, args)
+            if _cache_paths is not None:
+                _cache_sigs = {p: _path_sig(p) for p in _cache_paths}
 
         # File lock manager + locked-paths holder. Acquisition is deferred to
         # inside the try below so the finally always releases whatever was
@@ -2152,9 +2529,16 @@ class ToolRegistry(
             # Acquire file locks for write operations INSIDE try so the finally
             # always releases them, even if snapshotting below raises.
             if flm is not None and tool_name in self._WRITE_TOOLS:
-                locked_paths = flm.acquire_relevant(args)
+                locked_paths = flm.acquire_relevant(args, tool_name)
             # Snapshot under the lock so the captured state is consistent w.r.t.
             # concurrent writers (restore-on-rollback must reflect pre-write content).
+            # Pre-write Undo checkpoint, under the same lock as the rollback
+            # snapshot below so the captured state is consistent w.r.t.
+            # concurrent writers. Unlike _write_snapshots this covers ALL write
+            # tools — edit_text/edit_ast/anchor_edit self-validate and so skip
+            # the rollback snapshot, but the user still wants to undo them.
+            if tool_name in self._WRITE_TOOLS:
+                self._checkpoint_before_write(tool_name, args)
             if tool_name in self._WRITE_TOOLS and tool_name not in ("edit_text", "edit_ast", "anchor_edit"):
                 _write_snapshots = self._snapshot_target_files(tool_name, args)
             # Snapshot _text_edited_files BEFORE the handler runs: non-excluded
@@ -2206,11 +2590,18 @@ class ToolRegistry(
                                     )
 
                     if _repair_ok:
-                        return ToolResult(
+                        _repaired_result = ToolResult(
                             ok=True,
                             content="Auto-repaired indentation — edit applied successfully",
                             execution_time=result.execution_time,
                         )
+                        # Same central post-success contract as the normal tail:
+                        # the repaired file is on disk, so the caches must drop
+                        # pre-write state and the checkpoint must confirm it.
+                        self._after_write_success(
+                            tool_name, args, _repaired_result, _write_snapshots
+                        )
+                        return _repaired_result
 
                     # --- Try argument mismatch repair before rollback ---
                     # Handles "not enough arguments" / "too many arguments"
@@ -2222,9 +2613,9 @@ class ToolRegistry(
                     try:
                         _arg_repaired = self._repair_verify_failure(_write_snapshots)
                     except Exception as _repair_exc:
-                        logger.error(
+                        logger.exception(
                             "Write safety: repair path crashed — falling through "
-                            "to rollback: %s", _repair_exc, exc_info=True,
+                            "to rollback: %s", _repair_exc,
                         )
                         _arg_repaired = False
                     if _arg_repaired:
@@ -2234,6 +2625,7 @@ class ToolRegistry(
                             "edit applied successfully"
                         )
                         result.metadata["repaired_args"] = True
+                        self._after_write_success(tool_name, args, result, _write_snapshots)
                         return result
 
                     # --- Cross-op dependency guard: non-syntax compilation errors may be ---
@@ -2243,10 +2635,10 @@ class ToolRegistry(
                     try:
                         _soft_fail = self._should_soft_fail_verify(_verify_detail, _write_snapshots)
                     except Exception as _soft_exc:
-                        logger.error(
+                        logger.exception(
                             "Write safety: soft-fail classification crashed — "
                             "treating as hard fail (rollback): %s",
-                            _soft_exc, exc_info=True,
+                            _soft_exc,
                         )
                         _soft_fail = False
                     if not _soft_fail:
@@ -2262,6 +2654,7 @@ class ToolRegistry(
                             _verify_detail,
                         )
                         result.metadata["verify_warning"] = _verify_detail
+                        self._after_write_success(tool_name, args, result, _write_snapshots)
                         return result
 
                     _detail_parts = [_verify_detail]
@@ -2327,72 +2720,19 @@ class ToolRegistry(
             # (the wrapper), not here — that covers this path AND every early
             # return (write-safety rollback, gate/arg validation, unknown tool).
 
-            # ── Phase 2: deterministic semantic auto-repair (F401/F821) ──
-            # Runs after syntax verify passes (or after soft-fail preserves changes).
-            # Auto-fixes unused imports (F401 via ruff --fix) and undefined names
-            # (F821 via project-wide import search). Non-fatal: any failure here
-            # degrades gracefully to Phase 1 warning surfacing in design_chat_loop.py.
-            #
-            # Self-validating tools (edit_text/edit_ast/anchor_edit) skip the
-            # syntax-verify snapshot above (redundant I/O), but they can still
-            # *introduce* undefined names (F821) — e.g. edit_ast inserting a
-            # reference to a symbol whose import is missing. Semantic auto-repair
-            # is orthogonal to syntax verify, so build an on-demand snapshot here
-            # when the verify-path snapshot was skipped. Without this, F821 import
-            # insertion silently never runs for these tools.
-            if result.ok and tool_name in self._WRITE_TOOLS:
-                _sem_snapshots = _write_snapshots
-                if not _sem_snapshots:
-                    try:
-                        _sem_snapshots = self._snapshot_target_files(tool_name, args)
-                    except Exception:
-                        _sem_snapshots = {}
-                if _sem_snapshots:
-                    try:
-                        _sem_repaired = self._safety_manager.auto_repair_semantic(
-                            _sem_snapshots
-                        )
-                        if _sem_repaired > 0:
-                            logger.info(
-                                "[AUTO-REPAIR] Write safety: auto-repaired %d semantic finding(s)",
-                                _sem_repaired,
-                            )
-                            result.metadata["semantic_repaired"] = _sem_repaired
-                    except Exception as _sem_exc:
-                        logger.debug(
-                            "Semantic auto-repair error: %s", _sem_exc, exc_info=True
-                        )
+            # ── Central post-success point ──
+            # Semantic auto-repair, post-write cache invalidation (file/walk/
+            # symbol/RAG/graph + tool-result), Undo-checkpoint confirmation and
+            # git-snapshot clearing — one call shared with the repair and
+            # soft-fail early returns above, so no disk-changing success path
+            # can skip them (see _after_write_success).
+            self._after_write_success(tool_name, args, result, _write_snapshots)
 
-                # ── Post-write cache invalidation (PARITY across write tools) ──
-                # _invalidate_cache_after_write was reachable from exactly TWO
-                # handler-internal call sites (write_plan, and one apply_patch
-                # branch guarded by `if touched:`), while _WRITE_TOOLS has seven
-                # members. Measured: a successful apply_patch — new file AND
-                # existing file — invoked it ZERO times, so the file cache, call
-                # graph, RAG index and per-root walk caches all kept serving
-                # pre-write state until their TTLs expired. The agent then could
-                # not find a symbol in code it had just written (find_symbol
-                # answered "No definitions found" for a function on disk).
-                #
-                # Invalidating HERE, at the same central post-success point the
-                # semantic auto-repair above already uses for the same
-                # parity reason, makes it structurally impossible for a write
-                # tool to skip it — including the three self-validating tools
-                # (edit_text/edit_ast/anchor_edit) that never had a call at all.
-                # The two handler-internal calls remain and are harmless: every
-                # step of _invalidate_cache_after_write is idempotent.
-                try:
-                    self._invalidate_cache_after_write(sorted(_sem_snapshots))
-                except Exception as _inv_exc:
-                    logger.debug(
-                        "Post-write cache invalidation failed for %s: %s",
-                        tool_name, _inv_exc, exc_info=True,
-                    )
-
-            # Cache result for read-only tools (if not already a cache hit)
+            # Cache result for read-only tools (a cache hit already returned
+            # above, so `result.ok` alone is sufficient here)
             if (self._tool_result_cache is not None and
                 tool_name in self._READ_ONLY_TOOLS and
-                result.ok and not cache_hit):
+                result.ok):
                 # Convert ToolResult to serializable dict.
                 # ``metadata`` defaults to {} via default_factory, but a handler
                 # that passes metadata=None explicitly overrides that default —
@@ -2406,62 +2746,28 @@ class ToolRegistry(
                     "error": result.error,
                     "metadata": dict(result.metadata or {}),
                 }
-                _cache_paths = self._extract_read_scope_paths(tool_name, args)
-                self._tool_result_cache.set(tool_name, args, cached, paths=_cache_paths)
+                # paths/file_sigs were captured BEFORE the handler ran (see the
+                # miss-path pre-capture above) — a mid-read rewrite now makes
+                # the next get() drop this entry instead of serving stale
+                # content as fresh for the whole TTL.
+                self._tool_result_cache.set(
+                    tool_name, args, cached,
+                    paths=_cache_paths, file_sigs=_cache_sigs,
+                )
                 logger.debug("Tool result cache SET: %s (args: %s, paths: %s)", tool_name, args, _cache_paths)
 
-            # Invalidate tool result cache + notify listeners on successful write operations.
-            # For bash, only invalidate when the command actually mutates files/git state —
-            # read-only bash (ls, git status, grep, …) leaving the cache intact greatly
-            # improves hit rate because the model interleaves such commands between edits.
-            _should_invalidate = result.ok and self._tool_call_mutates(tool_name, args)
-            if _should_invalidate:
-                if self._tool_result_cache is not None:
-                    # Write tools know their target file(s) → drop only overlapping
-                    # cache entries. bash (and anything else with an unknown target)
-                    # falls back to a full clear — safer than guessing scope.
-                    _write_paths = (
-                        self._extract_write_target_paths(tool_name, args)
-                        if tool_name in self._WRITE_TOOLS else None
-                    )
-                    if _write_paths:
-                        _n = self._tool_result_cache.invalidate_paths(_write_paths)
-                        logger.debug(
-                            "Tool result cache scoped-invalidated %d entr(y/ies) for %s -> %s",
-                            _n, tool_name, _write_paths,
-                        )
-                    else:
-                        self._tool_result_cache.clear()
-                        logger.debug("Tool result cache cleared due to successful write tool: %s", tool_name)
-                # Write tools already ran _invalidate_cache_after_write with their
-                # known target paths at the central post-success point above. A
-                # mutating NON-write tool (bash) never reaches that, so its file /
-                # walk / symbol caches kept serving pre-write state — see
-                # _invalidate_caches_unknown_scope.
-                if tool_name not in self._WRITE_TOOLS:
-                    self._invalidate_caches_unknown_scope()
-                for cb in self._write_success_callbacks:
-                    try:
-                        cb()
-                    except Exception:
-                        # Non-critical — one bad observer must never block the
-                        # write path. Logged rather than swallowed: a callback
-                        # that raises every time is otherwise invisible forever.
-                        logger.debug(
-                            "write-success callback %r failed", cb, exc_info=True
-                        )
-
-            return result
         except Exception as e:
             logger.exception("Tool %s raised exception", tool_name)
             return ToolResult(ok=False, content="", error=f"{type(e).__name__}: {e}", execution_time=time.monotonic() - start_time)
+        else:
+            return result
         finally:
             if locked_paths and flm is not None:
                 flm.release_all(locked_paths)
 
     def dispatch_parallel(self, tool_calls: list[dict[str, Any]]) -> list[ToolResult]:
         """
-        Execute multiple tool calls in parallel using async executor.
+        Execute multiple tool calls in parallel via the shared thread pool.
 
         Args:
             tool_calls: List of dicts with 'tool' (name) and 'args' keys
@@ -2492,49 +2798,14 @@ class ToolRegistry(
             # Fall back to sequential execution
             logger.debug("Parallel execution disabled or unsafe: enabled=%s, count=%d, has_write=%s, has_serial=%s",
                          self.config.parallel_tool_execution_enabled, len(tool_calls), has_write_tool, has_serial_tool)
-            results = []
-            for call in tool_calls:
-                results.append(self.dispatch(call.get("tool", ""), call.get("args", {})))
-            return results
+            return [self.dispatch(call.get("tool", ""), call.get("args", {})) for call in tool_calls]
 
         logger.debug("Parallel tool execution activated for %d tools", len(tool_calls))
-        # Use async executor if available
-        if self.async_executor is not None:
-            import asyncio
-            loop = None
-            # Capture the caller's current loop WITHOUT raising. The legacy
-            # get_event_loop() can raise RuntimeError ("There is no current event
-            # loop in thread '...'", e.g. in a worker thread that never set one),
-            # in which case _prev_loop stays None and we skip restoration. Setting
-            # the loop to None is itself valid, so we restore whatever we captured.
-            _prev_loop = None
-            _captured = True
-            try:
-                _prev_loop = asyncio.get_event_loop_policy().get_event_loop()
-            except RuntimeError:
-                _captured = False  # no loop in this thread — nothing to restore
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                results = loop.run_until_complete(
-                    self.async_executor.execute_parallel(tool_calls)
-                )
-                return results
-            except Exception:
-                logger.exception("Async parallel tool execution failed")
-                # Fall back to thread pool
-                pass
-            finally:
-                if loop is not None:
-                    loop.close()
-                # Restore the caller's original loop, but only if we captured one.
-                if _captured:
-                    try:
-                        asyncio.set_event_loop(_prev_loop)
-                    except Exception:
-                        pass
-
-        # Fallback: shared thread pool (eliminates pool create/destroy overhead)
+        # Shared thread pool — the single parallel dispatch path. The former
+        # asyncio layer was deleted: with no dependency edges it was semantically
+        # identical to this (same pool, same ordering, same error wrapping), and
+        # it relied on asyncio.get_event_loop_policy(), deprecated since 3.12 and
+        # removed in Python 3.16.
         futures = []
         for call in tool_calls:
             tool_name = call.get("tool", "")
@@ -2542,18 +2813,34 @@ class ToolRegistry(
             future = shared_pool.submit(self.dispatch, tool_name, args)
             futures.append((future, call))
 
-        # Collect results in order
+        # Collect results in order. Cancel-aware: poll instead of blocking on a
+        # bare future.result() so ESC (cancel_event) is honored while a long tool
+        # is still running — a blocking wait would freeze the whole turn until
+        # the tool's own timeout (seconds to minutes). The in-flight tool keeps
+        # running in the pool (threads cannot be killed); its result is discarded.
         results = []
+        _ce = self.config.cancel_event
         for future, _call in futures:
             try:
-                result = future.result()
-                results.append(result)
+                while True:
+                    try:
+                        result = future.result(timeout=CANCEL_POLL_INTERVAL)
+                        break
+                    except _FutureTimeoutError:
+                        if _ce is not None and _ce.is_set():
+                            raise AgentCancelled("cancelled by user during parallel tool phase") from None
+            except AgentCancelled:
+                # A cancel decided by the tool / the poll above must abort the
+                # batch, NOT be wrapped into a ToolResult error that the caller
+                # would feed back to the LLM as a tool failure.
+                raise
             except Exception as e:
                 logger.exception("Parallel tool execution failed")
-                results.append(ToolResult(
+                result = ToolResult(
                     ok=False, content="",
                     error=f"Parallel execution error: {type(e).__name__}: {e}"
-                ))
+                )
+            results.append(result)
         return results
 
     @staticmethod
@@ -2624,15 +2911,14 @@ class ToolRegistry(
         """LLM training-data path bias correction — replaces bias paths in shell commands/paths with the actual repo_root.
 
         Converts virtual paths containing bias paths like /workspace, /app, /project,
-        /code and repo basenames to the actual repo_root. Preserves subpaths (e.g. /tests)
-        and works within shell commands as well.
+        /code, /repo and repo basenames to the actual repo_root. Preserves subpaths
+        (e.g. /tests) and works within shell commands as well.
         """
         if not text:
             return text
         _basename = Path(self.repo_root).name
-        _BIAS_PATHS = frozenset({"/workspace", "/app", "/project", "/code", "/repo"})
 
-        # Pass 1: Strict bias paths (/workspace, /app, /project, /code)
+        # Pass 1: Strict bias paths (/workspace, /app, /project, /code, /repo)
         # When the LLM uses both virtual root + project name like /workspace/asicode,
         # remove the repo basename prefix (/asicode) from the subpath to prevent double paths.
         #   /workspace/asicode        → repo_root
@@ -2646,11 +2932,17 @@ class ToolRegistry(
             # protected interval's offsets (replacement != matched length).
             _iv = _literal_intervals(text)
 
-            def _strict_repl(m, _b=_basename):
+            def _strict_repl(m, _b=_basename, _iv=_iv):
                 # Never rewrite a bias path that lives inside a shell-quoted
                 # literal or a heredoc body (grep '/workspace', a config written
                 # via <<'EOF', etc.) — doing so corrupts the literal content.
                 if _match_in_quotes(m.start(), _iv):
+                    return m.group(0)
+                # Never rewrite a path that really exists on this machine — it
+                # is real user data, not a training-data bias path.
+                if _bias_matched_path_is_real(m):
+                    return m.group(0)
+                if _under_scratch_root(_bias_matched_candidate(m)):
                     return m.group(0)
                 prefix = "" if m.group(1) == "~" else m.group(1)
                 cd = m.group(2) or ""
@@ -2676,6 +2968,13 @@ class ToolRegistry(
         #    In URL query params (?repo_root=/asicode&...), \S*? would consume the
         #    entire URL, destroying the command.
         #    Use [\w./~+@-] (only characters found in file paths) instead.
+        #
+        # ⚠️  The token must be ABSOLUTE (start with / or ~). Training-data bias
+        #    paths are virtual roots, always spelled absolute. A RELATIVE token
+        #    ending in the basename is real data, not a bias: a branch literally
+        #    named `rename/asicode` made `git rev-parse rename/asicode` rewrite
+        #    to `git rev-parse <repo_root>`, which resolves to nothing and reads
+        #    as ref corruption (live incident 2026-08-02).
         _bp_basename = f"/{_basename}"
         if _bp_basename in text:
             _iv = _literal_intervals(text)
@@ -2683,13 +2982,17 @@ class ToolRegistry(
             def _basename_repl(m):
                 if _match_in_quotes(m.start(), _iv):
                     return m.group(0)
+                if _bias_matched_path_is_real(m):
+                    return m.group(0)
+                if _under_scratch_root(_bias_matched_candidate(m)):
+                    return m.group(0)
                 prefix = "" if m.group(1) == "~" else m.group(1)
                 cd = m.group(2) or ""
                 subpath = m.group(3) or ""
                 return prefix + cd + self.repo_root + subpath
 
             _re_basename = re.compile(
-                rf'(^|[\s~])(cd\s+)?[\w./~+@-]*?{re.escape(_bp_basename)}(/\S*)?(?=\s|[&;]|$)',
+                rf'(^|[\s~])(cd\s+)?(?:[~/][\w./~+@-]*?)?{re.escape(_bp_basename)}(/\S*)?(?=\s|[&;]|$)',
                 re.ASCII,
             )
             new_text = _re_basename.sub(_basename_repl, text)
@@ -2742,11 +3045,22 @@ class ToolRegistry(
         is a READ capability only, never a write capability. (Read-only analysis
         helpers such as ``_analyze_patch_symbol_change`` keep the default,
         flag-respecting mode.)
+
+        The repo-root resolution is memoized per effective-root string
+        (``_secure_root_resolve_cache``): the root is a session constant, so the
+        boundary check stays correct while skipping repeated filesystem
+        resolution on this hot path. Only the root resolve is cached — the
+        candidate path is resolved fresh on every call because resolving it IS
+        the symlink boundary check.
         """
         path = self._correct_bias_path(path)
         unrestricted = getattr(getattr(self, "config", None), "unrestricted_read", False)
         try:
-            repo = Path(self._effective_repo_root).resolve()
+            root_str = self._effective_repo_root
+            repo = self._secure_root_resolve_cache.get(root_str)
+            if repo is None:
+                repo = Path(root_str).resolve()
+                self._secure_root_resolve_cache[root_str] = repo
             p = Path(path)
             # Absolute paths resolve as-is; relative paths anchor at repo_root.
             resolved = p.resolve() if p.is_absolute() else (repo / path).resolve()
@@ -2756,9 +3070,11 @@ class ToolRegistry(
                 except ValueError:
                     logger.warning("Path traversal attempt blocked: %r -> %s", path, resolved)
                     return None
-            return resolved
         except Exception:
+            logger.debug("_secure_path: resolution failed for %r", path, exc_info=True)
             return None  # non-critical — never block execution
+        else:
+            return resolved
 
     @property
     def applied_patches(self) -> list[str]:
@@ -2767,31 +3083,26 @@ class ToolRegistry(
         """
         return list(self._applied_patches)
 
-    # NO __del__. There used to be one here that called
-    # ``async_executor.shutdown()`` to "avoid leaking worker threads when the
-    # registry is garbage-collected". It was redundant, and it was harmful in
-    # two distinct ways:
+    # NO __del__. There used to be one that shut down the (then per-registry)
+    # AsyncToolExecutor thread pool "to avoid leaking worker threads". It was
+    # redundant and harmful in two distinct ways:
     #
-    # 1. It shut down a pool this object does not own. ``clone_with_filter``
-    #    SHARES the parent's AsyncToolExecutor (unlike ``clone_for_subagent``,
-    #    which sets it to None), so collecting a filtered clone shut down the
-    #    parent's live pool and every later parallel dispatch raised
-    #    "cannot schedule new futures after shutdown".
-    # 2. It did blocking pool shutdown from a GC finalizer, which can run at
-    #    any allocation point. ``tests/unit`` on 3.12 crashed the interpreter
-    #    outright (SIGSEGV) with ``Garbage-collecting`` atop
-    #    ``__del__ -> AsyncToolExecutor.shutdown -> ThreadPoolExecutor.shutdown``,
-    #    interrupting an unrelated ``symbol_search._walk_outline``.
-    #    (A separate SIGBUS was also seen on 3.14, but its stack is GC during
-    #    ``subprocess._close_pipe_fds`` with no repo finalizer visible, so it is
-    #    NOT attributed here — same class of hazard, unproven same cause.)
+    # 1. It shut down a pool this object did not own: a filtered clone SHARED
+    #    the parent's executor, so collecting the clone shut down the parent's
+    #    live pool. (That clone path is long gone, and the executor itself is
+    #    now deleted — parallel dispatch goes straight to the process-wide
+    #    ``_thread_pool.shared_pool``.)
+    # 2. It did blocking pool shutdown from a GC finalizer, which can run at any
+    #    allocation point: ``tests/unit`` on 3.12 crashed the interpreter
+    #    (SIGSEGV) with ``Garbage-collecting`` atop
+    #    ``ThreadPoolExecutor.shutdown``.
     #
-    # Nothing replaces it because CPython already does this, finalizer-safely:
+    # Nothing replaces it because CPython does this cleanup finalizer-safely:
     # ThreadPoolExecutor holds ``weakref.ref(self, weakref_cb)`` whose callback
     # puts None on the work queue, so idle workers wake and exit once the
     # executor becomes unreachable (thread.py, 3.12 L191 / 3.14 L226). Pinned by
-    # test_registry_executor_lifecycle.test_idle_workers_exit_when_executor_is_dropped
-    # so the justification fails loudly if that ever stops being true.
+    # test_thread_pool.test_idle_workers_exit_when_executor_is_dropped so the
+    # justification fails loudly if that ever stops being true.
     #
     # If deterministic teardown is ever needed, add an explicit close()/context
     # manager — the same conclusion design_chat_loop reached for its own

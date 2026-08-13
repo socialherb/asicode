@@ -26,6 +26,7 @@ that directory, runs the AgentLoop, and writes ``result.json`` back.
 """
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import logging
@@ -33,9 +34,11 @@ import os
 import random
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
 from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
+
+from ..client import interruptible_sleep
 
 logger = logging.getLogger(__name__)
 
@@ -151,10 +154,7 @@ def _path_matches_scope(changed_path: str, scope: set[str]) -> bool:
     if _np in scope:
         return True
     _sep = os.sep
-    for _s in scope:
-        if _np.startswith(_s + _sep):
-            return True
-    return False
+    return any(_np.startswith(_s + _sep) for _s in scope)
 
 
 def partition_changed_files(
@@ -193,6 +193,7 @@ def partition_changed_files(
         cmd = ["git", "status", "-z", "--porcelain", "--untracked-files=all"]
         out = _sp.run(
             cmd, cwd=repo_root, capture_output=True, text=True, timeout=timeout_s,
+            check=False,
         ).stdout
         # porcelain -z format (NUL-delimited):
         #   Non-rename: "XY PATH\0"
@@ -231,9 +232,10 @@ def partition_changed_files(
         # exceeded _MAX_DIR_EXPANSION_FILES) still match files under them.
         in_scope = [{"file": p} for p in all_paths if _path_matches_scope(p, assigned_norm)]
         out_scope = [{"file": p} for p in all_paths if not _path_matches_scope(p, assigned_norm)]
-        return in_scope, out_scope
     except Exception:
         return [], []
+    else:
+        return in_scope, out_scope
 
 
 def derive_applied_patches(
@@ -291,10 +293,8 @@ def _atomic_write(path: str, content: str) -> None:
         os.replace(tmp, path)  # atomic on POSIX
     except BaseException:
         # Best-effort cleanup of the orphaned temp file on any failure.
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(tmp)
-        except OSError:
-            pass
         raise
 
 
@@ -324,7 +324,7 @@ def _write_expected_epoch(d: str, epoch: int) -> None:
 def _read_expected_epoch(d: str) -> int:
     """Read the expected epoch sidecar (0 if absent/invalid → no validation)."""
     try:
-        with open(_expected_epoch_path(d), "r", encoding="utf-8") as f:
+        with open(_expected_epoch_path(d), encoding="utf-8") as f:
             return int(json.load(f).get("epoch", 0))
     except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
         return 0
@@ -369,10 +369,11 @@ def _load_heartbeat_json(path: str) -> Optional[dict]:
     must treat it as inconclusive, never as alive or dead.
     """
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError,
             PermissionError, OSError):
+        logger.debug("IPC: cannot read %s — heartbeat inconclusive", path)
         return None
 
 
@@ -392,6 +393,7 @@ def _heartbeat_age_from(data: Optional[dict]) -> Optional[float]:
     try:
         ts = float(data.get("ts", 0))
     except (ValueError, TypeError):
+        logger.debug("IPC: heartbeat has unparsable ts — inconclusive")
         return None
     if ts <= 0:
         return None
@@ -413,6 +415,7 @@ def _write_idle_heartbeat(repo_root: str, worker_id: str, payload: dict) -> Opti
     try:
         _atomic_write(path, json.dumps(payload))
     except OSError:
+        logger.debug("IPC: cannot write idle heartbeat %s — advisory only", path)
         return None
     return path
 
@@ -511,6 +514,18 @@ def write_worker_exited_heartbeat(repo_root: str, worker_id: str, *, pid: int = 
     })
 
 
+def _read_idle_heartbeat(repo_root: str, worker_id: str) -> Optional[dict]:
+    """Read the worker's idle heartbeat payload, or ``None``.
+
+    Centralizes the idle-heartbeat path/load skeleton (``_subagent_dir_path`` +
+    ``_IDLE_HEARTBEAT_FILENAME`` + ``_load_heartbeat_json``) for the two idle
+    readers — the task-heartbeat counterpart is :func:`read_heartbeat_state`.
+    ``None`` means missing or unreadable: inconclusive, never alive or dead.
+    """
+    d = _subagent_dir_path(repo_root, worker_id)
+    return _load_heartbeat_json(os.path.join(d, _IDLE_HEARTBEAT_FILENAME))
+
+
 def read_worker_idle_heartbeat_state(repo_root: str, worker_id: str) -> Optional[str]:
     """Return the ``state`` field of the worker's idle heartbeat, or ``None``.
 
@@ -518,10 +533,11 @@ def read_worker_idle_heartbeat_state(repo_root: str, worker_id: str) -> Optional
     be reused regardless of heartbeat age. ``None`` covers both "no heartbeat
     file yet" and any read failure — callers must NOT treat ``None`` as either
     alive or dead, only as inconclusive (mirrors :func:`read_worker_idle_heartbeat_age`).
+
+    Delegates to :func:`_read_idle_heartbeat` for the path/load skeleton, so the
+    two idle-heartbeat readers can never drift apart.
     """
-    d = _subagent_dir_path(repo_root, worker_id)
-    path = os.path.join(d, _IDLE_HEARTBEAT_FILENAME)
-    data = _load_heartbeat_json(path)
+    data = _read_idle_heartbeat(repo_root, worker_id)
     return data.get("state") if data is not None else None
 
 
@@ -533,10 +549,13 @@ def read_worker_idle_heartbeat_age(repo_root: str, worker_id: str) -> Optional[f
     — only a heartbeat that EXISTS and exceeds the stale threshold counts. This
     preserves backward compatibility: a pre-idle-heartbeat worker is still
     optimistically reusable (the claim falls back to the prior behavior).
+
+    Delegates to :func:`_read_idle_heartbeat` and applies
+    :func:`_heartbeat_age_from`, mirroring how :func:`read_heartbeat_age_s`
+    wraps :func:`read_heartbeat_state` — the idle path/load skeleton stays in
+    exactly ONE place.
     """
-    d = _subagent_dir_path(repo_root, worker_id)
-    path = os.path.join(d, _IDLE_HEARTBEAT_FILENAME)
-    return _heartbeat_age_from(_load_heartbeat_json(path))
+    return _heartbeat_age_from(_read_idle_heartbeat(repo_root, worker_id))
 
 
 def read_heartbeat_age_s(repo_root: str, agent_id: str) -> Optional[float]:
@@ -545,9 +564,13 @@ def read_heartbeat_age_s(repo_root: str, agent_id: str) -> Optional[float]:
     ``None`` means no heartbeat exists yet (worker just starting, or a legacy
     worker that never writes one). Callers must NOT treat ``None`` as "dead" —
     only a heartbeat that EXISTS and exceeds the stale threshold counts.
+
+    Delegates to :func:`read_heartbeat_state` and applies
+    :func:`_heartbeat_age_from`, so the path/load skeleton (and its exception
+    tuple) stays in exactly ONE place and the two task-heartbeat readers can
+    never drift apart.
     """
-    d = _subagent_dir_path(repo_root, agent_id)
-    return _heartbeat_age_from(_load_heartbeat_json(_heartbeat_path(d)))
+    return _heartbeat_age_from(read_heartbeat_state(repo_root, agent_id))
 
 
 def _quarantine_and_recheck(result_path, expected_epoch, agent_id):
@@ -568,24 +591,22 @@ def _quarantine_and_recheck(result_path, expected_epoch, agent_id):
     try:
         os.replace(result_path, qpath)  # atomic — captures whatever is on disk now
     except FileNotFoundError:
+        logger.debug("IPC: no result file to quarantine for %s — treat as stale", agent_id)
         return None
     try:
-        with open(qpath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        candidate = SubagentResult.from_dict(data)
-        if getattr(candidate, "epoch", 0) == expected_epoch:
-            logger.info(
-                "IPC: adopted fresh result for %s recovered from quarantine "
-                "(raced write detected between read and rename)", agent_id,
-            )
-            return candidate
-    except (json.JSONDecodeError, ValueError, TypeError, OSError):
-        pass
+        with contextlib.suppress(json.JSONDecodeError, ValueError, TypeError, OSError):
+            with open(qpath, encoding="utf-8") as f:
+                data = json.load(f)
+            candidate = SubagentResult.from_dict(data)
+            if getattr(candidate, "epoch", 0) == expected_epoch:
+                logger.info(
+                    "IPC: adopted fresh result for %s recovered from quarantine "
+                    "(raced write detected between read and rename)", agent_id,
+                )
+                return candidate
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(qpath)
-        except OSError:
-            pass
     return None
 # ── Orchestrator-side API ──────────────────────────────────────────────────
 
@@ -602,10 +623,7 @@ def write_task(repo_root: str, task: SubagentTask, worker_id: str = "") -> str:
 
     Returns the task directory path (where task.json was written).
     """
-    if worker_id:
-        d = _subagent_dir(repo_root, worker_id)
-    else:
-        d = _subagent_dir(repo_root, task.task_id)
+    d = _subagent_dir(repo_root, worker_id) if worker_id else _subagent_dir(repo_root, task.task_id)
     path = os.path.join(d, "task.json")
     # Clear any stale shutdown sentinel so a relaunched/reused worker doesn't
     # exit immediately.  Writing a task means "this worker is wanted alive";
@@ -615,31 +633,30 @@ def write_task(repo_root: str, task: SubagentTask, worker_id: str = "") -> str:
     # task the instant its watcher thread starts.  Both sentinels are
     # fire-once and must not survive into a fresh dispatch.
     for _sentinel in ("shutdown.json", "cancel.json"):
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(os.path.join(d, _sentinel))
-        except FileNotFoundError:
-            pass
     # Clean up any orphaned rename-claim files left by a worker that crashed
     # mid-acquisition (task.json.claimed.<pid>) or a quarantined malformed task
     # (task.json.claimed.<pid>.bad).  Also clean up orphaned .ipc-tmp-* files
     # left by a crash inside _atomic_write before os.replace completes.
     # These are harmless but can accumulate; a fresh task must start clean.
     for _stale in glob.glob(os.path.join(d, "task.json.claimed.*")):
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(_stale)
-        except OSError:
-            pass
     for _stale in glob.glob(os.path.join(d, ".ipc-tmp-*")):
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(_stale)
-        except OSError:
-            pass
-    # Assign a monotonic epoch nonce so wait_for_result can reject a result
-    # left over from a previous run on this agent_id (defense-in-depth: the
-    # worker echoes task.epoch into result.epoch).
-    if not task.epoch:
-        task.epoch = time.monotonic_ns()
-    _atomic_write(path, json.dumps(task.to_dict(), ensure_ascii=False, indent=2))
+    # Assign a FRESH monotonic epoch nonce on every dispatch so wait_for_result
+    # can reject a result left over from a previous run on this agent_id
+    # (defense-in-depth: the worker echoes task.epoch into result.epoch).
+    #
+    # Always minting (rather than only when task.epoch is falsy) removes the
+    # caller-side discipline that a re-dispatched task object MUST have its
+    # epoch reset to 0 before write_task (orchestrator's retry loop previously
+    # had to remember `ipc_task.epoch = 0`).  Any re-dispatch now gets a
+    # provably distinct nonce, so a stale result from an earlier attempt of the
+    # SAME task_id cannot match the expected epoch.
+    task.epoch = time.monotonic_ns()
     # The expected-epoch sidecar must live in the task's OWN directory — the
     # same place write_result deposits result.json and wait_for_result reads it
     # back.  In reuse mode (worker_id set) task.json is written to the worker's
@@ -649,7 +666,19 @@ def write_task(repo_root: str, task: SubagentTask, worker_id: str = "") -> str:
     # expected.json, causing wait_for_result to read epoch=0 and silently skip
     # validation (the reuse-path gap this closes).
     task_dir = _subagent_dir(repo_root, task.task_id)
+    # ORDER MATTERS: the expected-epoch sidecar is written BEFORE task.json.
+    # The worker can claim task.json the instant it lands (rename is atomic)
+    # and, on a fast-failure path, could deposit result.json before a
+    # task.json-then-expected.json ordering had finished writing the sidecar.
+    # wait_for_result would then read expected_epoch=0 and silently skip epoch
+    # validation — reopening the stale-result window this whole nonce mechanism
+    # exists to close.  Writing the sidecar first guarantees that by the time
+    # task.json is visible to any worker, the expected epoch is already on disk
+    # (a pre-existing stale result.json is rejected by clear_result before this
+    # call, and any result written after task.json appears carries the fresh
+    # nonce the sidecar now pins).
     _write_expected_epoch(task_dir, task.epoch)
+    _atomic_write(path, json.dumps(task.to_dict(), ensure_ascii=False, indent=2))
     logger.info("IPC: wrote task %s → %s (epoch=%d)", task.task_id, path, task.epoch)
     return d
 
@@ -715,7 +744,7 @@ def wait_for_result(
             logger.info("IPC: wait_for_result(%s) cancelled", agent_id)
             return None
         try:
-            with open(result_path, "r", encoding="utf-8") as f:
+            with open(result_path, encoding="utf-8") as f:
                 raw = f.read()
             data = json.loads(raw)
             result = SubagentResult.from_dict(data)
@@ -746,7 +775,6 @@ def wait_for_result(
                 if _adopted is not None:
                     return _adopted
                 raise ValueError("stale result")
-            return result
         except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError, PermissionError, OSError):
             # Result not ready — check worker liveness via heartbeat so a
             # CRASHED worker (OOM/segfault) does not burn the full timeout.
@@ -808,8 +836,12 @@ def wait_for_result(
             if on_poll and (now - last_poll_ts) >= 5.0:
                 on_poll(now - start_ts, agent_id)
                 last_poll_ts = now
-            time.sleep(interval)  # Still waiting
+            if interruptible_sleep(interval, cancel_event):
+                logger.info("IPC: wait_for_result(%s) cancelled mid-wait", agent_id)
+                return None  # cancelled mid-wait
             interval = _next_backoff(interval)  # ease idle FS load
+        else:
+            return result
     _eff = max_timeout_s if (max_timeout_s > timeout_s and heartbeat_extended) else timeout_s
     logger.warning("IPC: wait_for_result(%s) timed out after %.0fs", agent_id, _eff)
     return None
@@ -825,25 +857,19 @@ def clear_result(repo_root: str, agent_id: str) -> None:
     """
     d = _subagent_dir(repo_root, agent_id)
     result_path = os.path.join(d, "result.json")
-    try:
+    with contextlib.suppress(FileNotFoundError):
         os.unlink(result_path)
         logger.debug("IPC: cleared stale result.json for %s", agent_id)
-    except FileNotFoundError:
-        pass
     # Also clear the expected-epoch sidecar so a fresh write_task starts clean.
     # (write_task overwrites it regardless, but this keeps the dir tidy and
     # guarantees no stale epoch can match a pre-existing result.)
-    try:
+    with contextlib.suppress(FileNotFoundError):
         os.unlink(_expected_epoch_path(d))
-    except FileNotFoundError:
-        pass
     # Also clear a stale heartbeat: the previous task's heartbeat.json would
     # otherwise be seen as stale by the next wait_for_result and falsely flag
     # the (re)launched worker as dead before it has written a fresh one.
-    try:
+    with contextlib.suppress(FileNotFoundError):
         os.unlink(_heartbeat_path(d))
-    except FileNotFoundError:
-        pass
 
 
 # ── Shutdown sentinel ────────────────────────────────────────────────────
@@ -987,13 +1013,14 @@ def _is_process_alive(pid: int) -> bool:
             kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
         return True  # exists, just owned by someone else
     except OSError:
         return False
+    else:
+        return True
 
 
 def poll_for_task(
@@ -1023,11 +1050,11 @@ def poll_for_task(
 
     * **POSIX**: ``os.getppid() != expected_parent_pid`` — on parent death
       the kernel reparents orphans to init/subreaper, so ``getppid()`` changes
-      instantly.  This is immune to the PID‑reuse race (a recycled PID will
+      instantly.  This is immune to the PID-reuse race (a recycled PID will
       not match the new init PID of 1).
     * **Windows**: ``_is_process_alive(expected_parent_pid)`` — no reparenting
       occurs, so ``getppid()`` would keep returning the dead pid forever.
-      A direct liveness probe is used instead.  This has a theoretical PID‑
+      A direct liveness probe is used instead.  This has a theoretical PID-
       reuse race (the dead PID could be recycled to a live process), but no
       better alternative exists without ``psutil``.
 
@@ -1062,10 +1089,7 @@ def poll_for_task(
 
     # When the caller asked for an unbounded poll, apply max_poll_s as a safety
     # cap (default 24h). A finite timeout_s already provides a deadline.
-    if timeout_s is None:
-        effective_timeout = max_poll_s if max_poll_s is not None else float("inf")
-    else:
-        effective_timeout = timeout_s
+    effective_timeout = (max_poll_s if max_poll_s is not None else float("inf")) if timeout_s is None else timeout_s
     start_ts = time.monotonic()
     deadline = start_ts + effective_timeout
     last_warn_ts = start_ts
@@ -1089,18 +1113,17 @@ def poll_for_task(
                         agent_id, os.getppid(), expected_parent_pid,
                     )
                     return None
-            else:
-                # Windows: getppid() stays at the dead pid forever (no
-                # reparenting), so use kernel-level liveness probe instead.
-                # Has a theoretical PID-reuse race (dead PID recycled to a
-                # live process) but no better option without psutil.
-                if not _is_process_alive(expected_parent_pid):
-                    logger.warning(
-                        "IPC: sub-agent %s orphaned — originator pid=%s gone; "
-                        "self-exit to avoid an infinite poll.",
-                        agent_id, expected_parent_pid,
-                    )
-                    return None
+            # Windows: getppid() stays at the dead pid forever (no
+            # reparenting), so use kernel-level liveness probe instead.
+            # Has a theoretical PID-reuse race (dead PID recycled to a
+            # live process) but no better option without psutil.
+            elif not _is_process_alive(expected_parent_pid):
+                logger.warning(
+                    "IPC: sub-agent %s orphaned — originator pid=%s gone; "
+                    "self-exit to avoid an infinite poll.",
+                    agent_id, expected_parent_pid,
+                )
+                return None
         # Direct orchestrator liveness probe (cross-platform, no reparenting
         # semantics involved): fires independently of the getppid() check
         # above, so it also catches the macOS Terminal.app launch path where
@@ -1132,10 +1155,9 @@ def poll_for_task(
         claimed_path = f"{task_path}.claimed.{os.getpid()}"
         acquired = False
         try:
-            os.rename(task_path, claimed_path)  # atomic acquisition
-            acquired = True
-        except FileNotFoundError:
-            pass  # No task yet (or another worker already claimed it).
+            with contextlib.suppress(FileNotFoundError):  # No task yet (or another worker already claimed it).
+                os.rename(task_path, claimed_path)  # atomic acquisition
+                acquired = True
         except OSError as e:
             # rename failed (e.g. cross-filesystem on an unusual mount). Fall
             # back to the legacy read-then-unlink path so deployment degrades
@@ -1149,7 +1171,7 @@ def poll_for_task(
             # happens AFTER the atomic rename so a never-acquired task cannot be
             # partially read by a losing worker.
             try:
-                with open(claimed_path, "r", encoding="utf-8") as f:
+                with open(claimed_path, encoding="utf-8") as f:
                     raw = f.read()
                 data = json.loads(raw)
                 task = SubagentTask.from_dict(data)
@@ -1158,16 +1180,13 @@ def poll_for_task(
                 # task.json itself).
                 os.unlink(claimed_path)
                 logger.info("IPC: sub-agent %s picked up task %s", agent_id, task.task_id)
-                return task
             except (json.JSONDecodeError, ValueError, TypeError):
                 # Malformed — quarantine so we do NOT spin forever re-reading and
                 # log-spamming every poll.  Move it aside for diagnosis, then the
                 # orchestrator's next write_task overwrites task.json cleanly.
                 _bad = f"{claimed_path}.bad"
-                try:
+                with contextlib.suppress(FileNotFoundError):
                     os.replace(claimed_path, _bad)
-                except FileNotFoundError:
-                    pass
                 logger.warning(
                     "IPC: sub-agent %s found malformed task.json, quarantined → %s",
                     agent_id, _bad,
@@ -1175,7 +1194,9 @@ def poll_for_task(
             except FileNotFoundError:
                 # claimed_path vanished between rename and read (e.g. an external
                 # cleanup) — treat as "no task" and keep polling.
-                pass
+                logger.debug("IPC: %s vanished between rename and read — keep polling", claimed_path)
+            else:
+                return task
         # 2) Only honor the shutdown sentinel when idle (no pending task).  The
         #    orchestrator writes this to signal workers to exit when orchestration
         #    ends (prevents terminal/process leaks).
@@ -1183,10 +1204,8 @@ def poll_for_task(
             logger.info("IPC: sub-agent %s received shutdown sentinel", agent_id)
             # Consume (delete) the sentinel so it is fire-once — a future worker
             # launched into this directory must not see a stale shutdown.json.
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.unlink(os.path.join(d, "shutdown.json"))
-            except FileNotFoundError:
-                pass
             return None
         # Idle diagnostic: surface pathological idling (orchestrator alive but
         # not dispatching) long before the max_poll_s cap kills the poll. The
@@ -1199,7 +1218,9 @@ def poll_for_task(
                 agent_id, _now - start_ts,
             )
             last_warn_ts = _now
-        time.sleep(interval)
+        if interruptible_sleep(interval, cancel_event):
+            logger.info("IPC: sub-agent %s poll cancelled mid-wait", agent_id)
+            return None
         interval = _next_backoff(interval)  # ease idle FS load
 
     if timeout_s is None and max_poll_s is not None:

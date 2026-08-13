@@ -39,9 +39,17 @@ sites are a separate, mechanical cleanup and are deliberately not gated here.
 
 Usage:
     python scripts/check_open_encoding.py
+    python scripts/check_open_encoding.py <file>.py ...  # check only given files
+
+Explicit file args (pre-commit per-file mode) scan only those files — the
+full-repo always_run scans were dropped from the hook config because they
+created a multi-second window where pre-commit's run-start `git diff` vs
+post-hook diff comparison false-positives on parallel-session writes.  No
+args (lint.yml CI) still scans the whole repo.
 """
 
 import ast
+import os
 import sys
 from pathlib import Path
 
@@ -52,12 +60,37 @@ SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", "node_modules", ".mypy_cach
              ".pytest_cache", "build", "dist", ".asicode", "tests"}
 
 
-def _iter_py_files():
-    for path in REPO.rglob("*.py"):
-        rel = path.relative_to(REPO)
-        if any(part in SKIP_DIRS or part.endswith(".egg-info") for part in rel.parts):
+def _resolve_scan_paths(args: list[str]) -> list[str] | None:
+    """Normalize explicit file args to repo-relative ``*.py`` paths.
+
+    Returns ``None`` when no file args survive (or none were given) — the
+    caller then scans the whole repo, preserving the no-args (lint.yml CI)
+    behaviour.  pre-commit passes absolute paths; lint.yml passes none — both
+    normalize to the same repo-relative key space as the full rglob scan.
+    """
+    out: list[str] = []
+    for a in args:
+        rel = os.path.relpath(Path(a).resolve(), Path(REPO).resolve())
+        if rel.endswith(".py") and not rel.startswith(".."):
+            out.append(rel)
+    return out or None
+
+
+def _iter_py_files(paths=None):
+    if paths is None:
+        for path in REPO.rglob("*.py"):
+            rel = path.relative_to(REPO)
+            if any(part in SKIP_DIRS or part.endswith(".egg-info") for part in rel.parts):
+                continue
+            yield rel, path
+        return
+    for rel in paths:
+        p = REPO / rel
+        if not p.is_file() or p.suffix != ".py":
             continue
-        yield rel, path
+        if any(part in SKIP_DIRS or part.endswith(".egg-info") for part in Path(rel).parts):
+            continue
+        yield Path(rel), p
 
 
 def _violations_in(source: str) -> list[int]:
@@ -106,7 +139,8 @@ def _violations_in(source: str) -> list[int]:
 
 def main() -> int:
     findings: list[str] = []
-    for rel, path in sorted(_iter_py_files()):
+    paths = _resolve_scan_paths([a for a in sys.argv[1:] if not a.startswith("--")])
+    for rel, path in sorted(_iter_py_files(paths)):
         try:
             source = path.read_text(encoding="utf-8", errors="replace")
         except OSError:

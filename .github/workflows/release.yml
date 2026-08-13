@@ -37,10 +37,9 @@ concurrency:
 jobs:
   # Behaviour gate in front of an IRREVERSIBLE upload. Until this existed the
   # only thing between a tag push and PyPI was `twine check` (metadata) plus an
-  # import smoke — nothing ran a single test, because p11-ci.yml is excluded
-  # from the public export and the private repo has no remote. So `lint.yml`
-  # was the only workflow that ever executed, and it only gates
-  # F401/F811/F821/F823 + three AST checks.
+  # import smoke — nothing ran a single test, because the private repo has no
+  # remote, so `lint.yml` (then ruff/AST checks only) was the only workflow
+  # that ever executed.
   #
   # This runs against the EXPORTED tree, which is what the public repo and the
   # wheel contain — lane/, webapp/, tools/ and their coupled tests are absent

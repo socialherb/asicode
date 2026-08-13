@@ -9,23 +9,25 @@ from external_llm.analysis.contradictory_logic_scanner import (
     ContradictoryCandidate,
     _assignment_target_overlaps,
     _branch_body_end,
+    _check_boolop_tautology,
     _collect_if_elif_chain,
     _extract_condition_names,
     _get_enclosing_symbol_name,
     _has_name_mutation,
     _is_constant_false,
-    _check_boolop_tautology,
     scan_contradictory_logic,
 )
 
 
 def _make_py_file(source: str) -> str:
     """Write source to a temp .py file and return its absolute path."""
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, encoding="utf-8",
-    )
-    tmp.write(textwrap.dedent(source))
-    tmp.close()
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".py",
+        delete=False,
+        encoding="utf-8",
+    ) as tmp:
+        tmp.write(textwrap.dedent(source))
     return tmp.name
 
 
@@ -297,9 +299,8 @@ def test_max_per_file_enforced():
 
 def test_non_py_file_skipped():
     """Non-.py files are skipped (pre-filtered by ScannerRegistry)."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w")
-    tmp.write("if True: pass\n")
-    tmp.close()
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w") as tmp:
+        tmp.write("if True: pass\n")
     from external_llm.agent.scanner_registry import get_registry
     reg = get_registry()
     result = reg.run("contradictory_logic_scanner", file_paths=[tmp.name])
@@ -666,8 +667,7 @@ def test_duplicate_beyond_distance_not_flagged():
     lines.append("    if x > 0:")
     lines.append("        pass")
     # add 200 filler lines
-    for i in range(200):
-        lines.append(f"    y = {i}")
+    lines.extend(f"    y = {i}" for i in range(200))
     lines.append("    if x > 0:")   # same condition, 200+ lines later
     lines.append("        pass")
     src = _make_py_file("\n".join(lines) + "\n")
@@ -968,8 +968,7 @@ def test_distant_attr_condition_blocked_by_call_barrier():
     lines.append("    if self.config.is_subagent:")
     lines.append("        pass")
     # simulate 200 lines of code including method calls
-    for i in range(100):
-        lines.append(f"    result_{i} = self.step_{i}()")
+    lines.extend(f"    result_{i} = self.step_{i}()" for i in range(100))
     lines.append("    if self.config.is_subagent:")
     lines.append("        pass")
     src = _make_py_file("\n".join(lines) + "\n")

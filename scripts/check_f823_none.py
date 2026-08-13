@@ -27,8 +27,16 @@ F821/F401/F811, so it sailed through review and CI.
 
 Usage:
     python scripts/check_f823_none.py
+    python scripts/check_f823_none.py <file>.py ...  # check only given files
+
+Explicit file args (pre-commit per-file mode) scan only those files — the
+full-repo always_run scans were dropped from the hook config because they
+created a multi-second window where pre-commit's run-start `git diff` vs
+post-hook diff comparison false-positives on parallel-session writes.  No
+args (lint.yml CI) still scans the whole repo.
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -36,15 +44,33 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 
-def _get_current_errors() -> list[str]:
+def _resolve_scan_paths(args: list[str]) -> list[str] | None:
+    """Normalize explicit file args to repo-relative ``*.py`` paths.
+
+    Returns ``None`` when no file args survive (or none were given) — the
+    caller then scans the whole repo, preserving the no-args (lint.yml CI)
+    behaviour.  pre-commit passes absolute paths; lint.yml passes none — both
+    normalize to the same repo-relative key space as the ``.`` full scan.
+    """
+    out: list[str] = []
+    for a in args:
+        rel = os.path.relpath(Path(a).resolve(), Path(REPO).resolve())
+        if rel.endswith(".py") and not rel.startswith(".."):
+            out.append(rel)
+    return out or None
+
+
+def _get_current_errors(paths: list[str] | None = None) -> list[str]:
     # timeout= so a hung ruff can never stall the hook/CI forever. A gate must
     # FAIL on timeout (fail-closed), not silently pass on empty output — which is
     # why we do NOT use common/subprocess_utils.run_bounded_subprocess here (that
     # helper swallows timeouts into returncode=-9, a fail-open semantic).
     try:
         result = subprocess.run(
-            ["ruff", "check", "--select=F823", "--output-format=concise", "."],
+            ["ruff", "check", "--select=F823", "--output-format=concise"]
+            + (paths or ["."]),
             capture_output=True, text=True, cwd=REPO, timeout=180,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         print("❌ ruff F823 scan timed out after 180s — failing closed rather than risk a silent pass.", file=sys.stderr)
@@ -56,7 +82,8 @@ def _get_current_errors() -> list[str]:
 
 
 def main() -> int:
-    errors = _get_current_errors()
+    paths = _resolve_scan_paths([a for a in sys.argv[1:] if not a.startswith("--")])
+    errors = _get_current_errors(paths)
     if not errors:
         print("✅ No F823 errors (0 tolerated — this gate has no baseline)")
         return 0

@@ -34,8 +34,7 @@ def normalize_patch_text(p: str) -> str:
         return ""
 
     # Ensure EXACTLY one trailing newline
-    s = s.rstrip("\n") + "\n"
-    return s
+    return s.rstrip("\n") + "\n"
 
 
 def _is_effectively_empty_patch(patch_text: str) -> bool:
@@ -118,11 +117,12 @@ def git_apply_check_only(repo_root: str, patch_text: str) -> tuple[bool, str, st
             return True, (out or "ok"), "OK"
 
         raw_taxonomy = _map_git_apply_output_to_taxonomy(out)
-        return False, (out or "git apply --check failed"), raw_taxonomy
 
     except Exception as e:
         msg = _normalize_git_output(f"check-exception: {type(e).__name__}: {e}")
         return False, msg, "CHECK_EXCEPTION"
+    else:
+        return False, (out or "git apply --check failed"), raw_taxonomy
 
 
 def prepare_patch_for_apply(

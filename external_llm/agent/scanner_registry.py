@@ -12,12 +12,16 @@ Available scanners (auto-registered):
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
+import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from ..analysis.scan_walk import SCAN_LANGUAGES
 from ..languages import LanguageId
 
 logger = logging.getLogger(__name__)
@@ -35,9 +39,6 @@ class ScannerSpec:
 
     input_schema: dict[str, str] = field(default_factory=dict)
     """Parameter name → type hint string, e.g. ``{"max_per_file": "int"}``."""
-
-    produces_workset_kinds: list[str] = field(default_factory=list)
-    """Workset kind strings, e.g. ``["dead_block_cluster"]``."""
 
     file_filter: str = ".py"
     """File extension filter — only files matching this extension are scanned.
@@ -123,6 +124,23 @@ def _scanner_accepts_cancel_event(fn: Callable[..., Any]) -> bool:
     )
 
 
+def _hash_source_file(path: str) -> Optional[str]:
+    """sha256 hex digest of *path*, or None when the file cannot be read.
+
+    Used by the scanner source-freshness check: the digest IS the logical
+    version of a module's code — it changes iff the code changes, with no
+    manual version bookkeeping to drift out of sync.
+    """
+    import hashlib
+
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        logger.debug("[SCANNER_REGISTRY] cannot hash source %s", path, exc_info=True)
+        return None
+
+
 class ScannerRegistry:
     """Registry of analysis scanners callable via RUN_SCANNER operations."""
 
@@ -133,6 +151,20 @@ class ScannerRegistry:
         # in run() (see comment there). Created in register() so it always
         # exists for any registered scanner.
         self._run_locks: dict[str, threading.Lock] = {}
+        # Scanner source freshness (R12-2): module source path → sha256 of the
+        # code actually loaded at registration time. A mismatch against the
+        # on-disk file later means this process executes pre-edit code.
+        self._loaded_fingerprints: dict[str, str] = {}
+        # P3-1 opt-in auto-reload: when True, hosts (structural-scan tool
+        # handler) reload stale scanner modules in place instead of only
+        # warning "restart required". Enabled process-wide via
+        # ``ASICODE_SCANNER_AUTO_RELOAD=1``; hosts may also flip the attribute
+        # on the shared registry at any time. Default keeps the warning-only
+        # design (reload mutates live code and must be explicitly opted into).
+        self.auto_reload_stale = (
+            os.environ.get("ASICODE_SCANNER_AUTO_RELOAD", "0")
+            in {"1", "true", "yes"}
+        )
 
     def register(self, spec: ScannerSpec, fn: Callable[..., Any]) -> None:
         """Register a scanner function under the given spec."""
@@ -142,6 +174,7 @@ class ScannerRegistry:
         # Cache whether fn accepts a cancel_event kwarg (cooperative cancel).
         # Inspected once at registration to avoid per-run signature overhead.
         fn._accepts_cancel_event = _scanner_accepts_cancel_event(fn)
+        self._record_source_fingerprints(fn)
         logger.info(
             "[SCANNER_REGISTRY] registered '%s' (%s)",
             spec.name, spec.description,
@@ -277,11 +310,9 @@ class ScannerRegistry:
         # scanner over the same set hits the cache instead of re-parsing.
         # Grows at most once per working set (see parse_cache.ensure_capacity).
         if file_paths:
-            try:
+            with contextlib.suppress(OSError, ValueError):  # pragma: no cover - cache sizing is best-effort
                 from ..analysis import parse_cache
                 parse_cache.ensure_capacity(len(file_paths))
-            except Exception:  # pragma: no cover - cache sizing is best-effort
-                pass
 
         # ── Critical section: truncation is out-of-band state on the shared ──
         # function object (scanners set ``fn._truncated`` on themselves, then
@@ -295,10 +326,8 @@ class ScannerRegistry:
         # concurrent (each has its own lock).
         with self._run_locks[name]:
             # Reset per-call truncation tracker (set by scanner function on self).
-            try:
+            with contextlib.suppress(AttributeError):
                 del fn._truncated
-            except AttributeError:
-                pass
 
             # Forward cancel_event only to scanners that accept it, so
             # cooperative cancellation reaches opt-in scanners (e.g. vulture)
@@ -341,285 +370,396 @@ class ScannerRegistry:
         )
 
 
+    # ── Scanner source freshness (R12-2) ─────────────────────────────────────
+    # A long-lived server (MCP / REPL / webapp) imports scanner modules once
+    # and keeps executing that in-memory code.  When a scanner source file
+    # changes on disk afterwards (e.g. a bugfix commit), the server silently
+    # keeps serving the OLD logic — scan results reflect pre-fix code with no
+    # observable signal.  The methods below detect this by comparing the code
+    # loaded at registration time against the current on-disk source, so
+    # callers can surface a "restart required" notice.
+
+    def _record_source_fingerprints(self, fn: Callable[..., Any]) -> None:
+        """Snapshot the loaded source of *fn*'s module for staleness checks.
+
+        Records (a) the entry module itself and (b) every scanner-implementation
+        module already imported in this process — scanner logic often lives in
+        shared siblings (``_dead_block_shared`` is a dependency of
+        ``dead_block_scanner``, not an entry point), and a change there is
+        invisible if only entry modules are fingerprinted.
+
+        Best-effort diagnostics: never raises, never breaks registration.
+        """
+        try:
+            # (a) The entry module. fn.__module__ may be a non-string (mocks,
+            # partials, C extensions) — only real module names are recorded.
+            mod_name = getattr(fn, "__module__", None)
+            if isinstance(mod_name, str):
+                self._record_module_source(mod_name)
+            # (b) Sibling implementation modules already imported. The union
+            # across registrations covers everything loaded during startup;
+            # modules imported lazily AFTER registration (e.g. parse_cache in
+            # run()) are not recorded — they were loaded fresh, so they cannot
+            # be stale, and re-recording them later would mask staleness.
+            for name in list(sys.modules):
+                if name.startswith(_SCANNER_IMPL_PKG):
+                    self._record_module_source(name)
+        except Exception:  # pragma: no cover - defensive, diagnostics only
+            logger.debug(
+                "[SCANNER_REGISTRY] source fingerprint recording failed",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _normalize_source_path(src: str) -> Optional[str]:
+        """Map a module ``__file__`` to its on-disk ``.py`` path (or None).
+
+        Non-editable installs expose ``.pyc`` — hash/reload the sibling ``.py``.
+        """
+        if src.endswith(".pyc"):
+            src = src[:-1]
+        return src if src.endswith(".py") else None
+
+    def _record_module_source(self, module_name: str) -> None:
+        """Fingerprint *module_name*'s source file, if resolvable."""
+        mod = sys.modules.get(module_name)
+        if mod is None:
+            return
+        src = getattr(mod, "__file__", None)
+        if not isinstance(src, str):
+            return
+        src = self._normalize_source_path(src)
+        if src is None:
+            return
+        digest = _hash_source_file(src)
+        if digest is not None:
+            self._loaded_fingerprints[src] = digest
+
+    def _module_for_source(self, path: str) -> Optional[Any]:
+        """Return the loaded module whose source file is *path* (or None)."""
+        for mod in list(sys.modules.values()):
+            src = getattr(mod, "__file__", None)
+            if isinstance(src, str):
+                src = self._normalize_source_path(src)
+                if src == path:
+                    return mod
+        return None
+
+    def reload_stale_sources(self) -> list[str]:
+        """Reload scanner modules whose on-disk source changed since load.
+
+        Best-effort opt-in (``auto_reload_stale``): returns the paths that were
+        successfully reloaded. Modules that fail to reload keep serving their
+        old code and are reported stale again by the next
+        ``verify_loaded_sources()``.
+
+        Sibling implementation modules are reloaded BEFORE the scanner entry
+        modules that import them: ``importlib.reload`` re-executes a module
+        body, but the import statements inside it hit ``sys.modules`` and
+        serve the OLD sibling objects, so a shared helper must be refreshed
+        first. After reloading, every registered scanner is re-registered from
+        the reloaded module so ``run()`` dispatches to the NEW function
+        objects (reload replaces module globals while the registry still holds
+        the old callables), and the freshness fingerprints are re-snapshotted.
+        """
+        stale = self.verify_loaded_sources()
+        if not stale:
+            return []
+        entry_mods = {
+            sys.modules[fn.__module__]
+            for fn in self._scanners.values()
+            if isinstance(getattr(fn, "__module__", None), str)
+            and fn.__module__ in sys.modules
+        }
+        stale_mods: list[tuple[str, Any]] = []
+        for path in stale:
+            mod = self._module_for_source(path)
+            if mod is not None:
+                stale_mods.append((path, mod))
+        siblings_first = [(p, m) for p, m in stale_mods if m not in entry_mods]
+        entries_after = [(p, m) for p, m in stale_mods if m in entry_mods]
+        reloaded: list[str] = []
+        for path, mod in siblings_first + entries_after:
+            try:
+                self._reload_module(mod, path)
+            except Exception:
+                logger.warning(
+                    "[SCANNER_REGISTRY] reload failed for %s (keeping old code)",
+                    path, exc_info=True,
+                )
+            else:
+                reloaded.append(path)
+        if reloaded:
+            # Re-register from the reloaded modules. Runs outside any run()
+            # critical section (the handler reloads before invoking scanners),
+            # so replacing per-scanner run locks here is safe.
+            self._re_register_all()
+        return reloaded
+
+    @staticmethod
+    def _reload_module(mod: Any, path: str) -> None:
+        """Reload *mod* from its source file, bypassing the bytecode cache.
+
+        ``importlib.reload`` (and ``exec_module``, which routes through
+        ``SourceFileLoader.get_code``) may serve a VALID-looking
+        ``__pycache__`` entry when the source changed within the same second
+        AND kept the same size (pyc validation compares (mtime, size)) —
+        silently keeping the OLD code. Reading the source directly and
+        compiling it always reflects the on-disk file, so a reload can never
+        serve stale bytecode. On failure the previous module object is
+        restored to ``sys.modules`` so callers keep a working (old-code)
+        module.
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(mod.__name__, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot create import spec for {path}")
+        new_mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod.__name__] = new_mod
+        try:
+            with open(path, "rb") as fh:
+                source = fh.read()
+            code = compile(source, path, "exec")
+            exec(code, new_mod.__dict__)
+        except Exception:
+            sys.modules[mod.__name__] = mod
+            raise
+
+    def _re_register_all(self) -> None:
+        """Re-register every scanner from its (possibly reloaded) module."""
+        for name, spec in list(self._specs.items()):
+            old_fn = self._scanners.get(name)
+            mod_name = getattr(old_fn, "__module__", None)
+            fn_name = getattr(old_fn, "__name__", None)
+            if not isinstance(mod_name, str) or not isinstance(fn_name, str):
+                continue
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                continue
+            new_fn = getattr(mod, fn_name, None)
+            if new_fn is None or new_fn is old_fn:
+                continue
+            self.register(spec, new_fn)
+
+    def verify_loaded_sources(self) -> list[str]:
+        """Return source files whose on-disk content differs from what loaded.
+
+        Empty list = every fingerprinted scanner module still matches the code
+        this process imported.  Non-empty = this process executes pre-edit code
+        for those modules; callers should surface a "restart the server" notice
+        (the structural-scan tool handler does this per invocation, and the MCP
+        server also logs at boot).
+        """
+        # None (deleted/unreadable) never equals a recorded digest → stale.
+        stale: list[str] = [path for path in sorted(self._loaded_fingerprints) if _hash_source_file(path) != self._loaded_fingerprints[path]]
+        return stale
+
+    def source_versions(self) -> dict[str, str]:
+        """Loaded-code fingerprints: source path → short sha256 prefix.
+
+        Diagnostic view of the logical version of every fingerprinted module.
+        """
+        return {
+            path: digest[:8]
+            for path, digest in sorted(self._loaded_fingerprints.items())
+        }
+
+
 # ── Module-level singleton ───────────────────────────────────────────────────
 
 # ── Language capability sets (single source of truth) ──────────────────────
-# Tree-sitter-backed scanners share this set — it must stay in sync with the
-# ``_LANG_DEF_NODES`` keys in ``analysis/_dead_block_shared.py``.
-_TS_LANGUAGES: frozenset = frozenset({
-    LanguageId.PYTHON, LanguageId.TYPESCRIPT, LanguageId.JAVASCRIPT,
-    LanguageId.GO, LanguageId.JAVA, LanguageId.KOTLIN,
-})
+# The 6-language scan set is owned by external_llm/analysis/scan_walk.py:
+# ``SCAN_LANGUAGES`` is DERIVED from ``SCAN_EXTS`` through ``_EXT_MAP``
+# (languages/models.py — the package's canonical extension → language map,
+# import-time fail-fast), and ``_TS_LANGUAGES`` here is an IDENTITY ALIAS
+# of it — the registry cannot drift from the scan walk (pinned by
+# test_scan_walk_constants_are_single_source_aliases).
+#
+# The per-language judge maps — ``_LANG_TOP_LEVEL_NODES`` / ``_LANG_KIND_MAP``
+# in analysis/duplicate_definition_scanner.py and ``_LANG_DEF_NODES`` in
+# analysis/_dead_block_shared.py — must keep exactly these six languages as
+# keys (a missing key silently unjudges that language, and for the five
+# non-Python languages duplicate_definition_scanner is the sole gate judge —
+# see the language-coverage contract at the gate).  Pinned by
+# test_duplicate_definition_lang_keys_match_registry.
+_TS_LANGUAGES: frozenset = SCAN_LANGUAGES
 _PYTHON_ONLY: frozenset = frozenset({LanguageId.PYTHON})
 _SCANNER_REGISTRY = ScannerRegistry()
+
+# Modules under this package prefix form the scanner implementation surface.
+# The freshness check fingerprints them so a long-lived server that loaded
+# pre-edit code can be detected (R12-2). Derived from __package__ so a package
+# rename keeps the check functional.
+_SCANNER_IMPL_PKG: str = f"{__package__.rsplit('.', 1)[0]}.analysis"
 
 
 def _auto_register() -> None:
     """Register built-in scanners at module load time."""
-    try:
-        from ..analysis.dead_block_scanner import scan_dead_blocks
+    from ..analysis.dead_block_scanner import scan_dead_blocks
 
-        _SCANNER_REGISTRY.register(
-            ScannerSpec(
-                name="dead_block_scanner",
-                description="Find clusters of unused module-level private symbols (Python-only: dead-code reachability is unreliable for other languages without native semantic analysis)",
-                input_schema={
-                    "max_per_file": "int",
-                    "cluster_gap_tolerance": "Optional[int]",
-                    "cross_file_referenced_names": "Optional[set]",
-                },
-                produces_workset_kinds=["dead_block_cluster"],
-                    file_filter=".py",
-                    supported_languages=set(_PYTHON_ONLY),
-                skip_in_all_mode=True,  # superseded by public_dead_code_scanner (superset)
-            ),
-            scan_dead_blocks,
-        )
-    except ImportError:
-        logger.debug("[SCANNER_REGISTRY] dead_block_scanner not available")
-
-    try:
-        from ..analysis.duplicate_definition_scanner import (
-            scan_duplicate_definitions,
-        )
-
-        _SCANNER_REGISTRY.register(
-            ScannerSpec(
-                name="duplicate_definition_scanner",
-                description="Find top-level duplicate definitions (same name, same kind)",
-                input_schema={"max_per_file": "int"},
-                produces_workset_kinds=["duplicate_definition"],
-                    file_filter="",
-                    supported_languages=set(_TS_LANGUAGES),
-            ),
-            scan_duplicate_definitions,
-        )
-    except ImportError:
-        logger.debug(
-            "[SCANNER_REGISTRY] duplicate_definition_scanner not available"
-        )
-
-    try:
-        from ..analysis.unused_import_scanner import scan_unused_imports
-
-        _SCANNER_REGISTRY.register(
-            ScannerSpec(
-                name="unused_import_scanner",
-                description="Find unused import statements via AST reference analysis",
-                input_schema={"max_per_file": "int"},
-                produces_workset_kinds=["unused_import"],
-                    file_filter=".py",
-                    supported_languages=set(_PYTHON_ONLY),
-            ),
-            scan_unused_imports,
-        )
-    except ImportError:
-        logger.debug(
-            "[SCANNER_REGISTRY] unused_import_scanner not available"
-        )
-
-    try:
-        from ..analysis.public_dead_code_scanner import scan_public_dead_blocks
-
-        _SCANNER_REGISTRY.register(
-            ScannerSpec(
-                name="public_dead_code_scanner",
-                description="Find unused public and private module-level symbols (cross-file reachability, Python-only)",
-                input_schema={
-                    "max_per_file": "int",
-                    "cluster_gap_tolerance": "Optional[int]",
-                    "cross_file_referenced_names": "Optional[set]",
-                },
-                produces_workset_kinds=["public_dead_block_cluster"],
-                    file_filter=".py",
-                    supported_languages=set(_PYTHON_ONLY),
-            ),
-            scan_public_dead_blocks,
-        )
-    except ImportError:
-        logger.debug(
-            "[SCANNER_REGISTRY] public_dead_code_scanner not available"
-        )
-
-    try:
-        from ..analysis.contradictory_logic_scanner import scan_contradictory_logic
-
-        _SCANNER_REGISTRY.register(
-            ScannerSpec(
-                name="contradictory_logic_scanner",
-                description="Find contradictory conditions, unreachable branches, always-false assertions",
-                input_schema={"max_per_file": "int"},
-                produces_workset_kinds=["contradictory_logic"],
+    _SCANNER_REGISTRY.register(
+        ScannerSpec(
+            name="dead_block_scanner",
+            description="Find clusters of unused module-level private symbols (Python-only: dead-code reachability is unreliable for other languages without native semantic analysis)",
+            input_schema={
+                "max_per_file": "int",
+                "cluster_gap_tolerance": "Optional[int]",
+                "cross_file_referenced_names": "Optional[set]",
+            },
                 file_filter=".py",
                 supported_languages=set(_PYTHON_ONLY),
-            ),
-            scan_contradictory_logic,
-        )
-    except ImportError:
-        logger.debug(
-            "[SCANNER_REGISTRY] contradictory_logic_scanner not available"
-        )
+            skip_in_all_mode=True,  # superseded by public_dead_code_scanner (superset)
+        ),
+        scan_dead_blocks,
+    )
 
-    try:
-        from ..analysis.ast_similarity_scanner import scan_similarity_candidates
+    from ..analysis.duplicate_definition_scanner import (
+        scan_duplicate_definitions,
+    )
 
-        _SCANNER_REGISTRY.register(
-            ScannerSpec(
-                name="ast_similarity_scanner",
-                description="Find structurally similar symbol pairs (near-duplicates, shared-scaffold)",
-                input_schema={
-                    "max_per_file": "int",
-                    "min_similarity": "float",
-                    "symbol_filter": "Optional[list]",
-                },
-                produces_workset_kinds=["shared_scaffold", "paired_local_patch", "structural_pair"],
+    _SCANNER_REGISTRY.register(
+        ScannerSpec(
+            name="duplicate_definition_scanner",
+            description="Find top-level duplicate definitions (same name, same kind)",
+            input_schema={"max_per_file": "int"},
+                file_filter="",
+                supported_languages=set(_TS_LANGUAGES),
+        ),
+        scan_duplicate_definitions,
+    )
+
+    from ..analysis.unused_import_scanner import scan_unused_imports
+
+    _SCANNER_REGISTRY.register(
+        ScannerSpec(
+            name="unused_import_scanner",
+            description="Find unused import statements via AST reference analysis",
+            input_schema={"max_per_file": "int"},
                 file_filter=".py",
                 supported_languages=set(_PYTHON_ONLY),
-            ),
-            scan_similarity_candidates,
-        )
-    except ImportError:
-        logger.debug(
-            "[SCANNER_REGISTRY] ast_similarity_scanner not available"
-        )
+        ),
+        scan_unused_imports,
+    )
 
-    try:
-        from ..analysis.vulture_scanner import scan_vulture_dead_code
+    from ..analysis.public_dead_code_scanner import scan_public_dead_blocks
 
-        _SCANNER_REGISTRY.register(
-            ScannerSpec(
-                name="vulture_dead_code_scanner",
-                description=(
-                    "Find unused Python methods/variables/attributes/properties/imports "
-                    "via the Vulture static analyzer (non-authoritative supplementary "
-                    "signal). Module-level function/class are excluded by default — "
-                    "public_dead_code_scanner covers those with cross-file reachability."
-                ),
-                input_schema={
-                    "max_per_file": "int",
-                    "min_confidence": "int",
-                    "exclude_patterns": "Optional[list]",
-                    "exclude_kinds": "Optional[Iterable[str]]",
-                },
-                produces_workset_kinds=["vulture_dead_code"],
+    _SCANNER_REGISTRY.register(
+        ScannerSpec(
+            name="public_dead_code_scanner",
+            description="Find unused public and private module-level symbols (cross-file reachability, Python-only)",
+            input_schema={
+                "max_per_file": "int",
+                "cluster_gap_tolerance": "Optional[int]",
+                "cross_file_referenced_names": "Optional[set]",
+            },
                 file_filter=".py",
                 supported_languages=set(_PYTHON_ONLY),
-                requires_graph=True,
+        ),
+        scan_public_dead_blocks,
+    )
+
+    from ..analysis.contradictory_logic_scanner import scan_contradictory_logic
+
+    _SCANNER_REGISTRY.register(
+        ScannerSpec(
+            name="contradictory_logic_scanner",
+            description="Find contradictory conditions, unreachable branches, always-false assertions",
+            input_schema={"max_per_file": "int"},
+            file_filter=".py",
+            supported_languages=set(_PYTHON_ONLY),
+        ),
+        scan_contradictory_logic,
+    )
+
+    from ..analysis.ast_similarity_scanner import scan_similarity_candidates
+
+    _SCANNER_REGISTRY.register(
+        ScannerSpec(
+            name="ast_similarity_scanner",
+            description="Find structurally similar symbol pairs (near-duplicates, shared-scaffold)",
+            input_schema={
+                "max_per_file": "int",
+                "min_similarity": "float",
+                "symbol_filter": "Optional[list]",
+            },
+            file_filter=".py",
+            supported_languages=set(_PYTHON_ONLY),
+        ),
+        scan_similarity_candidates,
+    )
+
+    from ..analysis.vulture_scanner import scan_vulture_dead_code
+
+    _SCANNER_REGISTRY.register(
+        ScannerSpec(
+            name="vulture_dead_code_scanner",
+            description=(
+                "Find unused Python methods/variables/attributes/properties/imports "
+                "via the Vulture static analyzer (non-authoritative supplementary "
+                "signal). Module-level function/class are excluded by default — "
+                "public_dead_code_scanner covers those with cross-file reachability."
             ),
-            scan_vulture_dead_code,
-        )
-    except ImportError:
-        logger.debug(
-            "[SCANNER_REGISTRY] vulture_dead_code_scanner not available "
-            "(install 'asicode[vulture]')"
-        )
+            input_schema={
+                "max_per_file": "int",
+                "min_confidence": "int",
+                "exclude_patterns": "Optional[list]",
+                "exclude_kinds": "Optional[Iterable[str]]",
+            },
+            file_filter=".py",
+            supported_languages=set(_PYTHON_ONLY),
+            requires_graph=True,
+        ),
+        scan_vulture_dead_code,
+    )
 
-    try:
-        from ..analysis.container_reachability_scanner import (
-            scan_container_reachability,
-        )
+    from ..analysis.container_reachability_scanner import (
+        scan_container_reachability,
+    )
 
-        _SCANNER_REGISTRY.register(
-            ScannerSpec(
-                name="container_reachability_scanner",
-                description=(
-                    "Find structurally unreachable keys in class-level and module-level "
-                    "dict literals via intra-class constant-domain propagation"
-                ),
-                input_schema={
-                    "max_per_file": "int",
-                    "min_unreachable_keys": "int",
-                    "cross_file_referenced_names": "Optional[set]",
-                },
-                produces_workset_kinds=["container_dead_keys"],
-                file_filter=".py",
-                supported_languages=set(_PYTHON_ONLY),
+    _SCANNER_REGISTRY.register(
+        ScannerSpec(
+            name="container_reachability_scanner",
+            description=(
+                "Find structurally unreachable keys in class-level and module-level "
+                "dict literals via intra-class constant-domain propagation"
             ),
-            scan_container_reachability,
-        )
-    except ImportError:
-        logger.debug(
-            "[SCANNER_REGISTRY] container_reachability_scanner not available"
-        )
+            input_schema={
+                "max_per_file": "int",
+                "min_unreachable_keys": "int",
+                "cross_file_referenced_names": "Optional[set]",
+            },
+            file_filter=".py",
+            supported_languages=set(_PYTHON_ONLY),
+        ),
+        scan_container_reachability,
+    )
 
-    try:
-        from ..analysis.broken_contract_scanner import scan_broken_contracts
+    from ..analysis.broken_contract_scanner import scan_broken_contracts
 
-        _SCANNER_REGISTRY.register(
-            ScannerSpec(
-                name="broken_contract_scanner",
-                description=(
-                    "Find writer/reader pairs split by migration — one half still "
-                    "live while the other is unreachable (orphan reader/writer)"
-                ),
-                input_schema={"max_per_file": "int"},
-                produces_workset_kinds=["broken_contract"],
-                file_filter=".py",
-                supported_languages=set(_PYTHON_ONLY),
-                requires_graph=True,
-                graph_required_for_results=True,
+    _SCANNER_REGISTRY.register(
+        ScannerSpec(
+            name="broken_contract_scanner",
+            description=(
+                "Find writer/reader pairs split by migration — one half still "
+                "live while the other is unreachable (orphan reader/writer)"
             ),
-            scan_broken_contracts,
-        )
-    except ImportError:
-        logger.debug(
-            "[SCANNER_REGISTRY] broken_contract_scanner not available"
-        )
-
-
-def _verify_workset_handler_coverage() -> None:
-    """Startup integrity check: every deterministic workset kind needs a handler.
-
-    Cross-checks the union of all ``produces_workset_kinds`` declared by
-    registered scanners against ``_WORKSET_HANDLERS`` in scanner_to_ops. A kind
-    that no handler consumes is flagged — either it is an intentional
-    LLM-judgment kind (ANALYZE_FIRST / EXTRACT_FUNCTION / PAIRED_MODIFY /
-    VULTURE_DEAD), or it is a genuine scanner→op pipeline break.
-
-    This static check complements the runtime guard in
-    ``build_delete_ops_from_structural_worksets``: the static check fires at
-    import time so a regression is visible immediately (B1 was invisible
-    because the old code silently ``continue``-d on missing handlers).
-    """
-    try:
-        from ..editor._editor_core.lane.scanner_to_ops import _WORKSET_HANDLERS
-    except ImportError:
-        # scanner_to_ops not importable in this environment — skip gracefully.
-        return
-
-    # Map every produced kind back to the scanner that produces it, so the
-    # warning message is actionable (points at the offending scanner).
-    kind_to_scanner: dict[str, str] = {}
-    for spec in _SCANNER_REGISTRY.list_scanners():
-        for kind in spec.produces_workset_kinds:
-            kind_to_scanner.setdefault(kind, spec.name)
-
-    for kind, scanner_name in sorted(kind_to_scanner.items()):
-        if kind in _WORKSET_HANDLERS:
-            continue
-        # We cannot read suggested_strategy from a static kind (the adapter sets
-        # it at runtime), so we only log an informational note. The runtime
-        # guard in build_delete_ops_* does the authoritative break/no-break
-        # classification via _is_pipeline_break(ws).
-        logger.debug(
-            "[SCANNER_REGISTRY] workset kind %r (from %s) has no "
-            "_WORKSET_HANDLERS entry — verify it is an intentional LLM-judgment kind, "
-            "else add a handler in scanner_to_ops.py",
-            kind, scanner_name,
-        )
+            input_schema={"max_per_file": "int"},
+            file_filter=".py",
+            supported_languages=set(_PYTHON_ONLY),
+            requires_graph=True,
+            graph_required_for_results=True,
+        ),
+        scan_broken_contracts,
+    )
 
 
 _auto_register()
-# NOTE: _verify_workset_handler_coverage() is NOT called at import time.
-# It imports `editor._editor_core.lane.scanner_to_ops`, which would couple
-# every importer of scanner_registry (transitively: design_chat_loop via
-# tool_schemas → tool_registry → agent_turn_pipeline) to the heavy lane
-# package — breaking the lane-decoupling contract asserted by
-# test_design_chat_loop_closure_has_no_lane_module. The check is an
-# informational DEBUG log with an authoritative runtime counterpart in
-# build_delete_ops_from_structural_worksets (_is_pipeline_break), so the
-# import-time guarantee is not load-bearing. It remains available as a
-# public function for explicit invocation in diagnostics/tests.
+# NOTE: the two scanner↔handler coverage checks that used to live here were
+# removed with the PLANNER lane — both read `_WORKSET_HANDLERS` /
+# `_SCANNER_ADAPTERS` out of `lane.scanner_to_ops` / `lane.structural_workset`,
+# which no longer exist. The authoritative runtime counterpart survives in
+# build_delete_ops_from_structural_worksets (_is_pipeline_break).
 
 
 def get_registry() -> "ScannerRegistry":

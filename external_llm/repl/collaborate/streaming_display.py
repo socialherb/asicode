@@ -536,9 +536,11 @@ def _markdown_lines(text: str, width: int) -> Optional[list[str]]:
 
         from rich.console import Console
         from rich.theme import Theme
+
         from external_llm.common.rich_markdown import markdown_cls
         Markdown = markdown_cls()
     except Exception:
+        logger.debug("rich markdown import failed", exc_info=True)
         return None
     try:
         buf = _io.StringIO()
@@ -547,6 +549,7 @@ def _markdown_lines(text: str, width: int) -> Optional[list[str]]:
             color_system="truecolor", theme=Theme(_MARKDOWN_THEME_COLORS),
         ).print(Markdown(text))
     except Exception:
+        logger.debug("rich markdown render failed", exc_info=True)
         return None
     lines = buf.getvalue().split("\n")
     while lines and lines[-1].strip() == "":  # Strip trailing blank lines left by rich

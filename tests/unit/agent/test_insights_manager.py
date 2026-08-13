@@ -22,6 +22,7 @@ from external_llm.agent.insights_manager import (
     InsightsStats,
     _active_invalidate,
     atomic_write_text,
+    build_archive_index,
     build_compact_messages,
     compute_stats,
     drop_entry,
@@ -36,7 +37,6 @@ from external_llm.agent.insights_manager import (
     select_demotion_candidates,
     select_entries_older_than,
     select_promotable_entries,
-    build_archive_index,
     serialize_insights,
     should_nudge,
 )
@@ -441,8 +441,9 @@ def test_edit_reconstruction_roundtrips():
 
 def test_edit_roundtrip_no_body_kwarg():
     """InsightEntry(body=...) must raise TypeError — body is a @property."""
-    from external_llm.agent.insights_manager import InsightEntry
     import pytest as _pytest
+
+    from external_llm.agent.insights_manager import InsightEntry
     with _pytest.raises(TypeError):
         InsightEntry(
             lines=["### [x] 2025\n", "body\n"],
@@ -550,7 +551,6 @@ def test_nudge_uses_oldest_entry_age_over_mtime():
 #   * nothing durable is deleted (demotion = move to archive);
 #   * promotion is cheap, local, and silent when nothing matches.
 
-import time as _time
 
 
 def _ts_entry(days_ago: int, body: str, category: str = "architecture",
@@ -700,7 +700,8 @@ def test_build_archive_index_empty_when_no_archive(tmp_repo):
 
 def test_build_archive_index_lists_and_caps(tmp_repo):
     from external_llm.agent.insights_manager import (
-        append_entries_to_archive, ARCHIVE_INDEX_MAX_ENTRIES,
+        ARCHIVE_INDEX_MAX_ENTRIES,
+        append_entries_to_archive,
     )
     many = [_ts_entry(i, f"entry number {i} body", "pattern") for i in range(1, 25)]
     append_entries_to_archive(tmp_repo, many)
@@ -718,10 +719,13 @@ def test_build_archive_index_labels_match_file_order(tmp_repo):
     ``/insights archive restore <n>`` and ``drop <n>`` operate on the correct entry.
     Display order is newest-first, but labels must reflect actual file positions.
     """
-    from external_llm.agent.insights_manager import (
-        append_entries_to_archive, load_archive_file, parse_insights,
-    )
     import re
+
+    from external_llm.agent.insights_manager import (
+        append_entries_to_archive,
+        load_archive_file,
+        parse_insights,
+    )
     # Add 3 distinct entries with unique bodies
     entries = [
         _ts_entry(100, "first entry body about alpha", "pattern"),
@@ -767,7 +771,7 @@ def test_select_promotable_matches_by_token_overlap(tmp_repo):
 
 
 def test_select_promotable_respects_min_overlap(tmp_repo):
-    from external_llm.agent.insights_manager import append_entries_to_archive, PROMOTE_MIN_SCORE
+    from external_llm.agent.insights_manager import PROMOTE_MIN_SCORE, append_entries_to_archive
     e = _ts_entry(60, "alpha beta gamma delta epsilon")
     append_entries_to_archive(tmp_repo, [e])
     # Single shared token leads to BM25 score ≈ 0.287 (< PROMOTE_MIN_SCORE=0.5)
@@ -789,7 +793,7 @@ def test_select_promotable_score_scales_with_token_overlap(tmp_repo):
         60, "lock identity WeakValueDictionary thread safety guard reset pool",
     )
     append_entries_to_archive(tmp_repo, [e])
-    # 5-token overlap → score ≈ 5 × idf ≫ PROMOTE_MIN_SCORE (0.5).
+    # 5-token overlap → score ≈ 5 x idf ≫ PROMOTE_MIN_SCORE (0.5).
     promoted = select_promotable_entries(
         tmp_repo, "lock identity WeakValueDictionary thread safety",
     )
@@ -809,6 +813,7 @@ def test_enforce_budget_demotion_is_archive_first(tmp_repo):
     that write would leave the archive empty and this assertion would fail.
     """
     from unittest import mock
+
     from external_llm.agent import insights_manager as im
 
     many = [_ts_entry(i, f"durable entry body {i}", "pattern") for i in range(1, 10)]
@@ -825,9 +830,11 @@ def test_enforce_budget_demotion_is_archive_first(tmp_repo):
             raise OSError("simulated crash during active write")
         return real_atomic(path, data)
 
-    with mock.patch.object(im, "atomic_write_text", side_effect=fault_active_only):
-        with pytest.raises(OSError):
-            im.enforce_budget_by_demotion(tmp_repo, budget)
+    with (
+        mock.patch.object(im, "atomic_write_text", side_effect=fault_active_only),
+        pytest.raises(OSError, match="simulated crash"),
+    ):
+        im.enforce_budget_by_demotion(tmp_repo, budget)
 
     arch = load_archive_file(tmp_repo)
     assert "durable entry body" in arch, (
@@ -862,6 +869,7 @@ def test_enforce_budget_crash_recovery_leaves_no_archive_duplicates(tmp_repo):
     header in the archive (each appears 2x).
     """
     from unittest import mock
+
     from external_llm.agent import insights_manager as im
 
     many = [_ts_entry(i, f"durable entry body {i}", "pattern") for i in range(1, 10)]
@@ -878,9 +886,11 @@ def test_enforce_budget_crash_recovery_leaves_no_archive_duplicates(tmp_repo):
         return real_atomic(path, data)
 
     # First enforce: archive append succeeds, active truncate crashes.
-    with mock.patch.object(im, "atomic_write_text", side_effect=fault_active_only):
-        with pytest.raises(OSError):
-            im.enforce_budget_by_demotion(tmp_repo, budget)
+    with (
+        mock.patch.object(im, "atomic_write_text", side_effect=fault_active_only),
+        pytest.raises(OSError, match="simulated crash"),
+    ):
+        im.enforce_budget_by_demotion(tmp_repo, budget)
 
     # Crash state: archive has the demoted entries; active still has them too.
     _, arch_before = parse_insights(load_archive_file(tmp_repo))
@@ -911,6 +921,7 @@ def test_build_archive_index_byte_stable_across_clock(tmp_repo):
     """
     import re
     from unittest import mock
+
     from external_llm.agent import insights_manager as im
     from external_llm.agent.insights_manager import append_entries_to_archive
 

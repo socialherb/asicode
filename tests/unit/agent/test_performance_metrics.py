@@ -28,7 +28,6 @@ from external_llm.agent.performance_metrics import (
     warn_slow_tools,
 )
 
-
 # -- #2: O(1) running aggregation, no unbounded list --------------------------
 
 
@@ -176,17 +175,18 @@ class TestIsResultCacheableProbeGuard:
     def _registry(self, tmp_path, *, cache_enabled):
         import subprocess
         from pathlib import Path
+
         from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 
         repo = Path(tmp_path)
         for c in (["git", "init", "-q"], ["git", "config", "user.email", "t@t.com"],
                   ["git", "config", "user.name", "t"]):
-            subprocess.run(c, cwd=str(repo), capture_output=True)
+            subprocess.run(c, cwd=str(repo), capture_output=True, check=False)
         (repo / "f.txt").write_text("x\n")
-        subprocess.run(["git", "add", "f.txt"], cwd=str(repo), capture_output=True)
-        subprocess.run(["git", "commit", "-qm", "b"], cwd=str(repo), capture_output=True)
+        subprocess.run(["git", "add", "f.txt"], cwd=str(repo), capture_output=True, check=False)
+        subprocess.run(["git", "commit", "-qm", "b"], cwd=str(repo), capture_output=True, check=False)
         cfg = AgentConfig(
-            max_turns=1, planning_enabled=False, rag_enabled=False,
+            max_turns=1, rag_enabled=False,
             tool_result_cache_enabled=cache_enabled,
         )
         return ToolRegistry(str(repo), cfg)
@@ -270,7 +270,7 @@ class TestToolFailureRecording:
 
 # -- #7: recent_failure_rate — sliding-window live health (the warn GATE) -------
 # The cumulative failure_rate (failures/total_calls) is diluted toward 0 over a
-# long run: a tool that succeeded 1000× then fails its next 20 calls reads ~2%
+# long run: a tool that succeeded 1000x then fails its next 20 calls reads ~2%
 # cumulative and NEVER trips the 0.50 health gate. recent_failure_rate tracks the
 # last N calls (bounded deque) so a freshly-broken tool trips within ~N calls.
 
@@ -360,7 +360,7 @@ class TestThreadSafety:
                         "read_file", 0.001 * (i % 5 + 1), cache_hit=(i % 2 == 0)
                     )
                     i += 1
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 errors.append(e)
 
         def summarizer():
@@ -371,7 +371,7 @@ class TestThreadSafety:
                     if ts is not None:
                         # torn read would let call_count drift from total_calls
                         assert ts["call_count"] == ts["total_calls"], ts
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 errors.append(e)
 
         threads = [threading.Thread(target=recorder) for _ in range(3)] + [
@@ -417,6 +417,7 @@ def _make_loop_unification(tmp_path):
     import subprocess
     from pathlib import Path
     from unittest.mock import Mock
+
     from external_llm.agent.agent_loop import AgentLoop
     from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 
@@ -425,14 +426,14 @@ def _make_loop_unification(tmp_path):
         ["git", "init", "-q"], ["git", "config", "user.email", "t@t.com"],
         ["git", "config", "user.name", "t"],
     ):
-        subprocess.run(c, cwd=str(repo), capture_output=True)
+        subprocess.run(c, cwd=str(repo), capture_output=True, check=False)
     (repo / "f.txt").write_text("alpha=1\n")
-    subprocess.run(["git", "add", "f.txt"], cwd=str(repo), capture_output=True)
-    subprocess.run(["git", "commit", "-qm", "base"], cwd=str(repo), capture_output=True)
+    subprocess.run(["git", "add", "f.txt"], cwd=str(repo), capture_output=True, check=False)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=str(repo), capture_output=True, check=False)
     client = Mock()
     client.get_provider_name.return_value = "openai"
     client.provider = "openai"
-    cfg = AgentConfig(max_turns=1, planning_enabled=False, rag_enabled=False)
+    cfg = AgentConfig(max_turns=1, rag_enabled=False)
     reg = ToolRegistry(str(repo), cfg)
     return AgentLoop(llm_client=client, registry=reg, config=cfg, model="test")
 
@@ -462,7 +463,7 @@ class TestCollectorUnification:
 
     The accepted tradeoff: cache metrics (``tool_result_cache``,
     ``rag_cache``, ``vector_cache``) are NOT in the per-turn summary
-    (they are dashboard‑only aggregates, fed to the global collector by
+    (they are dashboard-only aggregates, fed to the global collector by
     ``rag_searcher``).  Per-tool call and LLM metrics are present in both.
     """
 
@@ -943,6 +944,13 @@ class TestTopFailingLLM:
         out = top_failing_llm(s, threshold=0.50, min_calls=3)
         assert len(out) == 1 and abs(out[0]["recent_failure_rate"] - 0.8) < 1e-9
 
+    def test_malformed_entry_skipped_not_crash(self):
+        # Defensive parity with the tool variants: a malformed (non-dict)
+        # provider entry must be skipped, not raise AttributeError.
+        s = {"ollama": {"calls": 10, "failures": 8}, "broken": None}
+        out = top_failing_llm(s, threshold=0.50, min_calls=3)
+        assert [e["name"] for e in out] == ["ollama"]
+
 
     def test_only_failing_provider_flagged_among_many(self):
         # THE dilution guard (pure-function level): a healthy + a failing provider in
@@ -1146,6 +1154,94 @@ class TestLatencyPercentile:
         assert m.percentile(95) >= 1000.0   # window is now all-slow
         # Constant memory: never more than cap samples retained
         assert len(m._latency_samples) == cap
+
+
+class TestLatencyDeltaCache:
+    """p50/p95 delta cache: the ``_latency_sorted`` mirror must stay in lockstep
+    with ``_latency_samples`` (FIFO deque) across record + eviction, and must agree
+    EXACTLY with the reference sort-based ``_percentiles`` path at every point —
+    ``get_summary()`` reads the mirror (O(1) per entity), so a drift would
+    silently change the shipped p50/p95 values.
+    """
+
+    def _window_cap(self):
+        from external_llm.agent.config.thresholds import config as _cfg
+        return _cfg.scores.LATENCY_SAMPLE_WINDOW
+
+    def test_mirror_stays_sorted_and_same_length_after_eviction(self):
+        m = ToolMetrics(name="t")
+        cap = self._window_cap()
+        for v in (3.0, 1.0, 2.0, 5.0, 4.0):      # unsorted input order
+            m.record(v)
+        assert m._latency_sorted == [1.0, 2.0, 3.0, 4.0, 5.0]
+        assert len(m._latency_sorted) == len(m._latency_samples)
+        for _ in range(cap * 2):                 # force eviction rollover
+            m.record(7.0)
+        assert len(m._latency_samples) == cap
+        assert len(m._latency_sorted) == cap
+        assert m._latency_sorted == sorted(m._latency_samples)
+        assert m._latency_sorted == [7.0] * cap
+
+    def test_percentiles_parity_with_reference_across_eviction(self):
+        from collections import deque
+
+        from external_llm.agent.performance_metrics import _percentiles
+        m = ToolMetrics(name="t")
+        cap = self._window_cap()
+        for _ in range(cap):                     # fill the window with fast
+            m.record(1.0)
+        for _ in range(cap // 2):                # flood with slow → eviction mid-stream
+            m.record(1000.0)
+        for pcts in ((50,), (95,), (50, 95)):    # every read == reference sort path
+            assert m.percentiles(pcts) == _percentiles(deque(m._latency_samples), pcts)
+        # summary emit must agree too (seconds → ms conversion)
+        c = PerformanceCollector()
+        for _ in range(cap):
+            c.record_tool_call("grep", execution_time=0.001)
+        for _ in range(cap // 2):
+            c.record_tool_call("grep", execution_time=1.0)
+        s = c.get_summary()
+        e = s["tool_metrics"]["grep"]
+        exp = _percentiles(deque(c.tool_metrics["grep"]._latency_samples), (50, 95))
+        assert e["p50_ms"] == exp[0] * 1000.0
+        assert e["p95_ms"] == exp[1] * 1000.0
+
+    def test_llm_delta_cache_parity(self):
+        from collections import deque
+
+        from external_llm.agent.performance_metrics import _percentiles
+        c = PerformanceCollector()
+        cap = self._window_cap()
+        for _ in range(cap):
+            c.record_llm_call(provider="ollama", execution_time_ms=10.0)
+        for _ in range(cap):
+            c.record_llm_call(provider="ollama", execution_time_ms=500.0)
+        lm = c.llm_metrics["ollama"]
+        assert len(lm._latency_sorted) == cap
+        assert lm._latency_sorted == sorted(lm._latency_samples)
+        assert lm.percentiles((50, 95)) == _percentiles(deque(lm._latency_samples), (50, 95))
+        s = c.get_summary()
+        prov = s["llm_providers"]["ollama"]
+        exp = _percentiles(deque(lm._latency_samples), (50, 95))
+        assert prov["p50_ms"] == exp[0]
+        assert prov["p95_ms"] == exp[1]
+
+    def test_duplicate_values_evict_multiset_correctly(self):
+        # Duplicate-heavy window: eviction must remove exactly ONE occurrence of
+        # the oldest value from the mirror (bisect_left), preserving the multiset
+        # — removing the wrong occurrence would keep counts imbalanced.
+        from collections import Counter
+
+        m = ToolMetrics(name="d")
+        cap = self._window_cap()
+        for _ in range(cap):
+            m.record(5.0)
+        m.record(3.0)                            # window full → evicts one 5.0
+        assert m._latency_sorted == [3.0] + [5.0] * (cap - 1)
+        assert Counter(m._latency_sorted) == Counter(m._latency_samples)
+        m.record(3.0)                            # second 3.0 → evicts the next 5.0
+        assert m._latency_sorted == [3.0, 3.0] + [5.0] * (cap - 2)
+        assert Counter(m._latency_sorted) == Counter(m._latency_samples)
 
 
 class TestLLMLatencyPercentile:
@@ -1382,6 +1478,16 @@ class TestTopSlowLLM:
         names = [p["name"] for p in out]
         assert names == ["claude"]  # openai has p95_n=1 < 5
 
+    def test_malformed_entry_skipped_not_crash(self):
+        # Defensive parity with the tool variants: a malformed (non-dict)
+        # provider entry must be skipped, not raise AttributeError.
+        providers = {
+            "openai": {"p50_ms": 5000.0, "p95_ms": 35000.0, "calls": 20, "p95_n": 20},
+            "broken": "junk",
+        }
+        out = top_slow_llm(providers, threshold_ms=30000.0)
+        assert [p["name"] for p in out] == ["openai"]
+
 
 class TestWarnSlowTools:
     """Tests for the deduped log gate warn_slow_tools()."""
@@ -1389,7 +1495,8 @@ class TestWarnSlowTools:
     def test_warns_new_tool_then_dedups(self):
         _reset_warned_slow_tools()
         calls = []
-        log = lambda msg: calls.append(msg)  # noqa: E731
+        def log(msg):
+            calls.append(msg)
 
         s1 = {"slow_tools": [{"name": "bash", "p50_ms": 1000.0, "p95_ms": 25000.0}]}
         n = warn_slow_tools(s1, log=log)
@@ -1406,7 +1513,8 @@ class TestWarnSlowTools:
     def test_re_arm_on_recovery(self):
         _reset_warned_slow_tools()
         calls = []
-        log = lambda msg: calls.append(msg)  # noqa: E731
+        def log(msg):
+            calls.append(msg)
 
         s1 = {"slow_tools": [{"name": "bash", "p50_ms": 1000.0, "p95_ms": 25000.0}]}
         n = warn_slow_tools(s1, log=log)
@@ -1425,7 +1533,8 @@ class TestWarnSlowTools:
     def test_no_warn_when_summary_has_no_slow_tools(self):
         _reset_warned_slow_tools()
         calls = []
-        log = lambda msg: calls.append(msg)  # noqa: E731
+        def log(msg):
+            calls.append(msg)
         assert warn_slow_tools({}, log=log) == 0
         assert warn_slow_tools({"slow_tools": []}, log=log) == 0
         assert len(calls) == 0
@@ -1437,7 +1546,8 @@ class TestWarnSlowLLM:
     def test_warns_new_provider_then_dedups(self):
         _reset_warned_slow_llm()
         calls = []
-        log = lambda msg: calls.append(msg)  # noqa: E731
+        def log(msg):
+            calls.append(msg)
 
         s1 = {"slow_llm": [{"name": "openai", "p50_ms": 5000.0, "p95_ms": 35000.0}]}
         n = warn_slow_llm(s1, log=log)
@@ -1454,7 +1564,8 @@ class TestWarnSlowLLM:
     def test_re_arm_on_recovery(self):
         _reset_warned_slow_llm()
         calls = []
-        log = lambda msg: calls.append(msg)  # noqa: E731
+        def log(msg):
+            calls.append(msg)
 
         s1 = {"slow_llm": [{"name": "openai", "p50_ms": 5000.0, "p95_ms": 35000.0}]}
         warn_slow_llm(s1, log=log)
@@ -1470,7 +1581,8 @@ class TestWarnSlowLLM:
     def test_no_warn_when_empty(self):
         _reset_warned_slow_llm()
         calls = []
-        log = lambda msg: calls.append(msg)  # noqa: E731
+        def log(msg):
+            calls.append(msg)
         assert warn_slow_llm({}, log=log) == 0
         assert warn_slow_llm({"slow_llm": []}, log=log) == 0
         assert len(calls) == 0
@@ -1521,8 +1633,9 @@ class TestSlowToolsInSummary:
         A tool with 10 slow successful calls is excluded from slow_tools when
         LATENCY_P95_MIN_SAMPLES is raised to 15 (greater than available samples)."""
         from dataclasses import replace
-        from external_llm.agent.config.thresholds import config as _cfg
+
         import external_llm.agent.performance_metrics as _pm
+        from external_llm.agent.config.thresholds import config as _cfg
         c = PerformanceCollector()
         for _ in range(10):
             c.record_tool_call("moderate_tool", 10.0, failed=False)  # 10000ms p95
@@ -1540,8 +1653,9 @@ class TestSlowToolsInSummary:
     def test_slow_llm_min_samples_wired(self):
         """Same wiring verification for the LLM path."""
         from dataclasses import replace
-        from external_llm.agent.config.thresholds import config as _cfg
+
         import external_llm.agent.performance_metrics as _pm
+        from external_llm.agent.config.thresholds import config as _cfg
         c = PerformanceCollector()
         for _ in range(10):
             c.record_llm_call("moderate_provider", 0, 0, execution_time_ms=50000.0, failed=False)
@@ -1555,3 +1669,4 @@ class TestSlowToolsInSummary:
         with patch.object(_pm, "_threshold_config", new_config):
             summary_after = c.get_summary()
         assert summary_after["slow_llm"] == []
+

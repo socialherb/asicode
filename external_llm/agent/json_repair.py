@@ -13,10 +13,13 @@ Usage::
 """
 from __future__ import annotations
 
+import contextlib
 import json
 from typing import Any
 
 from .llm_output_utils import strip_markdown_fences
+
+
 def repair_json_brackets(text: str) -> str:
     """
     Repair common JSON bracket/brace imbalances.
@@ -81,8 +84,7 @@ def repair_json_brackets(text: str) -> str:
         result.append('"')
 
     # ── Close any remaining unclosed openers ───────────────────────────
-    for opener in reversed(stack):
-        result.append("}" if opener == "{" else "]")
+    result.extend("}" if opener == "{" else "]" for opener in reversed(stack))
 
     return "".join(result)
 
@@ -259,25 +261,19 @@ def try_parse_json(text: str) -> Any | None:
     """
     text = _normalize_llm_json(text)
 
-    try:
+    with contextlib.suppress(json.JSONDecodeError):
         return json.loads(text)
-    except json.JSONDecodeError:
-        pass
 
     # Attempt bracket repair (extra/missing brackets common in small LLM output)
     repaired = repair_json_brackets(text)
     if repaired != text:
-        try:
+        with contextlib.suppress(json.JSONDecodeError):
             return json.loads(repaired)
-        except json.JSONDecodeError:
-            pass
 
     # Attempt truncated JSON recovery (last complete operation object)
     truncated = repair_truncated_json(text)
     if truncated is not None and truncated != text:
-        try:
+        with contextlib.suppress(json.JSONDecodeError):
             return json.loads(truncated)
-        except json.JSONDecodeError:
-            pass
 
     return None

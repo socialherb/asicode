@@ -149,16 +149,18 @@ def test_all_models_failing_returns_none():
 def test_vector_cache_manager_without_dependencies():
     """Test VectorCacheManager when dependencies are missing."""
     # Temporarily patch the flags
-    with patch('external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS', False):
-        with patch('external_llm.agent.vector_cache.HAS_NUMPY', False):
-            with patch('external_llm.agent.vector_cache.HAS_FAISS', False):
-                reset_global_embedding_model()
-                manager = VectorCacheManager("/tmp/test_cache_no_deps")
+    with (
+        patch("external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS", False),
+        patch("external_llm.agent.vector_cache.HAS_NUMPY", False),
+        patch("external_llm.agent.vector_cache.HAS_FAISS", False),
+    ):
+        reset_global_embedding_model()
+        manager = VectorCacheManager("/tmp/test_cache_no_deps")
 
-                # Model should be None
-                assert manager.embedding_model is None
-                # Dimension should fall back to default
-                assert manager.dimension == 384
+        # Model should be None
+        assert manager.embedding_model is None
+        # Dimension should fall back to default
+        assert manager.dimension == 384
 
 
 def test_warmup_does_not_double_load_with_concurrent_caller():

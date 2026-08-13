@@ -14,8 +14,12 @@ Design notes
   entries on save) so a noisy repo can't grow the file unbounded.
 * **Decay**: ``recency_weight`` down-weights old observations so a transient
   spate of failures doesn't dominate forever after the underlying bug is fixed.
-* **Thread-safe**: a module-level registry of per-repo locks guards the JSON
-  file (mirrors ``FileLockManager``'s per-path mutual exclusion rationale).
+* **Thread-safe + cross-process-safe**: a module-level registry of per-repo
+  thread locks guards the JSON file (mirrors ``FileLockManager``'s per-path
+  mutual exclusion rationale), and every write runs its read-modify-write
+  cycle under ``cross_process_flock`` (``.asicode/failure_patterns.json.lock``)
+  so concurrent processes (CLI session + webapp, self-eval workers) cannot
+  lose each other's increments on flush.
 * **Recall is pull-based**: callers ask ``recall_for(tool, reason)`` and get ""
   when the pattern isn't yet "known bad" (below threshold) — so recall never
   fires on first occurrence and never spams.
@@ -27,6 +31,8 @@ agent accumulates automatically.
 from __future__ import annotations
 
 import atexit
+import contextlib
+import itertools
 import json
 import logging
 import os
@@ -35,6 +41,8 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
+
+from ..common.file_lock import cross_process_flock
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +102,7 @@ _ACTION_ADVICE_BY_NAME = {
     "READ_FIRST": "read the target first (it may have moved or changed)",
     "SKIP": "skip this — the change is likely already applied",
     "ABORT": "stop — this is a permission/environment issue that won't resolve by retrying",
+    "FIX_ARGS": "re-issue the call with the missing argument(s) supplied",
 }
 _RECALL_ADVICE_GENERIC = (
     "change approach (different tool, read the target first, or re-fetch fresh context)"
@@ -180,6 +189,10 @@ class FailurePatternStore:
        ``merge=True`` (the default), resurrecting the deleted keys.  In
        single-process CLI use this is not an issue; for multi-process
        coordination a generation counter in the JSON file would be needed.
+
+       The ``record()`` / ``flush()`` write cycle itself is serialised across
+       processes by a ``.lock`` file (no lost increments); the limitation
+       above is about merge-vs-delete *ordering*, not write atomicity.
     """
 
     def __init__(self, repo_root: str | Path, *, enabled: bool = True) -> None:
@@ -207,14 +220,32 @@ class FailurePatternStore:
     def _save(self, data: dict[str, dict], *, merge: bool = True) -> None:
         if not self.enabled:
             return
+        # Cross-process serialisation: the read → merge → atomic-rename cycle
+        # below is a single read-modify-write over the shared JSON file.  The
+        # in-process ``self._lock`` does not span processes, so without a
+        # cross-process lock two processes (parallel CLI session + webapp, or
+        # self-eval workers) can both read the same disk snapshot, merge their
+        # own increments, and rename — the second rename silently clobbers the
+        # first process's observations (lost-update).  ``cross_process_flock``
+        # serialises the whole cycle; the ``.lock`` file is left behind
+        # deliberately (see file_lock.cross_process_flock).
+        with cross_process_flock(Path(f"{self._path}.lock")):
+            self._save_unsafe(data, merge=merge)
+
+    def _save_unsafe(self, data: dict[str, dict], *, merge: bool = True) -> None:
+        """Write *data* to disk; caller must hold the cross-process lock.
+
+        Extracted from ``_save`` so the entire read-modify-write cycle (re-read
+        + merge + rename) runs under one ``cross_process_flock`` acquisition.
+        """
+        if not self.enabled:
+            return
         if merge:
             # Cross-process safety: re-read the file BEFORE writing and merge
             # our in-memory entries on top.  This avoids losing entries written
             # by another process since the last _load() call.  The merge is
-            # always done under the same thread lock, but since the file lock
-            # is process-local, concurrent processes can still race on the
-            # read-modify-write cycle.  Merging on every write mitigates this
-            # by ensuring no entries are lost.
+            # performed under the cross-process lock, so the re-read and the
+            # rename are atomic with respect to other writers.
             disk_data = self._read_from_disk_unsafe()
             merged = self._merge_max(disk_data, data, baseline=self._baseline)
         else:
@@ -277,19 +308,19 @@ class FailurePatternStore:
     def _read_from_disk_unsafe(self) -> dict[str, dict]:
         """Fresh read from the JSON file, bypassing the in-memory cache.
 
-        Called under ``self._lock`` so thread-safe, but the file itself is
-        not locked across processes — callers must accept eventual consistency.
+        Called under ``self._lock`` so thread-safe.  Reads are intentionally
+        lock-free across processes: the writer's ``os.replace`` makes each read
+        see a consistent snapshot (old or new file), and only the
+        read-modify-write in ``_save`` needs cross-process exclusion.
 
         Updates ``_last_read_ts`` so ``recall_for()`` TTL avoids redundant re-reads.
         """
-        try:
+        with contextlib.suppress(OSError, json.JSONDecodeError, ValueError):
             raw = self._path.read_text(encoding="utf-8")
             obj = json.loads(raw)
             if isinstance(obj, dict) and isinstance(obj.get("patterns"), dict):
                 self._last_read_ts = time.monotonic()
                 return obj["patterns"]
-        except (OSError, json.JSONDecodeError, ValueError):
-            pass
         self._last_read_ts = time.monotonic()
         return {}
 
@@ -422,6 +453,18 @@ class FailurePatternStore:
                     # = 0 for pending observations, silently losing them.  See
                     # test_count_preserved_across_recall_flush_boundary.
                     self._baseline = {k: v.get("count", 0) for k, v in disk_data.items()}
+                elif self._dirty_count == 0 and self._cache:
+                    # Empty store on disk — another process cleared it (or it was
+                    # never written).  Drop the stale cache so cleared patterns stop
+                    # firing recall hints: without this branch a remote clear() is
+                    # invisible to this process's cache forever, and recall_for
+                    # keeps hinting a pattern the user explicitly deleted.  When
+                    # pending unflushed records exist the cache must be kept
+                    # (discarding it would lose observations; their flush
+                    # resurrects the keys anyway — the documented merge=True
+                    # deletion limitation).
+                    self._cache = {}
+                    self._baseline = {}
             data = self._cache or {}
             entry = data.get(self._key(tool_name, reason))
             if not entry:
@@ -669,10 +712,8 @@ _atexit_registered = False
 def _flush_all_stores() -> None:
     """Flush all live stores on process exit — avoids losing the last batch."""
     for store in list(_stores.values()):
-        try:
+        with contextlib.suppress(OSError):  # flush is best-effort disk I/O
             store.flush()
-        except Exception:
-            pass
 
 
 def get_store(repo_root: str | Path, *, enabled: bool = True) -> FailurePatternStore:
@@ -697,10 +738,9 @@ def get_store(repo_root: str | Path, *, enabled: bool = True) -> FailurePatternS
         if s is None:
             if len(_stores) >= _MAX_STORES:
                 _evict_key, _evicted = _stores.popitem(last=False)  # evict oldest
-                try:
-                    _evicted.flush()  # flush pending writes before discarding
-                except Exception:
-                    pass
+                # flush pending writes before discarding
+                with contextlib.suppress(OSError):  # flush is best-effort disk I/O
+                    _evicted.flush()
             s = FailurePatternStore(root, enabled=enabled)
             _stores[root] = s
         else:
@@ -728,24 +768,45 @@ def get_store(repo_root: str | Path, *, enabled: bool = True) -> FailurePatternS
 # In-run dedup: a (session_key, repo, tool, reason) is recorded at most once
 # per *run* (webapp agent turn) / per *turn* (CLI design-chat respond) so
 # consecutive retries within that scope do not inflate the cross-run count —
-# replacing the caller-side ``fail_streak == 0`` gate.  *session_key* is a
-# fresh per-run object id supplied by each caller (webapp: id(ctx.fail_streak);
-# CLI: id(DesignChatResult)), so a NEW run both re-records AND re-surfaces the
-# recall hint — matching the original gate which reset every run.  A bare
-# process-global set would never reset under a long-lived server process, so
-# recall would fire at most once per process and then be silenced forever
-# (even for new conversations that need it most); the bounded LRU below keeps
-# memory in check while preserving per-run scoping.
+# replacing the caller-side ``fail_streak == 0`` gate.  *session_key* is
+# generated once per run/turn by ``new_session_key()`` (pid + monotonic
+# sequence), so a NEW run both re-records AND re-surfaces the recall hint —
+# matching the original gate which reset every run.  A bare process-global set
+# would never reset under a long-lived server process, so recall would fire at
+# most once per process and then be silenced forever (even for new
+# conversations that need it most); the bounded FIFO below keeps memory in
+# check while preserving per-run scoping.
 _CLASSIFIER: "object | None" = None  # FailureClassifier, lazily imported
 _RECORDED_SESSION_KEYS: "OrderedDict[tuple[str, str, str, str], None]" = OrderedDict()
 _RECORDED_SESSION_KEYS_LIMIT = 4096
+
+# Per-run/turn session identity.  MUST be generated fresh per run — the old
+# ``str(id(ctx.fail_streak))`` scheme reused freed object addresses, so
+# sequential runs in one process collided on the same key and the dedup map
+# silenced recall for the process lifetime (see _RECORDED_SESSION_KEYS note).
+# pid + itertools.count is unique across runs AND across concurrent processes
+# sharing this module; count's __next__ is atomic in CPython, so concurrent
+# threads each get a distinct sequence value.
+_RUN_SEQ = itertools.count(1)
+
+
+def new_session_key() -> str:
+    """Fresh per-run/per-turn session key for recall dedup & outcome settling.
+
+    Call once per agent run (webapp turn pipeline) or per CLI design-chat
+    respond() call, then reuse that same key for every tool result in the
+    scope — retries within the scope share the key (deduped), a new scope
+    re-records and re-surfaces the hint.
+    """
+    return f"{os.getpid()}-{next(_RUN_SEQ)}"
 
 
 def reset_recall_session() -> None:
     """Clear the in-run dedup map.
 
-    Test-only: each run supplies its own ``session_key`` (a fresh object id),
-    so production code never needs to reset — a new run simply uses a new key.
+    Test-only: each run supplies its own ``session_key`` (via
+    ``new_session_key()``), so production code never needs to reset — a new
+    run simply uses a new key.
     """
     _RECORDED_SESSION_KEYS.clear()
 
@@ -778,15 +839,13 @@ _PENDING_RECALL_LIMIT = 4096
 
 def _record_recall_fired(session_key: str) -> None:
     """Increment fired and arm the per-run marker for outcome settling."""
-    try:
-        with _recall_lock:
-            _recall_counts["fired"] += 1
-            if session_key:
-                _pending_recall[session_key] = None
-                while len(_pending_recall) > _PENDING_RECALL_LIMIT:
-                    _pending_recall.popitem(last=False)
-    except Exception:  # counters must never break recall
-        pass
+    # Counters must never break recall.
+    with _recall_lock:
+        _recall_counts["fired"] += 1
+        if session_key:
+            _pending_recall[session_key] = None
+            while len(_pending_recall) > _PENDING_RECALL_LIMIT:
+                _pending_recall.popitem(last=False)
 
 
 def record_recall_outcome(*, ok: bool, session_key: str = "") -> None:
@@ -798,20 +857,17 @@ def record_recall_outcome(*, ok: bool, session_key: str = "") -> None:
     ``helped``, failure → ``ignored``.  No-op when no marker is pending (the
     common case — most runs never fire a recall).
     """
-    try:
+    with _recall_lock:
         if not session_key:
             return
-        with _recall_lock:
-            # Use membership + del (not pop's return): the marker is stored with
-            # a None value, and OrderedDict.pop(key, None) returns None both when
-            # the key is absent AND when it is present-with-None-value — which
-            # would silently treat every fired recall as "no marker pending".
-            if session_key not in _pending_recall:
-                return
-            del _pending_recall[session_key]
-            _recall_counts["helped" if ok else "ignored"] += 1
-    except Exception:
-        pass
+        # Use membership + del (not pop's return): the marker is stored with
+        # a None value, and OrderedDict.pop(key, None) returns None both when
+        # the key is absent AND when it is present-with-None-value — which
+        # would silently treat every fired recall as "no marker pending".
+        if session_key not in _pending_recall:
+            return
+        del _pending_recall[session_key]
+        _recall_counts["helped" if ok else "ignored"] += 1
 
 
 def get_recall_counts() -> dict[str, int]:
@@ -853,12 +909,13 @@ def recall_on_failure(
     classifier's type/code hierarchy still applies to dispatch errors.
 
     *session_key* scopes dedup to a single run (webapp) / turn (CLI): pass a
-    fresh per-run object id (e.g. ``str(id(ctx.fail_streak))`` /
-    ``str(id(result))``).  Retries within the same run are deduped (no
-    double-counting), but a NEW run re-records and re-surfaces the hint once
-    the threshold is met — matching the original per-run ``fail_streak == 0``
-    gate.  Defaults to ``""`` (callers that omit it share one process-wide
-    scope, appropriate only for one-shot use).
+    key from ``new_session_key()`` (generated once per run/turn — NOT an
+    object id; ``str(id(...))`` reuses freed addresses and would dedup
+    distinct runs in one process).  Retries within the same run are deduped
+    (no double-counting), but a NEW run re-records and re-surfaces the hint
+    once the threshold is met — matching the original per-run
+    ``fail_streak == 0`` gate.  Defaults to ``""`` (callers that omit it
+    share one process-wide scope, appropriate only for one-shot use).
     """
     try:
         if not repo_root:
@@ -877,7 +934,7 @@ def recall_on_failure(
             src = _types.SimpleNamespace(error=exc, ok=False)
         else:
             return ""
-        classification = _CLASSIFIER.classify(tool_name, args, src)
+        classification = _CLASSIFIER.classify(tool_name, src)
         reason = getattr(classification, "reason", "") or ""
         action = getattr(classification, "action", None)
         if reason in _NON_RECALLABLE_REASONS:
@@ -893,8 +950,10 @@ def recall_on_failure(
         # cross-run count toward threshold) and re-hints once threshold is met.
         if dedup_key not in _RECORDED_SESSION_KEYS:
             _RECORDED_SESSION_KEYS[dedup_key] = None
-            # Bounded LRU: evict oldest so a long-lived process cannot grow
-            # the dedup map without bound.
+            # Bounded FIFO: evict oldest so a long-lived process cannot grow
+            # the dedup map without bound.  (Keys are write-once — a key that
+            # reappears is deduped and never re-added — so FIFO and LRU
+            # coincide here.)
             while len(_RECORDED_SESSION_KEYS) > _RECORDED_SESSION_KEYS_LIMIT:
                 _RECORDED_SESSION_KEYS.popitem(last=False)
             # Forward the classifier's action (shapes the advice) and the
@@ -906,6 +965,7 @@ def recall_on_failure(
             if hint:
                 _record_recall_fired(session_key)
             return hint
+    except (OSError, RuntimeError, ValueError):  # path/file failures only — recall must never break the caller
         return ""
-    except Exception:  # recall must never break the caller
+    else:
         return ""

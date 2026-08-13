@@ -9,11 +9,14 @@ import subprocess
 
 import pytest
 
-from external_llm.client import (
-    LLMMessage, LLMResponse, ToolCallRequest, ToolCallResponse,
-)
 from external_llm.agent.design_chat_loop import DesignChatLoop
 from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
+from external_llm.client import (
+    LLMMessage,
+    LLMResponse,
+    ToolCallRequest,
+    ToolCallResponse,
+)
 
 
 class _StubClient:

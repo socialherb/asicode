@@ -6,6 +6,8 @@ Handles streaming events, permission hooks, and session lifecycle.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Callable
@@ -55,10 +57,12 @@ class ClaudeSession:
         options: Any = None,  # ClaudeAgentOptions
         event_callback: Optional[Callable[[SessionEvent], None]] = None,
         include_partial: bool = True,
+        query_timeout: Optional[float] = None,
     ):
         self._options = options
         self._event_callback = event_callback
         self._include_partial = include_partial
+        self._query_timeout = query_timeout
         self._client: Any = None  # ClaudeSDKClient
         self._events: list[SessionEvent] = []
         self._start_time: float = 0.0
@@ -91,12 +95,10 @@ class ClaudeSession:
             # SDK resources (subprocess, file descriptors). disconnect()
             # on a not-yet-connected client is a no-op or raises; both
             # are safe to ignore.
-            try:
+            with contextlib.suppress(OSError, ConnectionError, RuntimeError):  # disconnect teardown
                 await self._client.disconnect()
-            except Exception:
-                pass
             self._client = None
-            logger.error("Failed to connect ClaudeSession: %s", ex)
+            logger.exception("Failed to connect ClaudeSession: %s", ex)
             raise
 
         return self
@@ -132,11 +134,16 @@ class ClaudeSession:
         start = time.monotonic()
 
         try:
-            # Send the query
-            await self._client.query(prompt)
-
-            # Process streaming response
-            verdict = await self._process_response_stream()
+            # Send the query and process the streaming response. The whole
+            # exchange is wrapped in wait_for when query_timeout is set:
+            # receive_response() has no internal deadline, so without this a
+            # stuck SDK subprocess would block the session forever.
+            if self._query_timeout is not None:
+                verdict = await asyncio.wait_for(
+                    self._run_query(prompt), timeout=self._query_timeout
+                )
+            else:
+                verdict = await self._run_query(prompt)
 
             duration = time.monotonic() - start
 
@@ -147,6 +154,31 @@ class ClaudeSession:
                 total_tokens=self._last_total_tokens,
                 total_cost_usd=self._last_cost_usd,
                 duration_seconds=duration,
+            )
+
+        except asyncio.TimeoutError:
+            duration = time.monotonic() - start
+            logger.warning(
+                "ClaudeSession.query timed out after %ss", self._query_timeout
+            )
+            # Best-effort stop the agent subprocess — without this the SDK
+            # keeps running the agent in the background (burning tokens/CPU)
+            # while the caller has already moved on.
+            await self._best_effort_interrupt()
+            return SessionResult(
+                verdict=CollaborationVerdict(
+                    status="failure",
+                    summary="Query timed out",
+                    details=(
+                        "Claude Code Agent did not complete within "
+                        f"{self._query_timeout} seconds"
+                    ),
+                    confidence=0.0,
+                ),
+                events=self._events,
+                tool_calls_count=self._tool_calls_count,
+                duration_seconds=duration,
+                error=f"Query timed out after {self._query_timeout} seconds",
             )
 
         except Exception as ex:
@@ -164,6 +196,26 @@ class ClaudeSession:
                 duration_seconds=duration,
                 error=str(ex),
             )
+
+    async def _run_query(self, prompt: str) -> CollaborationVerdict:
+        """Send the prompt and process the full stream (timeout-wrapped unit).
+
+        Kept as a separate coroutine so query() can wrap the entire
+        send+stream exchange in asyncio.wait_for without cancelling itself.
+        """
+        await self._client.query(prompt)
+        return await self._process_response_stream()
+
+    async def _best_effort_interrupt(self) -> None:
+        """Interrupt the SDK agent subprocess without raising.
+
+        Used on timeout/cancel paths where the primary failure already
+        happened and an interrupt failure must not mask it.
+        """
+        try:
+            await self.interrupt()
+        except Exception as ex:
+            logger.debug("Interrupt failed (ignored): %s", ex)
 
     async def _process_response_stream(self) -> CollaborationVerdict:
         """Process all messages from the streaming response.
@@ -427,7 +479,7 @@ class ClaudeSession:
 
         # 3. Result text (from unstructured output)
         result_text = str(getattr(message, "result", "") or "")
-        first_line = result_text.split("\n")[0][:80] if result_text else ""
+        first_line = result_text.split("\n", maxsplit=1)[0][:80] if result_text else ""
         if result_text:
             return _emit(CollaborationVerdict(
                 status="needs_review" if not getattr(message, 'is_error', False) else "failure",

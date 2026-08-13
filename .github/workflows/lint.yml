@@ -1,4 +1,4 @@
-name: Lint (F401/F811/F821 baseline-diff + F823/open-encoding/unguarded-subprocess gates)
+name: Lint + Unit tests (baseline-diff gates + full tests/unit)
 
 on:
   push:
@@ -49,13 +49,35 @@ jobs:
         # reporting all along, invisible because only F821/F401/F811 were gated.
         run: python scripts/check_f823_none.py
 
+      - name: Check ZERO undeclared writes to a module global
+        # The other half of the check above, and from the same incident. F823
+        # only fires when the name is also READ before assignment; a write-only
+        # `x = ...` that forgot `global` binds a local, discards the write, and
+        # produces no ruff diagnostic whatsoever. That is the half that stayed
+        # invisible: it froze .asicode/rg_fallback_counts.json at all-zeros
+        # (webapp _rg_dirty — zeros that read exactly like "never fired") and
+        # pinned the REPL's /think autocomplete to the startup model for the
+        # whole session (repl_impl _completer_provider, 6 dead assignments).
+        # No baseline: measured 7 candidates repo-wide at gate time, all fixed.
+        # Pure AST + symtable, no ruff — ruff has no equivalent rule.
+        run: python scripts/check_missing_global.py
+
       - name: Check no NEW silent except handlers vs baseline
         # Was pre-commit-ONLY until now, so it gated nothing for anyone who had
         # not run `pre-commit install` — and lint.yml is the only workflow that
-        # actually runs (p11-ci.yml is excluded from the public export). A gate
+        # actually runs on every push/PR. A gate
         # that exists but never executes is indistinguishable from no gate.
         # Baseline-diff: 1351 pre-existing handlers are frozen, net-new ones fail.
-        run: python scripts/check_no_new_silent_except.py
+        # --index-only: scan the HEAD+index snapshot (what the commit ships), not
+        # the working tree — same semantics as the pre-commit hook.
+        run: python scripts/check_no_new_silent_except.py --index-only
+
+      - name: Observe silent-except backlog trend (report-only)
+        # Reduction program: after each round the baseline is regenerated, so
+        # this step reports the drift (NEW/RESOLVED) since the last snapshot
+        # plus the absolute backlog count.  Always exits 0 — trend monitor,
+        # not a gate (same contract as check_plr2004_observation.py).
+        run: python scripts/check_no_new_silent_except.py --observe
 
       - name: Check ZERO text-mode open() without encoding=
         # Also no baseline: the 44 pre-existing sites were fixed when this was
@@ -75,3 +97,194 @@ jobs:
         # TestRunner._run_cmd spawns pytest/npm). Pure AST, no ruff.
         # Key <rel>::<scope>::<ordinal> is line-drift-stable. Production only.
         run: python scripts/check_no_new_unguarded_subprocess.py
+
+      - name: Check no NEW standalone-import failures vs baseline
+        # Baseline-diff: every module is imported in a FRESH interpreter — a
+        # module that only imports after something else was imported first
+        # carries a hidden import-order contract. Motivating incident:
+        # external_llm.repl.repl_impl imports asi at module level, and asi.py
+        # re-exports 76 symbols FROM repl_impl at the bottom of the file —
+        # `import asi` first works (the cycle resolves one way) but
+        # `import external_llm.repl.repl_impl` first raises ImportError. Four
+        # tests had to carry a manual `import asi  # noqa: F401` guard to work
+        # around it. --index-only: scan the HEAD+index snapshot (what the
+        # commit ships), same semantics as the pre-commit hook.
+        run: python scripts/check_standalone_imports.py --index-only
+
+      - name: Check no NEW first-party ImportError fallbacks vs baseline
+        # A first-party module (pyproject py-modules / packages.find, or any
+        # relative import) can never fail to import at runtime — an
+        # `except ImportError` around it is a dead fallback whose except body
+        # rots silently (P26-1: the content-ratio guard was wired only to a
+        # legacy branch nobody reached). 39 pre-existing fallbacks are frozen
+        # in scripts/first_party_import_fallback_baseline.txt; only net-new
+        # ones fail. Mirrors the pre-commit hook.
+        run: python scripts/check_no_new_first_party_import_fallback.py --index-only
+
+      - name: Check no NEW computed-and-dropped signal patterns vs baseline
+        # Baseline-diff: `x = <Call>` immediately followed by
+        # `raise ... f"...{x}..."` where x appears ONLY in the message f-string
+        # (never passed as structured data) is usually a dropped signal.
+        # Motivating incident: providers.py computed `retry_after =
+        # parse_retry_after(headers)` on Ollama 429s but only interpolated it
+        # into the message — retry layers read e.retry_after via getattr, so
+        # the server hint was silently dropped. 1 baselined entry is a
+        # display-only message string (web_search_tools detail). Mirrors the
+        # pre-commit hook.
+        run: python scripts/check_discarded_signal.py
+
+      - name: Check ZERO unused function/method parameters (dead-params gate)
+        # A parameter the body never reads is usually a bug (a caller-computed
+        # setting silently ignored — ui_tools v8 context_level, context_manager
+        # system_chars, agent_loop read_only_request) or signature noise. 29
+        # baselined entries are documented interface-uniformity exceptions
+        # (strategy functions, tool-handler dispatch, lru_cache keys).
+        # Mirrors the pre-commit hook.
+        run: python scripts/check_dead_params.py
+
+      - name: Check ZERO redundant [tool.ruff.lint] select entries
+        # Config-only gate: a per-rule select entry already covered by a
+        # prefix in select (e.g. "B904" under "B") changes nothing — the P-9
+        # B904 round added exactly such a redundant line, claiming a new gate
+        # for a rule that had been live all along. Every select round must
+        # prove a real behavior change. Mirrors the pre-commit hook.
+        run: python scripts/check_select_not_redundant.py
+
+      - name: Check ZERO violations under the full default rule set (ruff check .)
+        # Zero-tolerance, NO baseline: pyproject's default select set IS the
+        # gate. The ~1377-violation backlog that made a full scan impossible is
+        # gone — cleared rule-by-rule; the last 2 stragglers (PLW1510 check= in
+        # a test, RUF003 EN DASH in a comment) were fixed when this gate was
+        # added. A violation here means code slipped past review AND the
+        # baseline-diff hooks above. Keep it at zero; do not add --select
+        # overrides (an override silently disables every other rule).
+        run: python scripts/check_lint_full.py
+
+      - name: Check ZERO deterministic structural scanner candidates
+        # Zero-tolerance, NO baseline: contradictory_logic / duplicate_definition
+        # / unused_import were at zero repo-wide when gated (2026-08-07), so any
+        # candidate is a regression by construction. The four graph-dependent
+        # scanners were promoted 2026-08-08: the gate script now builds the
+        # call graph ONCE (~5s; get_callers is an O(1) reverse index since
+        # fa857800) and injects cross_file_referenced_names + repo_graph, which
+        # eliminated the cross-file false positives (dead_block 43 /
+        # public_dead_code 43) that kept them out of the gate; broken_contract
+        # (graph-required) previously always skipped standalone — a silent
+        # no-op — and vulture's 36 framework-dispatch false positives (enum
+        # members, pydantic/dataclass fields, http.server protocol methods,
+        # foreign-object attribute assignments) are suppressed structurally in
+        # vulture_scanner._framework_live_for_file. Remaining report-only:
+        # ast_similarity / container_reachability. See
+        # scripts/check_structural_scanners.py.
+        # --gate-only skips the two report-only scanners (~15% of wall time) —
+        # the zero-tolerance gate is unchanged, CI just stops paying for the
+        # drift report every push. Run the no-flag form manually/weekly for
+        # report-only drift checks.
+        # Package install needed: the script imports external_llm's registry
+        # (tree-sitter-language-pack is a core dependency).
+        run: |
+          python -m pip install -e . --quiet
+          python scripts/check_structural_scanners.py --gate-only
+
+      - name: PLR2004 magic-value drift observation (report-only, never gates)
+        # The 1836-site PLR2004 backlog (int/float literal comparisons: exit
+        # codes, HTTP statuses, timeouts, test expectations) is deliberately
+        # NOT converted — a manual sweep costs more than it returns, and
+        # int/float exemption would silently neuter the rule. The rule stays
+        # unselected in pyproject.toml; this step tracks NET-NEW drift on
+        # every push so "hold + watch" stays honest (a blind ignore would let
+        # the backlog grow undetected). Always exits 0 by design — it reports
+        # a trend, it does not block. Re-baseline deliberately:
+        # python scripts/check_plr2004_observation.py --write-baseline
+        # (Not mirrored in pre-commit: a pass-always hook there would just add
+        # noise to every commit; CI is the gate surface that matters.)
+        run: python scripts/check_plr2004_observation.py
+
+  # ── Unit-test gate ─────────────────────────────────────────────────────────
+  # This is the ONLY workflow that executes on every push/PR (release.yml only
+  # runs on tags). Until this job existed, a green CI meant ZERO tests had run — the
+  # whole suite was gated by nothing but ruff/AST checks.
+  #
+  # The job mirrors release.yml's test job exactly — same install, same
+  # command, same Python version — so a PR faces the same gate a release
+  # faces, on the exact configuration where the suite is proven green on the
+  # exported tree (no deselections: a perpetually-red gate trains everyone to
+  # bypass it). Mirrored, not re-invented, so the two can never drift apart.
+  unit-tests:
+    name: Unit tests (exported tree, clean install)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Match release.yml's test job (the version where the suite is
+          # proven green on the export), not the lint job's 3.11.
+          python-version: "3.12"
+
+      - name: Install ripgrep
+        # Several read-path tests need rg; pinning its presence keeps the job
+        # deterministic instead of tracking whatever the runner image ships.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ripgrep
+
+      - name: Install package + test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Unit tests
+        # --timeout 300 realises the pytest-timeout intent recorded in
+        # pyproject.toml ([dev] dep, but no ini default): a hung test fails as
+        # a test instead of burning the whole 30-minute job timeout.
+        #
+        # -n auto now defaults via pyproject.toml [tool.pytest.ini_options]
+        # addopts; the CLI flag is omitted here to avoid the duplicate.
+        # -m "not slow" deselects the ~98s full-repo gate mirror
+        # (test_full_scan_is_zero_on_gate_scanners) — the gate itself still
+        # runs in CI via the "Check ZERO deterministic structural scanner
+        # candidates" step above (same zero-candidate contract, --gate-only).
+        # Verified 2026-08-01 under 8-way parallelism: unit 12190 passed /
+        # 0 failed / 12 skipped / 4 xfailed in 2:46; integration 382 passed /
+        # 0 failed / 14 xfailed in 0:19. One earlier hash-order collection
+        # nondeterminism (test_scanner_to_ops_pipeline parametrize over a
+        # frozenset) was fixed and has stayed fixed.
+        run: |
+          python -m pytest tests/unit -q --timeout 300 -m "not slow"
+
+  # ── Integration-test gate ────────────────────────────────────────────────────
+  # tests/integration never ran anywhere in CI: p11-ci.yml (which nominally ran
+  # a 2-file slice) was deleted in 69c53035 as dead, and release.yml only runs
+  # tests/unit. The suite is hermetic — mocked LLM service, tmpdir git repos,
+  # no network — so it is CI-safe as-is. slow-marked tests are deselected
+  # (marker doc: "skip in CI") and optional-dependency tests (numpy/faiss
+  # vector cache) self-skip. Measured locally: 358 passed in ~3 min.
+  integration-tests:
+    name: Integration tests (exported tree, clean install)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ripgrep
+
+      - name: Install package + test dependencies
+        # webapp extra: the integration API tests exercise the FastAPI app.
+        # The unit-tests job does NOT need it — every fastapi-importing unit
+        # test is webapp-coupled and excluded from the export.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev,webapp]'
+
+      - name: Integration tests (no slow)
+        run: |
+          python -m pytest tests/integration -q --timeout 300 -m "not slow"

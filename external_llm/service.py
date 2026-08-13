@@ -11,6 +11,7 @@ Orchestrates the complete flow:
 """
 from __future__ import annotations
 
+import codecs
 import contextlib
 import io
 import logging
@@ -18,42 +19,30 @@ import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
-from .agent.config.thresholds import config as _cfg
-from .client import DEFAULT_LLM_TIMEOUT, OLLAMA_LLM_TIMEOUT, LLMClientError, LLMMessage, create_llm_client, effective_content
-from .code_structure_utils import extract_symbol_name, is_function_def
-from .output_parser import parse_file_blocks, parse_llm_output, validate_diff
 from common import normalize_rel_path_fast
-# context_builder.py in your repo has evolved over time.
-# Keep imports resilient across revisions.
-try:
-    # newer
-    from .context_builder import ContextBuilder, enhance_user_request  # type: ignore
-except ImportError:
-    # fallback (older revisions)
-    from .context_builder import EnhancedContextBuilder as ContextBuilder  # type: ignore
+from context_collector import _SNIPPET_READ_MAX_BYTES
+from path_security import resolve_inside_repo
+from utils.string_helper import utf8_trailing_incomplete_len
 
-    def enhance_user_request(user_request: str, *_, **__) -> str:  # type: ignore
-        return str(user_request or "").strip()
-
-# Super context builder (optional; only used when enabled by context_variant)
-try:
-    from .super_context_builder import SuperContextBuilder  # type: ignore
-except ImportError:
-    SuperContextBuilder = None  # type: ignore
+from .agent.agent_context_manager import get_git_snapshot
+from .agent.config.thresholds import config as _cfg
+from .client import (
+    DEFAULT_LLM_TIMEOUT,
+    OLLAMA_LLM_TIMEOUT,
+    LLMClientError,
+    LLMMessage,
+    create_llm_client,
+    effective_content,
+)
+from .code_structure_utils import extract_symbol_name, is_function_def
+from .context_builder import ContextBuilder, enhance_user_request
+from .output_parser import parse_file_blocks, parse_llm_output, validate_diff
+from .patch_engine import PatchEngine
+from .super_context_builder import SuperContextBuilder
 
 logger = logging.getLogger(__name__)
-
-# Patch engine for unified patch intelligence
-try:
-    from .patch_engine import PatchContext, PatchEngine
-except ImportError as e:
-    logger.warning("PatchEngine not available: %s", e)
-    PatchEngine = None  # type: ignore
-    PatchContext = None  # type: ignore
-
-# Phase 1 and 2 completed - always use PatchEngine when available
 
 
 def _asrp_text(s: str, max_chars: int) -> str:
@@ -75,6 +64,28 @@ def _asrp_text(s: str, max_chars: int) -> str:
         return t
     clipped = t[:mc].rstrip()
     return clipped + " …[CLIPPED]"
+
+
+# P21-1: bound target-file snippet reads. The snippet paths previously read
+# the whole file into memory (and the full text into the prompt) even though
+# only a small window is ever useful — same class as P19-1 (webapp ui_tools).
+# Bound is the shared _SNIPPET_READ_MAX_BYTES SSOT (context_collector).
+
+
+def _bounded_read_text(p: Path, max_bytes: int = _SNIPPET_READ_MAX_BYTES) -> tuple[str, bool]:
+    """Read up to ``max_bytes`` of ``p`` as UTF-8 (errors=replace), cut on a
+    UTF-8 boundary. Returns ``(text, truncated)``; never loads more than
+    ``max_bytes`` into memory. Raises OSError when the file cannot be stat'd
+    or read (callers translate it into their best-effort contract)."""
+    size = p.stat().st_size
+    if size <= max_bytes:
+        return p.read_text(encoding="utf-8", errors="replace"), False
+    with p.open("rb") as f:
+        raw = f.read(max_bytes)
+    trim = utf8_trailing_incomplete_len(raw)
+    if trim:
+        raw = raw[:-trim]
+    return raw.decode("utf-8", errors="replace"), True
 
 
 
@@ -103,9 +114,7 @@ def _is_section_boundary(line: str) -> bool:
         return True
     if stripped.startswith("TIP:"):
         return True
-    if stripped.startswith("END_CTX_PACK"):
-        return True
-    return False
+    return bool(stripped.startswith("END_CTX_PACK"))
 
 
 def _extract_failure_summary_block(txt: str) -> str:
@@ -161,8 +170,9 @@ def _extract_failed_reason(txt: str) -> str:
 
         if reason_lines:
             return _asrp_text(f"reason: {reason_lines[0]}", 400)
-        return ""
     except (TypeError, AttributeError):
+        return ""
+    else:
         return ""
 
 
@@ -173,12 +183,11 @@ def _extract_identifiers(text: str) -> list[str]:
     for ch in text:
         if ch.isalnum() or ch == '_':
             buf.append(ch)
-        else:
-            if buf:
-                word = ''.join(buf)
-                if len(word) >= 3 and (word[0].isalpha() or word[0] == '_'):
-                    result.append(word)
-                buf = []
+        elif buf:
+            word = ''.join(buf)
+            if len(word) >= 3 and (word[0].isalpha() or word[0] == '_'):
+                result.append(word)
+            buf = []
     if buf:
         word = ''.join(buf)
         if len(word) >= 3 and (word[0].isalpha() or word[0] == '_'):
@@ -287,20 +296,36 @@ class ExternalLLMService:
             return False
 
         try:
-            p = (Path(rr).resolve() / tf).resolve()
+            # P22-2: containment guard — path_security rejects traversal/absolute escapes.
+            p = resolve_inside_repo(rr, tf)
             if not p.exists() or not p.is_file():
                 return False
-            file_text = p.read_text(encoding="utf-8", errors="replace")
-        except (OSError, PermissionError):
+        except (OSError, PermissionError, ValueError):
             return False
 
         needles = cls._extract_literal_needles_from_request(user_request)
         if not needles:
             return False
 
-        for needle in needles:
-            if needle and (needle in file_text):
-                return True
+        # P21-1: streaming search — O(1) memory even for multi-hundred-MB
+        # files, and a needle at the very end of the file is still found
+        # (a head-bounded read would miss it and cause a spurious re-add).
+        max_needle = max(len(n) for n in needles if n)
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        buf = ""
+        try:
+            with p.open("rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    buf += dec.decode(chunk)
+                    if any(n and n in buf for n in needles):
+                        return True
+                    if len(buf) > max_needle + 4096:
+                        buf = buf[-(max_needle + 4096):]
+        except (OSError, PermissionError):
+            return False
         return False
 
 
@@ -308,9 +333,14 @@ class ExternalLLMService:
         self,
         repo_root: str,
         target_file: str,
+        *,
+        max_bytes: int = _SNIPPET_READ_MAX_BYTES,
     ) -> str:
-        """
-        Best-effort read of target file content.
+        """Best-effort read of target file content (head-bounded — P21-1).
+
+        Reads at most ``max_bytes`` (1 MiB default) so a multi-hundred-MB
+        target cannot spike memory or blow the prompt. A truncated read
+        appends an explicit marker so the model knows it only sees the head.
         """
         rr = str(repo_root or "").strip()
         tf = normalize_rel_path_fast(str(target_file))
@@ -318,17 +348,19 @@ class ExternalLLMService:
             return ""
 
         try:
-            root = Path(rr).resolve()
-            p = (root / tf).resolve()
+            # P22-2: containment guard — prompt-derived paths must not escape the repo.
+            p = resolve_inside_repo(rr, tf)
             if not p.exists() or not p.is_file():
                 return ""
-            txt = p.read_text(encoding="utf-8", errors="replace")
-        except (OSError, PermissionError):
+            txt, truncated = _bounded_read_text(p, max_bytes)
+        except (OSError, PermissionError, ValueError):
             return ""
 
         if not txt:
             return ""
 
+        if truncated:
+            txt += "\n...[SNIPPET TRUNCATED — file larger than 1 MiB; head shown]..."
         return txt if txt.endswith("\n") else txt + "\n"
 
     @staticmethod
@@ -380,12 +412,15 @@ class ExternalLLMService:
             return ""
 
         try:
-            root = Path(rr).resolve()
-            p = (root / tf).resolve()
+            # P22-2: containment guard — prompt-derived paths must not escape the repo.
+            p = resolve_inside_repo(rr, tf)
             if not p.exists() or not p.is_file():
                 return ""
-            txt = p.read_text(encoding="utf-8", errors="replace")
-        except (OSError, PermissionError):
+            # P21-1: head-bounded read. If the needle lives past 1 MiB the
+            # focused window is empty and callers fall back to the bounded
+            # head_tail snippet — never a full-file read.
+            txt, _trunc = _bounded_read_text(p)
+        except (OSError, PermissionError, ValueError):
             return ""
 
         if not txt:
@@ -428,6 +463,7 @@ class ExternalLLMService:
                 text=True,
                 capture_output=True,
                 timeout=5,
+                check=False,
             )
             if p.returncode != 0:
                 return ""
@@ -437,25 +473,26 @@ class ExternalLLMService:
 
     @classmethod
     def _get_git_identity_best_effort(cls, repo_root: str) -> dict[str, str]:
-        return {
-            "branch": cls._git_cmd_best_effort(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"]),
-            "head_commit": cls._git_cmd_best_effort(repo_root, ["rev-parse", "HEAD"]),
-        }
+        """Branch + HEAD commit, via the agent-wide git snapshot SSOT.
 
-    @staticmethod
-    def _read_file_text_best_effort(repo_root: str, target_file: str) -> str:
+        Previously two UNCACHED ``git rev-parse`` subprocesses per LLM-context
+        build (branch + HEAD); now a single TTL-cached snapshot (10s, per-root,
+        cleared on every successful write) serves both fields. The snapshot is
+        never stale past a write, and branch does not change mid-completion, so
+        a short TTL on this best-effort metadata is safe. Falls back to the
+        direct ``_git_cmd_best_effort`` only if the SSOT import itself fails —
+        ``get_git_snapshot`` already swallows all git/subprocess errors and
+        returns empty fields, so this path stays bulletproof.
+        """
         rr = str(repo_root or "").strip()
-        tf = normalize_rel_path_fast(str(target_file))
-        if not rr or not tf:
-            return ""
         try:
-            root = Path(rr).resolve()
-            p = (root / tf).resolve()
-            if not p.exists() or not p.is_file():
-                return ""
-            return p.read_text(encoding="utf-8", errors="replace") or ""
-        except (OSError, PermissionError):
-            return ""
+            snap = get_git_snapshot(rr)
+            return {"branch": snap.get("branch", ""), "head_commit": snap.get("head_hash", "")}
+        except Exception:
+            return {
+                "branch": cls._git_cmd_best_effort(rr, ["rev-parse", "--abbrev-ref", "HEAD"]),
+                "head_commit": cls._git_cmd_best_effort(rr, ["rev-parse", "HEAD"]),
+            }
 
     @staticmethod
     def _classify_failure_hint_best_effort(previous_failure_hint: str) -> str:
@@ -535,8 +572,6 @@ class ExternalLLMService:
         snippet = ""
 
         if rr and tgt:
-            meta["target_file_chars"] = len(self._read_file_text_best_effort(rr, tgt))
-
             fail_kind = self._classify_failure_hint_best_effort(previous_failure_hint)
             meta["snippet_failure_hint"] = fail_kind if fail_kind else None
 
@@ -646,7 +681,6 @@ class ExternalLLMService:
             if text and not text.endswith("\n"):
                 text += "\n"
             meta["length"] = len(text)
-            return (text, meta)
         except Exception as e:
             # Fallback to v7 if super builder fails
             txt, m = self._build_llm_context_v7_best_effort(
@@ -661,6 +695,8 @@ class ExternalLLMService:
             m["variant_fallback_from"] = "super"
             m["super_error"] = f"{type(e).__name__}: {e}"
             return (txt, m)
+        else:
+            return (text, meta)
 
 
     def __init__(
@@ -676,7 +712,7 @@ class ExternalLLMService:
         provider_stripped = (provider or "").strip()
         if provider_stripped.lower() == "ollama" and timeout == DEFAULT_LLM_TIMEOUT:
             timeout = OLLAMA_LLM_TIMEOUT
-            logger.info(f"Using extended timeout for Ollama: {timeout}s")
+            logger.info("Using extended timeout for Ollama: %ss", timeout)
 
         self.provider = provider_stripped
         self.model = (model or "").strip() or self._get_default_model(self.provider)
@@ -698,7 +734,7 @@ class ExternalLLMService:
     # ---------------------------------------------------------------------
     # ── Default model per provider ─────────────────────────────────────────
     # Used as fallback when no model is explicitly provided.
-    _PROVIDER_DEFAULT_MODELS: dict[str, str] = {
+    _PROVIDER_DEFAULT_MODELS: ClassVar[dict[str, str]] = {
         "openai": "gpt-4-turbo-preview",
         "anthropic": "claude-sonnet-4-6",
         "google": "gemini-2.0-flash",
@@ -821,7 +857,6 @@ class ExternalLLMService:
                         tgt,
                         needles=needles,
                         radius_lines=120,
-                        max_chars=6_000,
                     )
                     if not target_snippet:
                         target_snippet = self._read_target_file_snippet_best_effort(
@@ -962,6 +997,284 @@ class ExternalLLMService:
             tokens_used_retry = None
             tokens_used_total = tokens_used_first
 
+            def _eval_patch_engine_fast_path(
+                llm_out: str,
+                force_file_block: bool,
+            ) -> Optional[tuple[bool, str, str, Optional[str], str]]:
+                """Phase 1: PatchEngine direct synthesis.
+
+                Returns the full success tuple, or None when PatchEngine is
+                unavailable/failed (caller must fall back to legacy logic).
+                """
+                if PatchEngine is None or not tgt:
+                    return None
+                try:
+                    engine = PatchEngine(rr)
+                    output_mode = "full_file" if force_file_block else "auto"
+                    result = engine.synthesize_and_apply(llm_out, tgt, output_mode)
+
+                    if result.success:
+                        # Extract synth_reason from metadata
+                        synth_reason_from_meta = result.metadata.get("synth_reason", "")
+                        mode_from_meta = result.metadata.get("mode", "")
+                        synth0 = f"patch_engine_{mode_from_meta}"
+                        if synth_reason_from_meta:
+                            synth0 = f"{synth0}:{synth_reason_from_meta}"
+
+                        # Note: explanation is empty as we don't parse it from LLM output
+                        return (True, result.patch_applied or "", "", synth0, "")
+                    # PatchEngine failed, fall back to legacy logic
+                    logger.debug("PatchEngine failed: %s", result.error)
+                except Exception as e:
+                    logger.debug("PatchEngine exception, falling back: %s", e)
+                    # Continue with legacy logic
+                return None
+
+            def _eval_ast_rewrite_attempt(
+                rewriter: Optional[object],
+                llm_out: str,
+                synth0: Optional[str],
+            ) -> tuple[str, Optional[str]]:
+                """Symbol-based AST rewrite (FUNCTION:/CLASS:/METHOD:/autodetect headers).
+
+                Returns (patch0, synth0); patch0 is empty when no rewrite applied,
+                in which case synth0 is passed through unchanged.
+                """
+                patch0 = ""
+                try:
+                    if rewriter:
+                        # Attempt symbol-based rewrite first
+                        parsed_blocks = parse_file_blocks(llm_out or "")
+                        if parsed_blocks:
+                            block = parsed_blocks[0]
+                            new_code = block.get("text") or block.get("content") or ""
+
+                            llm_header = (llm_out or "").strip().splitlines()[0].strip()
+
+                            if llm_header.startswith("FUNCTION:"):
+                                func_name = llm_header.split("FUNCTION:")[1].strip()
+
+                                result = rewriter.replace_function(
+                                    tgt,
+                                    func_name,
+                                    new_code
+                                )
+
+                                patch0 = rewriter.generate_patch(tgt, result)
+                                synth0 = "ast_function"
+
+                            elif llm_header.startswith("CLASS:"):
+                                class_name = llm_header.split("CLASS:")[1].strip()
+
+                                result = rewriter.replace_class(
+                                    tgt,
+                                    class_name,
+                                    new_code
+                                )
+
+                                patch0 = rewriter.generate_patch(tgt, result)
+                                synth0 = "ast_class"
+
+                            elif llm_header.startswith("METHOD:"):
+                                path = llm_header.split("METHOD:")[1].strip()
+                                class_name, method_name = path.split(".")
+
+                                result = rewriter.replace_method(
+                                    tgt,
+                                    class_name,
+                                    method_name,
+                                    new_code
+                                )
+
+                                patch0 = rewriter.generate_patch(tgt, result)
+                                synth0 = "ast_method"
+
+                            elif is_function_def(new_code):
+                                _fname, _ = extract_symbol_name(new_code.strip())
+                                if _fname:
+                                    result = rewriter.replace_function(
+                                        tgt,
+                                        _fname,
+                                        new_code
+                                    )
+
+                                    patch0 = rewriter.generate_patch(tgt, result)
+                                    synth0 = "ast_autodetect"
+                except Exception as e:
+                    logger.debug("AST rewrite attempt failed: %s", e)
+                return patch0, synth0
+
+            def _eval_symbol_apply(
+                rewriter: Optional[object],
+                sym: object,
+                new_code: str,
+                synth0: Optional[str],
+            ) -> tuple[str, Optional[str]]:
+                """Apply the located symbol replacement; returns (patch0, synth0)."""
+                patch0 = ""
+                if sym.kind in ("function", "async_function", "method"):
+                    if rewriter:  # Safety check
+                        result = rewriter.replace_function(
+                            sym.file,  # was sym.file_path
+                            sym.name,
+                            new_code
+                        )
+                        patch0 = rewriter.generate_patch(sym.file, result)  # was sym.file_path
+                        synth0 = "ast_symbol_function"
+                elif sym.kind == "class" and rewriter:  # Safety check
+                    result = rewriter.replace_class(
+                        sym.file,  # was sym.file_path
+                        sym.name,
+                        new_code,
+                    )
+                    patch0 = rewriter.generate_patch(sym.file, result)  # was sym.file_path
+                    synth0 = "ast_symbol_class"
+                return patch0, synth0
+
+            def _eval_symbol_search_fallback(
+                rewriter: Optional[object],
+                llm_out: str,
+                synth0: Optional[str],
+            ) -> tuple[str, Optional[str]]:
+                """Symbol search fallback: locate the target symbol across the repo.
+
+                Returns (patch0, synth0); patch0 is empty when nothing replaced.
+                """
+                patch0 = ""
+                try:
+                    from external_llm.agent.symbol_search import get_symbol_searcher
+
+                    searcher = get_symbol_searcher(rr)
+
+                    parsed_blocks = parse_file_blocks(llm_out or "")
+                    if parsed_blocks:
+                        block = parsed_blocks[0]
+                        new_code = block.get("text") or block.get("content") or ""
+
+                        header = new_code.strip().splitlines()[0].strip()
+
+                        # Extract symbol name from header
+                        symbol_name, symbol_kind = extract_symbol_name(header)
+
+                        if symbol_name:
+                            results = searcher.find_symbol(symbol_name, kind=symbol_kind if symbol_kind != "function" else "any")
+                        else:
+                            results = searcher.find_symbol(header)  # Fallback to original behavior
+
+                        if not results:
+                            sym = searcher.fuzzy_find_symbol(symbol_name or header)
+                            if sym:
+                                results = [sym]
+
+                        if results:
+                            return _eval_symbol_apply(rewriter, results[0], new_code, synth0)
+                except Exception as e:
+                    logger.debug("Symbol search fallback failed: %s", e)
+                return patch0, synth0
+            def _eval_semantic_fallback(
+                llm_out: str,
+                synth0: Optional[str],
+            ) -> tuple[str, Optional[str]]:
+                """Semantic patch fallback: whole-block rewrite via SemanticPatchEngine.
+
+                Returns (patch0, synth0); patch0 is empty when no patch produced.
+                """
+                patch0 = ""
+                try:
+                    from external_llm.semantic_patch import SemanticPatchEngine
+
+                    parsed_blocks = parse_file_blocks(llm_out or "")
+                    if parsed_blocks:
+                        block = parsed_blocks[0]
+                        new_code = block.get("text") or block.get("content") or ""
+
+                        semantic_engine = SemanticPatchEngine(rr)
+                        sem_result = semantic_engine.apply_semantic_patch(
+                            file_path=tgt,
+                            new_code=new_code,
+                        )
+
+                        if sem_result:
+                            patch0 = semantic_engine.generate_patch(tgt, sem_result)
+                            synth0 = "semantic_class" if sem_result.kind == "class" else "semantic_function"
+                except Exception as e:
+                    logger.debug("Semantic patch fallback failed: %s", e)
+                return patch0, synth0
+
+            def _eval_file_block_diff_fallback(
+                llm_out: str,
+                synth0: Optional[str],
+            ) -> tuple[str, Optional[str]]:
+                """Last-resort: synthesize a diff from file blocks server-side.
+
+                synth0 is set unconditionally (preserves the reason even when the
+                patch comes out empty, e.g. file_rewrite_too_large).
+                """
+                engine = PatchEngine(rr)
+                p2, r2 = engine._try_synthesize_diff_from_file_blocks(
+                    repo_root=rr,
+                    target_file=tgt,
+                    llm_text=llm_out,
+                )
+                synth0 = r2
+                patch0 = p2.strip()
+                return patch0, synth0
+
+            def _eval_finalize_patch(
+                patch0: str,
+                expl0: str,
+                synth0: Optional[str],
+                llm_out: str,
+                force_file_block: bool,
+            ) -> tuple[bool, str, str, Optional[str], str]:
+                """Phase 4: central normalize/validate/apply-check + auto-repair.
+
+                Returns the final (ok, patch, explanation, synth_reason, fail_reason).
+                """
+                # Centralized patch normalization pipeline (shared by diff/auto/fast paths)
+                patch0, norm_error = self._normalize_candidate_patch(
+                    patch0, tgt if tgt else None, repo_root=rr
+                )
+
+                if not patch0:
+                    fr = "empty_patch"
+                    if force_file_block and synth0:
+                        fr = f"file_block_failed:{synth0}"
+                    return (False, "", expl0, synth0, fr)
+
+                ok_v, err_v = validate_diff(
+                    patch0,
+                    target_file=tgt if (mode == "auto" and tgt) else None,
+                )
+                if not ok_v:
+                    # Prefer the precise reason computed during normalization
+                    # ("Patch does not look like a unified diff") over the
+                    # generic fallback when validate_diff has no message.
+                    reason = err_v or norm_error or "validate_failed"
+                    return (False, "", expl0, synth0, f"invalid_diff:{reason}")
+
+                engine = PatchEngine(rr)
+                ok_g, err_g = engine._git_apply_check_best_effort(patch0)
+
+                # 🔧 AST Auto-Repair attempt
+                if not ok_g and tgt:
+                    try:
+                        repair_result = engine.repair_patch(patch0, tgt, "git_apply_failed", llm_out)
+                        repaired_patch = repair_result.patch if repair_result.success else None
+
+                        if repaired_patch:
+                            ok2, _err2 = engine._git_apply_check_best_effort(repaired_patch)
+                            if ok2:
+                                patch0 = repaired_patch
+                                ok_g = True
+                    except Exception as e:
+                        logger.debug("Auto-repair in pipeline failed: %s", e)
+
+                if not ok_g:
+                    return (False, "", expl0, synth0, f"git_apply_check_failed:{err_g}")
+
+                return (True, patch0, expl0, synth0, "")
+
             def _evaluate_llm_text(
                 llm_out: str,
                 *,
@@ -982,39 +1295,14 @@ class ExternalLLMService:
 
                 synth0: Optional[str] = None
 
-                # Try using PatchEngine if available
-                if PatchEngine is not None and tgt:
-                    try:
-                        engine = PatchEngine(rr)
-                        output_mode = "full_file" if force_file_block else "auto"
-                        PatchContext(
-                            original_request=None,
-                            file_content=None,
-                            llm_output=llm_out,
-                            output_mode=output_mode,
-                            metadata={"force_file_block": force_file_block}
-                        )
-                        result = engine.synthesize_and_apply(llm_out, tgt, output_mode)
+                # Phase 1: PatchEngine fast path (direct synthesis)
+                fast = _eval_patch_engine_fast_path(llm_out, force_file_block)
+                if fast is not None:
+                    return fast
 
-                        if result.success:
-                            # Extract synth_reason from metadata
-                            synth_reason_from_meta = result.metadata.get("synth_reason", "")
-                            mode_from_meta = result.metadata.get("mode", "")
-                            synth0 = f"patch_engine_{mode_from_meta}"
-                            if synth_reason_from_meta:
-                                synth0 = f"{synth0}:{synth_reason_from_meta}"
-
-                            # Note: explanation is empty as we don't parse it from LLM output
-                            return (True, result.patch_applied or "", "", synth0, "")
-                        else:
-                            # PatchEngine failed, fall back to legacy logic
-                            logger.debug("PatchEngine failed: %s", result.error)
-                    except Exception as e:
-                        logger.debug("PatchEngine exception, falling back: %s", e)
-                        # Continue with legacy logic
-
-                # When forcing FILE-block only (retry), do NOT accept partial/garbled diffs or salvage.
+                # Phase 2: build the candidate patch (legacy pipeline)
                 if force_file_block and tgt:
+                    # When forcing FILE-block only (retry), do NOT accept partial/garbled diffs or salvage.
                     expl0 = ""
                     patch0 = ""
                     engine = PatchEngine(rr)
@@ -1043,197 +1331,17 @@ class ExternalLLMService:
                                 logger.debug("AST rewriter import failed: %s", e)
                                 rewriter = None
 
-                            # --- AST rewrite attempt (block-level patching) ---
-                            try:
-                                if rewriter:
-                                    # Attempt symbol-based rewrite first
-                                    parsed_blocks = parse_file_blocks(llm_out or "")
-                                    if parsed_blocks:
-                                        block = parsed_blocks[0]
-                                        new_code = block.get("text") or block.get("content") or ""
-
-                                        llm_header = (llm_out or "").strip().splitlines()[0].strip()
-
-                                        if llm_header.startswith("FUNCTION:"):
-                                            func_name = llm_header.split("FUNCTION:")[1].strip()
-
-                                            result = rewriter.replace_function(
-                                                tgt,
-                                                func_name,
-                                                new_code
-                                            )
-
-                                            patch0 = rewriter.generate_patch(tgt, result)
-                                            synth0 = "ast_function"
-
-                                        elif llm_header.startswith("CLASS:"):
-                                            class_name = llm_header.split("CLASS:")[1].strip()
-
-                                            result = rewriter.replace_class(
-                                                tgt,
-                                                class_name,
-                                                new_code
-                                            )
-
-                                            patch0 = rewriter.generate_patch(tgt, result)
-                                            synth0 = "ast_class"
-
-                                        elif llm_header.startswith("METHOD:"):
-                                            path = llm_header.split("METHOD:")[1].strip()
-                                            class_name, method_name = path.split(".")
-
-                                            result = rewriter.replace_method(
-                                                tgt,
-                                                class_name,
-                                                method_name,
-                                                new_code
-                                            )
-
-                                            patch0 = rewriter.generate_patch(tgt, result)
-                                            synth0 = "ast_method"
-
-                                        elif is_function_def(new_code):
-                                            _fname, _ = extract_symbol_name(new_code.strip())
-                                            if _fname:
-                                                result = rewriter.replace_function(
-                                                    tgt,
-                                                    _fname,
-                                                    new_code
-                                                )
-
-                                                patch0 = rewriter.generate_patch(tgt, result)
-                                                synth0 = "ast_autodetect"
-
-                            except Exception as e:
-                                logger.debug("AST rewrite attempt failed: %s", e)
-
-                            # 🔥 NEW: symbol search fallback
+                            # --- sequential patch-production fallbacks ---
+                            patch0, synth0 = _eval_ast_rewrite_attempt(rewriter, llm_out, synth0)
                             if not patch0:
-                                try:
-                                    from external_llm.agent.symbol_search import SymbolSearcher
-
-                                    searcher = SymbolSearcher(rr)
-
-                                    parsed_blocks = parse_file_blocks(llm_out or "")
-                                    if parsed_blocks:
-                                        block = parsed_blocks[0]
-                                        new_code = block.get("text") or block.get("content") or ""
-
-                                        header = new_code.strip().splitlines()[0].strip()
-
-                                        # Extract symbol name from header
-                                        symbol_name, symbol_kind = extract_symbol_name(header)
-
-                                        if symbol_name:
-                                            results = searcher.find_symbol(symbol_name, kind=symbol_kind if symbol_kind != "function" else "any")
-                                        else:
-                                            results = searcher.find_symbol(header)  # Fallback to original behavior
-
-                                        if not results:
-                                            sym = searcher.fuzzy_find_symbol(symbol_name or header)
-                                            if sym:
-                                                results = [sym]
-
-                                        if results:
-                                            sym = results[0]
-
-                                            if sym.kind in ("function", "async_function", "method"):
-                                                if rewriter:  # Safety check
-                                                    result = rewriter.replace_function(
-                                                        sym.file,  # was sym.file_path
-                                                        sym.name,
-                                                        new_code
-                                                    )
-                                                    patch0 = rewriter.generate_patch(sym.file, result)  # was sym.file_path
-                                                    synth0 = "ast_symbol_function"
-                                            elif sym.kind == "class":
-                                                if rewriter:  # Safety check
-                                                    result = rewriter.replace_class(
-                                                        sym.file,  # was sym.file_path
-                                                        sym.name,
-                                                        new_code
-                                                    )
-                                                    patch0 = rewriter.generate_patch(sym.file, result)  # was sym.file_path
-                                                    synth0 = "ast_symbol_class"
-
-                                except Exception as e:
-                                    logger.debug("Symbol search fallback failed: %s", e)
-
-                            # semantic patch fallback
+                                patch0, synth0 = _eval_symbol_search_fallback(rewriter, llm_out, synth0)
                             if not patch0:
-                                try:
-                                    from external_llm.semantic_patch import SemanticPatchEngine
-
-                                    parsed_blocks = parse_file_blocks(llm_out or "")
-                                    if parsed_blocks:
-                                        block = parsed_blocks[0]
-                                        new_code = block.get("text") or block.get("content") or ""
-
-                                        semantic_engine = SemanticPatchEngine(rr)
-                                        sem_result = semantic_engine.apply_semantic_patch(
-                                            file_path=tgt,
-                                            new_code=new_code,
-                                        )
-
-                                        if sem_result:
-                                            patch0 = semantic_engine.generate_patch(tgt, sem_result)
-                                            if sem_result.kind == "class":
-                                                synth0 = "semantic_class"
-                                            else:
-                                                synth0 = "semantic_function"
-                                except Exception as e:
-                                    logger.debug("Semantic patch fallback failed: %s", e)
-
-                            # fallback to file-block diff synthesis
+                                patch0, synth0 = _eval_semantic_fallback(llm_out, synth0)
                             if not patch0:
-                                engine = PatchEngine(rr)
-                                p2, r2 = engine._try_synthesize_diff_from_file_blocks(
-                                    repo_root=rr,
-                                    target_file=tgt,
-                                    llm_text=llm_out,
-                                )
-                                synth0 = r2
-                                if p2.strip():
-                                    patch0 = p2.strip()
+                                patch0, synth0 = _eval_file_block_diff_fallback(llm_out, synth0)
 
-
-                # Centralized patch normalization pipeline (shared by diff/auto/fast paths)
-                patch0 = self._normalize_candidate_patch(patch0, tgt if tgt else None)
-
-                if not patch0:
-                    fr = "empty_patch"
-                    if force_file_block and synth0:
-                        fr = f"file_block_failed:{synth0}"
-                    return (False, "", expl0, synth0, fr)
-
-                ok_v, err_v = self._validate_diff_best_effort(
-                    patch0,
-                    target_file=tgt if (mode == "auto" and tgt) else None,
-                )
-                if not ok_v:
-                    return (False, "", expl0, synth0, f"invalid_diff:{err_v or 'validate_failed'}")
-
-                engine = PatchEngine(rr)
-                ok_g, err_g = engine._git_apply_check_best_effort(patch0)
-
-                # 🔧 AST Auto-Repair attempt
-                if not ok_g and tgt:
-                    try:
-                        repair_result = engine.repair_patch(patch0, tgt, "git_apply_failed", llm_out)
-                        repaired_patch = repair_result.patch if repair_result.success else None
-
-                        if repaired_patch:
-                            ok2, _err2 = engine._git_apply_check_best_effort(repaired_patch)
-                            if ok2:
-                                patch0 = repaired_patch
-                                ok_g = True
-                    except Exception as e:
-                        logger.debug("Auto-repair in pipeline failed: %s", e)
-
-                if not ok_g:
-                    return (False, "", expl0, synth0, f"git_apply_check_failed:{err_g}")
-
-                return (True, patch0, expl0, synth0, "")
+                # Phase 3: centralized normalize/validate/apply-check + auto-repair
+                return _eval_finalize_patch(patch0, expl0, synth0, llm_out, force_file_block)
 
             if progress_callback:
                 progress_callback("parsing_response", "Parsing LLM response...", 3, 4)
@@ -1324,10 +1432,7 @@ class ExternalLLMService:
 
             if (not patch) and (synth_reason != "noop"):
                 # Normalize error shape
-                if retry_used and retry_fail_reason:
-                    final_fail = retry_fail_reason
-                else:
-                    final_fail = fail_reason or "empty_patch"
+                final_fail = retry_fail_reason if retry_used and retry_fail_reason else fail_reason or "empty_patch"
 
                 if final_fail.startswith("invalid_diff:"):
                     err_msg = final_fail.split(":", 1)[1]
@@ -1388,6 +1493,30 @@ class ExternalLLMService:
 
             if progress_callback:
                 progress_callback("finalizing", "Finalizing patch...", 4, 4)
+
+        except LLMClientError as e:
+            logger.exception("LLM client error: %s", e)
+            return {
+                "success": False,
+                "patch": "",
+                "error": str(e),
+                "provider": self.provider,
+                "model": self.model,
+                "tokens_used": None,
+                "meta": ({"reason": "llm_error", "mode": mode, "target_file": tgt}),
+            }
+        except Exception as e:
+            logger.exception("Unexpected error in ExternalLLMService.generate_patch")
+            return {
+                "success": False,
+                "patch": "",
+                "error": f"{type(e).__name__}: {e}",
+                "provider": self.provider,
+                "model": self.model,
+                "tokens_used": None,
+                "meta": ({"reason": "internal_error", "mode": mode, "target_file": tgt}),
+            }
+        else:
             return {
                 "success": True,
                 "patch": patch,
@@ -1411,29 +1540,6 @@ class ExternalLLMService:
                     "tokens_used_total": tokens_used_total,
                     "noop_trust_level": noop_trust_level,
                 }),
-            }
-
-        except LLMClientError as e:
-            logger.error("LLM client error: %s", e)
-            return {
-                "success": False,
-                "patch": "",
-                "error": str(e),
-                "provider": self.provider,
-                "model": self.model,
-                "tokens_used": None,
-                "meta": ({"reason": "llm_error", "mode": mode, "target_file": tgt}),
-            }
-        except Exception as e:
-            logger.exception("Unexpected error in ExternalLLMService.generate_patch")
-            return {
-                "success": False,
-                "patch": "",
-                "error": f"{type(e).__name__}: {e}",
-                "provider": self.provider,
-                "model": self.model,
-                "tokens_used": None,
-                "meta": ({"reason": "internal_error", "mode": mode, "target_file": tgt}),
             }
 
     # ---------------------------------------------------------------------
@@ -1496,37 +1602,23 @@ class ExternalLLMService:
         }
 
     @staticmethod
-    def _validate_diff_best_effort(patch: str, target_file: Optional[str] = None) -> tuple[bool, str]:
-        """
-        validate_diff compatibility:
-        - some revisions return (bool, msg)
-        - some return bool only
-        - newer validate_diff supports target_file filtering
-        """
-        try:
-            out = validate_diff(patch or "", target_file=target_file)
-        except TypeError:
-            out = validate_diff(patch or "")
-
-        if isinstance(out, tuple) and len(out) == 2:
-            ok, msg = out
-            return (bool(ok), str(msg or ""))
-        return (bool(out), "" if out else "validate_diff_failed")
-
-    @staticmethod
-    def _normalize_candidate_patch(patch: str, target_file: Optional[str]) -> str:
+    def _normalize_candidate_patch(
+        patch: str, target_file: Optional[str], repo_root: Optional[str] = None
+    ) -> tuple[str, Optional[str]]:
         """
         Centralized patch normalization pipeline.
         Apply the same sanitation/repair steps across diff/auto/fast paths.
+
+        Returns (normalized, error). The error is None when the patch looks
+        like a unified diff; otherwise it carries the precise reason (e.g.
+        "Patch does not look like a unified diff") so callers can report it
+        as the fail_reason instead of a generic one.
         """
         if not patch:
-            return ""
+            return "", None
         # Use PatchEngine normalization
-        import os
-        engine = PatchEngine(os.getcwd())
-        normalized, _error = engine.normalize_and_validate(patch, target_file)
-        # We ignore error for now, just return normalized patch
-        return normalized
+        engine = PatchEngine(repo_root or os.getcwd())
+        return engine.normalize_and_validate(patch, target_file)
 
 
 
@@ -1618,17 +1710,26 @@ class ExternalLLMService:
             tgt_rel = normalize_rel_path_fast(str(target_file))
             if not tgt_rel:
                 return False
-            p = (rr / tgt_rel).resolve()
+            # P22-2: containment guard — prompt-derived paths must not escape the repo.
+            try:
+                p = resolve_inside_repo(rr, tgt_rel)
+            except ValueError:
+                return False
             if not p.exists() or (not p.is_file()):
                 return False
-            txt = p.read_text(encoding="utf-8", errors="replace")
-            return len(txt) <= int(self._MAX_FILE_RETRY_FILE_CHARS)
+            # P22-4: stat-based size check — no need to load the whole file just to
+            # compare its size; the bytes proxy is fail-safe vs the char cap.
+            try:
+                return p.stat().st_size <= int(self._MAX_FILE_RETRY_FILE_CHARS)
+            except OSError:
+                return False
         except (OSError, PermissionError):
             return False
 
 def create_service_from_env(
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Optional[ExternalLLMService]:
     """
     Create ExternalLLMService from environment variables.
@@ -1638,6 +1739,10 @@ def create_service_from_env(
     - EXTERNAL_LLM_MODEL: Model to use (optional)
     - OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_API_KEY / DEEPSEEK_API_KEY / OLLAMA_API_KEY / ZAI_API_KEY / OPENROUTER_API_KEY
     - EXTERNAL_LLM_BASE_URL: Optional base URL override
+
+    Args:
+        api_key: Optional API key override. If provided, takes precedence over
+            the provider's env var lookup.
     """
     prov = (provider or os.getenv("EXTERNAL_LLM_PROVIDER", "") or "").strip().lower()
     if not prov:
@@ -1659,12 +1764,13 @@ def create_service_from_env(
         logger.error("Unknown provider: %s", prov)
         return None
 
-    api_key = (os.getenv(api_key_var, "") or "").strip()
-    if not api_key:
+    # Use explicit api_key parameter if provided, otherwise fall back to env var
+    resolved_key = (api_key or "").strip() or (os.getenv(api_key_var, "") or "").strip()
+    if not resolved_key and prov != "ollama":
         # Local providers (ollama) don't require an API key
-        if prov != "ollama":
-            logger.warning("No API key found for %s (set %s)", prov, api_key_var)
-            return None
+        logger.warning("No API key found for %s (set %s or pass api_key)", prov, api_key_var)
+        return None
+    api_key = resolved_key
 
     m = (model or os.getenv("EXTERNAL_LLM_MODEL", "") or "").strip() or None
     # Provider-scoped base_url: a foreign provider's global base_url must not
@@ -1680,7 +1786,8 @@ def create_service_from_env(
             base_url=base_url,
         )
         logger.info("External LLM service created: %s (%s)", prov, svc.model)
-        return svc
     except Exception as e:
-        logger.error("Failed to create external LLM service: %s", e)
+        logger.exception("Failed to create external LLM service: %s", e)
         return None
+    else:
+        return svc

@@ -49,10 +49,19 @@ guaranteed present) and ``tests/`` are excluded.
 
 Usage:
     python scripts/check_no_new_unguarded_subprocess.py            # check for new
+    python scripts/check_no_new_unguarded_subprocess.py <file>.py ...  # given files
     python scripts/check_no_new_unguarded_subprocess.py --write-baseline  # regen
+
+Explicit file args (pre-commit per-file mode) scan only those files — the
+full-repo always_run scans were dropped from the hook config because they
+created a multi-second window where pre-commit's run-start `git diff` vs
+post-hook diff comparison false-positives on parallel-session writes.  No
+args (lint.yml CI) still scans the whole repo.  Files outside the scan scope
+(tests/, scripts/) are skipped, exactly like the full scan.
 """
 
 import ast
+import os
 import sys
 from pathlib import Path
 
@@ -111,29 +120,64 @@ def _handler_catches_oserror(handler: ast.ExceptHandler) -> bool:
     if t is None:
         return True
     elts = t.elts if isinstance(t, ast.Tuple) else [t]
-    for e in elts:
-        if isinstance(e, ast.Name) and e.id in _OSERROR_SUPERTYPES:
-            return True
-    return False
+    return any(isinstance(e, ast.Name) and e.id in _OSERROR_SUPERTYPES for e in elts)
+
+
+def _is_suppress_call(node: ast.Call) -> bool:
+    """True iff *node* is ``contextlib.suppress(...)`` or a bare ``suppress`` import.
+
+    The sibling silent-except program converts ``try/except X: pass`` into
+    ``with contextlib.suppress(X):`` (SIM105 is selected repo-wide), so the
+    subprocess guard must recognize both guard shapes or the two gates fight
+    each other: every suppress-wrapped subprocess call would look "unguarded".
+    """
+    f = node.func
+    if isinstance(f, ast.Attribute):
+        return f.attr == "suppress" and isinstance(f.value, ast.Name) and f.value.id == "contextlib"
+    return isinstance(f, ast.Name) and f.id == "suppress"
+
+
+def _type_expr_catches_oserror(t) -> bool:
+    """True iff type expression *t* names OSError or a supertype.
+
+    Mirrors :func:`_handler_catches_oserror` for ``suppress(...)`` arguments,
+    which are plain expressions rather than ExceptHandlers.
+    """
+    if t is None:
+        return True
+    elts = t.elts if isinstance(t, ast.Tuple) else [t]
+    return any(isinstance(e, ast.Name) and e.id in _OSERROR_SUPERTYPES for e in elts)
 
 
 def _is_oserror_guarded(call: ast.Call, parents: dict[int, ast.AST]) -> bool:
-    """True iff an enclosing ``try`` whose ``body`` contains *call* catches OSError.
+    """True iff an enclosing ``try``/``suppress`` whose body contains *call* catches OSError.
 
     Walks parent links upward.  At each enclosing ``Try`` where the call sits in
     ``try.body`` (the guarded region — NOT ``else``/``finally``/a ``handler``
     body), that Try's handlers apply.  If none catch OSError the exception
-    propagates out, so we keep checking outer ancestors.
+    propagates out, so we keep checking outer ancestors.  The same walk treats
+    ``with contextlib.suppress(OSError, ...)`` as an equivalent guard (see
+    :func:`_is_suppress_call`).
     """
     child: ast.AST = call
     while True:
         parent = parents.get(id(child))
         if parent is None:
             return False
-        if isinstance(parent, ast.Try) and any(child is s for s in parent.body):
-            if any(_handler_catches_oserror(h) for h in parent.handlers):
-                return True
-            # listed types miss OSError -> propagates past this try; keep going
+        if (
+            isinstance(parent, ast.Try)
+            and any(child is s for s in parent.body)
+            and any(_handler_catches_oserror(h) for h in parent.handlers)
+        ):
+            return True
+        if isinstance(parent, ast.With) and any(child is s for s in parent.body):
+            for item in parent.items:
+                ctx = item.context_expr
+                if isinstance(ctx, ast.Call) and _is_suppress_call(ctx) and any(
+                    _type_expr_catches_oserror(a) for a in ctx.args
+                ):
+                    return True
+        # listed types miss OSError -> propagates past this try; keep going
         child = parent
 
 
@@ -200,15 +244,44 @@ def _should_skip(path: Path) -> bool:
     return any(part in _SKIP_DIRS for part in path.parts)
 
 
-def _iter_repo_py() -> list[Path]:
-    paths: list[Path] = []
+def _resolve_scan_paths(args: list[str]) -> list[str] | None:
+    """Normalize explicit file args to repo-relative ``*.py`` paths.
+
+    Returns ``None`` when no file args survive (or none were given) — the
+    caller then scans the whole repo, preserving the no-args (lint.yml CI)
+    behaviour.  pre-commit passes absolute paths; lint.yml passes none — both
+    normalize to the same repo-relative key space as the full scan.
+    """
+    out: list[str] = []
+    for a in args:
+        rel = os.path.relpath(Path(a).resolve(), Path(REPO).resolve())
+        if rel.endswith(".py") and not rel.startswith(".."):
+            out.append(rel)
+    return out or None
+
+
+def _iter_repo_py(paths: list[str] | None = None) -> list[Path]:
+    if paths is not None:
+        out: list[Path] = []
+        for rel in paths:
+            p = REPO / rel
+            if not p.is_file() or p.suffix != ".py" or _should_skip(p):
+                continue
+            # Scope: SCAN_ROOTS trees + every root-level module, judged on the
+            # REPO-RELATIVE path (an absolute path's parts[0] is "/" — see the
+            # mirror predicate in the full scan; tests/ and scripts/ excluded).
+            rp = Path(rel)
+            if rp.parent == Path(".") or rp.parts[0] in _SCAN_ROOTS:
+                out.append(p)
+        return out
+    full: list[Path] = []
     for root in _SCAN_ROOTS:
         d = REPO / root
         if d.is_dir():
-            paths.extend(p for p in d.rglob("*.py") if not _should_skip(p))
+            full.extend(p for p in d.rglob("*.py") if not _should_skip(p))
     # Every root-level module, not just asi.py — they all ship in the wheel.
-    paths.extend(sorted(p for p in REPO.glob("*.py") if p.is_file()))
-    return paths
+    full.extend(sorted(p for p in REPO.glob("*.py") if p.is_file()))
+    return full
 
 
 def _scan_path(path: Path) -> list[str]:
@@ -220,9 +293,9 @@ def _scan_path(path: Path) -> list[str]:
     return _scan_source(src, rel)
 
 
-def _get_current_keys() -> set[str]:
+def _get_current_keys(paths: list[str] | None = None) -> set[str]:
     keys: set[str] = set()
-    for p in _iter_repo_py():
+    for p in _iter_repo_py(paths):
         keys.update(_scan_path(p))
     return keys
 
@@ -260,7 +333,8 @@ def _write_baseline(keys: set[str]) -> None:
 
 
 def main() -> int:
-    current = _get_current_keys()
+    paths = _resolve_scan_paths([a for a in sys.argv[1:] if not a.startswith("--")])
+    current = _get_current_keys(paths)
     if "--write-baseline" in sys.argv:
         _write_baseline(current)
         print(f"✅ Baseline written: {BASELINE} ({len(current)} entries)")

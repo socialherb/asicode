@@ -14,7 +14,16 @@ class SlashCommand:
     default_params: dict[str, Any] = field(default_factory=dict)
 
     def expand(self, args: str = "", context: str = "") -> str:
-        return self.template.format(args=args, context=context) if args else self.template
+        # Always run format(): the old `if args else template` short-circuit
+        # leaked a literal "{args}" into the prompt for empty args (P11-6).
+        try:
+            return self.template.format(args=args, context=context)
+        except (KeyError, IndexError, ValueError):
+            # Template contains braces that are not {args}/{context}
+            # placeholders (e.g. raw JSON) — fall back to literal
+            # substitution so the template text still round-trips
+            # instead of raising.
+            return self.template.replace("{args}", args).replace("{context}", context)
 
 
 class SlashCommandRegistry:
@@ -54,27 +63,6 @@ class SlashCommandRegistry:
                 seen.add(id(cmd))
                 result.append(cmd)
         return result
-
-    def detect_slash_command(self, text: str) -> Optional[str]:
-        """Detect a slash command in text, return command name or None."""
-        if not text:
-            return None
-        stripped = text.strip()
-        if not stripped.startswith("/"):
-            return None
-        parts = stripped[1:].split(None, 1)
-        name = parts[0].lower() if parts else ""
-        return name if self.get_command(name) else None
-
-    def generate_prompt(self, command: str, original: str) -> str:
-        """Generate an expanded prompt for a slash command."""
-        cmd = self.get_command(command)
-        if not cmd:
-            return original
-        parts = original.strip().split(None, 1)
-        args = parts[1] if len(parts) > 1 else ""
-        return cmd.expand(args)
-
 
 _registry: Optional[SlashCommandRegistry] = None
 

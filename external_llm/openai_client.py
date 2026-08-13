@@ -9,13 +9,16 @@ import logging
 import random
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any, Optional
 
 import requests
 
+from .agent._response_utils import extract_llm_reasoning
 from .client import (
     LLMAPIError,
     LLMAuthenticationError,
+    LLMCancelled,
     LLMClient,
     LLMMessage,
     LLMQuotaExceededError,
@@ -24,7 +27,9 @@ from .client import (
     LLMServerUnavailableError,
     ToolCallRequest,
     ToolCallResponse,
+    interruptible_sleep,
     is_balance_quota_signal,
+    iter_sse_data_events,
     parse_retry_after,
 )
 from .model_registry import text_only_model
@@ -77,12 +82,10 @@ def _openai_content(msg: LLMMessage, model: str = "", base: str = ""):
         )
         text = _images_to_text(images)
         return text + ("\n" + msg.content if msg.content else "")
-    parts: list[dict[str, Any]] = []
-    for img in images:
-        parts.append({
+    parts: list[dict[str, Any]] = [{
             "type": "image_url",
             "image_url": {"url": f"data:{img['media_type']};base64,{img['data']}"},
-        })
+        } for img in images]
     parts.append({"type": "text", "text": msg.content})
     return parts
 
@@ -151,10 +154,11 @@ def _is_reasoning_model(model: str) -> bool:
     # strip provider/route prefixes (e.g. "deepseek/deepseek-v4-flash",
     # "openrouter/deepseek/deepseek-v4-flash") down to the bare model name so the
     # v4-* check matches regardless of how the caller prefixed the model id.
-    _bare = _m.split("/")[-1]
+    _bare = _bare_model_name(model)
     return (
-        _m.startswith("o-") or _m.startswith("o1") or _m.startswith("o3")
-        or _m.startswith("o4") or "gpt-5" in _m or "reasoner" in _m
+        _m.startswith(("o-", "o1", "o3", "o4"))
+        or "gpt-5" in _m
+        or "reasoner" in _m
         or _bare.startswith("deepseek-v4")
         or "kimi-k3" in _m
     )
@@ -173,7 +177,7 @@ def _is_deepseek_v4(model: str) -> bool:
     Strips provider/route prefixes (``deepseek/``, ``openrouter/deepseek/``) so the
     bare model name is checked regardless of caller prefixing.
     """
-    _bare = model.strip().lower().split("/")[-1]
+    _bare = _bare_model_name(model)
     return _bare.startswith("deepseek-v4")
 
 
@@ -188,7 +192,7 @@ def _is_kimi_k3(model: str) -> bool:
 
     Strips provider/route prefixes so ``opencode/kimi-k3`` matches.
     """
-    _bare = model.strip().lower().split("/")[-1]
+    _bare = _bare_model_name(model)
     return "kimi-k3" in _bare  # substring to match variants (kimi-k3-0711, kimi-k3-turbo, etc.)
 
 
@@ -199,7 +203,7 @@ def _parse_error_code(response: requests.Response) -> Optional[int]:
     ``code`` field and return it as an integer.  Returns ``None`` when the body
     is not valid JSON, lacks an ``error`` dict, or the code is absent.
     """
-    try:
+    with suppress(ValueError, TypeError, json.JSONDecodeError):
         obj = json.loads(response.text.strip())
         err = obj.get("error") if isinstance(obj, dict) else None
         if isinstance(err, dict):
@@ -208,9 +212,7 @@ def _parse_error_code(response: requests.Response) -> Optional[int]:
                 return int(code)
             if isinstance(code, str) and code.strip().isdigit():
                 return int(code.strip())
-        return None
-    except (ValueError, TypeError, json.JSONDecodeError):
-        return None
+    return None
 
 
 def _short_error_reason(body: str, limit: int = 160) -> str:
@@ -346,10 +348,8 @@ class OpenAIClient(LLMClient):
 
     DEFAULT_BASE_URL = "https://api.openai.com/v1"
     DEFAULT_MODEL = "gpt-4-turbo-preview"
-    # Minimum input tokens for prefix caching to take effect.
     # ZAI/GLM and OpenAI use automatic prefix matching (no explicit cache_control
-    # breakpoints), with a 1024-token minimum for cache eligibility.
-    min_input_tokens_for_cache = 1024
+    # breakpoints).
 
     def get_provider_name(self) -> str:
         return "openai"
@@ -409,7 +409,8 @@ class OpenAIClient(LLMClient):
                         "API retry %d/%d after %.1fs delay (%s)",
                         _retry, _max_retries - 1, _delay, tag,
                     )
-                    time.sleep(_delay)
+                    if interruptible_sleep(_delay, self.cancel_event):
+                        raise LLMCancelled("cancelled during retry backoff")
             try:
                 response = self._session.post(
                     url, headers=headers, json=payload,
@@ -452,7 +453,8 @@ class OpenAIClient(LLMClient):
                             "API rate limited (429), waiting %ds (Retry-After), retry %d/%d (%s)",
                             _retry_after, _retry + 1, _max_retries - 1, tag,
                         )
-                        time.sleep(_retry_after)
+                        if interruptible_sleep(_retry_after, self.cancel_event):
+                            raise LLMCancelled("cancelled during Retry-After wait")
                         _skip_next_backoff = True  # just slept — skip next attempt's backoff
                     else:
                         logger.info(
@@ -555,7 +557,7 @@ class OpenAIClient(LLMClient):
         # Add any extra kwargs
         # reasoning_callback intentionally NOT consumed — closed-thinking
         # policy (OpenAI o-series + Anthropic extended-thinking) suppresses
-        # reasoning content from the UI panel. See anthropic_client.py:344.
+        # reasoning content from the UI panel. See anthropic_client.py chat().
         kwargs.pop("reasoning_callback", None)
         thinking_mode = kwargs.pop("thinking_mode", None)
         _effort_override = kwargs.pop("reasoning_effort", None)
@@ -657,7 +659,7 @@ class OpenAIClient(LLMClient):
             raise  # Already handled by retry loop above
 
         except requests.RequestException as e:
-            logger.error("API request failed: %s", e)
+            logger.exception("API request failed: %s", e)
             raise LLMAPIError(f"API request failed: {e}") from e
 
     def chat_with_tools(
@@ -718,7 +720,7 @@ class OpenAIClient(LLMClient):
             "tools": openai_tools,
             "tool_choice": "auto",
         }
-        # reasoning_callback intentionally NOT consumed — see chat() L312 note.
+        # reasoning_callback intentionally NOT consumed — see the chat() note.
         kwargs.pop("reasoning_callback", None)
         thinking_mode = kwargs.pop("thinking_mode", None)
         _effort_override = kwargs.pop("reasoning_effort", None)
@@ -830,7 +832,6 @@ class OpenAIClient(LLMClient):
         Simplified version of _chat_with_tools_streaming: no tool_call deltas.
         Returns LLMResponse (not ToolCallResponse) to match chat()'s contract.
         """
-        import json as _json
 
         stream_payload = dict(payload)
         stream_payload["stream"] = True
@@ -865,19 +866,7 @@ class OpenAIClient(LLMClient):
             cached_tokens = None
             reasoning_content = ""
 
-            for raw_line in response.iter_lines():
-                if not raw_line:
-                    continue
-                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if not data_str or data_str == "[DONE]":
-                    continue
-                try:
-                    ev = _json.loads(data_str)
-                except Exception:
-                    continue
+            for ev in iter_sse_data_events(response):
 
                 # Usage chunk (stream_options)
                 if ev.get("usage"):
@@ -900,8 +889,8 @@ class OpenAIClient(LLMClient):
                     text_content += chunk
                     try:
                         token_callback(chunk)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("streaming callback failed: %s", _exc)
 
                 # Reasoning content (DeepSeek Reasoner streams reasoning_content)
                 _rc = delta.get("reasoning_content") or ""
@@ -912,6 +901,33 @@ class OpenAIClient(LLMClient):
             raise LLMAPIError(f"OpenAI streaming request failed: {e}") from e
         finally:
             response.close()
+
+        # ── Response completeness validation ──────────────────────────────────
+        # Streaming content can be silently truncated even when finish_reason='stop'
+        # (the last content delta is dropped but the terminating chunk arrives
+        # intact). Detect structural truncation in JSON/text responses via the
+        # shared _count_delimiters helper (same logic as providers.py DeepSeek).
+        # The resulting finish_reason='truncated' is consumed by agent_loop's
+        # retry chain (tool and text paths retry on ('length', 'truncated')).
+        if finish_reason == "stop" and text_content:
+            _trimmed = text_content.strip()
+            if _trimmed.startswith(("{", "[")):
+                from .providers import _count_delimiters
+                _dc = _count_delimiters(_trimmed)
+                if _trimmed.startswith("{") and _dc["open_curly"] > _dc["close_curly"]:
+                    logger.warning(
+                        "OpenAI stream content appears truncated: %d unclosed braces "
+                        "in %d chars (finish_reason='stop' is misleading)",
+                        _dc["open_curly"] - _dc["close_curly"], len(_trimmed),
+                    )
+                    finish_reason = "truncated"
+                elif _trimmed.startswith("[") and _dc["open_square"] > _dc["close_square"]:
+                    logger.warning(
+                        "OpenAI stream content appears truncated: %d unclosed brackets "
+                        "in %d chars (finish_reason='stop' is misleading)",
+                        _dc["open_square"] - _dc["close_square"], len(_trimmed),
+                    )
+                    finish_reason = "truncated"
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         tokens_used = (prompt_tokens or 0) + (completion_tokens or 0) or None
@@ -962,7 +978,6 @@ class OpenAIClient(LLMClient):
         Forwards text content tokens via token_callback.
         Tool-call argument deltas are buffered silently.
         """
-        import json as _json
 
         stream_payload = dict(payload)
         stream_payload["stream"] = True
@@ -998,19 +1013,7 @@ class OpenAIClient(LLMClient):
             # Accumulate tool calls by index
             _tool_acc: dict[int, dict] = {}
 
-            for raw_line in response.iter_lines():
-                if not raw_line:
-                    continue
-                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if not data_str or data_str == "[DONE]":
-                    continue
-                try:
-                    ev = _json.loads(data_str)
-                except Exception:
-                    continue
+            for ev in iter_sse_data_events(response):
 
                 # Usage chunk (stream_options)
                 if ev.get("usage"):
@@ -1033,8 +1036,8 @@ class OpenAIClient(LLMClient):
                     text_content += chunk
                     try:
                         token_callback(chunk)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("streaming callback failed: %s", _exc)
 
                 # Tool call deltas
                 for tc_delta in (delta.get("tool_calls") or []):
@@ -1054,12 +1057,65 @@ class OpenAIClient(LLMClient):
         finally:
             response.close()
 
+        # ── Response completeness validation ──────────────────────────────────
+        # Streaming content/tool_calls can be silently truncated even when the
+        # server reports finish_reason='stop'/'tool_calls' (the final delta is
+        # dropped but the terminating chunk arrives intact). Mirrors providers.py
+        # DeepSeek detection via the shared _count_delimiters helper.
+        from .providers import _count_delimiters
+
+        if finish_reason == "stop" and text_content:
+            _trimmed = text_content.strip()
+            if _trimmed.startswith(("{", "[")):
+                _dc = _count_delimiters(_trimmed)
+                if _trimmed.startswith("{") and _dc["open_curly"] > _dc["close_curly"]:
+                    logger.warning(
+                        "OpenAI stream content appears truncated: %d unclosed braces "
+                        "in %d chars (finish_reason='stop' is misleading)",
+                        _dc["open_curly"] - _dc["close_curly"], len(_trimmed),
+                    )
+                    finish_reason = "truncated"
+                elif _trimmed.startswith("[") and _dc["open_square"] > _dc["close_square"]:
+                    logger.warning(
+                        "OpenAI stream content appears truncated: %d unclosed brackets "
+                        "in %d chars (finish_reason='stop' is misleading)",
+                        _dc["open_square"] - _dc["close_square"], len(_trimmed),
+                    )
+                    finish_reason = "truncated"
+
+        # Tool-call arguments truncation: when finish_reason='tool_calls' the
+        # buffered args_json may still be truncated (partial tool call due to
+        # max_tokens/limits). Clear malformed tool calls so the caller retries
+        # rather than executing partial arguments (agent_loop's tool path
+        # retries on ('length', 'truncated') with budget doubling up to 3
+        # attempts; clearing yields graceful degradation with content preserved
+        # — identical to DeepSeek's full_tool_calls_raw.clear()).
+        if finish_reason == "tool_calls" and _tool_acc:
+            _tc_truncated = False
+            for _acc in _tool_acc.values():
+                _args = _acc.get("args_json", "")
+                if not _args or not _args.strip():
+                    continue
+                _trimmed = _args.strip()
+                _dc = _count_delimiters(_trimmed)
+                if _dc["open_curly"] > _dc["close_curly"]:
+                    _tc_truncated = True
+                    logger.warning(
+                        "OpenAI tool call '%s' arguments appear truncated: %d unclosed "
+                        "braces in %d chars (finish_reason='tool_calls' may be misleading)",
+                        _acc.get("name", "tool_call"),
+                        _dc["open_curly"] - _dc["close_curly"], len(_trimmed),
+                    )
+            if _tc_truncated:
+                finish_reason = "truncated"
+                _tool_acc.clear()
+
         # Build tool calls
         tool_calls: list[ToolCallRequest] = []
         for idx in sorted(_tool_acc):
             acc = _tool_acc[idx]
             try:
-                args = _json.loads(acc["args_json"] or "{}")
+                args = json.loads(acc["args_json"] or "{}")
             except Exception:
                 args = {}
             tool_calls.append(ToolCallRequest(
@@ -1168,12 +1224,9 @@ class ZAIClient(OpenAIClient):
             return resp
         if resp.content or not resp.raw_response:
             return resp
-        choices = resp.raw_response.get("choices", [])
-        if choices:
-            msg = choices[0].get("message", {}) or {}
-            rc = msg.get("reasoning_content")
-            if rc:
-                return dataclasses.replace(resp, content=rc)
+        rc = extract_llm_reasoning(resp.raw_response)
+        if rc:
+            return dataclasses.replace(resp, content=rc)
         return resp
 
     def chat(
@@ -1212,8 +1265,7 @@ class ZAIClient(OpenAIClient):
 
         # GLM-5.2 (thinking ON) may emit the final answer in reasoning_content
         # with an empty content field — recover it via the shared helper.
-        resp = self._apply_glm_reasoning_fallback(resp)
-        return resp
+        return self._apply_glm_reasoning_fallback(resp)
 
     def chat_with_tools(
         self,
@@ -1256,9 +1308,8 @@ class ZAIClient(OpenAIClient):
         # planner_plan_create / orchestrator / design_chat, all of which read
         # .content directly; without this they silently get an empty string and
         # the model's decision is lost (multi-path fallback parity, insight A36).
-        resp = self._apply_glm_reasoning_fallback(resp)
+        return self._apply_glm_reasoning_fallback(resp)
 
-        return resp
 
 
 class OpenRouterClient(OpenAIClient):

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from ...common.indent_utils import INDENT_GUTTER_BAR, format_numbered_line
 from ...common.subprocess_utils import CANCEL_POLL_INTERVAL as _CANCEL_POLL_INTERVAL
 from ...common.subprocess_utils import cancel_probe as _cancel_probe
+from ...common.text_reading import read_line_window as _read_line_window
 from ..config.thresholds import config as _cfg
 from ..rag_configs import CodeTokenizer
 from ..rag_searcher import _bm25_score as _bm25
@@ -47,7 +48,7 @@ _METHODS_PER_CLASS = 15
 def _outline_extent(sym: Any) -> str:
     """Render a symbol's line extent for an outline row.
 
-    ``"120–450"`` when the end line is known, a bare ``"120"`` when it is not.
+    ``"120-450"`` when the end line is known, a bare ``"120"`` when it is not.
     Both forms occur: every AST-backed outline (Python, TS/JS, tree-sitter for
     the rest) carries ``end_line``, but ``_outline_ripgrep`` — the fallback for
     a language with no installed grammar — matches a declaration by regex and
@@ -55,7 +56,7 @@ def _outline_extent(sym: Any) -> str:
     exactly as useful as it was rather than printing a fabricated range.
 
     ``end_line > line`` rather than ``!= None``: a one-line symbol renders as a
-    bare line number, since "300–300" reads like a mistake and says no more.
+    bare line number, since "300-300" reads like a mistake and says no more.
     """
     end = getattr(sym, "end_line", None)
     if end and end > sym.line:
@@ -140,7 +141,7 @@ _STREAM_CHUNK = 1 << 16
 _MAX_LINE_INDEX = 1 << 62
 
 
-class SearchCancelled(Exception):
+class SearchCancelled(Exception):  # noqa: N818 — Cancelled-suffix convention
     """The user cancelled a running search. Distinct from a timeout.
 
     They mean different things to the caller and must not share a type: a
@@ -151,7 +152,76 @@ class SearchCancelled(Exception):
     """
 
 
-def _stream_split_window(fh, prefix: bytes, first: int, last: int, retain_chars: int):
+# Per-file access failures. Their presence means the search RAN and skipped
+# individual files — the tree was still searched, so whatever came back is a
+# real answer.
+_ACCESS_ERROR_MARKERS = (
+    "permission denied",
+    "no such file or directory",
+    "is a directory",
+    "operation not permitted",
+    "too many levels of symbolic links",
+    "input/output error",
+    "device or resource busy",
+)
+# Pattern-compile failures. These happen BEFORE any file is opened, so the
+# search never ran and retrying as a fixed string is the right move.
+_PATTERN_ERROR_MARKERS = (
+    "regex parse error",
+    "invalid regular expression",
+    "unclosed group",
+    "unmatched",
+    "unterminated",
+    "repetition operator",
+    "trailing backslash",
+    "brackets ([ ]) not balanced",
+    "parentheses not balanced",
+)
+
+
+def _search_ran_despite_errors(stderr: str) -> bool:
+    """True when exit 2 came from unreadable FILES, not from a bad pattern.
+
+    Both ripgrep and grep exit 2 for "an error occurred", which conflates two
+    opposite outcomes: a pattern that never compiled (nothing was searched) and
+    a tree that was searched fine except for a file the process could not open.
+    Treating the second as the first discarded real matches — measured against
+    the live handler, one ``chmod 000`` file next to a matching one turned the
+    whole call into ``ok=False, "grep failed (exit=2): Permission denied"`` and
+    the match was never reported. Root-owned files under a Docker bind mount
+    make that an ordinary repo state, not a corner case.
+
+    The markers are checked on the ERROR class rather than the success class
+    because ripgrep emits pattern errors before it opens anything, so the two
+    sets cannot co-occur; requiring an access marker AND no pattern marker
+    stays correct even when stderr was truncated by the 64 KB drain cap.
+    """
+    low = (stderr or "").lower()
+    if any(m in low for m in _PATTERN_ERROR_MARKERS):
+        return False
+    return any(m in low for m in _ACCESS_ERROR_MARKERS)
+
+
+def _unsupported_flag(stderr: str) -> str | None:
+    """The rejected long flag when the child rejected one, else None.
+
+    ``--max-columns-preview`` is ripgrep >= 12.0 (2020-03); Ubuntu 20.04 still
+    ships 11.0.2. An unknown flag is an exit 2 with no output, which lands in
+    the same conflated bucket as everything else above — so without this the
+    whole grep tool dies on those hosts, and never falls back to the system
+    grep whose code path is sitting right there.
+    """
+    low = (stderr or "").lower()
+    if "unrecognized flag" not in low and "unknown flag" not in low:
+        return None
+    _m = re.search(r"(--[a-z0-9-]+)", stderr or "")
+    return _m.group(1) if _m else ""
+
+
+def _stream_split_window(
+    fh, prefix: bytes, first: int, last: int, retain_chars: int, *,
+    stop_after_last: bool = False, cut_overflow_line: bool = False,
+):
     """``(total_lines, lines[first-1:last])`` without holding the whole file.
 
     read_file materialised every byte of a file to answer questions that need
@@ -178,60 +248,151 @@ def _stream_split_window(fh, prefix: bytes, first: int, last: int, retain_chars:
     character, multibyte codepoints and invalid UTF-8, at five chunk sizes,
     against ``raw.decode("utf-8", errors="replace").splitlines()``.
 
+    Only the NEW chunk is ever split. The carried part is held as a list of
+    pieces and joined once, when the line completes — because prepending it to
+    the next chunk and re-splitting the result is quadratic in the length of a
+    line, and a file with few newlines is a real input, not a hypothetical one
+    (a minified bundle, a .map, one-line JSON). Measured on a 34 MB single-line
+    file: 11.10 s, 9.81 s of it inside 1,042 ``splitlines()`` calls over an
+    ever-growing buffer, ~1.1 GB of transient strings. Splitting the chunk
+    alone also keeps the ``\\r``-boundary probe bounded by the chunk, since it
+    is that probe re-scanning the accumulated carry that produced half the
+    calls. The only break that can straddle a boundary is ``\\r\\n``, so it is
+    the only case the seam has to reason about.
+
     ``retain_chars`` bounds the window itself, because "give me lines 1 to
     2000000" is a request the caller can make and the char budget downstream
     will cut long before that. The count keeps going after retention stops, so
     the total is still exact.
+
+    A line wider than ``retain_chars`` is DROPPED by default and cut only under
+    ``cut_overflow_line``, because whether a prefix may be passed off as a line
+    depends on whether the caller can say that it is one. read_file can: the
+    budget that decides its output is :func:`_apply_char_budget` downstream,
+    which emits a prefix and reports ``partial_line`` — so dropping here just
+    starved it, and on a 34 MB one-liner the bulk path returned 60,355 chars
+    plus that metadata while this path returned an empty code block and ``{}``
+    (indistinguishable from "the file is empty"). The context-snippet caller
+    cannot: ``retain_chars`` IS its final budget and its numbered output has no
+    field to announce a partial line, so a silent prefix would read as the
+    whole line. Truncation is safe exactly where it can be declared.
+
+    ``stop_after_last`` (opt-in, default False) stops reading once the window
+    is final — line *last* fully emitted (or retention full), so anything
+    still carried is already beyond the window — and callers that discard
+    ``total_lines`` (e.g. a bounded context snippet) get O(last) I/O instead
+    of one full pass. With it, the returned total is only exact up to the stop
+    point; read_file's refusal guidance keeps the default and its
+    count-to-EOF contract.
     """
     import codecs as _codecs
 
     _dec = _codecs.getincrementaldecoder("utf-8")("replace")
-    _carry = ""
+    # Pieces of the line in progress. Holds no break character except a
+    # possible trailing lone '\r' (_carry_cr), because a part is only carried
+    # when it is unterminated or '\r'-terminated.
+    _carry: list[str] = []
+    _carry_cr = False
     _total = 0
     _window: list[str] = []
     _kept = 0
     _full = False
 
-    def _emit(part: str) -> None:
-        nonlocal _total, _kept, _full
-        _total += 1
-        if _full or not (first <= _total <= last):
-            return
+    def _keep(part: str) -> None:
+        nonlocal _kept, _full
         _stripped = part.splitlines()
         _line = _stripped[0] if _stripped else ""
         if _kept + len(_line) > retain_chars:
+            # Cut to what is left, for the caller that can declare the cut.
+            # Dropping made read_file answer a 34 MB one-line file with an
+            # empty code block — indistinguishable from "this file is empty" —
+            # while the bulk path emitted a prefix and set partial_line.
+            _room = retain_chars - _kept
+            if cut_overflow_line and _room > 0:
+                _window.append(_line[:_room])
+                _kept = retain_chars
             _full = True
             return
         _window.append(_line)
         _kept += len(_line)
 
+    def _emit(part: str) -> None:
+        nonlocal _total
+        _total += 1
+        if _full or not (first <= _total <= last):
+            return
+        _keep(part)
+
+    def _flush_carry() -> None:
+        """Complete the carried line: count it, and join it only if kept."""
+        nonlocal _carry, _carry_cr, _total
+        if not _carry:
+            _carry_cr = False
+            return
+        _total += 1
+        # The join is what materialises a wide line, so an out-of-window line
+        # is counted without ever being built — the case that made a whole-file
+        # carry expensive even when nothing from it could be returned.
+        if not _full and first <= _total <= last:
+            _keep("".join(_carry))
+        _carry = []
+        _carry_cr = False
+
     _raw = prefix
     while True:
         if _raw:
-            _buf = _carry + _dec.decode(_raw)
-            _parts = _buf.splitlines(keepends=True)
-            _carry = ""
+            _chunk = _dec.decode(_raw)
+            if _carry_cr:
+                # The one ambiguous seam: a trailing '\r' is already a break
+                # unless this chunk opens with the '\n' that makes it a CRLF.
+                if _chunk[:1] == "\n":
+                    _carry.append("\n")
+                    _chunk = _chunk[1:]
+                _flush_carry()
+            _parts = _chunk.splitlines(keepends=True)
+            _tail_carry = ""
             if _parts:
                 _tail = _parts[-1]
+                # Bounded by one chunk, never by the accumulated carry.
                 if _tail.splitlines()[0] == _tail or _tail.endswith("\r"):
-                    _carry = _parts.pop()
-            if _full or _total >= last or _total + len(_parts) < first:
-                # Nothing in this chunk can be retained — it is entirely before
-                # the window, or past it, or retention is already full. Only the
-                # count is still owed, and a per-line Python call to produce it
-                # is the whole cost at scale: a 108 MB file is 2M calls, ~0.9 s
-                # against a 0.13 s bulk split. (Counting break characters
-                # instead of splitting was measured and is 3x SLOWER — ten
-                # passes with str.count lose to one optimised split.)
-                _total += len(_parts)
-            else:
-                for _part in _parts:
-                    _emit(_part)
+                    _tail_carry = _parts.pop()
+            if _carry:
+                if _parts:
+                    # The carried line ends at the first complete line here.
+                    _carry.append(_parts.pop(0))
+                    _flush_carry()
+                elif _tail_carry:
+                    # No break anywhere in this chunk — the line goes on.
+                    _carry.append(_tail_carry)
+                    _tail_carry = ""
+            if _parts:
+                if _full or _total >= last or _total + len(_parts) < first:
+                    # Nothing in this chunk can be retained — it is entirely
+                    # before the window, or past it, or retention is already
+                    # full. Only the count is still owed, and a per-line Python
+                    # call to produce it is the whole cost at scale: a 108 MB
+                    # file is 2M calls, ~0.9 s against a 0.13 s bulk split.
+                    # (Counting break characters instead of splitting was
+                    # measured and is 3x SLOWER — ten passes with str.count
+                    # lose to one optimised split.)
+                    _total += len(_parts)
+                else:
+                    for _part in _parts:
+                        _emit(_part)
+            if _tail_carry:
+                _carry.append(_tail_carry)
+            _carry_cr = bool(_carry) and _carry[-1].endswith("\r")
+        if stop_after_last and (_full or _total >= last):
+            break
         _raw = fh.read(_STREAM_CHUNK)
         if not _raw:
             break
-    for _part in (_carry + _dec.decode(b"", True)).splitlines(keepends=True):
-        _emit(_part)
+    # The decoder's final flush yields at most a replacement character, never a
+    # break, so the carry is still at most one logical line.
+    _rest = _dec.decode(b"", True)
+    if _rest:
+        _carry.append(_rest)
+    _flush_carry()
     return _total, _window
 
 
@@ -280,30 +441,30 @@ def _binary_guidance(path: str, size: int, verdict: str) -> str:
     )
 
 
-def _split_source_lines(text: str) -> list[str]:
-    r"""Split ``text`` into lines using ``\n`` only — matching ``ast.lineno`` /
-    ``ast.end_lineno`` and git/unified-diff line numbering.
+def _read_symbol_window(path: Path, start: int, count: int) -> list[str]:
+    """Stream lines ``[start, start+count)`` of ``path`` (0-based).
 
-    ``str.splitlines()`` additionally treats ``\f`` (form-feed), ``\v``,
-    ``\x1c``–``\x1e``, ``\x85``, ``\u2028`` (line separator) and ``\u2029``
-    (paragraph separator) as line breaks. ``read_symbol`` indexes the resulting
-    list with ``sym.line`` / ``sym.end_line``, which originate from
-    ``ast.lineno`` (``\n``-only). For a source file containing any of those
-    extra characters the two models disagree, so read_symbol would slice and
-    DISPLAY THE WRONG LINES. Splitting on ``\n`` and dropping the trailing
-    empty element (from a final ``\n``) keeps the line count aligned with the
-    AST/git model.
+    Replaces the previous whole-file ``read_text`` + ``split("\n")`` in
+    ``_tool_read_symbol`` (P25-1): the AST index already knows the symbol's
+    exact line span, so loading the entire file — including every line before
+    the window — was pure waste on files with symbols near the end.
 
-    NOTE: ``read_file`` intentionally keeps ``str.splitlines()`` because its
-    line numbers are consumed by anchor_edit's ``anchor_ast_lineno`` mode,
-    which builds its own ``splitlines()`` array — changing one without the
-    other would desync them. read_symbol's line numbers come from the AST,
-    not from a caller, so it is safe (and correct) to align it here.
+    Thin wrapper over :func:`common.text_reading.read_line_window` — the
+    canonical implementation moved there (P26-3) so symbol_search's Go
+    signature-line read shares the exact same window semantics instead of a
+    drifting copy.
     """
-    parts = text.split("\n")
-    if parts and parts[-1] == "":
-        parts = parts[:-1]
-    return parts
+    return _read_line_window(path, start, count)
+
+
+def _count_file_lines(path: Path) -> int:
+    """Total line count of ``path`` via a streaming pass (O(1) memory).
+
+    Only used on the read_symbol truncation path, where the model is told
+    ``line_count`` (a file line number) so it can resume with read_file.
+    """
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        return sum(1 for _ in fh)
 
 
 def _apply_char_budget(
@@ -368,6 +529,10 @@ def _glob_to_regex(pattern: str) -> re.Pattern:
 
     Memoised: one glob call matches the pattern against every path in the repo
     index, and agents re-issue the same handful of patterns across turns.
+
+    Raises ``ValueError`` for a syntactically invalid character class (e.g. a
+    reversed range like ``[z-a]``), naming the pattern and the offending class
+    in glob coordinates — never a raw ``re.error`` over the translated regex.
     """
     out: list[str] = []
     i, n = 0, len(pattern)
@@ -398,9 +563,25 @@ def _glob_to_regex(pattern: str) -> re.Pattern:
                 i += 1
             else:
                 body = pattern[i + 1:j]
-                if body.startswith(("!", "^")):
-                    body = "^" + body[1:]
-                out.append(f"[{body}]")
+                negated = body.startswith(("!", "^"))
+                if negated:
+                    body = body[1:]
+                # POSIX glob: backslash is literal inside a class, and a
+                # leading `]` (even after `!`/`^`) is a member, not the
+                # closer. Make both regex-safe so `[]]`/`[a\]`/`[!]]`
+                # compile instead of surfacing a raw re.error.
+                body = body.replace("\\", "\\\\")
+                if body.startswith("]"):
+                    body = "\\]" + body[1:]
+                cls = ("^" if negated else "") + body
+                try:
+                    re.compile(f"[{cls}]")
+                except re.error as exc:
+                    raise ValueError(
+                        f"invalid glob pattern {pattern!r}: bad character class "
+                        f"[{pattern[i + 1:j]}] ({exc.msg})"
+                    ) from exc
+                out.append(f"[{cls}]")
                 i = j + 1
         else:
             out.append(re.escape(c))
@@ -462,7 +643,14 @@ class ReadToolsMixin:
         # finds every .py file), which is what both humans and models mean by
         # it. Patterns containing "/" are matched against the full repo-
         # relative path.
-        rx = _glob_to_regex(pattern)
+        try:
+            rx = _glob_to_regex(pattern)
+        except ValueError as exc:
+            # The translator raises in glob coordinates (original pattern +
+            # offending class) so the model can see what it did wrong — a raw
+            # re.error would reference the translated regex and send it into
+            # a retry loop.
+            return self._make_result(ok=False, content="", error=str(exc))
         basename_only = "/" not in pattern
 
         matches: list[str] = []
@@ -575,6 +763,11 @@ class ReadToolsMixin:
                     # either way, and the decoded copy is what cost the time.
                     _total, lines = _stream_split_window(
                         fh, head, _first, _last, _retain,
+                        # _apply_char_budget below cuts and reports
+                        # partial_line, so a line wider than _retain must
+                        # arrive as a prefix, not as nothing — that is what
+                        # the non-streaming branch hands it.
+                        cut_overflow_line=True,
                     )
                 else:
                     lines = (head + fh.read()).decode(
@@ -729,7 +922,7 @@ class ReadToolsMixin:
         method_indent = " " * (len("  lines ") + width + 2)
 
         rows: list[str] = []
-        for s, extent in zip(shown_symbols, extents):
+        for s, extent in zip(shown_symbols, extents, strict=True):
             rows.append(f"  lines {extent:>{width}}  [{s.kind}] {s.name}")
             # Methods carry no line of their own in the outline, so listing the
             # NAMES is what makes them reachable: read_symbol takes a name, and
@@ -752,7 +945,8 @@ class ReadToolsMixin:
         )
 
     @staticmethod
-    def _run_search_bounded(cmd, cwd, timeout, retain_lines, cancelled=None):
+    def _run_search_bounded(cmd, cwd, timeout, retain_lines, cancelled=None,
+                            max_line_chars=None):
         """Run a line-oriented search, keeping at most *retain_lines* of stdout.
 
         Returns ``(returncode, lines, total_lines, stderr)`` where *lines* is a
@@ -784,6 +978,13 @@ class ReadToolsMixin:
         5.01 s and ``echo hi; sleep 5`` at 5.03 s, i.e. no timeout at all.
         Waiting on an Event instead makes the deadline independent of whether
         any output ever shows up.
+
+        ``max_line_chars`` bounds the retained line's WIDTH, the axis
+        ``retain_lines`` says nothing about. rg is told the same number via
+        ``--max-columns`` so the truncation happens in the child and the wide
+        line never crosses the pipe; the system-grep fallback has no such flag,
+        so the clamp here is what bounds it — the transient line is already
+        decoded by then, but the retained list is not.
 
         *cancelled* is a zero-arg predicate polled on the same wait. ESC reached
         `bash` and stopped at the tool next door: a search is the other call
@@ -834,7 +1035,10 @@ class ReadToolsMixin:
                 for line in proc.stdout:
                     counted[0] += 1
                     if len(lines) < retain_lines:
-                        lines.append(line.rstrip("\n"))
+                        _kept = line.rstrip("\n")
+                        if max_line_chars is not None and len(_kept) > max_line_chars:
+                            _kept = _kept[:max_line_chars] + " [... long line truncated]"
+                        lines.append(_kept)
             except (OSError, ValueError) as exc:
                 # Same degradation as stderr: the pipe closed under us on the
                 # kill path, and the prefix read so far is still the answer.
@@ -868,7 +1072,15 @@ class ReadToolsMixin:
             # by ESC would otherwise keep walking the tree unowned — the same
             # shape the bash cancel path exists to prevent.
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                # start_new_session=True makes the child its own session
+                # leader, so pgid == proc.pid. Kill the stored pid, not a
+                # re-resolved getpgid(): the leader may have exited and been
+                # reaped while the search tree kept walking (rg itself is the
+                # leader here, but a wrapped command could exit early) —
+                # getpgid() would then raise ProcessLookupError and skip the
+                # kill, orphaning the very grandchildren this teardown exists
+                # for. killpg() targets the GROUP, which survives its leader.
+                os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError) as exc:
                 logger.debug("search process group already gone: %s", exc)
             proc.wait(timeout=5)
@@ -895,6 +1107,10 @@ class ReadToolsMixin:
         # Match bash tool's BASH_OUTPUT_MAX_CHARS threshold for consistency.
         from ..config.thresholds import config as _thresholds
         _MAX_RESULT_CHARS = _thresholds.tokens.BASH_OUTPUT_MAX_CHARS
+        # Width companion to the cap above. Without it the cap bounded only how
+        # many lines were emitted, and one match in a minified file returned
+        # 34,000,257 chars against this 60,000-char "hard limit".
+        _MAX_LINE_CHARS = _thresholds.lines.SEARCH_MAX_LINE_CHARS
 
         pattern = args.get("pattern", "").strip()
         if not pattern:
@@ -914,7 +1130,12 @@ class ReadToolsMixin:
         # gate only; the raw path is what gets searched.
         if self._secure_path(search_path) is None:
             return self._make_result(ok=False, content="", error=f"path {search_path!r} is outside the repository")
-        max_results = min(int(args.get("max_results", 200)), 500)
+        # Floor at 1, matching glob / find_relevant_files: a correct-type 0 is
+        # left intact by the argument-repair layer (only null is dropped), so it
+        # reaches the handler — and without the floor grep rendered "truncated to
+        # 0 of N matches", a useless answer that reads as "found nothing to show".
+        # (null is handled upstream by ArgumentRepairer → key dropped → default.)
+        max_results = max(1, min(int(args.get("max_results", 200)), 500))
         context = int(args.get("context", 0))
         ignore_case = args.get("ignore_case", False)
         include = args.get("include", "").strip()
@@ -928,9 +1149,27 @@ class ReadToolsMixin:
         _rg = shutil.which("rg")
         use_rg = _rg is not None
 
-        for _attempt in range(2):
+        # ``--max-columns-preview`` needs rg >= 12.0. Dropped and retried once
+        # if the installed rg rejects it — see _unsupported_flag. The retained
+        # width clamp below is independent of the flag, so the drop costs
+        # nothing but the in-child truncation.
+        _rg_preview = True
+        # Three attempts, because there are now two independent reasons to
+        # retry (unsupported flag, uncompilable pattern) and they can both fire
+        # on the same call. Each one flips a latch that cannot flip back, so the
+        # loop still terminates well inside the bound.
+        for _attempt in range(3):
             if use_rg:
-                cmd = [_rg, "-n", "--no-heading"]
+                cmd = [_rg, "-n", "--no-heading",
+                       # Truncate wide lines in the CHILD, so a match inside a
+                       # minified bundle never crosses the pipe at all. The
+                       # match COUNT is unaffected — rg still counts the line.
+                       "--max-columns", str(_MAX_LINE_CHARS)]
+                if _rg_preview:
+                    # The preview form keeps the head of the line; the plain
+                    # flag replaces it with a bare "omitted" marker, which
+                    # tells the model nothing about what matched.
+                    cmd.append("--max-columns-preview")
                 if ignore_case:
                     cmd.append("-i")
                 if context > 0:
@@ -971,6 +1210,10 @@ class ReadToolsMixin:
                 _rc, _lines, _total, _stderr = self._run_search_bounded(
                     cmd, self.repo_root, 120, _retain,
                     cancelled=_cancel_probe(self.config),
+                    # Redundant for rg (already clamped in the child by
+                    # --max-columns) and load-bearing for the system-grep
+                    # fallback, which has no equivalent flag.
+                    max_line_chars=_MAX_LINE_CHARS,
                 )
             except SearchCancelled:
                 # ok=False, mirroring the bash cancel: the user withdrew the
@@ -984,10 +1227,39 @@ class ReadToolsMixin:
             except Exception as e:
                 return self._make_result(ok=False, content="", error=f"grep failed: {e}")
 
-            if _rc != 2 or use_fixed:
-                break  # success or non-regex error — done
-            # Exit code 2 = regex syntax error → retry as fixed string
-            use_fixed = True
+            if _rc != 2 or _lines:
+                # Not an error, or an error that still produced matches: exit 2
+                # with output means the tree WAS searched and only some files
+                # were skipped. Retrying that as a fixed string would replace a
+                # correct regex answer with a literal one.
+                break
+            _bad_flag = _unsupported_flag(_stderr) if use_rg else None
+            if _bad_flag is not None and _rg_preview:
+                # Old ripgrep. Drop the flag it does not know and search again;
+                # the width clamp on retention still bounds the output.
+                logger.debug("grep: rg rejected %s — retrying without it", _bad_flag or "a flag")
+                _rg_preview = False
+                continue
+            if not use_fixed and not _search_ran_despite_errors(_stderr):
+                # Nothing matched and the failure is not per-file access noise
+                # → the pattern is the suspect. Retry it as a literal.
+                use_fixed = True
+                continue
+            break
+
+        # Exit 2 conflates "bad pattern" with "one file was unreadable". When
+        # the search demonstrably ran, re-map it onto the code its OUTPUT says
+        # it earned, so the branches below report matches / no-matches instead
+        # of failing the call outright.
+        _skipped_note = ""
+        if _rc == 2 and (_lines or _search_ran_despite_errors(_stderr)):
+            _first_err = next(
+                (ln.strip() for ln in (_stderr or "").splitlines() if ln.strip()), "",
+            )
+            _skipped_note = (
+                f"\n(note: some files could not be read and were skipped — {_first_err[:200]})"
+            )
+            _rc = 0 if _lines else 1
 
         if _rc == 0 or (_rc == 1 and _lines):
             lines = _lines
@@ -1055,8 +1327,16 @@ class ReadToolsMixin:
             for _item_ in lines[:max_results]:
                 display_chars += len(_item_) + 1  # +1 for newline
                 if display_chars > _MAX_RESULT_CHARS:
-                    # Include this line but stop; next loop break is informational
-                    display_lines.append(_item_)
+                    # Include this line but stop. It is CUT to what the budget
+                    # had left: appending it whole made this "hard char limit"
+                    # a limit plus one line of unbounded width, and a single
+                    # match in a minified bundle returned 34,000,257 chars —
+                    # 566x the cap, into the conversation history. The two
+                    # clamps upstream (rg --max-columns, the retention clamp)
+                    # keep a normal line intact here; this is the backstop for
+                    # the one line that still straddles the budget.
+                    _left = _MAX_RESULT_CHARS - (display_chars - len(_item_) - 1)
+                    display_lines.append(_item_[:_left] if _left > 0 else "")
                     break
                 display_lines.append(_item_)
             display = "\n".join(display_lines)
@@ -1071,20 +1351,24 @@ class ReadToolsMixin:
                 result += f"\n... (truncated at {_MAX_RESULT_CHARS:,} characters — {len(display_lines)} of {total} matches shown). For log files, use `bash grep -n 'pattern' file` then `read_file` with exact line range — drastically reduces tokens."
             elif truncated:
                 result += f"\n... (truncated to {max_results} of {total} matches — refine your pattern)"
+            result += _skipped_note
 
-            return self._make_result(ok=True, content=result)
-        elif _rc == 1:
+            return self._make_result(
+                ok=True, content=result,
+                metadata={"files_skipped": True} if _skipped_note else {},
+            )
+        if _rc == 1:
             tool_name = "rg" if use_rg else "grep"
             return self._make_result(
                 ok=True,
-                content=f"{tool_name}: {pattern!r} in {search_path} — no matches.",
+                content=f"{tool_name}: {pattern!r} in {search_path} — no matches.{_skipped_note}",
+                metadata={"files_skipped": True} if _skipped_note else {},
             )
-        else:
-            stderr = (_stderr or "").strip()[:500]
-            return self._make_result(
-                ok=False, content="",
-                error=f"grep failed (exit={_rc}): {stderr}",
-            )
+        stderr = (_stderr or "").strip()[:500]
+        return self._make_result(
+            ok=False, content="",
+            error=f"grep failed (exit={_rc}): {stderr}",
+        )
 
     def _tool_read_symbol(self, args: dict[str, Any]) -> "ToolResult":
         """Read a symbol definition (function, class, or variable) by name.
@@ -1126,19 +1410,27 @@ class ReadToolsMixin:
         if not abs_path.exists():
             return self._make_result(ok=True, content=f"File '{sym.file}' not found.")
 
-        lines = _split_source_lines(abs_path.read_text(encoding="utf-8", errors="replace"))
+        # P25-1: this read the WHOLE file and only then sliced the window —
+        # the one read-tool path bypassing the READ_FILE_MAX_CHARS SSOT. The
+        # output budget below bounded what the model SAW, but never what was
+        # loaded into memory; a 100 MB file with the symbol near the end was
+        # fully materialised on every call. The AST index already carries the
+        # exact line span, so only [start, start+count) is read — O(window)
+        # memory for any file size.
+        context_lines = max(0, min(context_lines, 100))
+        start = max(0, sym.line - 1 - context_lines)
         if sym.end_line and sym.end_line >= sym.line:
             # Full body: leading context (covers decorators) + trailing context.
-            start = max(0, sym.line - 1 - context_lines)
-            end = min(len(lines), sym.end_line + context_lines)
+            count = (sym.end_line + context_lines) - start
         else:
             # Fallback: fixed window around the definition line.
-            start = max(0, sym.line - 1 - context_lines)
-            end = min(len(lines), sym.line + context_lines)
+            count = (sym.line + context_lines) - start
+        window = _read_symbol_window(abs_path, start, count)
+        actual_end = start + len(window)
 
         numbered_lines = [
             _format_numbered_line(i, ln)
-            for i, ln in enumerate(lines[start:end], start=start + 1)
+            for i, ln in enumerate(window, start=start + 1)
         ]
 
         lang = sym.file.split(".")[-1] if "." in sym.file else ""
@@ -1182,7 +1474,7 @@ class ReadToolsMixin:
             else:
                 content += (
                     f"\n\n[Truncated at the {budget:,}-char output budget. "
-                    f"Lines {truncated_at}–{end} were not returned — "
+                    f"Lines {truncated_at}–{actual_end} were not returned — "
                     f"call read_file with start_line={truncated_at} to continue.]"
                 )
 
@@ -1194,7 +1486,8 @@ class ReadToolsMixin:
         # (not symbol-relative) because the resumption call is a read_file.
         meta: dict[str, Any] = {}
         if truncated_at is not None:
-            meta = {"truncated": True, "resume_line": truncated_at, "line_count": len(lines)}
+            # Streaming pass — only paid on the rare truncation path.
+            meta = {"truncated": True, "resume_line": truncated_at, "line_count": _count_file_lines(abs_path)}
             if partial_line is not None:
                 meta["partial_line"] = partial_line
         return self._make_result(ok=True, content=content, metadata=meta)
@@ -1256,12 +1549,10 @@ class ReadToolsMixin:
                     lines.append(f"Used in    : {', '.join(info['referenced_in'])}")
                 if "sample_references" in info:
                     lines.append("\nSample references:")
-                    for sr in info["sample_references"]:
-                        lines.append(f"  {sr['file']}:{sr['line']}  {sr['context'][:80]}")
+                    lines.extend(f"  {sr['file']}:{sr['line']}  {sr['context'][:80]}" for sr in info["sample_references"])
                 if "other_definitions" in info:
                     lines.append("\nOther definitions:")
-                    for od in info["other_definitions"]:
-                        lines.append(f"  [{od['kind']}] {od['file']}:{od['line']}")
+                    lines.extend(f"  [{od['kind']}] {od['file']}:{od['line']}" for od in info["other_definitions"])
 
         return self._make_result(ok=True, content="\n".join(lines))
 
@@ -1279,8 +1570,7 @@ class ReadToolsMixin:
             return self._make_result(ok=True, content=f"No references found for '{name}'.")
 
         lines: list[str] = [f"Found {len(refs)} reference(s) for '{name}':\n"]
-        for r in refs:
-            lines.append(f"  {r.file}:{r.line}:{r.col}  {r.context}")
+        lines.extend(f"  {r.file}:{r.line}:{r.col}  {r.context}" for r in refs)
 
         return self._make_result(ok=True, content="\n".join(lines))
 
@@ -1408,25 +1698,20 @@ class ReadToolsMixin:
         except Exception as e:
             return self._make_result(ok=False, content="", error=f"Failed to read image file {path!r}: {e}")
 
-        try:
-            from external_llm.providers import _try_ocr_base64 as _ocr_fn
-            ocr_text = _ocr_fn(data)
-        except ImportError:
-            return self._make_result(
-                ok=True,
-                content="OCR libraries (pytesseract or Pillow) are not installed. "
-                        "Install with: pip install pytesseract Pillow",
-            )
+        # providers is first-party (requests is a hard dependency) and
+        # _try_ocr_base64 degrades internally when OCR deps are missing —
+        # the old except ImportError fallback was dead code.
+        from external_llm.providers import _try_ocr_base64 as _ocr_fn
+        ocr_text = _ocr_fn(data)
 
         if ocr_text:
             return self._make_result(
                 ok=True,
                 content=f"[Image OCR — {abs_path.name}]\n{ocr_text}",
             )
-        else:
-            return self._make_result(
-                ok=True,
-                content=f"[Image OCR — {abs_path.name}] No text detected in the image. "
-                        "The image may contain only graphics without text, or OCR could not read it.",
-            )
+        return self._make_result(
+            ok=True,
+            content=f"[Image OCR — {abs_path.name}] No text detected in the image. "
+                    "The image may contain only graphics without text, or OCR could not read it.",
+        )
 

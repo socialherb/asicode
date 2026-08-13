@@ -26,7 +26,6 @@ All failures surface as ToolResult errors — the Developer decides how to recov
 from __future__ import annotations
 
 import ast
-import json
 import logging
 import time
 from collections.abc import Callable
@@ -96,54 +95,6 @@ _LOCAL_PROMPTS: dict[str, str] = {
         "Output ONLY the missing code. No markdown. No explanation."
     ),
 }
-
-# Prompt sent to the main LLM to decide what to delegate
-_DELEGATION_DECISION_PROMPT = (
-    "You are analyzing a coding task to identify subtasks that can be delegated to a "
-    "fast local code generation model (Qwen 7B).\n\n"
-    "The local model is GOOD at:\n"
-    "- Generating function bodies from signatures\n"
-    "- Writing unit test skeletons\n"
-    "- Creating boilerplate (imports, class scaffolds, configs)\n"
-    "- Adding docstrings and comments\n"
-    "- Simple code transformations (rename, type hints)\n"
-    "- Fill-in-middle code completion\n\n"
-    "The local model is BAD at:\n"
-    "- Multi-file changes\n"
-    "- Complex refactoring\n"
-    "- Generating unified diffs directly\n"
-    "- Cross-module understanding\n"
-    "- Architectural decisions\n\n"
-    "Task: {request}\n\n"
-    "Current file context:\n{file_context}\n\n"
-    "Respond with ONLY a JSON object (no markdown):\n"
-    "{{\n"
-    "  \"delegatable\": true/false,\n"
-    "  \"subtasks\": [\n"
-    "    {{\n"
-    "      \"role\": \"code_snippet|test_skeleton|boilerplate|docstring|transform|fim\",\n"
-    "      \"instruction\": \"what to generate\",\n"
-    "      \"function_signature\": \"def foo(x: int) -> str:\",\n"
-    "      \"file_path\": \"path/to/file.py\",\n"
-    "      \"constraints\": \"style notes, max lines, etc.\"\n"
-    "    }}\n"
-    "  ],\n"
-    "  \"main_llm_tasks\": [\"tasks that require the main LLM\"],\n"
-    "  \"integration_plan\": \"how to combine local outputs into the final change\"\n"
-    "}}\n\n"
-    "If the task is NOT suitable for delegation, set \"delegatable\": false and empty subtasks."
-)
-
-# Prompt sent to main LLM to integrate local model outputs into a patch
-_INTEGRATION_PROMPT = (
-    "Integrate the following generated code snippets into a unified patch.\n\n"
-    "Original request: {request}\n\n"
-    "File context:\n{file_context}\n\n"
-    "Generated code from local model:\n{delegation_summary}\n\n"
-    "Create a unified diff patch that correctly integrates all the generated code.\n"
-    "Include 3 lines of context before and after each change.\n"
-    "Output ONLY the unified diff. No explanation."
-)
 
 
 # ── Data Classes ──────────────────────────────────────────────────────────────
@@ -276,7 +227,7 @@ class OutputValidator:
     ) -> dict[str, Any]:
         try:
             ast.parse(output)
-        except SyntaxError:
+        except SyntaxError as e:
             # For function bodies, try wrapping in a dummy function
             if spec.role in ("code_snippet", "fim"):
                 wrapped = "def _tmp():\n" + "\n".join(
@@ -288,11 +239,11 @@ class OutputValidator:
                     result["syntax_ok"] = False
                     result["issues"].append(f"Python syntax error: {e}")
             else:
-                try:
-                    ast.parse(output)
-                except SyntaxError as e:
-                    result["syntax_ok"] = False
-                    result["issues"].append(f"Python syntax error: {e}")
+                # Reuse the first parse's exception — re-parsing the same
+                # output deterministically raises the identical SyntaxError,
+                # so the redundant second ast.parse is dropped.
+                result["syntax_ok"] = False
+                result["issues"].append(f"Python syntax error: {e}")
         return result
 
     def _validate_js(self, output: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -333,7 +284,7 @@ class OutputValidator:
                 result["issues"].append("Test skeleton missing test function (def test_)")
         elif spec.role == "docstring":
             stripped = output.strip()
-            if not (stripped.startswith('"""') or stripped.startswith("'''")):
+            if not (stripped.startswith(('"""', "'''"))):
                 result["pattern_match"] = False
                 result["issues"].append("Docstring must start with triple quotes")
         return result
@@ -359,32 +310,24 @@ class LocalAssistant:
     Primary entry point:
       delegate_single_task() — called by ToolRegistry._tool_delegate_to_helper()
 
-    Full-flow entry point (used when HELPER lane existed; kept for backward compat):
-      execute() — plan delegation, run helper model, integrate, apply patch.
-      Falls back to standard AgentLoop on any failure.
-
     The Planner (main LLM) is ALWAYS in control of what gets delegated.
     """
 
     def __init__(
         self,
-        planner_llm_client: Any,
-        planner_model: str,
         local_model: str,
         repo_root: str,
         callback: Optional[Callable[[str, dict[str, Any]], None]] = None,
         ollama_base_url: str = "http://127.0.0.1:11434",
         max_local_calls: int = 5,
     ):
-        self._planner_client = planner_llm_client
-        self._planner_model = planner_model
         self._local_model = local_model
         self._repo_root = repo_root
         self._cb = callback or (lambda e, d: None)
-        self._ollama_base_url = ollama_base_url
-        self._max_local_calls = max_local_calls
         self._validator = OutputValidator()
         self._cleaner = OutputCleaner()
+        self._max_local_calls = max(1, max_local_calls)
+        self._delegation_count = 0
 
         # Create Ollama client for local model calls
         try:
@@ -399,119 +342,6 @@ class LocalAssistant:
             self._local_client = None
 
     # ── public API ───────────────────────────────────────────────────────────
-
-    def execute(self, request: str, route_decision: Any, config: Any) -> Any:
-        """
-        Execute the local assistant flow.
-
-        Returns AgentResult (compatible with standard AgentLoop output).
-        On any failure, falls back transparently to AgentLoop.
-        """
-        from external_llm.agent.agent_loop import AgentResult
-
-        start = time.monotonic()
-
-        self._cb("local_assistant_start", {
-            "request": request[:200],
-            "local_model": self._local_model,
-            "task_kind": str(getattr(route_decision, 'task_kind', '')),
-        })
-
-        try:
-            # Step 1: gather file context
-            file_context = self._gather_context(request, config)
-
-            # Step 2: ask main LLM what to delegate
-            delegation_specs = self._plan_delegation(request, file_context)
-
-            if not delegation_specs:
-                self._cb("local_assistant_fallback", {
-                    "reason": "No delegatable subtasks identified by main LLM",
-                })
-                return self._fallback_to_main_agent(request, config)
-
-            self._cb("local_assistant_plan", {
-                "subtask_count": len(delegation_specs),
-                "roles": [s.role for s in delegation_specs],
-            })
-
-            # Step 3: execute each delegation on local model
-            delegations: list[DelegationResult] = []
-            for i, spec in enumerate(delegation_specs[: self._max_local_calls]):
-                self._cb("local_delegation_start", {
-                    "index": i,
-                    "role": spec.role,
-                    "instruction": spec.instruction[:100],
-                })
-                dr = self._execute_delegation(spec)
-                delegations.append(dr)
-                self._cb("local_delegation_complete", {
-                    "index": i,
-                    "role": spec.role,
-                    "accepted": dr.validation.get("overall_ok", False),
-                    "issues": dr.validation.get("issues", []),
-                    "execution_time": round(dr.execution_time, 2),
-                })
-
-            # Step 4: filter to valid outputs
-            valid = [d for d in delegations if d.validation.get("overall_ok", False)]
-
-            if not valid:
-                self._cb("local_assistant_fallback", {
-                    "reason": "All local model outputs failed validation",
-                    "issues": [d.validation.get("issues", []) for d in delegations],
-                })
-                return self._fallback_to_main_agent(request, config)
-
-            # Step 5: ask main LLM to integrate outputs into patch
-            final_patch = self._integrate_outputs(request, file_context, valid)
-
-            if not final_patch:
-                self._cb("local_assistant_fallback", {
-                    "reason": "Main LLM integration returned no valid patch",
-                })
-                return self._fallback_to_main_agent(request, config)
-
-            # Step 6: apply patch
-            from external_llm.agent.tool_registry import ToolRegistry
-            registry = ToolRegistry(self._repo_root, config)
-            patch_result = registry.dispatch("apply_patch", {"patch": final_patch})
-
-            elapsed = time.monotonic() - start
-
-            if patch_result.ok:
-                self._cb("local_assistant_complete", {
-                    "status": "success",
-                    "delegations": len(delegations),
-                    "valid": len(valid),
-                    "execution_time": round(elapsed, 2),
-                })
-                return AgentResult(
-                    status="success",
-                    turns=[],
-                    final_message=(
-                        f"Local assistant completed. "
-                        f"{len(valid)}/{len(delegations)} delegations applied."
-                    ),
-                    applied_patches=registry.applied_patches,
-                    metadata={
-                        "local_assistant": True,
-                        "local_model": self._local_model,
-                        "delegations": len(delegations),
-                        "valid_delegations": len(valid),
-                        "execution_time": elapsed,
-                    },
-                )
-            else:
-                self._cb("local_assistant_fallback", {
-                    "reason": f"Patch application failed: {patch_result.error}",
-                })
-                return self._fallback_to_main_agent(request, config)
-
-        except Exception as exc:
-            logger.exception("LocalAssistant.execute() failed: %s", exc)
-            self._cb("local_assistant_error", {"error": str(exc)})
-            return self._fallback_to_main_agent(request, config)
 
     def delegate_single_task(
         self,
@@ -548,6 +378,35 @@ class LocalAssistant:
                 execution_time: float in seconds
         """
 
+        # Enforce the per-session delegation budget (helper_max_calls). The
+        # counter lives on the instance, so the limit spans the whole
+        # AgentLoop session. The refused call is still counted, so once the
+        # limit is hit every subsequent call is refused.
+        self._delegation_count += 1
+        if self._delegation_count > self._max_local_calls:
+            logger.warning(
+                "delegate_to_helper limit reached: %d/%d calls",
+                self._delegation_count - 1,
+                self._max_local_calls,
+            )
+            return {
+                "success": False,
+                "code": "",
+                "raw_output": "",
+                "validation": {"overall_ok": False, "issues": []},
+                "issues": [
+                    f"Delegation limit reached: max {self._max_local_calls} "
+                    "local helper calls per session (helper_max_calls)"
+                ],
+                "error": (
+                    f"Delegation limit reached: max {self._max_local_calls} "
+                    "local helper calls per session (helper_max_calls)"
+                ),
+                "execution_time": 0.0,
+                "role": role,
+                "file_path": file_path,
+            }
+
         # Create delegation spec — budget enforced at spec boundary for local model
         spec = DelegationSpec(
             role=role,
@@ -576,103 +435,6 @@ class LocalAssistant:
         }
 
     # ── private helpers ───────────────────────────────────────────────────────
-
-    def _gather_context(self, request: str, config: Any) -> str:
-        """Read file context mentioned in the request via direct file I/O."""
-        from pathlib import Path
-
-        _known_exts = {'py', 'js', 'ts', 'tsx', 'jsx', 'html', 'css', 'json', 'yaml', 'yml'}
-        _delims = ' :()[]{}<>"\'\t\n\r'
-        file_patterns = []
-        _buf = []
-        for _ch in request:
-            if _ch in _delims:
-                if _buf:
-                    _w = ''.join(_buf).strip('.,;!')
-                    if '.' in _w:
-                        _parts = _w.rsplit('.', 1)
-                        if len(_parts) == 2 and _parts[1].lower() in _known_exts:
-                            file_patterns.append(_w)
-                    _buf = []
-            else:
-                _buf.append(_ch)
-        if _buf:
-            _w = ''.join(_buf).strip('.,;!')
-            if '.' in _w:
-                _parts = _w.rsplit('.', 1)
-                if len(_parts) == 2 and _parts[1].lower() in _known_exts:
-                    file_patterns.append(_w)
-        parts: list[str] = []
-        for path in list(dict.fromkeys(file_patterns))[:3]:  # dedup, max 3
-            abs_path = Path(self._repo_root) / path if not Path(path).is_absolute() else Path(path)
-            if abs_path.is_file():
-                try:
-                    content = abs_path.read_text(encoding="utf-8", errors="replace")
-                    lines = content.splitlines()
-                    part_content = "\n".join(f"{i+1}: {line}" for i, line in enumerate(lines[:200]))
-                    parts.append(f"=== {path} ===\n[File: {path} | Lines: 1-{min(len(lines), 200)} of {len(lines)}]\n{part_content}")
-                except Exception:
-                    pass
-
-        if not parts:
-            # fallback: search for key terms
-            import subprocess
-            words = request.split()[:5]
-            try:
-                proc = subprocess.run(
-                    ["rg", "--no-heading", "--line-number", "-C", "2", "--", " ".join(words), str(self._repo_root)],
-                    capture_output=True, text=True, timeout=5,
-                )
-                if proc.returncode == 0 and proc.stdout:
-                    parts.append(f"=== Search Results ===\n{proc.stdout}")
-            except Exception:
-                pass
-
-        return "\n\n".join(parts) if parts else "(no file context available)"
-
-    def _plan_delegation(self, request: str, file_context: str) -> list[DelegationSpec]:
-        """Ask main LLM to identify which subtasks can be delegated to local model."""
-        from external_llm.client import LLMMessage, effective_content
-
-        prompt = _DELEGATION_DECISION_PROMPT.format(
-            request=request,
-            file_context=file_context,
-        )
-        try:
-            response = self._planner_client.chat(
-                messages=[
-                    LLMMessage(role="system", content="You are a task decomposition expert."),
-                    LLMMessage(role="user", content=prompt),
-                ],
-                model=self._planner_model,
-                temperature=0.0,
-                max_tokens=_cfg.tokens.LOCAL_ASSISTANT_DEFAULT,
-            )
-            text = effective_content(response).strip()
-            start = text.find('{')
-            end = text.rfind('}')
-            if start == -1 or end == -1:
-                return []
-
-            data = json.loads(text[start:end + 1])
-            if not data.get("delegatable", False):
-                return []
-
-            specs: list[DelegationSpec] = []
-            for sub in data.get("subtasks", []):
-                specs.append(DelegationSpec(
-                    role=sub.get("role", "code_snippet"),
-                    instruction=sub.get("instruction", ""),
-                    function_signature=sub.get("function_signature", ""),
-                    context_code=file_context[:_cfg.tokens.LOCAL_MODEL_CONTEXT_CHARS],
-                    file_path=sub.get("file_path", ""),
-                    constraints=sub.get("constraints", ""),
-                ))
-            return specs
-
-        except Exception as exc:
-            logger.warning("Delegation planning failed: %s", exc)
-            return []
 
     def _execute_delegation(self, spec: DelegationSpec) -> DelegationResult:
         """Execute a single delegation on the local Ollama model."""
@@ -726,76 +488,3 @@ class LocalAssistant:
                 accepted=False,
                 execution_time=elapsed,
             )
-
-    def _integrate_outputs(
-        self,
-        request: str,
-        file_context: str,
-        valid_delegations: list[DelegationResult],
-    ) -> Optional[str]:
-        """Ask main LLM to integrate local model outputs into a unified diff patch."""
-        from external_llm.client import LLMMessage, effective_content
-
-        summary_parts = []
-        for i, dr in enumerate(valid_delegations):
-            summary_parts.append(
-                f"### Subtask {i + 1}: {dr.spec.role}\n"
-                f"File: {dr.spec.file_path}\n"
-                f"Generated code:\n```\n{dr.cleaned_output}\n```"
-            )
-        delegation_summary = "\n\n".join(summary_parts)
-
-        prompt = _INTEGRATION_PROMPT.format(
-            request=request,
-            file_context=file_context,
-            delegation_summary=delegation_summary,
-        )
-
-        try:
-            response = self._planner_client.chat(
-                messages=[
-                    LLMMessage(
-                        role="system",
-                        content="You are an expert at creating unified diff patches.",
-                    ),
-                    LLMMessage(role="user", content=prompt),
-                ],
-                model=self._planner_model,
-                temperature=0.0,
-                max_tokens=_cfg.tokens.SUBAGENT_SHORT,
-            )
-            text = effective_content(response).strip()
-
-            # Try extracting from markdown fence
-            if "```" in text:
-                fenced = _extract_fenced_blocks(text)
-                if fenced:
-                    return fenced[0].strip()
-
-            # Accept raw diff
-            if text.startswith("---") or text.startswith("diff "):
-                return text
-
-            return None
-
-        except Exception as exc:
-            logger.warning("Integration prompt failed: %s", exc)
-            return None
-
-    def _fallback_to_main_agent(self, request: str, config: Any) -> Any:
-        """Transparently fall back to the standard AgentLoop."""
-        from external_llm.agent.agent_loop import AgentLoop
-        from external_llm.agent.tool_registry import ToolRegistry
-
-        self._cb("local_assistant_fallback_agent_start", {
-            "reason": "Falling back to standard AgentLoop",
-        })
-
-        registry = ToolRegistry(self._repo_root, config)
-        loop = AgentLoop(
-            llm_client=self._planner_client,
-            registry=registry,
-            config=config,
-            model=self._planner_model,
-        )
-        return loop.run(request)

@@ -14,7 +14,6 @@ from unittest.mock import MagicMock
 
 from external_llm.agent.tool_registry import AgentConfig
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. No callback when stream_callback is None
 # ══════════════════════════════════════════════════════════════════════════════

@@ -17,12 +17,16 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
+from concurrent.futures import TimeoutError as _FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from external_llm.agent._response_utils import _TRUNCATION_REASONS, extract_llm_reasoning, replace_tool_calls
 from external_llm.client import (
+    ContextWindowCollapseError,
     LLMAPIError,
     LLMAuthenticationError,
+    LLMCancelled,
     LLMClientError,
     LLMConnectionError,
     LLMMessage,
@@ -32,10 +36,15 @@ from external_llm.client import (
     ToolCallResponse,
 )
 
-from ._shared_utils import context_message_cap, estimate_tokens_from_msgs, preemptive_trim
+from ._shared_utils import (
+    MIN_USABLE_MESSAGE_BUDGET,
+    coerce_token_count,
+    context_message_cap,
+    estimate_tokens_from_msgs,
+    preemptive_trim,
+)
 from .agent_loop_types import AgentCancelled
 from .agent_turn_pipeline import _cache_hit_ratio, _evict_for_loop
-from .performance_metrics import get_global_collector
 from .config.thresholds import config as _cfg
 from .context_budget import (
     _is_context_length_error,
@@ -44,6 +53,7 @@ from .context_budget import (
     repair_tool_message_sequence,
 )
 from .insights_manager import (
+    _active_invalidate,
     atomic_write_text,
     build_archive_index,
     drop_entry,
@@ -56,17 +66,16 @@ from .insights_manager import (
 )
 from .insights_manager import (
     insights_path as _insights_manager_path,
-    _active_invalidate,
 )
+from .performance_metrics import get_global_collector
 from .plan_state import open_items as _plan_open_items
 from .rag_searcher import _TOKENIZER, _bm25_score
+from .vector_cache import HAS_FAISS, HAS_NUMPY, HAS_SENTENCE_TRANSFORMERS, VectorCacheManager
 
-_HAS_VECTOR_CACHE = False
-try:
-    from .vector_cache import HAS_FAISS, HAS_NUMPY, HAS_SENTENCE_TRANSFORMERS, VectorCacheManager
-    _HAS_VECTOR_CACHE = HAS_SENTENCE_TRANSFORMERS and HAS_NUMPY and HAS_FAISS
-except ImportError:
-    pass
+# vector_cache owns its optional-dependency degradation (HAS_* flags); the
+# module itself always imports, so the old try/except ImportError fallback
+# was dead code.
+_HAS_VECTOR_CACHE = HAS_SENTENCE_TRANSFORMERS and HAS_NUMPY and HAS_FAISS
 
 
 logger = logging.getLogger(__name__)
@@ -74,14 +83,22 @@ logger = logging.getLogger(__name__)
 # Design-chat sampling temperature: randomized ONCE per process (asi launch)
 # and held until the process exits. Per-call randomization was unintended —
 # every LLM call in a session should sample at the same temperature.
-_PROCESS_TEMPERATURE = random.uniform(0.0, 0.3)
+#
+# Rounded at the source: raw random.uniform() yields ~17 significant digits, and
+# z.ai's Anthropic endpoint 400s on a temperature with >2 decimal places (code
+# 1210), which the design-chat loop degrades into a tool-LESS plain chat — the
+# "model talks but never calls a tool" symptom. ZAIAnthropicClient quantizes
+# defensively at the call site, but that only covers the one provider known to
+# be strict; emitting a legal value here keeps the next endpoint from
+# rediscovering the same failure. 2 decimals is ample for a 0.0-0.3 range.
+_PROCESS_TEMPERATURE = round(random.uniform(0.0, 0.3), 2)
 
 # z.ai endpoint failover (connection-error retry).  z.ai exposes the same GLM
 # backend behind two protocol facades — an Anthropic-compatible endpoint
 # (ZAIAnthropicClient) and an OpenAI-compatible one (ZAIClient).  When one
 # facade is unreachable (timeout / cannot-connect) the other may still answer,
 # so a connection-level retry flips between them.  The failover client gets a
-# shorter timeout so alternating attempts can't stack N × the (long) primary
+# shorter timeout so alternating attempts can't stack N x the (long) primary
 # timeout into a multi-minute hang; the retry fires almost immediately because
 # switching facades — not waiting — is the mitigation.
 _ZAI_FAILOVER_TIMEOUT = 60      # seconds; cap for the flipped sibling client
@@ -94,6 +111,17 @@ _ZAI_FAILOVER_RETRY_DELAY = 1   # seconds; near-zero backoff after an endpoint f
 # After one nudge without resolution, the turn ends with the open items
 # surfaced honestly (no further nagging).
 _PLAN_GATE_MAX_NUDGES = 1
+
+# Empty-response funnel guard: when the LLM keeps emitting empty content after
+# every retry (normal termination, max-iterations tail, or tool-loop fallback),
+# _respond_impl can return content="". The funnel in respond() replaces it with
+# this message so the REPL / webapp / subagent summary / session history never
+# receive a blank turn. is_error stays False — budget exhaustion with partial
+# progress is not a failure.
+_EMPTY_RESPONSE_FALLBACK = (
+    "⚠️ The model returned an empty response — nothing to show for this turn. "
+    "Please try again."
+)
 
 # ── Shared fallback utilities (module-level for reuse by routes/design_chat.py) ──
 
@@ -132,6 +160,7 @@ def _apply_context_hard_cap(
     messages: list[LLMMessage],
     model: str,
     tool_schemas: Any = None,
+    base_url: Optional[str] = None,
 ) -> list[LLMMessage]:
     """
     Context hard cap guard: trim messages if they exceed the model's context limit.
@@ -141,9 +170,20 @@ def _apply_context_hard_cap(
 
     Returns the (possibly trimmed) message list.
     """
-    _ctx_limit = _resolve_context_limit(model)
+    _ctx_limit = _resolve_context_limit(model, base_url=base_url)
     _safety_margin = _cfg.tokens.CONTEXT_HARD_CAP_SAFETY_MARGIN
     _cap = context_message_cap(_ctx_limit, _safety_margin, tool_schemas)
+    if _cap < MIN_USABLE_MESSAGE_BUDGET:
+        # Structural collapse: output reserve + tool schemas ALONE already
+        # exhaust the window — the call would 400 even with zero chat history.
+        # context_message_cap logs the diagnosis once per signature; raise a
+        # clear error instead of a guaranteed-400 request + 3 doomed retries.
+        raise ContextWindowCollapseError(
+            f"context window ({_ctx_limit}) is too small for the tool "
+            f"schemas + output reserve: only {_cap} tokens remain for "
+            f"messages (minimum {MIN_USABLE_MESSAGE_BUDGET}). Reduce the "
+            f"toolset or raise the model's context window (e.g. num_ctx)."
+        )
     _est = estimate_tokens_from_msgs(messages)
     if _est > _cap:
         _before = len(messages)
@@ -163,6 +203,25 @@ def _apply_context_hard_cap(
         )
     return messages
 
+
+
+def _cancel_aware_callback(stream_callback, cancel_event):
+    """Wrap a stream callback so a cancelled turn suppresses late tool events.
+
+    Abandoned pool workers keep running after AgentCancelled (threads cannot
+    be killed); without this guard they would keep emitting tool events into a
+    turn that has already ended — UI lines appearing after the prompt returns.
+    Returns the original callback unchanged when there is nothing to guard.
+    """
+    if stream_callback is None or cancel_event is None:
+        return stream_callback
+
+    def _guarded(*cb_args, **cb_kwargs):
+        if cancel_event.is_set():
+            return
+        stream_callback(*cb_args, **cb_kwargs)
+
+    return _guarded
 
 
 def _extract_provider_message(raw: str) -> str:
@@ -236,6 +295,14 @@ def _user_facing_llm_error(e: Exception) -> str:
             f"⚠️ The upstream model provider{_where} returned an error — this is a "
             "provider-side issue, not your setup. Please try again shortly or switch models."
         )
+    elif isinstance(e, ContextWindowCollapseError):
+        # Local pre-flight detection: the window is structurally too small for
+        # the tool schemas + output reserve, so message trimming cannot fix it.
+        base = (
+            "⚠️ The model's context window is too small for the enabled tool "
+            "schemas — message trimming cannot fix this. Reduce the enabled "
+            "toolset or use a larger context window (e.g. raise num_ctx)."
+        )
     else:
         base = "⚠️ An error occurred while processing the LLM request."
     return f"{base}\n(server message: {provider_msg})" if provider_msg else base
@@ -272,19 +339,19 @@ def _fallback_plain_chat(
         _reasoning = ""
         try:
             raw = response.raw_response or {}
-            msg_obj = raw.get("choices", [{}])[0].get("message", {})
-            _reasoning = msg_obj.get("reasoning_content", "") or ""
+            _reasoning = extract_llm_reasoning(raw)
         except Exception:
-            pass
+            logger.debug("reasoning extraction failed", exc_info=True)
         return {
             "content": _content,
             "reasoning": _reasoning,
             "error": False,
-            "tokens_used": response.tokens_used or 0,
-            "prompt_tokens": getattr(response, "prompt_tokens", 0) or getattr(response, "tokens_used", 0) or 0,
-            "completion_tokens": getattr(response, "completion_tokens", 0) or 0,
-            "cache_read_tokens": getattr(response, "cache_read_input_tokens", 0) or 0,
-            "cache_creation_tokens": getattr(response, "cache_creation_input_tokens", 0) or 0,
+            "tokens_used": coerce_token_count(response.tokens_used),
+            "prompt_tokens": coerce_token_count(
+                getattr(response, "prompt_tokens", 0) or getattr(response, "tokens_used", 0)),
+            "completion_tokens": coerce_token_count(getattr(response, "completion_tokens", 0)),
+            "cache_read_tokens": coerce_token_count(getattr(response, "cache_read_input_tokens", 0)),
+            "cache_creation_tokens": coerce_token_count(getattr(response, "cache_creation_input_tokens", 0)),
             "provider": getattr(response, "provider", "") or "",
             "execution_time_ms": round(_fb_elapsed * 1000),
         }
@@ -345,36 +412,46 @@ def _parse_text_tool_calls(content: str) -> list[dict[str, Any]]:
         result, stack, in_str, esc = [], [], False, False
         for ch in text:
             if esc:
-                result.append(ch); esc = False; continue
+                result.append(ch)
+                esc = False
+                continue
             if ch == "\\" and in_str:
-                result.append(ch); esc = True; continue
+                result.append(ch)
+                esc = True
+                continue
             if ch == '"':
-                in_str = not in_str; result.append(ch); continue
+                in_str = not in_str
+                result.append(ch)
+                continue
             if in_str:
-                result.append(ch); continue
+                result.append(ch)
+                continue
             if ch in ("{", "["):
-                stack.append(ch); result.append(ch)
+                stack.append(ch)
+                result.append(ch)
             elif ch == "}":
                 if stack and stack[-1] == "{":
-                    stack.pop(); result.append(ch)
+                    stack.pop()
+                result.append(ch)
             elif ch == "]":
                 if stack and stack[-1] == "[":
-                    stack.pop(); result.append(ch)
+                    stack.pop()
+                result.append(ch)
             else:
                 result.append(ch)
-        for opener in reversed(stack):
-            result.append("}" if opener == "{" else "]")
+        result.extend("}" if opener == "{" else "]" for opener in reversed(stack))
         return "".join(result)
 
     def _try_json(text: str):
         try:
             return json.loads(text)
         except (TypeError, ValueError):
-            pass
+            logger.debug("raw tool-call JSON parse failed — trying bracket repair")
         repaired = _repair_brackets(text)
         try:
             return json.loads(repaired)
         except (TypeError, ValueError):
+            logger.debug("tool-call JSON unparseable even after bracket repair")
             return None
 
     def _normalize(data: dict) -> Optional[dict[str, Any]]:
@@ -497,40 +574,6 @@ def _parse_text_tool_calls(content: str) -> list[dict[str, Any]]:
 
     return tool_calls
 
-
-
-def build_handoff_context(
-    *,
-    decisions: Optional[list[dict[str, Any]]] = None,
-    implementation_spec: Optional[dict[str, Any]] = None,
-) -> tuple:
-    """Assemble the prior_context string for design-chat → implementation handoff.
-
-    Returns: (prior_context: str, preview_decisions: list[str], preview_target_files: list[str])
-
-    Implementation spec JSON is used as structured data to generate prebuilt_spec_for_planner.
-
-    Note: ``preview_target_files`` (3rd tuple element) is always ``[]`` and
-    retained only for backward-compatible 3-tuple unpacking at the call site
-    (``prior_context, _, _ = build_handoff_context(...)``).
-    Called identically from both asi and routes/design_chat.py.
-    """
-    _ctx_parts: list[str] = []
-
-    # Implementation Spec — JSON transport, for generating prebuilt_spec_for_planner
-    if implementation_spec:
-        _ctx_parts.append(
-            "=== IMPLEMENTATION SPEC ===\n"
-            + json.dumps(implementation_spec, ensure_ascii=False)
-            + "\n=== END IMPLEMENTATION SPEC ==="
-        )
-
-    _handoff_context = "\n\n".join(_ctx_parts)
-    _preview_decisions = [
-        _d.get("decision", "") for _d in (decisions or [])
-        if isinstance(_d, dict) and _d.get("decision")
-    ]
-    return _handoff_context, _preview_decisions, []
 
 
 # _PLANNER_SWITCH_SIGNAL — removed (planner lane deactivated)
@@ -712,24 +755,20 @@ def load_design_insights(repo_root: str, max_chars: int = 50000) -> str:
     content = load_active_insights_cached(repo_root).strip()
     if not content:
         return ""
+    if len(content) > max_chars:
+        logger.debug("[TRUNCATION_VIOLATION] design_insights=%d chars exceeds %d, but passing full content", len(content), max_chars)
+
+    # Layer 2: always-on archive header index (bounded — ~tens of bytes/line).
+    # Only changes when the archive file changes (demotion/restore/drop), so
+    # it is safe to keep inside the cached 0c prefix. (Already signature-cached
+    # inside build_archive_index.)
     try:
-        if len(content) > max_chars:
-            logger.debug("[TRUNCATION_VIOLATION] design_insights=%d chars exceeds %d, but passing full content", len(content), max_chars)
-
-        # Layer 2: always-on archive header index (bounded — ~tens of bytes/line).
-        # Only changes when the archive file changes (demotion/restore/drop), so
-        # it is safe to keep inside the cached 0c prefix. (Already signature-cached
-        # inside build_archive_index.)
-        try:
-            _idx = build_archive_index(repo_root)
-            if _idx:
-                content += "\n" + _idx.strip()
-        except Exception:
-            pass  # non-critical
-
-        return content
+        _idx = build_archive_index(repo_root)
+        if _idx:
+            content += "\n" + _idx.strip()
     except Exception:
-        return ""  # non-critical — never block execution
+        logger.debug("archive index build failed", exc_info=True)
+    return content
 
 
 def load_promoted_insights(repo_root: str, task_query: str) -> str:
@@ -759,10 +798,9 @@ def load_promoted_insights(repo_root: str, task_query: str) -> str:
             "",
             "=== PROMOTED FROM ARCHIVE (relevance to current task) ===",
         ]
-        for _e in _promoted:
-            _blocks.append("".join(_e.lines).rstrip())
+        _blocks.extend("".join(_e.lines).rstrip() for _e in _promoted)
         return "\n" + "\n".join(_blocks) + "\n"
-    except Exception:
+    except (OSError, ValueError, KeyError, TypeError):  # insights file/shape failures
         return ""  # non-critical — never block injection
 
 @dataclass
@@ -798,6 +836,10 @@ class DesignChatResult:
     # Set to "auth" when the error is LLMAuthenticationError — allows the REPL
     # to offer an interactive API key re-entry prompt instead of just showing a
     # static error message.
+    # Per-turn recall session identity (failure_pattern_store dedup).  Set once
+    # per respond() call via new_session_key() — NOT str(id(result)), which
+    # reuses freed object addresses and collapses distinct turns onto one key.
+    recall_session_key: str = ""
 
 class _SessionSearcher:
     """
@@ -828,11 +870,17 @@ class _SessionSearcher:
         # A caller may pass a SHARED VectorCacheManager so that multiple
         # searchers built for the same search_design_history() call reuse one
         # index load instead of each triggering a fresh ~77ms on-disk FAISS +
-        # metadata load (3 searchers × 77ms = 231ms otherwise). When None (the
-        # default, used by RAGSearcher-style standalone callers), fall back to
-        # creating a private cache for backward compatibility.
+        # metadata load (3 searchers x 77ms = 231ms otherwise). Three forms:
+        #   * a VectorCacheManager instance → use it (shared-cache path)
+        #   * False → explicitly BM25-only (no model load): used by
+        #     search_design_history for corpora below _SEMANTIC_RERANK_MIN_CORPUS
+        #     where semantic re-ranking adds ~zero recall but would force the
+        #     ~8s cold embedding-model import/load.
+        #   * None (the default, used by RAGSearcher-style standalone callers)
+        #     → fall back to creating a private cache for backward compatibility.
         if vector_cache is not None:
-            self._vector_cache = vector_cache
+            # False sentinel = caller explicitly opted out of vector re-ranking.
+            self._vector_cache = None if vector_cache is False else vector_cache
         else:
             self._vector_cache = None
             if _HAS_VECTOR_CACHE:
@@ -843,7 +891,7 @@ class _SessionSearcher:
                 try:
                     self._vector_cache = _get_session_vcm()
                 except Exception:
-                    pass
+                    logger.debug("session VCM init failed — BM25 only", exc_info=True)
 
     def index_docs(
         self,
@@ -910,15 +958,15 @@ class _SessionSearcher:
                     continue
                 try:
                     doc_key = f"{self._session_prefix}{_id}"
-                    # Serialize FAISS mutation: the shared VCM's index is touched
-                    # from multiple threads (search_design_history runs in the
-                    # shared pool — see the parallel dispatch branch). Per-doc
-                    # scope keeps contention minimal while preventing an
-                    # interleaved add/search on the same IndexFlatIP.
-                    with _SESSION_VCM_IO_LOCK:
-                        self._vector_cache.add_document(doc_key, text)
+                    # The shared VCM serialises FAISS internally: concurrent
+                    # search_design_history calls (read tools run in the shared
+                    # pool — see the parallel dispatch branch) share this
+                    # index, and VectorCacheManager takes its own lock around
+                    # index add/search, so an interleaved add/search on the
+                    # same IndexFlatIP cannot happen.
+                    self._vector_cache.add_document(doc_key, text)
                 except Exception:
-                    pass
+                    logger.debug("vector-cache add_document failed", exc_info=True)
 
         # Mark archive sig as vector-indexed for future skips (always record
         # after a full pass — the sig is now always passed so that the second
@@ -972,13 +1020,13 @@ class _SessionSearcher:
         vector_rank: dict[int, int] = {}
         if self._vector_cache is not None:
             try:
-                # Serialize FAISS read: concurrent search_design_history calls
-                # share this index (see _SESSION_VCM_IO_LOCK). Only the FAISS
-                # call is held; the subsequent key_to_idx/ranking is unlocked.
-                with _SESSION_VCM_IO_LOCK:
-                    vec_results = self._vector_cache.search(
-                        query, top_k=min(max(top_k * 2, 10), self._n_docs)
-                    )
+                # The shared VCM serialises FAISS internally (see the
+                # VectorCacheManager lock in add_document/search); only the
+                # FAISS call is held, so the subsequent key_to_idx/ranking is
+                # unlocked.
+                vec_results = self._vector_cache.search(
+                    query, top_k=min(max(top_k * 2, 10), self._n_docs)
+                )
                 key_to_idx = {
                     f"{self._session_prefix}{self._doc_ids[i]}": i
                     for i in range(self._n_docs)
@@ -1007,8 +1055,8 @@ class _SessionSearcher:
         else:
             RRF_K = 60.0
             rrf_scored: list[tuple[float, int]] = []
-            for idx in bm25_rank:
-                rrf = 1.0 / (RRF_K + bm25_rank[idx])
+            for idx, bm25_score in bm25_rank.items():
+                rrf = 1.0 / (RRF_K + bm25_score)
                 if idx in vector_rank:
                     rrf += 1.0 / (RRF_K + vector_rank[idx])
                 rrf_scored.append((rrf, idx))
@@ -1017,15 +1065,12 @@ class _SessionSearcher:
 
         # Build results. The displayed "score" stays the interpretable BM25
         # value (0.0 for vector-only hits); RRF drives ordering only.
-        results = []
-        for doc_idx in ranked_idxs[:top_k]:
-            results.append({
+        return [{
                 "id": self._doc_ids[doc_idx],
                 "text": self._doc_texts[doc_idx],
                 "score": round(bm25_score_of.get(doc_idx, 0.0), 4),
-            })
+            } for doc_idx in ranked_idxs[:top_k]]
 
-        return results
 
 
 
@@ -1105,6 +1150,21 @@ _VECTOR_CACHE_LOCK = threading.Lock()
 _VECTOR_CACHE_INDEXED_ARCHIVES_MAX = 100
 """Safety cap on ``_VECTOR_CACHE_INDEXED_ARCHIVES`` growth (process-lifetime set)."""
 
+_SEMANTIC_RERANK_MIN_CORPUS = 32
+"""Minimum indexed-doc count to enable semantic (vector) re-ranking.
+
+Semantic re-ranking fuses BM25 scores with vector similarity (RRF).  It only
+helps when the corpus is large enough that lexical mismatch routinely buries a
+relevant document — i.e. dozens of turns or more.  On a small corpus BM25
+already ranks perfectly, while engaging the VCM path forces the first
+``add_document`` to ``_ensure_model_loaded()`` (``import sentence_transformers``
+~6s cold + ~1.7s model init), a cost paid for ~zero recall benefit.
+
+Below this threshold ``_search_design_history`` passes ``vector_cache=None`` to
+every ``_SessionSearcher``, so the embedding model is never imported for typical
+short sessions.
+"""
+
 
 _SHARED_SESSION_VCM: Optional[Any] = None
 """Process-wide memoised ``VectorCacheManager`` for ``.asicode/session_vector_cache``.
@@ -1129,20 +1189,6 @@ dependency (disk is still checkpointed every 100 docs + at process exit).
 _SHARED_SESSION_VCM_LOCK = threading.Lock()
 """Guards creation of ``_SHARED_SESSION_VCM`` (double-checked init)."""
 
-_SESSION_VCM_IO_LOCK = threading.Lock()
-"""Serialises FAISS index mutation/read on the shared session VCM.
-
-``search_design_history`` is a read-tool and dispatches concurrently in the
-shared pool (a multi-tool batch runs read-tools in parallel threads — see the
-parallel dispatch branch in ``_process_tool_call``).  The shared VCM's
-``IndexFlatIP`` is therefore mutated (``add_document``) and read (``search``)
-from multiple threads; FAISS add/search are not safe to interleave on one
-index, so both operations take this lock.  Held only around the FAISS call —
-BM25 ranking (the primary signal) and the per-doc dedup map are untouched, so
-contention stays minimal (and the archive-sig gate means each archive is
-indexed once per process, so ``add_document`` is rare after warmup).
-"""
-
 
 def _get_session_vcm() -> Optional[Any]:
     """Return the process-wide shared session vector cache (created once).
@@ -1159,6 +1205,7 @@ def _get_session_vcm() -> Optional[Any]:
             try:
                 _SHARED_SESSION_VCM = VectorCacheManager(".asicode/session_vector_cache")
             except Exception:
+                logger.debug("session VCM construction failed", exc_info=True)
                 return None
         return _SHARED_SESSION_VCM
 
@@ -1177,9 +1224,11 @@ def _archive_sig(session_mgr: Any, sid: str):
         if not p.exists():
             return None
         st = p.stat()
-        return (sid, st.st_size, st.st_mtime_ns)
     except Exception:
+        logger.debug("archive sig stat failed for %s", sid, exc_info=True)
         return None
+    else:
+        return (sid, st.st_size, st.st_mtime_ns)
 
 
 def _archived_bm25_entries(
@@ -1284,17 +1333,36 @@ class DesignChatLoop:
     ) -> DesignChatResult:
         """Process a single design chat turn with tool use."""
         result = DesignChatResult()
+        # Per-turn recall session identity: fresh key per respond() call so the
+        # [RECALL] dedup re-arms on the next turn (id()-based keys reused freed
+        # addresses — see failure_pattern_store.new_session_key).
+        from .failure_pattern_store import new_session_key
+        result.recall_session_key = new_session_key()
         msgs = list(messages)
         self.session_id = session_id or ""
         self._session_mgr = session_mgr
+        # Sync the client's cancellation hook from the registry config so the
+        # client-internal retry backoff sleeps abort on ESC instead of
+        # blocking up to ~36s (see interruptible_sleep).  Re-synced each turn
+        # because the loop may have been flipped to a new client since.
+        _ce = getattr(getattr(getattr(self, "registry", None), "config", None), "cancel_event", None)
+        if _ce is not None:
+            self.llm_client.cancel_event = _ce
         try:
-            return self._respond_impl(msgs, stream_callback, reasoning_callback, max_tool_iterations, token_callback, result, mode=mode, thinking_mode=thinking_mode, reasoning_effort=reasoning_effort)
+            _r = self._respond_impl(msgs, stream_callback, reasoning_callback, max_tool_iterations, token_callback, result, mode=mode, thinking_mode=thinking_mode, reasoning_effort=reasoning_effort)
         except AgentCancelled as _ac:
             # User pressed ESC — let the caller pause/cancel, not an error.
             # Attach the partial result so the caller can persist what the agent
  # was doing (keeps a referent for a following "let's do that" confirmation).
             _ac.partial_result = result
             raise
+        except LLMCancelled as _lc:
+            # Client-internal retry backoff aborted by ESC - a user
+            # cancellation, not an LLM error: attach the partial result and
+            # re-raise as AgentCancelled like the handler above.
+            _ac = AgentCancelled(str(_lc))
+            _ac.partial_result = result
+            raise _ac from _lc
         except LLMClientError as e:
             # Expected, service-side LLM errors (rate limit / auth / quota /
             # server overload) — not a bug in our code.  Log a single concise
@@ -1313,7 +1381,7 @@ class DesignChatLoop:
             result.is_error = True
             return result
         except Exception as e:
-            logger.error("Design chat respond failed unexpectedly: %s", e, exc_info=True)
+            logger.exception("Design chat respond failed unexpectedly: %s", e)
             result.content = f"An unexpected error occurred while processing design chat: {e}"
             result.is_error = True
             return result
@@ -1337,13 +1405,30 @@ class DesignChatLoop:
                 try:
                     stream_callback("design_thinking_stop", {})
                 except Exception:
-                    pass  # non-critical — never block teardown
+                    logger.debug("design_thinking_stop callback raised", exc_info=True)
+
+        # ── Empty-response funnel guard ──────────────────────────────────────
+        # Every _respond_impl exit path (normal termination, max-iterations tail,
+        # tool-loop fallback) can return content="" when the LLM keeps emitting
+        # empty responses after all retries. Guard at this single funnel — every
+        # result passes through here — so a future return site can't silently
+        # regress into shipping an empty answer to the REPL, webapp, subagent
+        # summary, or session history. is_error stays False: budget exhaustion
+        # with partial progress is not a failure.
+        if not _r.content.strip() and not _r.is_error:
+            _r.content = _EMPTY_RESPONSE_FALLBACK
+            logger.warning(
+                "Design chat: empty response escaped the tool loop "
+                "(hit_max_iterations=%s, tools_made=%d) — injected fallback message",
+                _r.hit_max_iterations, len(_r.tool_calls_made),
+            )
+        return _r
 
     def _call_llm_with_retry(
         self,
         fn: Callable[[], Any],
         _estimated_prompt_tokens: int | None = None,
-        overflow_retry_cb: Callable[[], bool] | None = None,
+        overflow_retry_cb: Callable[[], int | None] | None = None,
     ) -> Any:
         """Call an LLM tool function, retrying on *transient* service errors.
 
@@ -1353,9 +1438,14 @@ class DesignChatLoop:
         design-chat turn survives a longer-lived blip instead of surfacing a
         one-off error.
 
-        Only rate-limit and server-unavailable are retried — auth and quota are
-        permanent and re-raise immediately.  The wait honors the cancel_event so
-        ESC stays responsive mid-backoff, and a server Retry-After hint when the
+        Rate-limit, server-unavailable, and connection errors are retried —
+        auth and quota are permanent and re-raise immediately.  Connection
+        errors retry by flipping the z.ai facade to its sibling endpoint when
+        possible (switching hosts beats waiting); otherwise they use the same
+        exponential backoff as the other transient errors — a refused
+        TCP/TLS handshake or mid-stream drop is usually an overload blip, not
+        a dead endpoint.  The wait honors the cancel_event so ESC stays
+        responsive mid-backoff, and a server Retry-After hint when the
         exception carries one.
 
         Context-length 400 is also retried once after re-trimming messages via
@@ -1371,7 +1461,9 @@ class DesignChatLoop:
                 if _attempt >= retries:
                     raise
                 _hint = getattr(e, "retry_after", None)
-                delay = _hint if isinstance(_hint, int) and _hint > 0 else min(2 ** (_attempt + 2), 30)
+                # Bounded at construction (LLMRateLimitError clamps to
+                # [1, RETRY_AFTER_MAX_WAIT]); accept int/float defensively.
+                delay = _hint if isinstance(_hint, (int, float)) and _hint > 0 else min(2 ** (_attempt + 2), 30)
                 # INFO, not WARNING: a transient auto-recovering retry is file-only
                 # noise (asi's _TerminalInfoFilter keeps it off the prompt).
                 # The final give-up surfaces as a raised exception either way.
@@ -1381,19 +1473,28 @@ class DesignChatLoop:
                 )
                 self._retry_wait(delay)
             except LLMConnectionError as e:
-                # A connection-level failure (timeout / cannot-connect) is endpoint-
-                # specific, so retry ONLY by flipping the z.ai facade to its sibling
-                # (Anthropic-compat <-> OpenAI-compat).  If no flip is possible
-                # (non-z.ai provider, or a custom base_url with no known sibling),
-                # preserve the prior behavior of surfacing the error immediately
-                # rather than silently re-hitting the same dead endpoint.
-                if _attempt >= retries or not self._flip_zai_endpoint():
+                if _attempt >= retries:
                     raise
-                logger.info(
-                    "Design chat connection error (%s) — flipped z.ai endpoint, "
-                    "outer retry %d/%d", type(e).__name__, _attempt + 1, retries,
+                # A connection-level failure (timeout / cannot-connect) is
+                # transient in nature — providers under overload refuse the
+                # handshake, and international TLS paths blip. Retry it like
+                # the other transient errors instead of surfacing immediately.
+                # z.ai additionally flips to its sibling endpoint
+                # (Anthropic-compat <-> OpenAI-compat), where switching hosts
+                # is the stronger mitigation — hence the near-zero delay after
+                # a flip; non-z.ai (or a custom base_url) uses backoff.
+                _flipped = self._flip_zai_endpoint()
+                delay = (
+                    _ZAI_FAILOVER_RETRY_DELAY
+                    if _flipped
+                    else min(2 ** (_attempt + 2), 30)
                 )
-                self._retry_wait(_ZAI_FAILOVER_RETRY_DELAY)
+                logger.info(
+                    "Design chat connection error (%s), outer retry %d/%d in %ds%s",
+                    type(e).__name__, _attempt + 1, retries, delay,
+                    " — flipped z.ai endpoint" if _flipped else "",
+                )
+                self._retry_wait(delay)
             except LLMAuthenticationError as e:
                 # zai serves two endpoints (Anthropic-compat + OpenAI-compat)
                 # under the SAME key, but an account may be authorized for only
@@ -1417,15 +1518,23 @@ class DesignChatLoop:
             except LLMAPIError as e:
                 # Context-length 400 → record overflow override + in-turn retry
                 if _is_context_length_error(e):
-                    _record_context_overflow(self.model, estimated_prompt_tokens=_estimated_prompt_tokens)
+                    _record_context_overflow(self.model, estimated_prompt_tokens=_estimated_prompt_tokens, base_url=getattr(self.llm_client, "base_url", None))
                     logger.warning(
                         "Context-length 400 for %s — recorded overflow override (est=%s)",
                         self.model, _estimated_prompt_tokens,
                     )
                     # In-turn recovery: re-trim messages and retry once in this loop,
                     # continuing rather than raising so the retry loop handles it.
+                    # The callback returns the POST-trim estimate (int) when trim made
+                    # progress, None when it did not. The returned estimate replaces
+                    # _estimated_prompt_tokens so a SECOND 400 in the same turn is
+                    # recorded against the size that was actually rejected — a stale
+                    # pre-trim estimate would inflate the override clamp and stall
+                    # convergence (the reduction-cap 3 steps run out first).
                     if overflow_retry_cb is not None and _attempt < retries:
-                        if overflow_retry_cb():  # True = trim made progress
+                        _new_est = overflow_retry_cb()
+                        if _new_est is not None:
+                            _estimated_prompt_tokens = _new_est
                             continue
                 raise
         # Unreachable: the loop either returns or re-raises on the last attempt.
@@ -1462,7 +1571,7 @@ class DesignChatLoop:
         try:
             if cur.get_provider_name().lower() != "zai":
                 return False
-        except Exception:
+        except (AttributeError, TypeError):  # client without get_provider_name
             return False
         if getattr(cur, "base_url", None):  # custom endpoint — no known sibling
             return False
@@ -1476,6 +1585,11 @@ class DesignChatLoop:
         else:
             return False
         self.llm_client = new_client
+        # Carry the cancellation hook onto the flipped client too, so its
+        # internal retry backoff remains ESC-interruptible.
+        _ce = getattr(getattr(getattr(self, "registry", None), "config", None), "cancel_event", None)
+        if _ce is not None:
+            new_client.cancel_event = _ce
         logger.info(
             "z.ai endpoint flipped to %s (timeout=%ss) for connection-error retry",
             type(new_client).__name__, _ZAI_FAILOVER_TIMEOUT,
@@ -1507,7 +1621,11 @@ class DesignChatLoop:
             tool_schemas = [s for s in all_schemas if s["name"] in _GENERAL_MODE_TOOLS]
         else:
             tool_schemas = all_schemas
-        _max_tokens = 65536
+        # Output budget for the main tool loop. Design chat produces long
+        # analysis/report text, so it runs 2x agent_loop's AGENT_TOOL_CALL
+        # budget (config/thresholds.py). The truncation ladder below doubles it
+        # on finish_reason=length/truncated, iteration-locally.
+        _max_tokens = _cfg.tokens.AGENT_TOOL_CALL * 2
 
         # ── Main tool loop ───────────────────────────────────────────────
         _empty_retried = False  # allow one empty-response retry across all iterations
@@ -1526,11 +1644,11 @@ class DesignChatLoop:
                 raise AgentCancelled("cancelled by user during design chat")
             # ── Tool-result eviction (occupancy-gated gentle context bound; only
             # fires as the prompt nears the model's cap — see _evict_for_loop) ──
-            msgs = _evict_for_loop(msgs, model=self.model or "", tool_schemas=tool_schemas)
+            msgs = _evict_for_loop(msgs, model=self.model or "", tool_schemas=tool_schemas, base_url=getattr(self.llm_client, "base_url", None))
             # ── Context hard cap guard (prevents HTTP 400 on oversized context) ──
             # Reserve output room AND account for tool-schema tokens — otherwise a
             # full prompt fills small windows (Ollama 8192) leaving 0 to generate.
-            msgs = _apply_context_hard_cap(msgs, self.model, tool_schemas=tool_schemas)
+            msgs = _apply_context_hard_cap(msgs, self.model, tool_schemas=tool_schemas, base_url=getattr(self.llm_client, "base_url", None))
             # ── Work-plan state ──
             # The work plan is surfaced to the model via the update_plan tool
             # result itself (agent_tools._tool_update_plan returns render_plan),
@@ -1543,18 +1661,25 @@ class DesignChatLoop:
             # Pre-call token estimate for fast context-override convergence.
             _est_tokens = estimate_tokens_from_msgs(_llm_msgs)
 
-            def _re_trim_design_context_overflow() -> bool:
+            def _re_trim_design_context_overflow() -> int | None:
                 """Re-trim _llm_msgs after a context-override reduction (in-turn recovery).
 
-                Returns True if trim actually reduced the estimated token count
-                (caller should retry), False if no progress was made (caller should
-                raise the original 400 error).
+                Returns the POST-trim estimated token count when trim actually reduced
+                the estimate (caller should retry and record the next 400 against this
+                accurate size), or None if no progress was made (caller should raise
+                the original 400 error).
                 """
                 nonlocal _llm_msgs
                 _before_est = estimate_tokens_from_msgs(_llm_msgs)
                 _before_count = len(_llm_msgs)
-                _new_limit = _resolve_context_limit(self.model)
+                _new_limit = _resolve_context_limit(self.model, base_url=getattr(self.llm_client, "base_url", None))
                 _new_cap = context_message_cap(_new_limit, _cfg.tokens.CONTEXT_HARD_CAP_SAFETY_MARGIN, tool_schemas)
+                if _new_cap < MIN_USABLE_MESSAGE_BUDGET:
+                    # Structural collapse (reserve + schemas exceed the window):
+                    # re-trimming cannot create budget that never existed. Skip
+                    # the trim and return None so the caller propagates the
+                    # original 400 immediately instead of more doomed attempts.
+                    return None
                 _llm_msgs = preemptive_trim(_llm_msgs, max_tokens=_new_cap, preserve_last=2, tag="DESIGN_CHAT_PREEMPTIVE_TRIM")
                 _llm_msgs = repair_tool_message_sequence(_llm_msgs)
                 _after_est = estimate_tokens_from_msgs(_llm_msgs)
@@ -1565,7 +1690,7 @@ class DesignChatLoop:
                     self.model, _before_count, len(_llm_msgs),
                     _new_cap, _before_est, _after_est, _reduced,
                 )
-                return _reduced
+                return _after_est if _reduced else None
 
             try:
                 _call_start = time.monotonic()
@@ -1573,21 +1698,72 @@ class DesignChatLoop:
                     try:
                         stream_callback("design_thinking_start", {})
                     except Exception:
-                        pass  # non-critical — never block execution
-                response: ToolCallResponse = self._call_llm_with_retry(
-                    lambda: self.llm_client.chat_with_tools(
-                        messages=_llm_msgs, tools=tool_schemas, model=self.model,
-                        cache_breakpoint_offset=0,
-                        temperature=_PROCESS_TEMPERATURE, max_tokens=_max_tokens,
-                        reasoning_callback=reasoning_callback,
-                        token_callback=token_callback,
-                        **(dict(thinking_mode=thinking_mode) if thinking_mode is not None else {}),
-                        **(dict(reasoning_effort=reasoning_effort) if reasoning_effort else {}),
-                    ),
-                    _estimated_prompt_tokens=_est_tokens,
-                    overflow_retry_cb=_re_trim_design_context_overflow,
-                )
+                        logger.debug("design_thinking_start callback raised", exc_info=True)
+                # ── Truncation max_tokens ladder (agent_loop parity) ──────────
+                # finish_reason=length/truncated means the OUTPUT budget was
+                # exhausted — the model may have finished reasoning and only
+                # needs more room for the tool call. agent_loop retries with a
+                # doubling budget (_base * 2^attempt, up to 3 attempts); mirror
+                # it here so a reasoning model burning its shared budget doesn't
+                # lose the turn's tool call. The ladder is iteration-local
+                # (_max_tokens itself is untouched) so the next loop iteration
+                # starts from the original budget again.
+                _base_tokens = _max_tokens
+                _ladder_tokens = _max_tokens
+                _attempt = 0
+                while True:
+                    # B023: _ladder_tokens is early-bound via _lt below (stable for the
+                    # whole call); _llm_msgs must STAY late-bound — the overflow-retry
+                    # callback _re_trim_design_context_overflow rebinds it (nonlocal)
+                    # and re-invokes this callable, so freezing the value would retry
+                    # with the oversized pre-trim messages.
+                    response: ToolCallResponse = self._call_llm_with_retry(
+                        lambda _lt=_ladder_tokens: self.llm_client.chat_with_tools(
+                            messages=_llm_msgs,  # noqa: B023 — _llm_msgs deliberately late-bound (comment above)
+                            tools=tool_schemas, model=self.model,
+                            cache_breakpoint_offset=0,
+                            temperature=_PROCESS_TEMPERATURE, max_tokens=_lt,
+                            reasoning_callback=reasoning_callback,
+                            token_callback=token_callback,
+                            **({"thinking_mode": thinking_mode} if thinking_mode is not None else {}),
+                            **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
+                        ),
+                        _estimated_prompt_tokens=_est_tokens,
+                        overflow_retry_cb=_re_trim_design_context_overflow,
+                    )
+                    _finish_reason = getattr(response, "finish_reason", None)
+                    if _finish_reason in _TRUNCATION_REASONS and _attempt < 2:
+                        _attempt += 1
+                        _ladder_tokens = _base_tokens * (1 << _attempt)
+                        logger.warning(
+                            "[DESIGN_CHAT_LLM_RETRY] finish_reason=%s (max_tokens=%d), "
+                            "retrying (%d/3)",
+                            _finish_reason, _ladder_tokens, _attempt + 1,
+                        )
+                        continue
+                    break
                 _call_elapsed = time.monotonic() - _call_start
+                # ── Truncation guard (finish_reason=length/truncated) ─────────
+                # Reached only after the 3-attempt budget ladder above is
+                # exhausted. A response cut off at max_tokens can carry a
+                # PARTIAL tool call whose arguments were truncated mid-JSON.
+                # Executing it would dispatch stale/partial args (e.g. a bash
+                # command cut mid-way). Mirror agent_loop's contract: clear the
+                # tool calls, keep the text content (even partial) so the turn
+                # loop continues naturally instead of executing garbage.
+                if _finish_reason in _TRUNCATION_REASONS:
+                    _truncated_calls = len(getattr(response, "tool_calls", []) or [])
+                    if _truncated_calls:
+                        response = replace_tool_calls(response, [])
+                        logger.warning(
+                            "Design chat: finish_reason=%s — cleared %d partial tool call(s)",
+                            _finish_reason, _truncated_calls,
+                        )
+                    # Turn-level outcome channel (record_agent_result): the ONLY
+                    # place a truncation storm surfaces — the LLM call itself
+                    # succeeded, so record_llm_call(failed=True) never fires and
+                    # llm_metrics reads healthy (agent_loop parity).
+                    get_global_collector().record_agent_result(truncated=True)
                 logger.debug(
                     "Design chat LLM call: iter=%d elapsed=%.1fs tokens=%d tools=%d",
                     iteration, _call_elapsed, response.tokens_used or 0,
@@ -1645,6 +1821,14 @@ class DesignChatLoop:
                 result.total_llm_calls += 1
                 _fb = _fallback_plain_chat(msgs, self.llm_client, self.model, max_tokens=_max_tokens, token_callback=token_callback)
                 result.content = _fb["content"]
+                result.reasoning_content = _fb.get("reasoning", "") or ""
+                # Mirror the reasoning fallback of the other exit paths (normal
+                # termination / max-iterations tail): a thinking model may put
+                # its final answer in reasoning_content while content stays
+                # empty. Without this, the fallback path would still ship an
+                # empty turn where the answer was actually available.
+                if not result.content.strip() and result.reasoning_content:
+                    result.content = result.reasoning_content
                 result.is_error = _fb["error"]
                 # Mirror the split-token accumulation of the normal/final-summary
                 # paths — the fallback performs a real LLM call that consumes
@@ -1695,12 +1879,11 @@ class DesignChatLoop:
             reasoning_for_msg = ""
             raw = response.raw_response or {}
             try:
-                msg_obj = raw.get("choices", [{}])[0].get("message", {})
-                reasoning_for_msg = msg_obj.get("reasoning_content", "") or ""
+                reasoning_for_msg = extract_llm_reasoning(raw)
                 if reasoning_for_msg and not result.reasoning_content:
                     result.reasoning_content = reasoning_for_msg
             except (AttributeError, TypeError):
-                pass
+                logger.debug("reasoning extraction failed", exc_info=True)
 
             # ── Text-mode fallback ──────────────────────────────────────────────
             # Models that don't support native /api/chat tool_calls output tools
@@ -1775,7 +1958,7 @@ class DesignChatLoop:
                                     "max_nudges": _PLAN_GATE_MAX_NUDGES,
                                 })
                             except Exception:
-                                pass  # non-critical — never block execution
+                                logger.debug("design_plan_gate callback raised", exc_info=True)
                         msgs.append(LLMMessage(role="assistant", content=result.content))
                         msgs.append(LLMMessage(
                             role="user",
@@ -1802,7 +1985,7 @@ class DesignChatLoop:
                 try:
                     token_callback(None)  # None = reset sentinel
                 except Exception:
-                    pass  # non-critical — never block execution
+                    logger.debug("token reset callback raised", exc_info=True)
 
             # Emit text content alongside tool calls for CLI display
             if stream_callback and response.content and response.content.strip():
@@ -1812,7 +1995,7 @@ class DesignChatLoop:
                         "elapsed": _call_elapsed,
                     })
                 except Exception:
-                    pass  # non-critical — never block execution
+                    logger.debug("design_thinking callback raised", exc_info=True)
 
             # Keep the latest intermediate assistant statement in result.content so
             # that if the user cancels (ESC) mid-loop, the caller can still persist
@@ -1826,14 +2009,11 @@ class DesignChatLoop:
                 # raw_response.choices[0].message.reasoning_content with an
                 # empty top-level content field. Fall back to that.
                 try:
-                    _choices = response.raw_response.get("choices", [])
-                    if _choices:
-                        _msg = _choices[0].get("message", {})
-                        _rc = (_msg.get("reasoning_content", "") or "").strip()
-                        if _rc:
-                            result.content = _rc
+                    _rc = extract_llm_reasoning(response.raw_response, strip=True)
+                    if _rc:
+                        result.content = _rc
                 except (AttributeError, TypeError):
-                    pass
+                    logger.debug("raw-response reasoning fallback failed", exc_info=True)
 
             # Preserve provider-native content blocks so they echo back on the
             # next turn. Anthropic extended-thinking multi-turn requires the
@@ -1888,16 +2068,51 @@ class DesignChatLoop:
                         "tool_call_count": len(_effective_tool_calls),
                     })
                 except Exception:
-                    pass
+                    logger.debug("design_llm_call event failed", exc_info=True)
 
             # ── Process each tool call ───────────────────────────────────
             if len(_effective_tool_calls) == 1:
-                # Single tool call — no thread overhead
+                # Single tool call — routed through the pool so ESC
+                # (cancel_event) can preempt the wait at the poll cadence,
+                # exactly like the parallel phase. A bare inline call would
+                # freeze the whole turn until the tool's own timeout (seconds
+                # to minutes). Threads cannot be killed: the in-flight tool
+                # keeps running and its result is discarded on cancel.
                 tc = _effective_tool_calls[0]
+                _ce = getattr(self.registry.config, "cancel_event", None)
                 try:
-                    tool_result = self._process_tool_call_with_learning(
-                        tc, stream_callback, result,
-                    )
+                    if self.registry._tool_call_is_serial(tc.name, tc.args):
+                        # Serial tool (ask_user / job kill): blocks on human
+                        # input / terminal state, so it must run INLINE on this
+                        # thread — never on the pool (phase-3 contract). A pool
+                        # worker would grab stdin while the design thread exits
+                        # on ESC, leaving a second reader on the live prompt
+                        # (_cli_checkpoint_cb's termios dance). Not pollable:
+                        # check the cancel event at entry; AgentCancelled raised
+                        # by the tool itself propagates via the handler below.
+                        if _ce is not None and _ce.is_set():
+                            raise AgentCancelled("cancelled by user before serial tool")
+                        tool_result = self._process_tool_call_with_learning(
+                            tc, stream_callback, result,
+                        )
+                    else:
+                        from ._thread_pool import CANCEL_POLL_INTERVAL, shared_pool
+                        _future = shared_pool.submit(
+                            self._process_tool_call_with_learning, tc,
+                            _cancel_aware_callback(stream_callback, _ce), result,
+                        )
+                        while True:
+                            try:
+                                tool_result = _future.result(timeout=CANCEL_POLL_INTERVAL)
+                                break
+                            except _FutureTimeoutError:
+                                if _ce is not None and _ce.is_set():
+                                    raise AgentCancelled("cancelled by user during tool phase") from None
+                except AgentCancelled:
+                    # A tool that decided the turn is cancelled must abort the
+                    # iteration — NOT degrade into a tool-error message that
+                    # feeds another LLM call (parity with the parallel phase).
+                    raise
                 except Exception as _err:
                     # Defensive: _process_tool_call should never raise, but if
                     # it does (dispatcher bug, unexpected tool shape) we must
@@ -1932,6 +2147,10 @@ class DesignChatLoop:
                 # threads don't interleave events to the same sink (e.g.
                 # websocket/SSE buffers).
                 _cb_lock = threading.Lock()
+                # Both locks are bound as default args in the worker defs below
+                # (B023): pool threads can outlive the loop iteration on cancel
+                # (threads can't be killed), and the next iteration creates fresh
+                # locks — an abandoned worker must serialize on ITS batch's locks.
 
                 def _is_mutating(tc):
                     """True if the tool call changes filesystem / source / git state.
@@ -1946,18 +2165,29 @@ class DesignChatLoop:
                     """
                     return self.registry._tool_call_mutates(tc.name, tc.args)
 
-                def _safe_process(tc):
+                # Loop-level sibling of _safe_process (not nested): ruff's B023 only
+                # credits default-arg bindings on direct loop children, so nesting
+                # _safe_cb inside _safe_process would defeat the _cb_lock binding.
+                def _safe_cb(*cb_args, _cb_lock=_cb_lock, **cb_kwargs):
+                    """Stream-callback wrapper serialized on the batch's _cb_lock."""
+                    if stream_callback is None:
+                        return
+                    _ce_cb = getattr(self.registry.config, "cancel_event", None)
+                    if _ce_cb is not None and _ce_cb.is_set():
+                        # Cancelled turn: abandoned pool workers keep
+                        # running (threads can't be killed) — suppress
+                        # their late events instead of emitting tool lines
+                        # into a turn that has already ended.
+                        return
+                    with _cb_lock:
+                        stream_callback(*cb_args, **cb_kwargs)
+
+                def _safe_process(tc, _write_lock=_write_lock):
                     """Thread-safe wrapper around _process_tool_call.
                     Write tools (and mutating bash) acquire a lock; read tools run
                     concurrently. The stream callback is serialized across all threads.
                     """
                     is_mutating = _is_mutating(tc)
-
-                    def _safe_cb(*cb_args, **cb_kwargs):
-                        if stream_callback is None:
-                            return
-                        with _cb_lock:
-                            stream_callback(*cb_args, **cb_kwargs)
 
                     if is_mutating:
                         with _write_lock:
@@ -2002,19 +2232,38 @@ class DesignChatLoop:
                     raise AssertionError("tool phase partition is not a disjoint cover")
 
                 _results: list[Optional[str]] = [None] * len(_effective_tool_calls)
-                _tc_by_index = {i: tc for i, tc in enumerate(_effective_tool_calls)}
+                _tc_by_index = dict(enumerate(_effective_tool_calls))
 
-                def _collect_phase(phase_calls):
+                def _collect_phase(phase_calls, _tc_by_index=_tc_by_index, _results=_results):
                     if not phase_calls:
                         return
                     futures = [
                         (shared_pool.submit(_safe_process, tc), idx)
                         for idx, tc in phase_calls
                     ]
+                    # Cancel-aware collection: poll instead of blocking on a bare
+                    # future.result() so ESC (cancel_event) is honored while a long
+                    # tool is still running — a blocking wait would otherwise freeze
+                    # the whole turn until the tool's own timeout (seconds to
+                    # minutes). Threads cannot be killed: the in-flight tool keeps
+                    # running in the pool and its result is simply discarded.
+                    from ._thread_pool import CANCEL_POLL_INTERVAL
+                    _ce = getattr(self.registry.config, "cancel_event", None)
                     for future, idx in futures:
                         tc = _tc_by_index[idx]
                         try:
-                            _, tool_result = future.result()
+                            while True:
+                                try:
+                                    _, tool_result = future.result(timeout=CANCEL_POLL_INTERVAL)
+                                    break
+                                except _FutureTimeoutError:
+                                    if _ce is not None and _ce.is_set():
+                                        raise AgentCancelled("cancelled by user during tool phase") from None
+                        except AgentCancelled:
+                            # A tool that already decided the turn is cancelled must
+                            # abort the whole batch, NOT degrade into a tool-error
+                            # message that feeds another LLM call.
+                            raise
                         except Exception as _ferr:
                             # _safe_process itself can raise (e.g. registry lookup,
                             # dispatcher bug) — never let one failing tool abort
@@ -2033,9 +2282,17 @@ class DesignChatLoop:
                 # Phase 2: writes run after (invalidates cache exactly once at the end).
                 _collect_phase(_write_calls)
                 # Phase 3: serial tools run strictly sequentially (one at a time).
+                # ask_user blocks on HUMAN input — not pollable — so honor the
+                # cancel_event at phase entry and let an AgentCancelled from the
+                # tool itself propagate instead of degrading into a tool error.
+                _ce_serial = getattr(self.registry.config, "cancel_event", None)
                 for idx, tc in _serial_calls:
+                    if _ce_serial is not None and _ce_serial.is_set():
+                        raise AgentCancelled("cancelled by user during serial tool phase")
                     try:
                         _, tool_result = _safe_process(tc)
+                    except AgentCancelled:
+                        raise
                     except Exception as _ferr:
                         logger.warning("Design chat: serial tool failed: %s", _ferr)
                         tool_result = f"Error: tool execution failed: {_ferr}"
@@ -2068,7 +2325,7 @@ class DesignChatLoop:
         _final_recorded = False
         try:
             plain_msgs = _strip_tool_messages(msgs)
-            plain_msgs = _apply_context_hard_cap(plain_msgs, self.model)
+            plain_msgs = _apply_context_hard_cap(plain_msgs, self.model, base_url=getattr(self.llm_client, "base_url", None))
             result.total_llm_calls += 1
             final_response = self.llm_client.chat(
                 messages=plain_msgs, model=self.model,
@@ -2090,14 +2347,13 @@ class DesignChatLoop:
             if not _final_content.strip():
                 raw = final_response.raw_response or {}
                 try:
-                    msg_obj = raw.get("choices", [{}])[0].get("message", {})
-                    _rc = msg_obj.get("reasoning_content", "") or ""
+                    _rc = extract_llm_reasoning(raw)
                     if _rc:
                         _final_content = _rc
                         if not result.reasoning_content:
                             result.reasoning_content = _rc
                 except (AttributeError, TypeError):
-                    pass
+                    logger.debug("final-response reasoning extraction failed", exc_info=True)
 
             # ── Retry with stronger instruction when LLM still returns empty ──
             # Some tool-strong models (Gemma 4 via Ollama) may return empty
@@ -2132,30 +2388,33 @@ class DesignChatLoop:
                     # Also check reasoning_content on retry
                     if not _final_content.strip() and retry_response.raw_response:
                         try:
-                            _retry_raw = retry_response.raw_response
-                            _rm = _retry_raw.get("choices", [{}])[0].get("message", {})
-                            _rc2 = (_rm.get("reasoning_content", "") or "").strip()
+                            _rc2 = extract_llm_reasoning(retry_response.raw_response, strip=True)
                             if _rc2:
                                 _final_content = _rc2
                         except (AttributeError, TypeError):
-                            pass
+                            logger.debug("retry reasoning extraction failed", exc_info=True)
                     result.tokens_used += retry_response.tokens_used or 0
                     # Mirror the split-token accumulation of the final-response
                     # path below — retry also consumes prompt/completion budget
                     # and should be reflected in the per-bucket counters.
                     _dc_rpt = getattr(retry_response, "prompt_tokens", None)
                     if _dc_rpt is None:
-                        _dc_rpt = getattr(retry_response, "tokens_used", 0) or 0
-                    result.prompt_tokens += _dc_rpt
-                    result.completion_tokens += getattr(retry_response, "completion_tokens", None) or 0
-                    result.cache_read_tokens += getattr(retry_response, "cache_read_input_tokens", None) or 0
-                    result.cache_creation_tokens += getattr(retry_response, "cache_creation_input_tokens", None) or 0
+                        _dc_rpt = getattr(retry_response, "tokens_used", 0)
+                    result.prompt_tokens += coerce_token_count(_dc_rpt)
+                    result.completion_tokens += coerce_token_count(getattr(retry_response, "completion_tokens", None))
+                    result.cache_read_tokens += coerce_token_count(
+                        getattr(retry_response, "cache_read_input_tokens", None))
+                    result.cache_creation_tokens += coerce_token_count(
+                        getattr(retry_response, "cache_creation_input_tokens", None))
                     # A successful retry supersedes the final_response — its token
                     # split becomes the authoritative "last call" reading.
-                    result.last_call_prompt_tokens = getattr(retry_response, "prompt_tokens", None) or 0
-                    result.last_call_completion_tokens = getattr(retry_response, "completion_tokens", None) or 0
-                    result.last_call_cache_read_tokens = getattr(retry_response, "cache_read_input_tokens", None) or 0
-                    result.last_call_cache_creation_tokens = getattr(retry_response, "cache_creation_input_tokens", None) or 0
+                    result.last_call_prompt_tokens = coerce_token_count(getattr(retry_response, "prompt_tokens", None))
+                    result.last_call_completion_tokens = coerce_token_count(
+                        getattr(retry_response, "completion_tokens", None))
+                    result.last_call_cache_read_tokens = coerce_token_count(
+                        getattr(retry_response, "cache_read_input_tokens", None))
+                    result.last_call_cache_creation_tokens = coerce_token_count(
+                        getattr(retry_response, "cache_creation_input_tokens", None))
                     _retry_superseded = True
                     # Record the retry-response LLM call to global collector
                     # (parallel with final_response recording at L2059-2066).
@@ -2186,23 +2445,27 @@ class DesignChatLoop:
                     logger.warning("Design chat: retry also failed: %s", retry_e)
 
             result.content = _final_content
-            result.tokens_used += final_response.tokens_used or 0
+            result.tokens_used += coerce_token_count(final_response.tokens_used)
             _dc_pt2 = getattr(final_response, "prompt_tokens", None)
             if _dc_pt2 is None:
-                _dc_pt2 = getattr(final_response, "tokens_used", 0) or 0  # fallback: total when split unavailable
-            result.prompt_tokens += _dc_pt2
-            result.completion_tokens += getattr(final_response, "completion_tokens", None) or 0
-            result.cache_read_tokens += getattr(final_response, "cache_read_input_tokens", None) or 0
-            result.cache_creation_tokens += getattr(final_response, "cache_creation_input_tokens", None) or 0
+                _dc_pt2 = getattr(final_response, "tokens_used", 0)  # fallback: total when split unavailable
+            result.prompt_tokens += coerce_token_count(_dc_pt2)
+            result.completion_tokens += coerce_token_count(getattr(final_response, "completion_tokens", None))
+            result.cache_read_tokens += coerce_token_count(getattr(final_response, "cache_read_input_tokens", None))
+            result.cache_creation_tokens += coerce_token_count(
+                getattr(final_response, "cache_creation_input_tokens", None))
             # Only record final_response's split as "last call" if it was not
             # already superseded by a successful retry above. The retry supersedes
             # final_response because the LLM's final answer was actually drawn
             # from retry_response, so its token split is authoritative.
             if not _retry_superseded:
-                result.last_call_prompt_tokens = getattr(final_response, "prompt_tokens", None) or 0
-                result.last_call_completion_tokens = getattr(final_response, "completion_tokens", None) or 0
-                result.last_call_cache_read_tokens = getattr(final_response, "cache_read_input_tokens", None) or 0
-                result.last_call_cache_creation_tokens = getattr(final_response, "cache_creation_input_tokens", None) or 0
+                result.last_call_prompt_tokens = coerce_token_count(getattr(final_response, "prompt_tokens", None))
+                result.last_call_completion_tokens = coerce_token_count(
+                    getattr(final_response, "completion_tokens", None))
+                result.last_call_cache_read_tokens = coerce_token_count(
+                    getattr(final_response, "cache_read_input_tokens", None))
+                result.last_call_cache_creation_tokens = coerce_token_count(
+                    getattr(final_response, "cache_creation_input_tokens", None))
             if not result.provider:
                 result.provider = getattr(final_response, "provider", "") or ""
         except Exception as e:
@@ -2282,14 +2545,8 @@ class DesignChatLoop:
                 updated = s.get("updated_at", 0)
                 turns = s.get("turn_count", 0)
                 has_summary = s.get("has_summary", False)
-                if created:
-                    created_str = datetime.datetime.fromtimestamp(created).strftime("%Y-%m-%d %H:%M")
-                else:
-                    created_str = "?"
-                if updated:
-                    updated_str = datetime.datetime.fromtimestamp(updated).strftime("%Y-%m-%d %H:%M")
-                else:
-                    updated_str = "?"
+                created_str = datetime.datetime.fromtimestamp(created).strftime("%Y-%m-%d %H:%M") if created else "?"
+                updated_str = datetime.datetime.fromtimestamp(updated).strftime("%Y-%m-%d %H:%M") if updated else "?"
                 summary_mark = " 📋" if has_summary else ""
                 lines.append(
                     f"  session={sid}{summary_mark}\n"
@@ -2310,13 +2567,18 @@ class DesignChatLoop:
 
         # decisions/summary are session-level (not per-turn) — no all-sessions scan needed
 
+        # P27-1: only content/all searches need the on-disk turn archive — decisions/
+        # summary docs live on the session object, so loading the full archive for
+        # them pays a file read + JSON parse for nothing (and grows with session age).
+        _need_archive = _field in ("content", "all")
+
         def _load_archived(sid: str) -> list:
             # Old compressed turns live in <sid>.archive.jsonl — include them so
             # history search still covers the full conversation.
             if hasattr(self._session_mgr, "load_archived_turns"):
                 try:
                     return self._session_mgr.load_archived_turns(sid)
-                except Exception:
+                except (OSError, ValueError, KeyError, TypeError):  # archive read/shape
                     return []
             return []
 
@@ -2325,7 +2587,7 @@ class DesignChatLoop:
         if target_session_id and target_session_id != self.session_id:
             # Cross-session search: load the target session from disk
             session = self._session_mgr.get_or_create(target_session_id)
-            _archived = _load_archived(target_session_id)
+            _archived = _load_archived(target_session_id) if _need_archive else []
             _active = session.turns
             label = f"session '{target_session_id}'"
             if not (_archived or _active) and _field in ("content", "all"):
@@ -2339,7 +2601,7 @@ class DesignChatLoop:
             _local_cut = max(
                 0, session.compressed_up_to - getattr(session, "archived_count", 0)
             )
-            _archived = _load_archived(self.session_id)
+            _archived = _load_archived(self.session_id) if _need_archive else []
             _active = session.turns[:_local_cut] if _local_cut > 0 else []
             label = "current session"
             if not (_archived or _active) and _field in ("content", "all"):
@@ -2361,7 +2623,17 @@ class DesignChatLoop:
         _shared_vcm: Optional[Any] = None
         _shared_vcm_loaded = False
 
-        def _get_shared_vcm() -> Any:
+        def _get_shared_vcm(n_docs: int = 0) -> Any:
+            # Small corpora gain nothing from semantic re-ranking (BM25 already
+            # ranks a handful of docs perfectly) but would force the ~8s cold
+            # embedding-model load via add_document → _ensure_model_loaded.
+            # Gate before touching the VCM singleton.
+            if n_docs < _SEMANTIC_RERANK_MIN_CORPUS:
+                # False sentinel — _SessionSearcher treats this as "BM25-only",
+                # distinct from the None default ("standalone caller, auto-create
+                # a private VCM"). Returning None here would DEFEAT the gate:
+                # the constructor would call _get_session_vcm() itself.
+                return False
             nonlocal _shared_vcm, _shared_vcm_loaded
             if not _shared_vcm_loaded:
                 _shared_vcm_loaded = True
@@ -2384,8 +2656,7 @@ class DesignChatLoop:
         if _field in ("decisions", "summary"):
             docs: list[tuple[Any, str]] = []
             if _field == "decisions":
-                for d in session.decisions:
-                    docs.append(("Decision", d))
+                docs.extend(("Decision", d) for d in session.decisions)
             else:  # summary
                 _summary = session.compressed_summary
                 if not _summary:
@@ -2396,7 +2667,7 @@ class DesignChatLoop:
                 return f"No matches found for '{query}' in {_field} of {label}."
 
             searcher = _SessionSearcher(
-                session_prefix=_session_key, vector_cache=_get_shared_vcm()
+                session_prefix=_session_key, vector_cache=_get_shared_vcm(len(docs))
             )
             searcher.index_docs(docs)
             results = searcher.search(query, top_k=max_results)
@@ -2420,7 +2691,7 @@ class DesignChatLoop:
 
         # ── Per-turn + field search (content / all) ──────────────────────────
         searcher = _SessionSearcher(
-            session_prefix=_session_key, vector_cache=_get_shared_vcm()
+            session_prefix=_session_key, vector_cache=_get_shared_vcm(len(_turns))
         )
         # Cached archived-turn BM25 vectors (skips ~3.9s re-tokenisation on
         # repeat searches of a long archive).  The small active prefix is
@@ -2459,10 +2730,7 @@ class DesignChatLoop:
                     prefix = "▶ " if t == turn_idx else "  "
                     role_label = "user" if turn.get("role") == "user" else "assistant"
                     ts = turn.get("timestamp", "")
-                    if ts:
-                        ts_str = datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
-                    else:
-                        ts_str = ""
+                    ts_str = datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else ""
                     score_str = f" (score={score})" if t == turn_idx else ""
                     content = turn.get("content", "")
                     excerpt = content[:1000].replace("\n", " ")
@@ -2476,7 +2744,7 @@ class DesignChatLoop:
             # Decisions
             if session.decisions:
                 d_searcher = _SessionSearcher(
-                    session_prefix=_session_key, vector_cache=_get_shared_vcm()
+                    session_prefix=_session_key, vector_cache=_get_shared_vcm(len(session.decisions))
                 )
                 d_searcher.index_docs([("Decision", d) for d in session.decisions])
                 d_results = d_searcher.search(query, top_k=min(5, max_results))
@@ -2492,7 +2760,7 @@ class DesignChatLoop:
             _summary = session.compressed_summary
             if _summary:
                 s_searcher = _SessionSearcher(
-                    session_prefix=_session_key, vector_cache=_get_shared_vcm()
+                    session_prefix=_session_key, vector_cache=_get_shared_vcm(1)
                 )
                 s_searcher.index_docs([("Summary", _summary)])
                 s_results = s_searcher.search(query, top_k=min(3, max_results))
@@ -2527,7 +2795,7 @@ class DesignChatLoop:
             try:
                 self._run_store.record_tool_usage("tool_loop", tc.name, success)
             except Exception:
-                pass  # non-critical — never block execution
+                logger.debug("record_tool_usage failed", exc_info=True)
         return tool_result
 
     def _apply_no_effective_progress_gate(
@@ -2561,7 +2829,7 @@ class DesignChatLoop:
             try:
                 metadata.setdefault("failure_class", "no_effective_change")
             except (AttributeError, TypeError):
-                pass
+                logger.debug("metadata.setdefault failed — gate bypassed")
             return False
         return ok
 
@@ -2598,7 +2866,7 @@ class DesignChatLoop:
                         "status": "running",
                     })
                 except Exception:
-                    pass  # non-critical — never block execution
+                    logger.debug("save_insight running event failed", exc_info=True)
             try:
                 _saved = _save_insight_to_file(
                     repo_root=self.registry.repo_root,
@@ -2617,14 +2885,15 @@ class DesignChatLoop:
                             "preview": f"💡 Insight saved: {_insight[:80]}...",
                         })
                     except Exception:
-                        pass  # non-critical — never block execution
-                return _saved
+                        logger.debug("save_insight complete event failed", exc_info=True)
             except Exception as e:
                 logger.warning("save_insight failed: %s", e)
                 with self._result_lock:
                     result.tool_calls_made.append({"tool": tc.name, "args": tc.args, "result_length": 0})
                     result.tool_results.append({"tool": tc.name, "args": tc.args, "content": "", "ok": False})
                 return f"Error saving insight: {e}"
+            else:
+                return _saved
 
         # delete_insight: remove an entry from .asicode/design_insights.md
         if tc.name == "delete_insight":
@@ -2642,7 +2911,7 @@ class DesignChatLoop:
                         "status": "running",
                     })
                 except Exception:
-                    pass
+                    logger.debug("delete_insight running event failed", exc_info=True)
             try:
                 _result = _delete_insight(
                     repo_root=self.registry.repo_root,
@@ -2661,14 +2930,15 @@ class DesignChatLoop:
                             "preview": _result[:120],
                         })
                     except Exception:
-                        pass
-                return _result
+                        logger.debug("delete_insight complete event failed", exc_info=True)
             except Exception as e:
                 logger.warning("delete_insight failed: %s", e)
                 with self._result_lock:
                     result.tool_calls_made.append({"tool": tc.name, "args": tc.args, "result_length": 0})
                     result.tool_results.append({"tool": tc.name, "args": tc.args, "content": "", "ok": False})
                 return f"Error deleting insight: {e}"
+            else:
+                return _result
 
         # edit_insight: replace an entry's body in .asicode/design_insights.md
         if tc.name == "edit_insight":
@@ -2693,7 +2963,7 @@ class DesignChatLoop:
                         "status": "running",
                     })
                 except Exception:
-                    pass
+                    logger.debug("edit_insight running event failed", exc_info=True)
             try:
                 _result = _edit_insight(
                     repo_root=self.registry.repo_root,
@@ -2714,14 +2984,15 @@ class DesignChatLoop:
                             "preview": _result[:120],
                         })
                     except Exception:
-                        pass
-                return _result
+                        logger.debug("edit_insight complete event failed", exc_info=True)
             except Exception as e:
                 logger.warning("edit_insight failed: %s", e)
                 with self._result_lock:
                     result.tool_calls_made.append({"tool": tc.name, "args": tc.args, "result_length": 0})
                     result.tool_results.append({"tool": tc.name, "args": tc.args, "content": "", "ok": False})
                 return f"Error editing insight: {e}"
+            else:
+                return _result
 
         # search_design_history: keyword search over old (compressed) turns
         if tc.name == "search_design_history":
@@ -2742,7 +3013,7 @@ class DesignChatLoop:
                         "status": "running",
                     })
                 except Exception:
-                    pass  # non-critical — never block execution
+                    logger.debug("search_design_history running event failed", exc_info=True)
             # Coerce max_results defensively: a text-mode model may emit a
             # non-numeric / non-scalar value. Clamp to a sane range and keep
             # this a recoverable tool error rather than aborting the turn.
@@ -2768,11 +3039,10 @@ class DesignChatLoop:
                             "preview": _result.split("\n")[0] if _result and not _result.startswith("No") and not _result.startswith("Error") else _result[:120],
                         })
                     except Exception:
-                        pass  # non-critical — never block execution
+                        logger.debug("search_design_history complete event failed", exc_info=True)
                 with self._result_lock:
                     result.tool_calls_made.append({"tool": tc.name, "args": tc.args, "result_length": len(_result)})
                     result.tool_results.append({"tool": tc.name, "args": tc.args, "content": _result, "ok": True})
-                return _result
             except Exception as e:
                 logger.warning("search_design_history failed: %s", e)
                 _err_msg = f"Error searching design history: {e}"
@@ -2785,11 +3055,13 @@ class DesignChatLoop:
                             "preview": _err_msg,
                         })
                     except Exception:
-                        pass  # non-critical — never block execution
+                        logger.debug("search_design_history error event failed", exc_info=True)
                 with self._result_lock:
                     result.tool_calls_made.append({"tool": tc.name, "args": tc.args, "result_length": 0})
                     result.tool_results.append({"tool": tc.name, "args": tc.args, "content": _err_msg, "ok": False})
                 return _err_msg
+            else:
+                return _result
 
         # ── Execute tool ──
         _tool_start = time.monotonic()
@@ -2801,7 +3073,7 @@ class DesignChatLoop:
             try:
                 stream_callback("design_tool_call", {"call_id": tc.call_id, "tool": tc.name, "args": _display_args, "status": "running"})
             except Exception:
-                pass  # non-critical — never block execution
+                logger.debug("design_tool_call running event failed", exc_info=True)
 
         # Pre-write snapshot for a deterministic post-edit diff summary.
         # Directly targets NO_EFFECTIVE_PROGRESS: surface whether a write tool
@@ -2826,28 +3098,36 @@ class DesignChatLoop:
             ok = False
             _dispatch_exc = e
 
-        # ── Persist failed write-tool invocations for post-hoc analysis ──
+        # ── Persist write-tool outcomes for post-hoc analysis ──
         # Captures (tool, failure_class, file_path, args_summary, error) to
         # ~/.asicode/learning/write_tool_failures.jsonl so we can answer
         # "which tools fail, in which failure_class, against what file/args".
-        # Success of a complete write tool is a no-op inside the helper.
-        if tc.name in self.registry._WRITE_TOOLS and not ok:
+        # Success of a complete write tool is a no-op inside the helper; the
+        # call also settles/fires the suggestion-hit tracker on every
+        # write-tool result (success settles a pending marker as "helped").
+        if tc.name in self.registry._WRITE_TOOLS:
             try:
                 from .tool_failure_log import (
                     record_write_tool_failure,
                     record_write_tool_failure_from_tr,
                 )
                 _repo_root = getattr(self.registry, "repo_root", None)
+                # Per-turn key (same identity the recall settle/arm below uses,
+                # stamped once per respond() via new_session_key()): retries
+                # within one turn share the key, a new turn re-arms.
+                _session_key = result.recall_session_key
                 if tr is not None:
                     record_write_tool_failure_from_tr(
                         tool=tc.name, tr=tr, args=tc.args,
                         model=self.model, repo_root=_repo_root,
+                        session_key=_session_key,
                     )
                 else:
                     record_write_tool_failure(
                         tool=tc.name, ok=False,
                         error=tool_result, metadata=None,
                         args=tc.args, model=self.model, repo_root=_repo_root,
+                        session_key=_session_key,
                     )
             except Exception:
                 logger.debug("tool_failure_log: record failed", exc_info=True)
@@ -2858,7 +3138,7 @@ class DesignChatLoop:
         # so the two never tangle.
         try:
             from .failure_pattern_store import record_recall_outcome
-            record_recall_outcome(ok=ok, session_key=str(id(result)))
+            record_recall_outcome(ok=ok, session_key=_session_key)
         except Exception:
             logger.debug("recall_outcome settle error", exc_info=True)
 
@@ -2879,10 +3159,10 @@ class DesignChatLoop:
                     tc.name, tc.args, tr,
                     getattr(self.registry, "repo_root", None),
                     exc=_dispatch_exc,
-                    # result is a fresh DesignChatResult per respond() call →
-                    # id() is a stable per-turn key: retries within one turn are
-                    # deduped, a new turn re-records & re-hints.
-                    session_key=str(id(result)),
+                    # Per-turn key (new_session_key() stamped on the result at
+                    # respond() entry): retries within one turn are deduped, a
+                    # new turn re-records & re-hints.
+                    session_key=_session_key,
                 )
                 if _recall_hint:
                     tool_result = f"{tool_result}\n\n{_recall_hint}"
@@ -2917,7 +3197,7 @@ class DesignChatLoop:
                 if _vw:
                     tool_result = f"{tool_result}\n\n[⚠️ VERIFY WARNING]\n{_vw}"
             except (AttributeError, TypeError):
-                pass
+                logger.debug("verify_warning metadata read failed")
 
             # Phase 1 — semantic lint F-code findings (soft signal, no rollback)
             if self._asr_semantic_lint:
@@ -2936,7 +3216,7 @@ class DesignChatLoop:
                 if _ar > 0:
                     tool_result = f"{tool_result}\n\n[AUTO-REPAIR] {_ar} semantic finding(s) auto-fixed"
             except (AttributeError, TypeError):
-                pass
+                logger.debug("semantic_repaired metadata read failed")
 
         if stream_callback:
             # Tool-specific preview limits: test/lint results need more room
@@ -2963,7 +3243,7 @@ class DesignChatLoop:
                         extra["plan"] = _md["plan"]
                         extra["plan_prev"] = _md.get("prev_statuses")
                 except (AttributeError, TypeError):
-                    pass
+                    logger.debug("plan metadata read failed")
             try:
                 stream_callback("design_tool_call", {
                     "call_id": tc.call_id,
@@ -2971,7 +3251,7 @@ class DesignChatLoop:
                     "preview": preview, **extra,
                 })
             except Exception:
-                pass  # non-critical — never block execution
+                logger.debug("design_tool_call complete event failed", exc_info=True)
 
         with self._result_lock:
             result.tool_calls_made.append({"tool": tc.name, "args": tc.args, "result_length": len(tool_result)})

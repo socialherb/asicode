@@ -36,6 +36,7 @@ def _run(cmd, env=None):
         _apply_shell_shims(cmd),
         shell=True, executable=_BASH,
         capture_output=True, text=True, env=env,
+        check=False,
     )
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
 
@@ -54,6 +55,7 @@ def test_prelude_alone_is_silent():
     p = subprocess.run(
         _SHELL_SHIM_PRELUDE, shell=True, executable=_BASH,
         capture_output=True, text=True,
+        check=False,
     )
     assert p.stdout == "" and p.stderr == ""
 
@@ -96,6 +98,79 @@ def test_missing_command():
 def test_pipe_and_redirection_preserved():
     # The gradlew-shaped pattern: timeout N CMD 2>&1 | tail -1
     rc, out, _ = _run("timeout 2 bash -c 'echo line1; echo line2' 2>&1 | tail -1")
+    assert rc == 0
+    assert out == "line2"
+
+
+# ── (2b) GNU option forms — the duration is NOT always "$1" ──────────────────
+#
+# The shim used to bind dur="$1" unconditionally, so every option form shifted
+# the real duration into the command slot: `timeout -k 2 5 echo hi` ran `2 5
+# echo hi` and returned 127 with the command never executed. That is the silent
+# -failure-in-a-pipeline hazard the whole prelude exists to prevent, because
+# `timeout -k 5 300 pytest ... | tail -20` then yields an empty tail that the
+# agent reads as a pass. Every shape below is one an LLM emits routinely; they
+# hold for real GNU coreutils too, so this table is not shim-only.
+
+@pytest.mark.slow
+@pytest.mark.parametrize("invocation", [
+    "timeout -k 2 5 echo hi",
+    "timeout -k2 5 echo hi",
+    "timeout --kill-after=2 5 echo hi",
+    "timeout -s KILL 5 echo hi",
+    "timeout -s TERM 5 echo hi",
+    "timeout --signal=KILL 5 echo hi",
+    "timeout --preserve-status 5 echo hi",
+    "timeout --foreground 5 echo hi",
+    "timeout -k 2 -s KILL 5 echo hi",
+    "timeout 5s echo hi",  # GNU duration suffix, no option
+])
+def test_option_forms_still_run_the_command(invocation):
+    rc, out, err = _run(invocation)
+    assert out == "hi", f"{invocation!r} did not run the command (stderr: {err!r})"
+    assert rc == 0, f"{invocation!r} → rc={rc}"
+
+
+@pytest.mark.slow
+def test_option_forms_still_time_out():
+    """An option prefix must not cost the 124 verdict."""
+    rc, _, _ = _run("timeout -k 1 1 sleep 5")
+    assert rc == 124
+
+
+@pytest.mark.slow
+def test_kill_after_escalates_to_sigkill():
+    """`-k` is honoured, not merely parsed and dropped.
+
+    The child traps TERM and keeps running, so only the KILL escalation can end
+    it. Without `-k` handling this hangs until the outer test timeout; with it,
+    the run ends promptly and still reports 124.
+
+    Promptness is asserted, not just assumed: the escalation must take the
+    whole process GROUP down (`set -m` + `kill -- -pid`), so the wrapper's
+    children die with it. A pid-only kill orphans the child's `sleep`, which
+    keeps the caller's pipes open until it finishes on its own — measured as a
+    2 s timeout turning into a 31 s hang, invisible to the rc assertion alone.
+    """
+    import time as _time
+
+    _start = _time.monotonic()
+    rc, _, _ = _run(
+        "timeout -k 1 1 bash -c 'trap \"\" TERM; sleep 30'"
+    )
+    _elapsed = _time.monotonic() - _start
+    assert rc == 124
+    # 1 s TERM grace + 1 s KILL grace + reap slack; the pre-fix orphan held the
+    # pipes for the full 30 s of its own lifetime.
+    assert _elapsed < 5, f"run dragged on for {_elapsed:.1f}s (group kill failed?)"
+
+
+@pytest.mark.slow
+def test_option_forms_survive_a_pipeline():
+    """The regression's real-world shape: an option form heading a pipeline."""
+    rc, out, _ = _run(
+        "timeout -k 2 5 bash -c 'echo line1; echo line2' 2>&1 | tail -1"
+    )
     assert rc == 0
     assert out == "line2"
 
@@ -209,9 +284,12 @@ def _widened_prelude() -> str:
     """The shipped shim, with the watchdog left alive past its own kill."""
     from external_llm.agent.tool_handlers.git_tools import _SHELL_SHIM_PRELUDE
 
+    # Anchored on the watchdog subshell's closing line rather than on the kill
+    # itself: the kill is now followed by the optional `-k` escalation block, so
+    # "one beat past its kill" means one beat past the whole subshell body.
     widened = _SHELL_SHIM_PRELUDE.replace(
-        'kill -TERM "$pid" 2>/dev/null ) &',
-        'kill -TERM "$pid" 2>/dev/null; sleep 0.3 ) &',
+        "      fi ) &",
+        "      fi; sleep 0.3 ) &",
     )
     assert widened != _SHELL_SHIM_PRELUDE, (
         "the watchdog line moved — update this test's widening patch, do not "
@@ -225,6 +303,7 @@ def test_timeout_reports_124_even_when_the_watchdog_outlives_its_kill(name):
     rc = subprocess.run(
         _widened_prelude() + f"\n{name} 1 sleep 5",
         shell=True, executable=_BASH, capture_output=True, text=True,
+        check=False,
     ).returncode
     assert rc == 124, (
         f"{name} returned {rc} (143 = SIGTERM leaked through) — the timeout "

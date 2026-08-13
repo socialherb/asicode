@@ -36,6 +36,40 @@ pip install 'asicode[all] @ git+https://github.com/socialherb/asicode.git'
 asi
 ```
 
+## Web UI
+
+asicode also ships a local web UI — dashboard, agent panel and conversational
+design chat — served by FastAPI/uvicorn (bundled with the install):
+
+```bash
+uvicorn webapp.main:app --host 127.0.0.1 --port 8000
+# then open http://127.0.0.1:8000/
+```
+
+By default only `127.0.0.1`, `localhost` and `::1` Host headers are accepted —
+this is the DNS-rebinding defense, and it means a LAN/reverse-proxy deployment
+gets 403s until the hostnames your browser will actually use are allowlisted.
+Extend the list via `ASICODE_ALLOWED_HOSTS` (comma- or space-separated):
+
+```bash
+ASICODE_ALLOWED_HOSTS=192.168.0.10,myhost.local uvicorn webapp.main:app --host 0.0.0.0 --port 8000
+```
+
+Disallowed hosts are logged server-side with a pointer to `ASICODE_ALLOWED_HOSTS`,
+so the 403 is self-explanatory.
+
+The agent panel runs autonomous agent tasks on a shared worker pool. The pool
+size is 10 by default; tune it via `ASICODE_AGENT_MAX_WORKERS` (values below 1
+or non-numeric values fall back to the default):
+
+```bash
+ASICODE_AGENT_MAX_WORKERS=4 uvicorn webapp.main:app --port 8000
+```
+
+When all workers are busy, a queued run shows a "워커 대기 중" chip — including
+how many busy workers are parked on an approval/ask_user gate (`blocked_on_gate`),
+i.e. runs whose cards you can answer to free a slot immediately.
+
 ## Installation Options
 
 ```bash

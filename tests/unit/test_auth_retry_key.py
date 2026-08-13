@@ -11,6 +11,14 @@ from __future__ import annotations
 import asi
 
 
+def _bomb_dotenv(*_a, **_k):
+    """Fail loudly if a test reaches the real .env writer."""
+    raise AssertionError(
+        "_save_key_to_dotenv reached from a test — this writes the developer's "
+        "real .env (it clobbered DEEPSEEK_API_KEY for months). Stub it."
+    )
+
+
 class _FakeSvc:
     """Minimal stand-in for ExternalLLMService — only ``.model`` is read."""
 
@@ -51,6 +59,8 @@ class TestAuthRetryDetectsUnsupportedModel:
         # Stub create_llm_client so no network call happens.
         import external_llm.client as _client
         monkeypatch.setattr(_client, "create_llm_client", lambda **kw: object())
+        monkeypatch.setattr(asi, "_save_key_to_dotenv", _bomb_dotenv)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "placeholder")
         svc = _FakeSvc(model="deepseek-chat")
 
         result = asi._prompt_auth_retry_key(
@@ -60,6 +70,67 @@ class TestAuthRetryDetectsUnsupportedModel:
 
         assert result is True
         assert svc.llm_service.client is not None
+
+
+class TestUnverifiedKeyIsNeverPersisted:
+    """The prompt must not write to .env until a live call accepts the key.
+
+    This is a real-damage regression: ``create_llm_client`` only constructs an
+    object, so ANY non-empty string "succeeded" and was written straight into
+    the developer's ``.env``. This very test file used to drive that path with
+    ``sk-newkey`` and silently clobbered the real DEEPSEEK_API_KEY on every
+    ``pytest`` run.
+    """
+
+    def test_prompt_alone_does_not_touch_dotenv(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda *_: "sk-unverified")
+        import external_llm.client as _client
+        monkeypatch.setattr(_client, "create_llm_client", lambda **kw: object())
+        monkeypatch.setattr(asi, "_save_key_to_dotenv", _bomb_dotenv)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "placeholder")
+
+        assert asi._prompt_auth_retry_key("deepseek", _FakeSvc(model="deepseek-chat")) is True
+        # _bomb_dotenv would have exploded — reaching here IS the assertion.
+
+    def test_commit_persists_only_after_verification(self, monkeypatch):
+        saved: list[tuple] = []
+        monkeypatch.setattr("builtins.input", lambda *_: "sk-verified")
+        import external_llm.client as _client
+        monkeypatch.setattr(_client, "create_llm_client", lambda **kw: object())
+        monkeypatch.setattr(asi, "_save_key_to_dotenv",
+                            lambda root, k, v: saved.append((k, v)))
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "placeholder")
+
+        asi._prompt_auth_retry_key("deepseek", _FakeSvc(model="deepseek-chat"))
+        assert saved == [], "must not persist before the retry proves the key"
+
+        asi._commit_verified_api_key()
+        assert saved == [("DEEPSEEK_API_KEY", "sk-verified")]
+
+    def test_commit_is_a_noop_without_a_pending_key(self, monkeypatch):
+        asi._PENDING_API_KEY.clear()
+        monkeypatch.setattr(asi, "_save_key_to_dotenv", _bomb_dotenv)
+        asi._commit_verified_api_key()   # skipped prompt / failed retry
+
+    def test_skipped_prompt_leaves_nothing_pending(self, monkeypatch):
+        asi._PENDING_API_KEY.clear()
+        monkeypatch.setattr("builtins.input", lambda *_: "")
+        assert asi._prompt_auth_retry_key("deepseek", _FakeSvc()) is False
+        assert asi._PENDING_API_KEY == {}
+
+    def test_shell_export_shadowing_is_reported(self, monkeypatch):
+        """A .env write is inert while the shell exports the same key — say so."""
+        warned: list[str] = []
+        monkeypatch.setattr("builtins.input", lambda *_: "sk-verified")
+        import external_llm.client as _client
+        monkeypatch.setattr(_client, "create_llm_client", lambda **kw: object())
+        monkeypatch.setattr(asi, "_save_key_to_dotenv", lambda *a: None)
+        monkeypatch.setattr(asi, "_print", lambda msg, *a, **k: warned.append(msg))
+        monkeypatch.setattr(asi, "_SHELL_PROVIDED_ENV_KEYS", {"DEEPSEEK_API_KEY"})
+
+        asi._prompt_auth_retry_key("deepseek", _FakeSvc(model="deepseek-chat"))
+        asi._commit_verified_api_key()
+        assert any("overrides .env" in m for m in warned), warned
 
     def test_empty_error_message_falls_through_to_key_prompt(self, monkeypatch):
         # No error_message supplied (legacy call sites) → behave like a real

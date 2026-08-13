@@ -55,7 +55,7 @@ def test_codes_none_matches_any_noqa():
 # ─── the two verification-caught regressions ─────────────────────────────────
 
 def test_bare_noqa_suppresses_every_code():
-    # flake8 semantics: "# noqa" with no code list suppresses everything.
+    # flake8 semantics: a directive with no code list suppresses everything.
     assert _has_noqa_comment("import os  # noqa", {"F401"})
     assert _has_noqa_comment("import os  # noqa", {"F841"})
 

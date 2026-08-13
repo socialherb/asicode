@@ -1,6 +1,10 @@
 """Tests for the per-repo persistent failure-pattern store."""
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import threading
 import time
 import types
 
@@ -8,16 +12,17 @@ import pytest
 
 from external_llm.agent.failure_classifier import RecoveryAction
 from external_llm.agent.failure_pattern_store import (
-    FailurePatternStore,
-    get_store,
-    recall_on_failure,
-    record_recall_outcome,
-    get_recall_counts,
-    reset_recall_counts,
-    reset_recall_session,
-    _decay_weight,
     _FLUSH_INTERVAL,
     _MAX_PATHS,
+    FailurePatternStore,
+    _decay_weight,
+    get_recall_counts,
+    get_store,
+    new_session_key,
+    recall_on_failure,
+    record_recall_outcome,
+    reset_recall_counts,
+    reset_recall_session,
 )
 
 
@@ -163,6 +168,40 @@ def test_recall_on_failure_rehints_in_new_run_at_threshold(tmp_path):
     assert store.effective_count("apply_patch", "patch context mismatch") == 4
 
 
+# ── session-key generation (P0-1 regression) ────────────────────────────────
+
+
+def test_new_session_key_unique_per_call():
+    """Regression: keys must never collide across runs in one process.  The old
+    ``str(id(ctx.fail_streak))`` scheme reused freed object addresses, so
+    sequential runs produced the SAME key and the dedup map silenced recall
+    for the whole process lifetime."""
+    keys = [new_session_key() for _ in range(200)]
+    assert len(set(keys)) == 200  # all distinct
+    # pid-prefixed: distinct processes (webapp + CLI + parallel agents) can
+    # never collide either.
+    assert all(k.startswith(f"{os.getpid()}-") for k in keys)
+
+
+def test_recall_runs_driven_by_new_session_key(tmp_path):
+    """Behavioral contract: a fresh key per run (as the pipelines generate at
+    run/turn entry) re-records each run; the same key within a run dedups.
+    This is the caller contract for agent_turn_pipeline / design_chat_loop."""
+    reset_recall_session()
+    result = _mk_result(FileNotFoundError("nope"))
+    run1, run2, run3 = new_session_key(), new_session_key(), new_session_key()
+    assert run1 != run2 != run3
+    # Three sequential runs, each failing once → three observations; the third
+    # crosses the threshold and fires the hint (per-run scoping preserved).
+    assert recall_on_failure("read_file", {}, result, tmp_path, session_key=run1) == ""
+    assert recall_on_failure("read_file", {}, result, tmp_path, session_key=run2) == ""
+    assert recall_on_failure("read_file", {}, result, tmp_path, session_key=run3).startswith("[RECALL]")
+    assert get_store(tmp_path).effective_count("read_file", "file missing") == 3
+    # A retry within run3 is deduped (same key) — no fourth observation.
+    assert recall_on_failure("read_file", {}, result, tmp_path, session_key=run3) == ""
+    assert get_store(tmp_path).effective_count("read_file", "file missing") == 3
+
+
 def test_recall_on_failure_dedup_scoped_per_repo(tmp_path, tmp_path_factory):
     reset_recall_session()
     other_repo = tmp_path_factory.mktemp("other_repo")
@@ -180,6 +219,21 @@ def test_recall_on_failure_skips_non_recallable_reason(tmp_path):
     # which is in _NON_RECALLABLE_REASONS → not recorded, no hint.
     assert recall_on_failure("read_file", {}, _mk_result(RuntimeError("zzz")), tmp_path) == ""
     assert get_store(tmp_path).effective_count("read_file", "generic failure") == 0
+
+
+def test_recall_on_failure_missing_arg_reason_is_recallable(tmp_path):
+    """'is required' → FIX_ARGS / "missing required argument": a specific,
+    recallable reason — recorded like any other, and the hint carries the
+    FIX_ARGS advice (unlike "generic failure", which is excluded)."""
+    reset_recall_session()
+    result = _mk_result("'code' is required")
+    assert recall_on_failure("modify_symbol", {}, result, tmp_path, session_key="A") == ""
+    assert recall_on_failure("modify_symbol", {}, result, tmp_path, session_key="B") == ""
+    hint = recall_on_failure("modify_symbol", {}, result, tmp_path, session_key="C")
+    assert hint.startswith("[RECALL]")
+    assert "missing required argument" in hint
+    assert "missing argument(s) supplied" in hint
+    assert get_store(tmp_path).effective_count("modify_symbol", "missing required argument") == 3
 
 
 def test_recall_on_failure_classifies_raised_exception(tmp_path):
@@ -506,10 +560,78 @@ def test_drop_index_with_pending_does_not_lose_pending(store):
     )
 
 
+# ── prune ─────────────────────────────────────────────────────────────────────
+# prune() is exposed via the REPL (/failure-patterns prune) but had no direct
+# unit tests — only the save-time auto-prune path was covered.
+
+def test_prune_removes_below_threshold_only(store):
+    for _ in range(3):
+        store.record("t1", "r1")  # effective 3
+    store.record("t2", "r2")  # effective 1
+    assert store.prune(threshold=2.0) == 1
+    assert store.effective_count("t1", "r1") == 3
+    assert store.effective_count("t2", "r2") == 0
+
+
+def test_prune_singleton_dropped_at_default_threshold(store):
+    """A count-1 pattern is pruned by the default threshold 1.0.
+
+    Continuous decay makes any finite-age effective score strictly below the
+    raw count (age > 0 → weight < 1), so a fresh singleton's effective score
+    is ~0.9999 < 1.0 and is dropped — matching the documented "effective
+    score below threshold" semantics.
+    """
+    store.record("t1", "r1")
+    assert store.prune(threshold=1.0) == 1
+    assert store.effective_count("t1", "r1") == 0
+
+
+def test_prune_zero_threshold_is_noop(store):
+    store.record("t1", "r1")
+    assert store.prune(threshold=0.0) == 0
+    assert store.effective_count("t1", "r1") == 1
+
+
+def test_prune_persists_across_instances(tmp_path):
+    s1 = FailurePatternStore(tmp_path)
+    s1.record("t1", "r1")
+    s1.record("t1", "r1")
+    s1.record("t2", "r2")
+    s1.flush()
+    s2 = FailurePatternStore(tmp_path)
+    assert s2.prune(threshold=1.0) == 1  # t2 (count 1) dropped, t1 (count 2) kept
+    s3 = FailurePatternStore(tmp_path)
+    assert s3.effective_count("t1", "r1") == 2
+    assert s3.effective_count("t2", "r2") == 0
+
+
+def test_prune_flushes_pending_before_discard(tmp_path):
+    """Pending (unflushed) records must be persisted before prune discards the cache."""
+    s = FailurePatternStore(tmp_path)
+    s.record("t1", "r1")
+    s.record("t1", "r1")
+    s.record("t2", "r2")  # below _FLUSH_INTERVAL → still dirty
+    assert s._dirty_count > 0
+    assert s.prune(threshold=1.0) == 1  # t2 dropped; t1 kept
+    s2 = FailurePatternStore(tmp_path)
+    assert s2.effective_count("t1", "r1") == 2  # pending record survived prune
+    assert s2.effective_count("t2", "r2") == 0
+
+
+def test_prune_all_empties_store_and_disk(tmp_path):
+    s = FailurePatternStore(tmp_path)
+    s.record("t1", "r1")
+    s.flush()
+    assert s.prune(threshold=10.0) == 1
+    assert s.store_size() == 0
+    s2 = FailurePatternStore(tmp_path)
+    assert s2.store_size() == 0
+
+
 # ── count inflation regression ───────────────────────────────────────────────
 # _save() previously set baseline to pre-write disk_data instead of post-write
 # merged, causing the delta-merge to double-count across successive flushes.
-# E.g. 23 observations → persisted 53 (2.3× inflation).
+# E.g. 23 observations → persisted 53 (2.3x inflation).
 
 
 def test_count_does_not_inflate_across_flush_boundaries(tmp_path):
@@ -611,6 +733,40 @@ def test_count_not_inflated_by_repeated_recall(tmp_path):
     assert c <= 2, f"count inflated to {c} by repeated recall_for"
 
 
+def test_recall_for_drops_stale_cache_after_remote_clear(tmp_path):
+    """Regression: a remote clear() must stop recall hints in this process.
+
+    Before the fix, recall_for's TTL refresh skipped the merge when the disk
+    store was EMPTY (``if disk_data:``), so the stale in-memory cache kept
+    firing [RECALL] hints for patterns another process had cleared — forever,
+    not just within the TTL window.
+    """
+    a = FailurePatternStore(tmp_path)
+    for _ in range(3):
+        a.record("apply_patch", "patch context mismatch")
+    a.flush()
+
+    b = FailurePatternStore(tmp_path)
+    assert "RECALL" in b.recall_for("apply_patch", "patch context mismatch")
+
+    a.clear()  # disk now holds an empty patterns dict
+    b._last_read_ts = 0.0  # force the TTL refresh path (b's cache is stale)
+    assert b.recall_for("apply_patch", "patch context mismatch") == ""
+
+
+def test_recall_for_keeps_pending_records_when_disk_empty(tmp_path):
+    """Empty-disk refresh must NOT discard our own unflushed observations."""
+    s = FailurePatternStore(tmp_path)
+    s.record("tool", "reason")  # dirty, below _FLUSH_INTERVAL
+    assert s._dirty_count > 0
+    s._last_read_ts = 0.0
+    hint = s.recall_for("tool", "reason", min_count=1)
+    assert "RECALL" in hint
+    s.flush()
+    s2 = FailurePatternStore(tmp_path)
+    assert s2.effective_count("tool", "reason") == 1
+
+
 def test_recall_ttl_ignores_wallclock_backward_jump(tmp_path, monkeypatch):
     """Regression: recall_for TTL must compare in time.monotonic(), not time.time().
 
@@ -659,7 +815,9 @@ def test_decay_not_lost_by_delta_merge(tmp_path):
     disk_c + 0 when mem_c < bl_c (decay reduced the count), silently
     losing the decay and writing the pre-decay disk count back.
     """
-    import time, json
+    import json
+    import time
+
     from external_llm.agent.failure_pattern_store import FailurePatternStore
 
     now = time.time()
@@ -705,6 +863,7 @@ def test_cross_process_decay_preserves_other_process_increments(tmp_path):
     not 4 (which would lose the other process's +3).
     """
     import time
+
     from external_llm.agent.failure_pattern_store import FailurePatternStore
 
     s = FailurePatternStore(tmp_path)
@@ -738,6 +897,7 @@ def test_cross_process_decay_single_process_unchanged(tmp_path):
     as the original ``merged_count = mem_c``.
     """
     import time
+
     from external_llm.agent.failure_pattern_store import FailurePatternStore
 
     s = FailurePatternStore(tmp_path)
@@ -759,6 +919,74 @@ def test_cross_process_decay_single_process_unchanged(tmp_path):
     merged_count = merged["tool::reason"]["count"]
     assert merged_count == 4, (
         f"single-process: expected 4 (decayed count preserved), got {merged_count}"
+    )
+
+
+# ── cross-process write serialisation (regression: B-3) ─────────────────────
+def test_flush_blocks_while_store_lock_held(tmp_path):
+    """``_save`` must acquire the cross-process lock: while the test thread
+    holds it, a flush cannot complete until the lock is released.
+
+    Pre-fix there was no cross-process lock (only the in-process
+    ``self._lock``, which does not span processes), so two processes could
+    interleave read → merge → rename and the second rename silently dropped
+    the first process's increments.
+    """
+    from external_llm.common.file_lock import cross_process_flock
+
+    store = FailurePatternStore(tmp_path)
+    store.record("apply_patch", "context mismatch")  # _dirty_count > 0
+    done = threading.Event()
+
+    def flusher() -> None:
+        store.flush()
+        done.set()
+
+    lock_path = tmp_path / ".asicode" / "failure_patterns.json.lock"
+    with cross_process_flock(lock_path):
+        t = threading.Thread(target=flusher)
+        t.start()
+        # While we hold the lock, the flush must not finish.
+        finished = done.wait(timeout=0.4)
+        assert not finished, "flush completed while lock held — lock not acquired"
+    t.join(timeout=10)
+    assert done.is_set(), "flush did not complete after lock release"
+    # The flush actually persisted to disk after the lock was released.
+    s2 = FailurePatternStore(tmp_path)
+    assert s2.effective_count("apply_patch", "context mismatch") == 1
+
+
+def test_concurrent_processes_same_key_no_lost_updates(tmp_path):
+    """Two real processes recording the same key concurrently must not lose
+    increments.
+
+    Regression for the pre-fix read→merge→rename race: process A reads a disk
+    snapshot, process B reads the same snapshot and renames first, then A's
+    rename clobbers B's increments.  The in-process per-path thread lock is
+    shared by instances in the same process, so an in-thread test cannot
+    reproduce the race — this uses real subprocesses (each with its own
+    thread lock), like the parallel CLI session + webapp deployment.
+    """
+    n = 60
+    repo = str(tmp_path)
+    script = (
+        "from external_llm.agent.failure_pattern_store import FailurePatternStore\n"
+        f"s = FailurePatternStore({repo!r})\n"
+        "for _ in range(%d):\n"
+        "    s.record('stress_tool', 'boom')\n"
+        "s.flush()\n"
+    ) % n
+    procs = [
+        subprocess.Popen([sys.executable, "-c", script]) for _ in range(2)
+    ]
+    for p in procs:
+        assert p.wait(timeout=60) == 0, "recorder subprocess failed"
+
+    final = FailurePatternStore(tmp_path)
+    count = final.effective_count("stress_tool", "boom")
+    assert count == 2 * n, (
+        f"expected exactly {2 * n} observations, got {count} — "
+        f"lost-update race still present (pre-fix: rename clobbers increments)"
     )
 
 

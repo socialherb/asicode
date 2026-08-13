@@ -71,7 +71,7 @@ def _has_noqa_comment(line_text: str, codes: set[str] | None = None) -> bool:
         return True
     codes_part = rest[4:].lstrip()  # after "noqa"
     if not codes_part.startswith(":"):
-        return True  # bare "# noqa" suppresses every code (flake8 semantics)
+        return True  # bare marker (no codes) suppresses every code (flake8 semantics)
     found: set[str] = set()
     for chunk in codes_part[1:].split(","):
         words = chunk.split()
@@ -136,9 +136,8 @@ def _extract_all_names(tree: ast.Module) -> set:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             if node.targets[0].id == "__all__":
                 value = node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            if node.target.id == "__all__":
-                value = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "__all__":
+            value = node.value
         if value is None:
             continue
         for n in ast.walk(value):
@@ -155,9 +154,7 @@ def _is_type_checking_test(test: ast.expr) -> bool:
     """True for ``TYPE_CHECKING`` or ``typing.TYPE_CHECKING`` conditions."""
     if isinstance(test, ast.Name) and test.id == "TYPE_CHECKING":
         return True
-    if isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING":
-        return True
-    return False
+    return bool(isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING")
 
 
 def _collect_type_checking_ranges(tree: ast.Module) -> list[tuple[int, int]]:
@@ -184,10 +181,7 @@ def _import_block_has_noqa(
     line (the alias line) rather than the ``from`` or ``import`` line.
     """
     end = end_lineno or start_lineno
-    for ln in range(start_lineno, min(end, len(lines)) + 1):
-        if _has_noqa_comment(lines[ln - 1], codes):
-            return True
-    return False
+    return any(_has_noqa_comment(lines[ln - 1], codes) for ln in range(start_lineno, min(end, len(lines)) + 1))
 
 
 def _collect_import_info(tree: ast.Module, lines: list[str]) -> list:

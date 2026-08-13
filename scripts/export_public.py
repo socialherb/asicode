@@ -5,13 +5,10 @@ The private repo is the single source of truth; the public GitHub repo is a
 filtered subset with fresh history. This script materializes that subset.
 
 Excluded from the public snapshot:
-  - external_llm/editor/_editor_core/lane/  (PLANNER lane — permanently
-    disabled at routing; kept private, see planner_lane_facade)
   - webapp/          (FastAPI server/UI — not deployed)
   - tools/           (legacy verification scripts)
   - tasks/, screenshots/, .vscode/, CLAUDE.md  (internal artifacts)
-  - .github/workflows/p11-ci.yml  (runs a tools/ script)
-  - tests that import lane/webapp/tools (recomputed on every export, so
+  - tests that import webapp/tools (recomputed on every export, so
     newly added coupled tests are excluded automatically)
   - tests that REQUEST a fixture defined by an excluded conftest.py — a test
     need not import an excluded package itself to depend on one (see
@@ -19,7 +16,7 @@ Excluded from the public snapshot:
 
 Lint-baseline files (scripts/*_baseline.txt) are copied then pruned: any
 entry keyed by ``<path>::...`` whose path is itself excluded from the
-export (e.g. a lane/ module, or a coupled test) is dropped, so the public
+export (e.g. a webapp/ module, or a coupled test) is dropped, so the public
 snapshot's baseline never references or names a file that isn't there.
 
 Usage:
@@ -33,17 +30,12 @@ import re
 import shutil
 import subprocess
 import sys
+from functools import cache
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
 EXCLUDE_PREFIXES = (
-    "external_llm/editor/_editor_core/lane/",
-    # lane-only machinery outside lane/ (sole importers are lane executor mixins)
-    "external_llm/editor/operation_handlers/",
-    "external_llm/editor/refactor/",
-    "external_llm/editor/safety/",
-    "external_llm/editor/semantic_lineage/",
     "webapp/",
     "tools/",
     "tasks/",
@@ -52,27 +44,30 @@ EXCLUDE_PREFIXES = (
 )
 EXCLUDE_FILES = {
     "CLAUDE.md",
-    ".github/workflows/p11-ci.yml",
     # private development history (references lane/planner internals);
     # the public repo starts its own CHANGELOG at the first release
     "CHANGELOG.md",
-    # lane-internal design doc (planner_agent/operation_executor key map)
-    "docs/design/stage_context_key_map.md",
-    # lane-only lazy-constant shims (sole consumers live in lane/)
-    "external_llm/agent/_lazy_constants.py",
-    "tests/unit/agent/test_lazy_constants.py",
-    # repo-shape guards over lane/tools content — meaningless in the snapshot
-    "tests/unit/agent/test_scanner_registry_coverage.py",
-    "tests/unit/agent/test_skip_reason_classification.py",
+    # repo-shape guards over tools/ content — meaningless in the snapshot
     "tests/unit/test_config_flag_reachable.py",
     # Same category: this one asserts things about the PRIVATE tree that are
-    # false by construction after export — that lane/ modules lazily imported by
-    # shipped code are git-tracked (they are not, in the snapshot lane/ is gone)
-    # and that webapp/ exists as an excluded package (it does not ship at all).
-    # It guards the pre-export release gate, so it belongs upstream of the
-    # export, never inside it.
+    # false by construction after export — that webapp/ exists as an excluded
+    # package (it does not ship at all). It guards the pre-export release gate,
+    # so it belongs upstream of the export, never inside it.
     "tests/unit/test_release_untracked_import_gate.py",
+    # Third of the same family: it runs the zero-tolerance structural scanners
+    # over the tree and asserts a zero count. That holds for the PRIVATE tree
+    # only — public symbols whose sole consumers live under webapp/ (config.py's
+    # BENCH_RAW_LLM, LEGACY_DIFF_MODE, INSTRUCTION_MODE, ALLOW_MULTIFILE, and
+    # peers in patch_synth/services) are genuinely unreferenced once webapp/ is
+    # dropped, so the scanner is right and the assertion is wrong. Measured on
+    # the 0.2.19 export: 12 candidates. The gate belongs upstream of the export.
+    "tests/unit/test_check_structural_scanners.py",
 }
+
+# Modules under these packages ship in the wheel; the release gate's import
+# scan only cares about them. Defined here (not in release_public, which is
+# re-executed per invocation) so the memoized scan can key on it.
+FIRST_PARTY_PREFIXES = ("external_llm.", "webapp.")
 
 # A test file is excluded when it imports (or patches into) an excluded area.
 #
@@ -84,10 +79,7 @@ EXCLUDE_FILES = {
 # and webapp/ does not exist in the public snapshot, so the test failed on a
 # fresh clone of the released repo.
 _COUPLED_TEST_PAT = re.compile(
-    r"(_editor_core\.lane|_editor_core/lane"
-    r"|editor\.operation_handlers|editor/operation_handlers"
-    r"|editor\.refactor|editor\.safety|editor\.semantic_lineage"
-    r"|^\s*from webapp|^\s*import webapp\b|from webapp import|from webapp\."
+    r"(^\s*from webapp|^\s*import webapp\b|from webapp import|from webapp\."
     r"|^\s*from tools|^\s*import tools\b|from tools import|from tools\."
     # path-string loading of excluded dirs (importlib.spec_from_file_location,
     # subprocess script invocations): REPO / "tools" / "x.py", "webapp/..." etc.
@@ -99,9 +91,20 @@ _COUPLED_TEST_PAT = re.compile(
 def tracked_files() -> list[str]:
     # -z: NUL-separated so non-ASCII (e.g. Korean) filenames are exact,
     # never C-quoted (see git ls-files quoting semantics).
-    out = subprocess.run(
-        ["git", "ls-files", "-z"], cwd=REPO, capture_output=True, check=True
-    ).stdout
+    # timeout: this is the release gate's first step, and a git that never
+    # returns (index.lock held by another process, a stalled filesystem) would
+    # hang the release instead of failing it. Fail-closed — a partial or absent
+    # file list here would silently ship the wrong tree.
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=REPO, capture_output=True,
+            check=True, timeout=120,
+        ).stdout
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(
+            f"git ls-files timed out after {exc.timeout}s in {REPO} — "
+            "refusing to export from an unknown file list"
+        ) from exc
     return [p.decode("utf-8") for p in out.split(b"\0") if p]
 
 
@@ -146,18 +149,24 @@ def _fixture_names(src: str) -> set[str]:
     return names
 
 
-def _requested_params(src: str) -> set[str]:
+@cache
+def _requested_params(src: str) -> frozenset[str]:
     """Every parameter name a test/fixture function in *src* asks pytest to inject.
 
     Parameters are how a test declares a fixture dependency, so this is exact
     where a substring search is not: a docstring or a string literal that merely
     mentions ``test_client`` does not make the file coupled.
+
+    Memoized by source text and returned as a frozenset: release flows evaluate
+    this for every test file on every invocation, and files do not change
+    during a run, so repeated parses are deduplicated.  Callers must not mutate
+    the result (it is shared).
     """
     params: set[str] = set()
     try:
         tree = ast.parse(src)
     except SyntaxError:
-        return params
+        return frozenset()
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -165,7 +174,7 @@ def _requested_params(src: str) -> set[str]:
         for a in (*args.posonlyargs, *args.args, *args.kwonlyargs):
             if a.arg not in ("self", "cls"):
                 params.add(a.arg)
-    return params
+    return frozenset(params)
 
 
 _FIXTURE_COUPLED_CACHE: dict[str, frozenset[str]] | None = None
@@ -203,8 +212,15 @@ def _excluded_conftest_fixtures() -> dict[str, frozenset[str]]:
     return out
 
 
+@cache
 def is_excluded(rel: str) -> str | None:
-    """Return the exclusion reason, or None if the file ships."""
+    """Return the exclusion reason, or None if the file ships.
+
+    Memoized per path: the release gate and the export walk every tracked file
+    on every invocation, and repo files are immutable during a run — the same
+    assumption the conftest-fixture cache below already makes — so the first
+    evaluation per path is authoritative for the process.
+    """
     reason = _base_exclusion(rel)
     if reason:
         return reason
@@ -222,6 +238,40 @@ def is_excluded(rel: str) -> str | None:
                 if rel.startswith(dirpath) and (requested & names):
                     return "coupled-test"
     return None
+
+
+@cache
+def _first_party_imports(rel: str) -> frozenset[str]:
+    """First-party module names imported by *rel* — memoized per path.
+
+    This is the release gate's import scan (release_public delegates here):
+    whole-tree ``ast.walk`` so function-level imports are found (the 0.2.14
+    rich_markdown bug was a function-level import), relative imports skipped,
+    non-first-party names filtered out.  The tree is immutable during a run,
+    so the scan result — not just the parse — is cached; repeated gate
+    invocations (gate, export, tests) pay read+parse+walk once per file.
+    Missing/unreadable/parse-error files yield an empty set (the gate skips
+    malformed files).
+    """
+    try:
+        src = (REPO / rel).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return frozenset()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return frozenset()
+    mods: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                mods.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level and node.level > 0:
+                continue
+            if node.module:
+                mods.add(node.module)
+    return frozenset(m for m in mods if m.startswith(FIRST_PARTY_PREFIXES))
 
 
 def _prune_baseline_file(path: Path) -> int:

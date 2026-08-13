@@ -37,6 +37,19 @@ pytestmark = pytest.mark.skipif(
 _DIM = 384
 
 
+@pytest.fixture(autouse=True)
+def _no_real_model(monkeypatch):
+    """Never load a real SentenceTransformer in these index-mechanics tests.
+
+    ``_ensure_index_loaded`` now resolves the embedding model FIRST (F1), so
+    without this every test would pay a 2-4s model load and the marker-based
+    reuse logic would depend on network/offline fallback state.
+    """
+    import external_llm.agent.vector_cache as vc
+
+    monkeypatch.setattr(vc, "get_global_embedding_model", lambda: None)
+
+
 def _legacy_cache(tmp_path, n=50, content_size=20_000):
     """Write a cache in the pre-migration format (entries carry 'content')."""
     import faiss

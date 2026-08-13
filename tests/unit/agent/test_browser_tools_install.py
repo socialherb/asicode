@@ -15,7 +15,7 @@ external dependency (subprocess, importlib) is mocked away.
 """
 import sys
 
-import external_llm.agent.tool_handlers.browser_tools as browser_tools
+from external_llm.agent.tool_handlers import browser_tools
 from external_llm.agent.tool_handlers.browser_tools import (
     BrowserActionToolsMixin,
 )

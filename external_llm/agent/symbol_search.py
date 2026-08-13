@@ -10,75 +10,93 @@ SymbolSearcher(repo_root)
   .find_symbol(name, *, kind, search_path)       -> List[SymbolDef]
   .find_references(name, *, search_path)          -> List[SymbolRef]
   .get_symbol_info(name, *, file_path, kind, defs) -> Optional[dict]
+get_symbol_searcher(repo_root)             -> process-shared pooled SymbolSearcher
 """
 from __future__ import annotations
 
 import ast
+import contextlib
 import difflib
 import logging
 import os
 import re
 import shutil
 import subprocess
+import threading
+import time as _time
+from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
+from ..common.text_reading import read_line_window
+from ..common.walk_policy import _WALK_SKIP_DIRS
 from ..languages import (
     LanguageId,  # S8 fix: missing module-level import
     LanguageRegistry,
 )
-from ._shared_utils import (
-    _WALK_CACHE_TTL,
-    _WALK_SKIP_DIRS,
-    _capped_put,
+from ..languages.tree_sitter_utils import (
+    _LANG_MODULE_MAP as _TS_LANG_MODULE_MAP,
 )
-from ._shared_utils import (
-    _walk_py_files as _shared_walk_py_files,
+from ..languages.tree_sitter_utils import (
+    find_all_symbols as _ts_find_all_symbols,
 )
-from ._shared_utils import (
-    _walk_ts_js_files as _shared_walk_ts_js_files,
+from ..languages.tree_sitter_utils import (
+    get_available_languages as _ts_available_languages,
 )
-from ._thread_pool import shared_pool as _shared_pool
+from ..languages.tree_sitter_utils import (
+    get_node_text as _ts_get_node_text,
+)
+from ..languages.tree_sitter_utils import (
+    is_language_available as _ts_language_available,
+)
+from ..languages.tree_sitter_utils import (
+    parse_to_tree as _ts_parse_to_tree,
+)
+
 # Walk-cache introspection — lets find_symbol distinguish a genuine miss
 # ("symbol absent") from a truncated index ("symbol may live in un-indexed
 # files"). Both caches are module-global in ._shared_utils.
 from ._shared_utils import _PY_WALK_CACHE as _SHARED_PY_WALK_CACHE
 from ._shared_utils import _TS_WALK_CACHE as _SHARED_TS_WALK_CACHE
+from ._shared_utils import (
+    _WALK_CACHE_TTL,
+    _capped_put,
+)
+from ._shared_utils import (
+    _walk_py_files as _shared_walk_py_files,
+)
 from ._shared_utils import _walk_truncated_for as _shared_walk_truncated_for
+from ._shared_utils import (
+    _walk_ts_js_files as _shared_walk_ts_js_files,
+)
+from ._thread_pool import shared_pool as _shared_pool
 from .config.thresholds import config as _cfg
 from .rag_configs import CodeTokenizer
 from .rag_searcher import _bm25_score as _bm25
+
+# Cap on how long the speculative non-Python probe (submitted to _shared_pool
+# before the Python scan) may be awaited. The probe runs on the SAME pool a
+# dispatch may already be occupying (P1: execute_parallel dispatches on
+# _thread_pool.shared_pool), so N concurrent find_symbol calls each blocking on
+# a still-queued probe would exhaust the pool and deadlock permanently; with a
+# cap the worst case is this stall followed by the inline fallback below.
+_NONPY_PROBE_TIMEOUT_SEC = 10.0
+
 # Module-level lazy tokenizer singleton — avoids re-constructing
 # CodeTokenizer (which compiles internal regex-alternative scanners)
 # on every find_references call (a hot path).
 _TOKENIZER: Any = None
 
 # ── Tree-sitter availability ─────────────────────────────────────────────
-try:
-    from ..languages.tree_sitter_utils import (
-        _LANG_MODULE_MAP as _TS_LANG_MODULE_MAP,
-    )
-    from ..languages.tree_sitter_utils import (
-        find_all_symbols as _ts_find_all_symbols,
-    )
-    from ..languages.tree_sitter_utils import (
-        get_available_languages as _ts_available_languages,
-    )
-    from ..languages.tree_sitter_utils import (  # type: ignore
-        is_language_available as _ts_language_available,
-    )
-    from ..languages.tree_sitter_utils import (  # type: ignore
-        get_node_text as _ts_get_node_text,
-    )
-    from ..languages.tree_sitter_utils import (
-        parse_to_tree as _ts_parse_to_tree,
-    )
-    _HAS_TS = True
-except ImportError:
-    _HAS_TS = False
-    _TS_LANG_MODULE_MAP = {}
+# tree_sitter_utils guards its own tree-sitter import (get_parser returns
+# None / _ts_language_available False when the grammar is missing), so the
+# module itself can never fail to import — the old try/except ImportError
+# fallback was dead code. _HAS_TS stays as a module flag so tests can force
+# the regex fallback path via monkeypatch.
+_HAS_TS = True
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +116,44 @@ _warned_missing_grammar: set[str] = set()
 _MAX_PY_FILES = _cfg.counts.SYMBOL_MAX_PY_FILES
 _MAX_TS_FILES = _cfg.counts.SYMBOL_MAX_TS_FILES
 
+# ── Superlinear tree-sitter guard for Python ────────────────────────────────
+# tree-sitter's Python grammar parses a long RUN of indented comment lines
+# inside a function body quadratically in the run length: measured with
+# 200-char comments, 1000 lines → 0.50 s, 2000 → 1.98 s, 3000 → 4.53 s,
+# 4000 → 7.88 s. The same lines at module level cost 8 ms, 4000 non-comment
+# lines 14 ms, class-body comments 12 ms — the run of indented comments is
+# the trigger, not the line count or the line width (4000x20-char comments
+# still cost 0.89 s). Real code never forms such runs (the largest in this
+# repo is 32 consecutive indented comments), so the guard only fires on
+# generated files, license/docstring walls and synthetic fixtures.
+# ast.parse is linear and extracts the same symbols for valid files, so
+# such files are routed to the AST path; tree-sitter remains the last
+# resort when ast fails on a syntax-broken file.
+_TS_SKIP_MIN_LINES = 300  # below this, keep tree-sitter (error tolerance)
+_TS_SKIP_COMMENT_RUN = 50  # consecutive indented comment lines that trigger
+
+
+def _python_ts_parse_too_costly(source: str) -> bool:
+    """True when tree-sitter Python parsing of *source* is superlinear.
+
+    Counts consecutive indented ``#`` comment lines — the measured O(n²)
+    trigger. Short-circuits as soon as the run crosses the threshold past
+    the minimum line count, so the scan costs O(run) on the offending
+    prefix and one cheap pass otherwise.
+    """
+    run = 0
+    for n_total, line in enumerate(source.splitlines(), start=1):
+        if line[:1].isspace() and line.lstrip().startswith("#"):
+            run += 1
+            if run >= _TS_SKIP_COMMENT_RUN and n_total >= _TS_SKIP_MIN_LINES:
+                return True
+        else:
+            run = 0
+    return False
+
+
 # _WALK_CACHE_TTL is re-exported from ._shared_utils (shared with call_graph).
 # _time is still needed for the non-Python index TTL check below.
-import time as _time
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data classes
@@ -119,7 +172,6 @@ class SymbolDef:
     decorators: Optional[list[str]] = None
     end_line: Optional[int] = None           # 1-indexed inclusive end (from AST end_lineno)
     parent_class: Optional[str] = None      # set when symbol is a method inside a class
-    file_mtime: Optional[float] = None      # os.stat(file).st_mtime at resolve time — staleness guard
 
 
 @dataclass
@@ -146,7 +198,7 @@ def _is_definition_line(file_path: str, line: str, name: str) -> bool:
     escaped = re.escape(name)
 
     # ── Primary: language-provider patterns (language-agnostic) ──────────
-    try:
+    with contextlib.suppress(KeyError, TypeError, ValueError, AttributeError, re.error):  # fall through to heuristic fallback
         registry = LanguageRegistry.instance()
         provider = registry.get(file_path)
         if provider is not None:
@@ -158,14 +210,10 @@ def _is_definition_line(file_path: str, line: str, name: str) -> bool:
                         return True
                 # Provider had patterns but none matched — definitively not a definition
                 return False
-    except Exception:
-        pass  # fall through to heuristic fallback
 
     # ── Fallback: generic patterns for unrecognised providers ────────────
     return bool(
-        stripped.startswith(f"def {name}")
-        or stripped.startswith(f"async def {name}")
-        or stripped.startswith(f"class {name}")
+        stripped.startswith((f"def {name}", f"async def {name}", f"class {name}"))
         or re.match(rf"^(function\s+{escaped}|const\s+{escaped}\s*=)", stripped)
     )
 def _unparse(node: ast.AST) -> str:
@@ -249,6 +297,19 @@ def _build_ts_method_signature(class_name: str, method: Any) -> str:
     return f"{class_name}.{static}{prefix}{method.name}({', '.join(params)}){ret}"
 
 
+def _ts_node_end_line(node: Any) -> Optional[int]:
+    """Extent of a TS/JS IR node, or None when it carries no usable one.
+
+    Mirrors the ``meta or bare attribute`` shape the start lines already use,
+    via getattr because not every IR node declares both (IRImport/IRExport
+    carry only ``meta``). ``or None`` normalises the dataclass default of 0,
+    which would otherwise render as a "line N-0" range.
+    """
+    _m = getattr(node, "meta", None)
+    _e = getattr(_m, "end_line", None) if _m else getattr(node, "end_line", None)
+    return _e or None
+
+
 def _walk_py_files(root: Path) -> list[Path]:
     """Walk repo, returning .py files, skipping hidden/vendor dirs.
 
@@ -301,9 +362,7 @@ def _nonpy_index_globs() -> list[str]:
         # leaves only the pattern-less providers (css/html/json here) to
         # resolve, on what is now find_symbol's hot path — the whole-set form
         # imported all 19 mapped grammars (~50 ms) to decide 28 globs.
-        if provider.get_symbol_patterns(kind="any"):
-            globs.extend(provider.get_file_globs())
-        elif _HAS_TS and _ts_language_available(lang_id):
+        if provider.get_symbol_patterns(kind="any") or (_HAS_TS and _ts_language_available(lang_id)):
             globs.extend(provider.get_file_globs())
     return globs
 
@@ -313,6 +372,45 @@ def _nonpy_index_globs() -> list[str]:
 # Above these caps the spawn is cheaper and bounded, so we defer to rg.
 _NONPY_INPROC_MAX_FILES = 200
 _NONPY_INPROC_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _too_big_to_parse_inproc(st_size: int, file_path: Any) -> bool:
+    """True when one file is too large to read + parse in this process.
+
+    P26-4 gated the BATCH tree-sitter walker (``_index_via_treesitter``) at
+    ``_NONPY_INPROC_MAX_BYTES`` because "a single minified dist/*.js (tens of
+    MB is common) was read + tree-sitter-parsed in full".  Every PER-FILE
+    entry point had the identical hole, and each of them already holds the
+    answer: ``_find_in_python_cached`` / ``_go_class_methods_map`` /
+    ``_ts_module_map`` all ``stat()`` the file and then spend ``st_size`` on
+    nothing but a cache signature.
+
+    Measured on a generated 32 MB bundle before this gate: read_file's
+    over-cap refusal — a 131-character message that returns no file content
+    at all — cost 13.31 s and 1.65 GB of peak RSS (8.67 s of it a single
+    ``tree_sitter.Parser.parse``), and find_symbol over the same tree cost
+    21.87 s to answer "not found".  A 13 MB .py cost 3.40 s / 684 MB by the
+    same route.  That is ~20x the whole-process peak-RSS budget 0.2.15
+    established when it capped tree-sitter parse memos at 76 MB.
+
+    Callers degrade, never fail: an empty map sends ``get_file_outline`` down
+    its documented ``_outline_treesitter`` → ``_outline_ripgrep`` fallback and
+    leaves find_symbol to the rg path — the same behaviour an unparsable file
+    already produces.  The cost is that a symbol defined in an 8 MiB+ source
+    file is not reachable by exact-parse lookup; that is the trade P26-4
+    already made for the batch walker, made consistent here.
+    """
+    if st_size <= _NONPY_INPROC_MAX_BYTES:
+        return False
+    logger.debug(
+        "[symbol-search] skipping in-process parse of %s (%d bytes > %d)",
+        file_path, st_size, _NONPY_INPROC_MAX_BYTES,
+    )
+    return True
+# Stream size for _word_in_files. A whole-word match needs at most
+# len(token) + 2 bytes of context (one word char on each side), so carrying
+# that many trailing bytes across the seam keeps the lookarounds exact.
+_NONPY_SCAN_CHUNK = 64 * 1024
 # {root: (timestamp, files, total_bytes)} — files is None when unanswerable.
 _NONPY_FILES_CACHE: dict[str, tuple] = {}
 
@@ -344,6 +442,7 @@ def _nonpy_indexable_files(root: Path) -> Optional[tuple[list[str], int]]:
         proc = subprocess.run(
             [rg, "--files", "--no-ignore-vcs", *glob_args, "."],
             cwd=str(root), capture_output=True, text=True, timeout=10,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError) as e:
         logger.debug("nonpy file list: rg failed (%s)", e)
@@ -381,17 +480,162 @@ def _word_in_files(files: list[str], token: str) -> bool:
 
     Unreadable files are skipped, matching ``_index_via_treesitter_batch`` —
     a file the build cannot read holds no indexable symbol either.
+
+    Files are streamed in ``_NONPY_SCAN_CHUNK`` chunks rather than slurped:
+    a hit near the top of a large generated file no longer forces the whole
+    file into memory, and ``len(token) + 2`` trailing bytes are carried
+    across the seam so tokens split by a chunk boundary still match.
     """
     pat = re.compile(r"(?<!\w)" + re.escape(token) + r"(?!\w)")
+    carry = len(token) + 2
     for f in files:
         try:
             with open(f, encoding="utf-8", errors="replace") as fh:
-                if pat.search(fh.read()):
-                    return True
+                tail = ""
+                for chunk in iter(lambda: fh.read(_NONPY_SCAN_CHUNK), ""):
+                    buf = tail + chunk
+                    if pat.search(buf):
+                        return True
+                    tail = buf[-carry:]
         except OSError as e:
             logger.debug("nonpy probe: unreadable %s (%s) — skipped", f, e)
             continue
     return False
+
+
+# Memo for token SEQUENCES: _word_in_files re-reads the whole (capped) file
+# set on every probe, and find_symbol probes once per call — SymbolSearcher
+# instances are per-lookup, so the per-instance index cache cannot dedupe the
+# repeat lookups a turn issues. The first probe pays ONE full read and caches
+# the set's content as one blob; every later token answers with a single
+# literal search over it, no file I/O at all.
+#
+# The streaming core keeps its early-exit-on-hit; the probe path deliberately
+# trades it: a HIT triggers a cold whole-repo index build anyway, and the
+# probe runs concurrently with the Python scan (speculative), so the one extra
+# read is hidden on the wall clock while the miss-heavy repeat case drops from
+# a full re-read per token to a memchr-speed scan.
+#
+# Freshness mirrors _nonpy_indexable_files: the key carries the file LIST (a
+# newly created file changes the list and the key), and per-file
+# (st_mtime_ns, st_size) signatures are re-verified on every probe, so a
+# just-written file invalidates the blob without waiting for the TTL.
+# invalidate_nonpy_caches clears both layers together.
+#
+# FIFO-capped BELOW the sibling caches on purpose: a value is content (up to
+# _NONPY_INPROC_MAX_BYTES each), not paths, so the cap is also the memory
+# bound (4 x 8 MB worst case).
+_NONPY_BLOB_CACHE: dict[tuple, tuple[float, dict[str, Optional[tuple[int, int]]], str]] = {}
+_NONPY_BLOB_MAX_ENTRIES: int = 4
+
+# The lookaround form (?<!\w)...(?!\w) costs ~16 ns/byte (the engine visits
+# every position), which dominates the probe on multi-MB sets. The equivalent
+# literal search + manual boundary check is ~0.6 ns/byte — the same semantics
+# (a seam/newline is not \w, so joined files behave exactly like the per-file
+# scan) at memchr speed.
+_WORD_CHAR = re.compile(r"\w")
+
+
+def _blob_contains_word(blob: str, token: str) -> bool:
+    """Whether *token* occurs as a whole word in *blob*.
+
+    Exact equivalent of ``(?<!\\w)`` + escape + ``(?!\\w)``: a literal hit
+    counts only when neither flanking char is a word char (start/end of the
+    blob count as clean). Bad-boundary hits are skipped by resuming the
+    search one char past them, so repeated matches cannot loop — the empty
+    token included, which matches exactly where the lookarounds would.
+
+    The ``_pos <= len(blob)`` bound exists for the empty-pattern edge: a
+    literal-only search at pos > len() clamps back to the end and returns an
+    empty match, which would otherwise pin ``_pos`` forever.
+    """
+    _lit = re.compile(re.escape(token))
+    _pos = 0
+    while _pos <= len(blob):
+        m = _lit.search(blob, _pos)
+        if m is None:
+            return False
+        _s, _e = m.start(), m.end()
+        if (_s == 0 or not _WORD_CHAR.match(blob, _s - 1)) and (
+            _e == len(blob) or not _WORD_CHAR.match(blob, _e)
+        ):
+            return True
+        _pos = _s + 1
+    return False
+
+
+def _path_sig(path: str) -> Optional[tuple[int, int]]:
+    """(st_mtime_ns, st_size) of *path*, or None when it cannot be stat-ed."""
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        logger.debug("nonpy blob: cannot stat %s (%s) — treated as absent", path, e)
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _sigs_valid(sigs: dict[str, Optional[tuple[int, int]]], files: list[str]) -> bool:
+    """Whether every *file* still matches its cached signature.
+
+    A stored None (file was missing at build time) stays valid while the file
+    stays missing; a file that reappears or changes produces a tuple that
+    mismatches, forcing a rebuild. An open-failed-but-stat-able file keeps its
+    REAL signature, so a permission-denied file does not rebuild on every
+    probe — the "becomes readable mid-TTL" edge is covered by the TTL, the
+    same staleness horizon as the file-list cache.
+    """
+    return all(sigs.get(f) == _path_sig(f) for f in files)
+
+
+def _nonpy_blob(files: list[str]) -> tuple[dict[str, Optional[tuple[int, int]]], str]:
+    """``(sigs, content)`` — one full read of *files* joined by ``"\\n"``.
+
+    Unreadable files are skipped with their signature still recorded, matching
+    _word_in_files' skip semantics. The newline separator is a non-word char,
+    so the ``(?<!\\w)/(?!\\w)`` lookarounds see a seam exactly like a file
+    boundary: whole-word semantics survive the join. (Hence the newline guard
+    in the caller — a token containing one could otherwise match across seams.)
+    """
+    sigs: dict[str, Optional[tuple[int, int]]] = {}
+    parts: list[str] = []
+    for f in files:
+        try:
+            st = os.stat(f)
+        except OSError as e:
+            sigs[f] = None
+            logger.debug("nonpy blob: cannot stat %s (%s) — skipped", f, e)
+            continue
+        sigs[f] = (st.st_mtime_ns, st.st_size)
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                parts.append(fh.read())
+        except OSError as e:
+            logger.debug("nonpy blob: unreadable %s (%s) — skipped", f, e)
+    return sigs, "\n".join(parts)
+
+
+def _word_in_files_cached(root: Path, files: list[str], token: str) -> bool:
+    """``_word_in_files`` with the per-root content memo above.
+
+    A token containing a newline falls back to the streaming core, where the
+    per-file scan cannot match across files (the ``"\\n"`` join would).
+    """
+    if "\n" in token:
+        return _word_in_files(files, token)
+    key = (str(root), tuple(files))
+    hit = _NONPY_BLOB_CACHE.get(key)
+    if hit is not None and (_time.monotonic() - hit[0]) < _WALK_CACHE_TTL:
+        _ts, _sigs, _blob = hit
+        if _sigs_valid(_sigs, files):
+            return _blob_contains_word(_blob, token)
+    # Cold: ONE full read builds the memo, and the answer comes from the same
+    # pass (see the module comment — the extra read vs. early-exit streaming
+    # is hidden by the speculative probe, and it turns every later token into
+    # a no-I/O literal search).
+    _sigs, _blob = _nonpy_blob(files)
+    _capped_put(_NONPY_BLOB_CACHE, key, (_time.monotonic(), _sigs, _blob),
+                _NONPY_BLOB_MAX_ENTRIES)
+    return _blob_contains_word(_blob, token)
 
 
 def _rg_token_in_nonpy_files(root: Path, token: str) -> Optional[bool]:
@@ -417,12 +661,14 @@ def _rg_token_in_nonpy_files(root: Path, token: str) -> Optional[bool]:
         return None
     # Fast path: the indexable set is walked ONCE per root (TTL-cached, token
     # independent) and scanned in-process, so repeat lookups cost a read rather
-    # than a spawn. Falls through to rg when the set is unknown or too big.
+    # than a spawn — and after the first miss, a single in-memory scan over the
+    # cached blob (_word_in_files_cached). Falls through to rg when the set is
+    # unknown or too big.
     _listed = _nonpy_indexable_files(root)
     if _listed is not None:
         _files, _bytes = _listed
         if len(_files) <= _NONPY_INPROC_MAX_FILES and _bytes <= _NONPY_INPROC_MAX_BYTES:
-            return _word_in_files(_files, token)
+            return _word_in_files_cached(root, _files, token)
     glob_args: list[str] = []
     for g in _nonpy_index_globs():
         glob_args += ["--glob", g]
@@ -430,9 +676,10 @@ def _rg_token_in_nonpy_files(root: Path, token: str) -> Optional[bool]:
         return None  # no non-Python providers -> nothing to assert; build as before
     try:
         proc = subprocess.run(
-            [rg, "--quiet", "--no-ignore-vcs", "--word-regexp", "--fixed-strings"]
-            + glob_args + ["--", token, "."],
+            [rg, "--quiet", "--no-ignore-vcs", "--word-regexp", "--fixed-strings",
+                *glob_args, "--", token, "."],
             cwd=str(root), capture_output=True, text=True, timeout=10,
+                check=False,
         )
     except (OSError, subprocess.SubprocessError) as e:
         logger.debug("nonpy index probe: rg failed (%s) — building index", e)
@@ -547,6 +794,7 @@ def _rg_list_py_files(root: Path, matcher_args: list[str]) -> Optional[set[str]]
             [rg, "--files-with-matches", "--type", "py",
              "--no-ignore-vcs", *_skip_globs, *matcher_args, "."],
             cwd=str(root), capture_output=True, text=True, timeout=10,
+             check=False,
         )
     except (OSError, subprocess.SubprocessError) as e:
         logger.debug("find_symbol prefilter: rg failed (%s) — scanning all files", e)
@@ -635,52 +883,56 @@ def _walk_ts_js_files(root: Path) -> list[Path]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ts_build_py_function_signature(node, code_bytes: bytes) -> str:
-    """Build function signature from a tree-sitter function_definition node."""
-    try:
-        name_node = node.child_by_field_name("name")
-        params_node = node.child_by_field_name("parameters")
-        ret_node = node.child_by_field_name("return_type")
-        fn_name = _ts_get_node_text(code_bytes, name_node) if name_node else ""
-        parts: list[str] = []
-        if params_node:
-            for child in params_node.children:
-                if child.type == "identifier":
-                    parts.append(_ts_get_node_text(code_bytes, child))
-                elif child.type in ("typed_parameter", "default_parameter", "typed_default_parameter"):
-                    n = child.child_by_field_name("name")
-                    # Some Python tree-sitter grammars don't have "name" as a
-                    # named field on typed_parameter — fall back to first child.
-                    if n is None and child.children:
-                        n = child.children[0]
-                    t = child.child_by_field_name("type")
-                    pname = _ts_get_node_text(code_bytes, n) if n else ""
-                    ptype = f": {_ts_get_node_text(code_bytes, t)}" if t else ""
-                    parts.append(f"{pname}{ptype}")
-        ret = f" -> {_ts_get_node_text(code_bytes, ret_node)}" if ret_node else ""
-        return f"def {fn_name}({', '.join(parts)}){ret}"
-    except Exception:
-        return ""
+    """Build function signature from a tree-sitter function_definition node.
+
+    No local exception fence: failures propagate to the caller boundary in
+    ``_extract_all_python_symbols`` (the TS→AST fallback), so a broken node
+    shape degrades to full AST extraction instead of a silently empty
+    signature.
+    """
+    name_node = node.child_by_field_name("name")
+    params_node = node.child_by_field_name("parameters")
+    ret_node = node.child_by_field_name("return_type")
+    fn_name = _ts_get_node_text(code_bytes, name_node) if name_node else ""
+    parts: list[str] = []
+    if params_node:
+        for child in params_node.children:
+            if child.type == "identifier":
+                parts.append(_ts_get_node_text(code_bytes, child))
+            elif child.type in ("typed_parameter", "default_parameter", "typed_default_parameter"):
+                n = child.child_by_field_name("name")
+                # Some Python tree-sitter grammars don't have "name" as a
+                # named field on typed_parameter — fall back to first child.
+                if n is None and child.children:
+                    n = child.children[0]
+                t = child.child_by_field_name("type")
+                pname = _ts_get_node_text(code_bytes, n) if n else ""
+                ptype = f": {_ts_get_node_text(code_bytes, t)}" if t else ""
+                parts.append(f"{pname}{ptype}")
+    ret = f" -> {_ts_get_node_text(code_bytes, ret_node)}" if ret_node else ""
+    return f"def {fn_name}({', '.join(parts)}){ret}"
 
 
 def _ts_extract_decorators(node, code_bytes: bytes) -> list[str]:
-    """Extract decorator names from a decorated_definition or function node."""
+    """Extract decorator names from a decorated_definition or function node.
+
+    No local exception fence — a broken node shape propagates to the
+    ``_extract_all_python_symbols`` TS→AST fallback boundary.
+    """
     decs: list[str] = []
-    try:
-        if node.type == "decorated_definition":
-            for child in node.children:
+    if node.type == "decorated_definition":
+        for child in node.children:
+            if child.type == "decorator":
+                d_text = code_bytes[child.start_byte:child.end_byte].decode("utf-8")
+                decs.append(d_text.lstrip("@").strip())
+    else:
+        # Function may have decorator_list child
+        dec_list = node.child_by_field_name("decorator")
+        if dec_list:
+            for child in dec_list.children:
                 if child.type == "decorator":
-                    d_text = code_bytes[child.start_byte:child.end_byte].decode("utf-8")
+                    d_text = _ts_get_node_text(code_bytes, child)
                     decs.append(d_text.lstrip("@").strip())
-        else:
-            # Function may have decorator_list child
-            dec_list = node.child_by_field_name("decorator")
-            if dec_list:
-                for child in dec_list.children:
-                    if child.type == "decorator":
-                        d_text = _ts_get_node_text(code_bytes, child)
-                        decs.append(d_text.lstrip("@").strip())
-    except Exception:
-        pass
     return decs
 
 
@@ -697,65 +949,114 @@ def _ts_extract_docstring(node, code_bytes: bytes) -> Optional[str]:
     2. The wrapper may not be there at all: standalone ``tree-sitter-python``
        gives ``block → expression_statement → string``, while the
        ``tree-sitter-language-pack`` bundle gives ``block → string``.
+
+    No local exception fence — a broken node shape propagates to the
+    ``_extract_all_python_symbols`` TS→AST fallback boundary.
     """
-    try:
-        body = node.child_by_field_name("body")
-        if body and body.children:
-            first = body.children[0]
-            if first.type in ("expression_statement", "string"):
-                expr = first if first.type == "string" else (
-                    first.children[0] if first.children else None
-                )
-                if expr is not None and expr.type == "string":
-                    text = _ts_get_node_text(code_bytes, expr)
-                    # Strip quotes
-                    if text.startswith(('"""', "'''")):
-                        text = text[3:-3]
-                    elif text.startswith(("'", '"')):
-                        text = text[1:-1]
-                    return text[:150] or None
-    except Exception:
-        pass
+    body = node.child_by_field_name("body")
+    if body and body.children:
+        first = body.children[0]
+        if first.type in ("expression_statement", "string"):
+            expr = first if first.type == "string" else (
+                first.children[0] if first.children else None
+            )
+            if expr is not None and expr.type == "string":
+                text = _ts_get_node_text(code_bytes, expr)
+                # Strip quotes
+                if text.startswith(('"""', "'''")):
+                    text = text[3:-3]
+                elif text.startswith(("'", '"')):
+                    text = text[1:-1]
+                return text[:150] or None
     return None
 
 
 def _ts_extract_class_bases(node, code_bytes: bytes) -> list[str]:
-    """Extract base class names from a class_definition node."""
+    """Extract base class names from a class_definition node.
+
+    No local exception fence — a broken node shape propagates to the
+    ``_extract_all_python_symbols`` TS→AST fallback boundary.
+    """
     bases: list[str] = []
-    try:
-        super_node = node.child_by_field_name("superclass")
-        if super_node:
-            for child in super_node.children:
-                if child.type == "argument_list":
-                    for arg in child.children:
-                        if arg.type in ("identifier", "attribute", "call"):
-                            bases.append(_ts_get_node_text(code_bytes, arg))
-                        elif arg.type == "comment":
-                            continue
-    except Exception:
-        pass
+    super_node = node.child_by_field_name("superclass")
+    if super_node:
+        for child in super_node.children:
+            if child.type == "argument_list":
+                for arg in child.children:
+                    if arg.type in ("identifier", "attribute", "call"):
+                        bases.append(_ts_get_node_text(code_bytes, arg))
+                    elif arg.type == "comment":
+                        continue
     return bases
 
 
 def _ts_collect_class_methods(node, code_bytes: bytes) -> list[str]:
-    """Collect method names from a class_definition's body."""
+    """Collect method names from a class_definition's body.
+
+    No local exception fence — a broken node shape propagates to the
+    ``_extract_all_python_symbols`` TS→AST fallback boundary.
+    """
     methods: list[str] = []
-    try:
-        body = node.child_by_field_name("body")
-        if body:
-            for child in body.children:
-                if child.type == "function_definition":
-                    name_node = child.child_by_field_name("name")
-                    if name_node:
-                        methods.append(_ts_get_node_text(code_bytes, name_node))
-    except Exception:
-        pass
+    body = node.child_by_field_name("body")
+    if body:
+        for child in body.children:
+            if child.type == "function_definition":
+                name_node = child.child_by_field_name("name")
+                if name_node:
+                    methods.append(_ts_get_node_text(code_bytes, name_node))
     return methods
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main class
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── per-file symbol cache LRU bounds ────────────────────────────────────────
+# _py_file_cache, _ts_file_cache and _go_file_cache are plain dicts keyed on
+# the resolved abs path. Without a bound, a long session touching many files
+# would grow memory without limit (each entry holds a per-file symbol map).
+# All three are capped with the same LRU discipline: the dict is
+# insertion-ordered, a cache hit moves the entry to the MRU end
+# (_cache_get_lru), and a put evicts the oldest entry once the cap is exceeded
+# (_cache_put_lru).
+_PY_FILE_CACHE_MAX_ENTRIES = 512
+_TS_FILE_CACHE_MAX_ENTRIES = 256  # TS entries carry heavier module analysis
+_GO_FILE_CACHE_MAX_ENTRIES = 512  # Go entries are light method tuples
+# _realpath_memo shares the same LRU discipline (see _cache_get_lru /
+# _cache_put_lru). Entries are two small strings, so the cap is far larger than
+# the file caches; the >4096 full clear it replaces threw away every memoised
+# path at once, while LRU eviction drops only the least-recently-used key.
+_REALPATH_MEMO_MAX_ENTRIES = 4096
+
+
+def _cache_get_lru(cache: dict, key: str):
+    """dict.get() that refreshes LRU recency — a hit moves the entry to MRU.
+
+    Plain dicts preserve insertion order but have no ``move_to_end``, so the
+    recency refresh is a delete + re-insert (position resets to the end).
+    """
+    val = cache.get(key)
+    if val is not None:
+        del cache[key]
+        cache[key] = val
+    return val
+
+
+def _cache_put_lru(cache: dict, key: str, value, max_entries: int) -> None:
+    """Insert into a bounded LRU cache, evicting the oldest entry over the cap.
+
+    ``pop(key, None)`` before assignment is a no-op for a fresh key and
+    refreshes recency when a stale entry is rebuilt in place. ``next(iter(
+    cache))`` is the least-recently-used entry because hits and puts both move
+    their key to the MRU end.
+    """
+    # Delegate to the shared FIFO/LRU eviction SSOT (``_capped_put`` pop-then-
+    # assign = move-to-end, matching this helper's documented LRU contract).
+    # ``_capped_put`` is strictly more defensive: it guards ``next(iter())``
+    # against free-threaded dict resize (RuntimeError/StopIteration), which the
+    # previous bare ``pop(next(iter(cache)))`` did not.
+    _capped_put(cache, key, value, cap=max_entries)
+
 
 class SymbolSearcher:
     """
@@ -767,6 +1068,7 @@ class SymbolSearcher:
         self.repo_root = Path(repo_root).resolve()
         # ── per-file Python parse cache ────────────────────────────────────
         # Key: abs file path -> (mtime, full_symbol_map)
+        # LRU-capped at _PY_FILE_CACHE_MAX_ENTRIES (see _cache_put_lru).
         # full_symbol_map: {name -> [SymbolDef, ...]} covering ALL definitions
         # (functions, classes, methods, constants) found in that file, including
         # parent_class scope info so name-filtered lookups reproduce the exact
@@ -779,10 +1081,47 @@ class SymbolSearcher:
         self._nonpy_index_cache: dict[str, tuple] = {}
         # ── TS/JS per-file module analysis cache ───────────────────────────
         # Key: abs file path -> (mtime, {name -> [SymbolDef]}) covering every
+        # LRU-capped at _TS_FILE_CACHE_MAX_ENTRIES (see _cache_put_lru).
         # symbol kind TSSemanticTracer exposes. analyze_core costs ~15ms/file
         # and is pure function of content, so caching it removes the dominant
         # cost of repeated find_symbol over TS/JS repos.
         self._ts_file_cache: dict[str, tuple] = {}
+        # ── Go per-file class→methods cache ──────────────────────────────────
+        # Key: abs file path -> (mtime, {class_name -> [(name, start, end)]})
+        # LRU-capped at _GO_FILE_CACHE_MAX_ENTRIES (see _cache_put_lru).
+        # _find_in_go used to read_text + re-parse the file (tree-sitter walk)
+        # on every dotted lookup; the map is built once per signature and
+        # lookups become O(1) dict gets. Invalidation rides the same
+        # invalidate_file_caches() post-write path as the Python/TS maps.
+        self._go_file_cache: dict[str, tuple] = {}
+        # Memoised os.path.realpath for the three per-file caches above. Both are
+        # keyed on the RESOLVED path so invalidate_file_caches() can pop in O(1)
+        # instead of scanning: the write path and the search path reach the same
+        # file by different spellings (repo-relative vs absolute, and on macOS
+        # /var vs the resolved /private/var), and comparing those by realpath at
+        # invalidation time cost ~3 ms per write over a 200-entry cache —
+        # measured, and paid on the COMMON path since most writes touch files
+        # that were never symbol-searched. Resolving once at key construction
+        # moves that syscall to the cache-miss path, where a full file parse
+        # already dominates it.
+        # LRU-capped at _REALPATH_MEMO_MAX_ENTRIES (see _cache_put_lru). The
+        # old bound cleared the whole memo past 4096 entries; LRU eviction
+        # instead drops only the least-recently-used key.
+        self._realpath_memo: dict[str, str] = {}
+
+    def _cache_key(self, file_path) -> str:
+        """Resolved, memoised cache key for the per-file symbol caches."""
+        raw = str(file_path)
+        hit = _cache_get_lru(self._realpath_memo, raw)
+        if hit is not None:
+            return hit
+        try:
+            resolved = os.path.realpath(raw)
+        except OSError:
+            resolved = raw
+        _cache_put_lru(self._realpath_memo, raw, resolved,
+                       _REALPATH_MEMO_MAX_ENTRIES)
+        return resolved
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -887,8 +1226,15 @@ class SymbolSearcher:
 
                     # @dataclass fallback: if searching for __init__ in a @dataclass,
                     # there's no explicit __init__ — return the class body instead.
+                    # parent_defs[0] comes from the same cached per-file symbol map
+                    # _find_in_python_cached just used, so checking its decorators
+                    # replaces a whole re-read + re-parse of the file (former
+                    # _is_dataclass helper).
                     if search_name == "__init__" and parent_defs[0].kind == "class":
-                        _is_dataclass = self._is_dataclass(parent_file, parent_class)
+                        _is_dataclass = any(
+                            d.startswith(("dataclass", "@dataclass"))
+                            for d in (parent_defs[0].decorators or [])
+                        )
                         if _is_dataclass:
                             logger.info(
                                 "find_symbol: %s.__init__ not found — @dataclass detected, "
@@ -952,19 +1298,14 @@ class SymbolSearcher:
                 break
 
         # ── TS/JS rich scan via TSSemanticTracer ─────────────────────────────
-        try:
-            from config import MULTILANG_SYMBOL_SEARCH as _ML_SYM
-        except Exception:
-            _ML_SYM = True  # non-critical — never block execution
+        from config import MULTILANG_SYMBOL_SEARCH as _ML_SYM  # config defines it — no fallback needed
         if _ML_SYM and not results:
             if root.is_file() and LanguageId.from_path(str(root)) in (LanguageId.TYPESCRIPT, LanguageId.JAVASCRIPT):
                 results.extend(self._find_in_ts_js(root, search_name, kind))
             elif root.is_dir():
-                _ts_count = 0
-                for _tf in _walk_ts_js_files(root):
+                for _ts_count, _tf in enumerate(_walk_ts_js_files(root), start=1):
                     results.extend(self._find_in_ts_js(_tf, search_name, kind))
-                    _ts_count += 1
-                    if len(results) >= _cfg.counts.SEARCH_RESULTS_CAP or _ts_count >= self._MAX_TS_FILES:
+                    if len(results) >= _cfg.counts.SEARCH_RESULTS_CAP or _ts_count >= _MAX_TS_FILES:
                         break
 
         # ── Provider-aware search for registered languages (persistent index)
@@ -985,12 +1326,21 @@ class SymbolSearcher:
             #
             # A probe failure must not lose the branch, so it falls back to the
             # inline call — the same answer, just without the overlap.
+            #
+            # The wait is also capped (_NONPY_PROBE_TIMEOUT_SEC): the probe was
+            # submitted to the same _shared_pool a dispatch may be running on
+            # (P1), so under pool saturation a queued probe could otherwise be
+            # awaited forever — N such waiters would wedge the whole pool.
+            # On timeout we cancel the queued future (best-effort — a running
+            # probe is left to finish and its answer discarded) and retry
+            # inline, so saturation degrades to a stall, never a deadlock.
             _worth = False
             if has_nonpy_provider:
                 if _nonpy_probe is not None:
                     try:
-                        _worth = _nonpy_probe.result()
+                        _worth = _nonpy_probe.result(timeout=_NONPY_PROBE_TIMEOUT_SEC)
                     except Exception as e:
+                        _nonpy_probe.cancel()  # best-effort: don't leave it queued
                         logger.debug("nonpy probe failed (%s) — retrying inline", e)
                         _worth = self._nonpy_index_worth_building(root, search_name)
                 else:
@@ -999,35 +1349,63 @@ class SymbolSearcher:
                 # The persistent index already aggregates all non-Python
                 # providers in one rg pass; filter to this name/kind.
                 _idx = self._nonpy_index_for(root)
+                # Filter loop kept (PERF401 rejected): the kind-matching
+                # predicate below spans ~50 lines with per-language comments;
+                # folding it into a list comprehension would bury that
+                # documentation for a micro-optimization the rule itself
+                # calls negligible.
                 for d in _idx.get(search_name, []):
-                    if kind in ("function", "method", "any") and d.kind in (
-                        "function", "async_function", "method",
+                    if (
+                        (
+                            kind in ("function", "method", "any")
+                            and d.kind
+                            in (
+                                "function",
+                                "async_function",
+                                "method",
+                            )
+                        )
+                        or (
+                            kind in ("variable", "any")
+                            and d.kind
+                            in (
+                                # Variable/constant declarations across languages.
+                                # "variable" covers Go var/short_var, "constant" covers
+                                # Go const + Rust const/static, "css_variable" covers
+                                # CSS custom properties (--name).
+                                "variable",
+                                "constant",
+                                "css_variable",
+                            )
+                        )
+                        or (
+                            kind in ("class", "any")
+                            and d.kind
+                            in (
+                                # All type/aggregate-like declarations across languages.
+                                # "class"-group covers: OOP classes, interfaces, type
+                                # aliases, enums, CSS selectors (NOT custom properties —
+                                # those are in the variable group above), plus the
+                                # struct/trait/record/module/protocol kinds emitted by the
+                                # Rust/C#/Ruby/PHP/Swift providers & AST path.
+                                # "namespace" covers Ruby modules / AST-normalized
+                                # module-kind symbols.
+                                "class",
+                                "interface",
+                                "type",
+                                "enum",
+                                "struct",
+                                "trait",
+                                "record",
+                                "module",
+                                "protocol",
+                                "namespace",
+                                "css_class",
+                                "css_id",
+                            )
+                        )
+                        or kind == "any"
                     ):
-                        results.append(d)
-                    elif kind in ("variable", "any") and d.kind in (
-                        # Variable/constant declarations across languages.
-                        # "variable" covers Go var/short_var, "constant" covers
-                        # Go const + Rust const/static, "css_variable" covers
-                        # CSS custom properties (--name).
-                        "variable", "constant", "css_variable",
-                    ):
-                        results.append(d)
-                    elif kind in ("class", "any") and d.kind in (
-                        # All type/aggregate-like declarations across languages.
-                        # "class"-group covers: OOP classes, interfaces, type
-                        # aliases, enums, CSS selectors (NOT custom properties —
-                        # those are in the variable group above), plus the
-                        # struct/trait/record/module/protocol kinds emitted by the
-                        # Rust/C#/Ruby/PHP/Swift providers & AST path.
-                        # "namespace" covers Ruby modules / AST-normalized
-                        # module-kind symbols.
-                        "class", "interface", "type", "enum",
-                        "struct", "trait", "record", "module", "protocol",
-                        "namespace",
-                        "css_class", "css_id",
-                    ):
-                        results.append(d)
-                    elif kind == "any":
                         results.append(d)
 
         # ── Legacy rg fallback (_find_in_other_langs) — RETIRED ──────────────
@@ -1127,13 +1505,14 @@ class SymbolSearcher:
             proc = subprocess.run(
                 cmd, cwd=str(self.repo_root),
                 capture_output=True, text=True, timeout=10,
+                check=False,
             )
             refs: list[SymbolRef] = []
             for line in (proc.stdout or "").splitlines()[:80]:
                 parts = line.split(":", 2)
                 if len(parts) < 3:
                     continue
-                try:
+                with contextlib.suppress(AttributeError, TypeError, ValueError):
                     rel = str(Path(parts[0]).relative_to(self.repo_root))
                     lineno = int(parts[1])
                     ctx = parts[2].strip()
@@ -1142,8 +1521,6 @@ class SymbolSearcher:
                         continue
                     col = ctx.find(name)
                     refs.append(SymbolRef(file=rel, line=lineno, col=max(col, 0), context=ctx[:120]))
-                except (AttributeError, TypeError, ValueError):
-                    pass
 
             # BM25 ranking: sort by relevance to the symbol name before capping.
             # Treats each reference's file+context as a pseudo-document and scores
@@ -1269,17 +1646,20 @@ class SymbolSearcher:
                 return []
             if not p.is_file():
                 return []
+            # Gate BEFORE the language dispatch: every branch below reads and
+            # parses the whole file, and this is the entry point read_file's
+            # over-cap guidance calls — the path that spent 13.31 s / 1.65 GB
+            # to decorate a refusal message. See _too_big_to_parse_inproc.
+            if _too_big_to_parse_inproc(p.stat().st_size, p):
+                return []
             rel = str(p.relative_to(self.repo_root))
-        except Exception:
+        except (OSError, RuntimeError, ValueError):  # vanished file / symlink loop / path outside root
             return []  # non-critical — never block execution
 
         if LanguageId.from_path(str(p)) == LanguageId.PYTHON:
             return self._outline_python(p, rel)
-        elif LanguageId.from_path(str(p)) in (LanguageId.TYPESCRIPT, LanguageId.JAVASCRIPT):
-            try:
-                from config import MULTILANG_OUTLINE as _ML_OL
-            except Exception:
-                _ML_OL = True  # non-critical — never block execution
+        if LanguageId.from_path(str(p)) in (LanguageId.TYPESCRIPT, LanguageId.JAVASCRIPT):
+            from config import MULTILANG_OUTLINE as _ML_OL  # config defines it — no fallback needed
             if _ML_OL:
                 _ts_outline = self._outline_ts_js(p, rel)
                 if _ts_outline:
@@ -1288,174 +1668,42 @@ class SymbolSearcher:
             if _ast_outline:
                 return _ast_outline
             return self._outline_ripgrep(p, rel)
-        else:
-            # AST-first: tree-sitter gives an accurate (start, end) per symbol
-            # and handles modifiers/annotations structurally. Fall back to the
-            # provider-regex rg path only when tree-sitter is unavailable or the
-            # grammar is not installed (e.g. Kotlin before tree_sitter_kotlin).
-            _ast_outline = self._outline_treesitter(p, rel)
-            if _ast_outline:
-                return _ast_outline
-            return self._outline_ripgrep(p, rel)
+        # AST-first: tree-sitter gives an accurate (start, end) per symbol
+        # and handles modifiers/annotations structurally. Fall back to the
+        # provider-regex rg path only when tree-sitter is unavailable or the
+        # grammar is not installed (e.g. Kotlin before tree_sitter_kotlin).
+        _ast_outline = self._outline_treesitter(p, rel)
+        if _ast_outline:
+            return _ast_outline
+        return self._outline_ripgrep(p, rel)
 
     def _outline_python(self, file_path: Path, rel: str) -> list[SymbolDef]:
-        """Tree-sitter-based outline for a single Python file (AST fallback).
+        """Outline for a single Python file, derived from the shared per-file
+        symbol map (the same map ``_find_in_python_cached`` builds via
+        :meth:`_python_symbol_map`).
 
-        Both paths populate ``end_line`` — the extent is free here (tree-sitter
-        ``end_point`` / ``ast.end_lineno``) and it is what the outline is read
-        FOR: the caller's next move is a ``read_file`` range, and with only a
-        start line the model has to invent ``end_line``. Observed cost of that
-        guesswork: inverted ranges (``start_line=600, end_line=460``) that fail
-        the call and spend a turn. ``_outline_treesitter`` already carried the
-        extent; this closes the gap for Python and TS/JS.
+        The map is the single source of truth, so outline and lookup share one
+        parse per file: whichever runs first warms ``_py_file_cache`` and the
+        other reuses it — a ``find_symbol`` immediately followed by
+        ``get_file_outline`` (or vice versa) parses the file once instead of
+        twice. Previously the outline ran its own dedicated tree-sitter walk
+        that ignored the cache entirely.
+
+        Returns top-level symbols only (``parent_class is None``), sorted by
+        line — the same contract as the former dedicated walk, including the
+        ``end_line`` extent the caller reads ranges with. One deliberate
+        additive change: class entries now carry ``decorators`` (populated by
+        ``_extract_all_python_symbols``), matching what find_symbol exposes;
+        and in the AST fallback, docstrings are truncated at 150 chars and
+        method lists at 25 entries, exactly as the map already stores them.
         """
-        results: list[SymbolDef] = []
-        try:
-            source = file_path.read_text(encoding="utf-8", errors="replace")
-        except (AttributeError, TypeError):
-            return results
-        code_bytes = source.encode("utf-8")
-
-        # ── Primary: tree-sitter ─────────────────────────────────────────
-        if _HAS_TS:
-            try:
-                tree = _ts_parse_to_tree(source, "python")
-                if tree is not None:
-
-                    def _walk_outline(node, parent_class: str = "") -> None:
-                        """Walk tree-sitter tree and collect outline entries."""
-                        if node.type == "function_definition":
-                            name_node = node.child_by_field_name("name")
-                            if name_node:
-                                fn_name = _ts_get_node_text(code_bytes, name_node)
-                                if not parent_class:  # only top-level
-                                    sig = _ts_build_py_function_signature(node, code_bytes)
-                                    doc = _ts_extract_docstring(node, code_bytes)
-                                    decs = _ts_extract_decorators(node, code_bytes)
-                                    results.append(SymbolDef(
-                                        file=rel, line=node.start_point.row + 1,
-                                        kind="function", name=fn_name,
-                                        signature=sig or None, docstring=doc,
-                                        decorators=decs or None,
-                                        end_line=node.end_point.row + 1,
-                                    ))
-                            return  # stop descent for function bodies
-
-                        elif node.type == "class_definition":
-                            name_node = node.child_by_field_name("name")
-                            if name_node:
-                                cls_name = _ts_get_node_text(code_bytes, name_node)
-                                bases = _ts_extract_class_bases(node, code_bytes) or None
-                                methods = _ts_collect_class_methods(node, code_bytes) or None
-                                doc = _ts_extract_docstring(node, code_bytes)
-                                results.append(SymbolDef(
-                                    file=rel, line=node.start_point.row + 1,
-                                    kind="class", name=cls_name,
-                                    bases=bases, methods=methods, docstring=doc,
-                                    end_line=node.end_point.row + 1,
-                                ))
-                            return  # don't descend into class body for outline
-
-                        elif node.type == "decorated_definition":
-                            # Unwrap: the real definition is inside
-                            for child in node.children:
-                                if child.type in ("function_definition", "class_definition"):
-                                    _walk_outline(child, parent_class)
-                            return
-
-                        elif node.type in ("expression_statement", "assignment"):
-                            # Top-level assignment (constant)
-                            if not parent_class:
-                                # Python tree-sitter grammar: expression_statement has
-                                # no "expression" named field — child_by_field_name
-                                # always returns None. Use children[0] instead.
-                                # And the wrapper is grammar-dependent: the
-                                # language-pack bundle puts `assignment` straight
-                                # under `module`, so accept the bare node too.
-                                expr = node if node.type == "assignment" else (
-                                    node.children[0] if node.children else None
-                                )
-                                if expr and expr.type == "assignment":
-                                    left = expr.child_by_field_name("left")
-                                    right = expr.child_by_field_name("right")
-                                    if left and left.type == "identifier":
-                                        name = _ts_get_node_text(code_bytes, left)
-                                        val = _ts_get_node_text(code_bytes, right)[:60] if right else ""
-                                        results.append(SymbolDef(
-                                            file=rel, line=node.start_point.row + 1,
-                                            kind="constant", name=name,
-                                            signature=f"{name} = {val}" if val else None,
-                                            end_line=node.end_point.row + 1,
-                                        ))
-                            return
-
-                        # Recurse into children (skip function/class bodies)
-                        for child in node.children:
-                            _walk_outline(child, parent_class)
-
-                    _walk_outline(tree.root_node)
-                    results.sort(key=lambda s: s.line)
-                    return results
-            except Exception:
-                pass  # fall through to AST
-
-        # ── Fallback: AST ────────────────────────────────────────────────
-        try:
-            tree = ast.parse(source, filename=str(file_path))
-        except (SyntaxError, TypeError, AttributeError):
-            return results
-
-        for node in ast.iter_child_nodes(tree):
-            # ── functions ──
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                sig = _get_function_signature(node)
-                doc = ast.get_docstring(node) or None
-                decs = [_unparse(d) for d in node.decorator_list] or None
-                nk = "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function"
-                results.append(SymbolDef(
-                    file=rel, line=node.lineno, kind=nk, name=node.name,
-                    signature=sig, docstring=doc, decorators=decs,
-                    end_line=node.end_lineno,
-                ))
-
-            # ── classes ──
-            elif isinstance(node, ast.ClassDef):
-                bases = [_unparse(b) for b in node.bases] or None
-                methods = [
-                    n.name for n in node.body
-                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                ]
-                doc = ast.get_docstring(node) or None
-                results.append(SymbolDef(
-                    file=rel, line=node.lineno, kind="class", name=node.name,
-                    bases=bases, methods=methods or None, docstring=doc,
-                    end_line=node.end_lineno,
-                ))
-
-            # ── top-level assignments (constants) ──
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        val = _unparse(node.value)[:60]
-                        results.append(SymbolDef(
-                            file=rel, line=node.lineno, kind="constant",
-                            name=target.id,
-                            signature=f"{target.id} = {val}" if val else None,
-                            end_line=node.end_lineno,
-                        ))
-            elif isinstance(node, ast.AnnAssign):
-                if isinstance(node.target, ast.Name):
-                    ann = _unparse(node.annotation)
-                    val = _unparse(node.value)[:40] if node.value else ""
-                    sig = f"{node.target.id}: {ann}" + (f" = {val}" if val else "")
-                    results.append(SymbolDef(
-                        file=rel, line=node.lineno, kind="constant",
-                        name=node.target.id, signature=sig,
-                        end_line=node.end_lineno,
-                    ))
-
-        results.sort(key=lambda s: s.line)
-        return results
+        full_map = self._python_symbol_map(file_path)
+        out = [
+            d for defs in full_map.values() for d in defs
+            if d.parent_class is None
+        ]
+        out.sort(key=lambda s: s.line)
+        return out
 
     def _outline_treesitter(self, file_path: Path, rel: str) -> list[SymbolDef]:
         """Tree-sitter outline for non-Python files (Go/Java/Rust/Ruby/...).
@@ -1492,7 +1740,11 @@ class SymbolSearcher:
             return []
         try:
             syms = _ts_find_all_symbols(content, lang_id)
-        except Exception:
+        except Exception as _err:
+            logger.debug(
+                "[symbol-search] tree-sitter outline failed for %s (%s) — "
+                "falling back to ripgrep outline", file_path, _err,
+            )
             return []  # non-critical — fall back to _outline_ripgrep
         src_lines = content.splitlines()
         results: list[SymbolDef] = []
@@ -1540,7 +1792,11 @@ class SymbolSearcher:
             ]
 
         for pat, kind in patterns:
-            try:
+            with contextlib.suppress(AttributeError, TypeError, OSError, subprocess.SubprocessError):
+                # OSError covers rg-absent FileNotFoundError (rg is an OPTIONAL dep,
+                # see pyproject [search]); SubprocessError covers TimeoutExpired on
+                # a hung rg — both degrade gracefully: skip this pattern and return
+                # whatever the other patterns found (possibly empty).
                 # --with-filename is mandatory: with a single FILE argument, rg omits
                 # the path prefix and emits "lineno:content", which would collapse the
                 # 3-part split below (path:lineno:content) and silently drop every
@@ -1548,6 +1804,7 @@ class SymbolSearcher:
                 proc = subprocess.run(
                     ["rg", "--no-heading", "--with-filename", "--line-number", "-m", "50", pat, str(file_path)],
                     capture_output=True, text=True, timeout=5,
+                    check=False,
                 )
                 for line in (proc.stdout or "").splitlines():
                     parts = line.split(":", 2)
@@ -1556,6 +1813,7 @@ class SymbolSearcher:
                     try:
                         lineno = int(parts[1])
                     except ValueError:
+                        logger.debug("symbol_search: unparsable rg line number in %r", line)
                         continue
                     ctx = parts[2].strip()
                     # Prefer the pattern's own capture group — provider patterns
@@ -1577,11 +1835,6 @@ class SymbolSearcher:
                         file=rel, line=lineno, kind=kind, name=name,
                         signature=ctx,
                     ))
-            except (AttributeError, TypeError, OSError):
-                # OSError covers rg-absent FileNotFoundError (rg is an OPTIONAL dep,
-                # see pyproject [search]); graceful degradation — skip this pattern
-                # and return whatever the other patterns found (possibly empty).
-                continue
 
         results.sort(key=lambda s: s.line)
         return results
@@ -1589,12 +1842,10 @@ class SymbolSearcher:
     def _resolve_search_root(self, search_path: Optional[str]) -> Optional[Path]:
         if not search_path:
             return self.repo_root
-        try:
+        with contextlib.suppress(OSError, RuntimeError):  # resolve() on broken path / symlink loop
             p = (self.repo_root / search_path).resolve()
             if p.is_relative_to(self.repo_root):
                 return p
-        except Exception:
-            pass  # non-critical — never block execution
         return None
 
     def index_was_truncated(self, search_path: Optional[str] = None) -> bool:
@@ -1638,41 +1889,40 @@ class SymbolSearcher:
         out: dict[str, list[SymbolDef]] = {}
         try:
             source = file_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
+        except OSError:
             return out
 
         # ── Primary: tree-sitter (collect every symbol) ──────────────────
-        if _HAS_TS:
-            try:
+        # Comment-wall files are superlinear in tree-sitter (see
+        # _python_ts_parse_too_costly) — the AST path below is identical.
+        if _HAS_TS and not _python_ts_parse_too_costly(source):
+            with contextlib.suppress(Exception):  # fall through to AST
                 code_bytes = source.encode("utf-8")
                 tree = _ts_parse_to_tree(source, "python")
                 if tree is not None:
                     self._ts_collect_all(tree.root_node, code_bytes, rel, "", out)
                     return out
-            except Exception:
-                pass  # fall through to AST
 
         # ── Fallback: AST ──────────────────────────────────────────────────
         try:
             tree = ast.parse(source, filename=str(file_path))
         except (SyntaxError, TypeError, AttributeError):
+            # Syntax-broken file: ast cannot extract anything, but the
+            # error-tolerant tree-sitter parse still finds symbols — use it
+            # as the last resort (the slow-parse case is exactly the kind of
+            # file that is unlikely to be broken, so this stays rare). The
+            # guard applies here too: a broken comment wall costs seconds
+            # for symbols the brokenness already makes untrustworthy.
+            if _HAS_TS and not _python_ts_parse_too_costly(source):
+                with contextlib.suppress(Exception):
+                    code_bytes = source.encode("utf-8")
+                    tree = _ts_parse_to_tree(source, "python")
+                    if tree is not None:
+                        self._ts_collect_all(tree.root_node, code_bytes, rel, "", out)
             return out
 
-        # Build an enclosing-class map once (AST-level O(n)) instead of the
-        # O(n²) nested ast.walk that _find_in_python does per matched node.
-        enclosing: dict[int, str] = {}  # id(node) -> class name
-
-        def _record_enclosing(cls_node: ast.ClassDef, prefix: str) -> None:
-            full = f"{prefix}.{cls_node.name}" if prefix else cls_node.name
-            for child in cls_node.body:
-                enclosing[id(child)] = full
-                # recurse into nested classes
-                for nc in ast.walk(child):
-                    if isinstance(nc, ast.ClassDef) and nc is not child:
-                        # only record direct children of nested class via separate pass
-                        pass
-
-        # Single-pass: walk and record direct enclosing class for top-level body items
+        # Single-pass walk: thread parent_class as a parameter (O(n)) instead of
+        # the O(n²) nested ast.walk that recomputes the enclosing class per node.
         def _walk_body(body: list, parent_class: str) -> None:
             for node in body:
                 if isinstance(node, ast.ClassDef):
@@ -1681,7 +1931,6 @@ class SymbolSearcher:
                     self._ast_add_class(out, node, rel, parent_class)
                     # record its direct members under `full`
                     for child in node.body:
-                        enclosing[id(child)] = full
                         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                             self._ast_add_func(out, child, rel, full)
                         elif isinstance(child, ast.Assign):
@@ -1727,9 +1976,11 @@ class SymbolSearcher:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
         doc = (ast.get_docstring(node) or "")[:150] or None
+        decs = [_unparse(d) for d in node.decorator_list if d] or None
         out.setdefault(node.name, []).append(SymbolDef(
             file=rel, line=node.lineno, kind="class", name=node.name,
             bases=bases, methods=methods[:25] or None, docstring=doc,
+            decorators=decs,
             end_line=getattr(node, "end_lineno", None),
             parent_class=parent_class or None,
         ))
@@ -1790,17 +2041,24 @@ class SymbolSearcher:
                 ))
             return  # do not descend into function bodies
 
-        elif node.type == "class_definition":
+        if node.type == "class_definition":
             name_node = node.child_by_field_name("name")
             cls_name = _ts_get_node_text(code_bytes, name_node) if name_node else ""
             if cls_name:
                 bases = _ts_extract_class_bases(node, code_bytes) or None
                 methods = _ts_collect_class_methods(node, code_bytes) or None
                 doc = _ts_extract_docstring(node, code_bytes)
+                # Decorated classes appear as class_definition under a
+                # decorated_definition parent — pull decorators from there so
+                # find_symbol's @dataclass fallback can rely on the cached map.
+                decs = None
+                _parent = getattr(node, "parent", None)
+                if _parent is not None and _parent.type == "decorated_definition":
+                    decs = _ts_extract_decorators(_parent, code_bytes) or None
                 out.setdefault(cls_name, []).append(SymbolDef(
                     file=rel, line=node.start_point.row + 1,
                     kind="class", name=cls_name,
-                    bases=bases, methods=methods, docstring=doc,
+                    bases=bases, methods=methods, docstring=doc, decorators=decs,
                     end_line=node.end_point.row + 1,
                     parent_class=parent_class or None,
                 ))
@@ -1809,13 +2067,13 @@ class SymbolSearcher:
                 self._ts_collect_all(child, code_bytes, rel, new_parent, out)
             return
 
-        elif node.type == "decorated_definition":
+        if node.type == "decorated_definition":
             for child in node.children:
                 if child.type in ("function_definition", "class_definition"):
                     self._ts_collect_all(child, code_bytes, rel, parent_class, out)
             return
 
-        elif node.type in ("expression_statement", "assignment"):
+        if node.type in ("expression_statement", "assignment"):
             # Bare `assignment` is the language-pack grammar's shape for the same
             # statement the standalone grammar wraps in `expression_statement`.
             expr = node if node.type == "assignment" else (
@@ -1839,31 +2097,65 @@ class SymbolSearcher:
         for child in node.children:
             self._ts_collect_all(child, code_bytes, rel, parent_class, out)
 
-    def _find_in_python_cached(
-        self, file_path: Path, name: str, kind: str,
-        parent_class: str = "",
-    ) -> list[SymbolDef]:
-        """mtime-cached wrapper around per-file full symbol extraction.
+    def _python_symbol_map(self, file_path: Path) -> dict[str, list[SymbolDef]]:
+            """Return the per-file ``{name -> [SymbolDef]}`` map, building and
+            caching it on miss.
 
-        Equivalent to _find_in_python(file_path, name, kind, parent_class) but
-        amortizes parsing: the file is parsed once and every symbol is cached,
-        so subsequent lookups for any name in the same file are O(1).
-        """
-        key = str(file_path)
-        try:
-            mtime = file_path.stat().st_mtime
-        except OSError:
-            return []
-        cached = self._py_file_cache.get(key)
-        if cached is None or cached[0] != mtime:
+            Shared by ``_find_in_python_cached`` and ``_outline_python`` so both
+            warm the same ``_py_file_cache``: a find_symbol + get_file_outline pair
+            on one file parses it once instead of twice, in either order. The
+            key/signature semantics are identical to the former inline code in
+            ``_find_in_python_cached``: ``(st_mtime_ns, st_size)`` signature plus
+            explicit per-path drops via :meth:`invalidate_file_caches` for the
+            agent's own writes. The cache is LRU-capped at
+            ``_PY_FILE_CACHE_MAX_ENTRIES`` — the least-recently-used file is
+            evicted on overflow, so long sessions cannot grow memory without
+            limit.
+            """
+            key = self._cache_key(file_path)
+            try:
+                _st = file_path.stat()
+                sig = (_st.st_mtime_ns, _st.st_size)
+            except OSError:
+                return {}
+            if _too_big_to_parse_inproc(_st.st_size, file_path):
+                return {}
+            cached = _cache_get_lru(self._py_file_cache, key)
+            if cached is not None and cached[0] == sig:
+                return cached[1]
             try:
                 rel = str(file_path.relative_to(self.repo_root))
             except ValueError:
                 rel = str(file_path)
             full_map = self._extract_all_python_symbols(file_path, rel)
-            self._py_file_cache[key] = (mtime, full_map)
-        else:
-            full_map = cached[1]
+            _cache_put_lru(self._py_file_cache, key, (sig, full_map),
+                           _PY_FILE_CACHE_MAX_ENTRIES)
+            return full_map
+    def _find_in_python_cached(
+        self, file_path: Path, name: str, kind: str,
+        parent_class: str = "",
+    ) -> list[SymbolDef]:
+        """Signature-cached wrapper around per-file full symbol extraction.
+
+        Equivalent to _find_in_python(file_path, name, kind, parent_class) but
+        amortizes parsing: the file is parsed once and every symbol is cached,
+        so subsequent lookups for any name in the same file are O(1).
+
+        The key is ``(st_mtime_ns, st_size)``, matching parse_cache._stat_key
+        and the insights_manager signature family. A bare ``st_mtime`` was not
+        enough: on a filesystem with coarse mtime granularity (container bind
+        mounts, NFS/SMB) — or on any tree whose mtimes were restored by
+        tar/rsync -t/cp -p — two different contents share one stat value, and
+        this cache then hands back pre-edit LINE NUMBERS for a file the agent
+        just wrote (measured: target reported at line 5 while it had moved to
+        line 9, and a newly added symbol was invisible).
+
+        Note this is the belt, not the suspenders: a same-size edit on such a
+        filesystem still collides. The guarantee for the agent's own writes
+        comes from :meth:`invalidate_file_caches`, called by the post-write
+        invalidation path — that one needs no filesystem assumptions.
+        """
+        full_map = self._python_symbol_map(file_path)
 
         defs = full_map.get(name, [])
         # Apply kind + parent_class filter (same semantics as _find_in_python)
@@ -1872,68 +2164,59 @@ class SymbolSearcher:
             # parent_class filter: empty means "any scope"; otherwise exact match.
             if parent_class and (d.parent_class or "") != parent_class:
                 continue
-            if kind in ("function", "method", "any") and d.kind in ("function", "async_function", "method"):
-                out.append(d)
-            elif kind in ("class", "any") and d.kind == "class":
-                out.append(d)
-            elif kind in ("variable", "constant", "any") and d.kind == "constant":
-                out.append(d)
-            elif kind == "any":
+            if (
+                (kind in ("function", "method", "any") and d.kind in ("function", "async_function", "method"))
+                or (kind in ("class", "any") and d.kind == "class")
+                or (kind in ("variable", "constant", "any") and d.kind == "constant")
+                or kind == "any"
+            ):
                 out.append(d)
         return out
 
-    @staticmethod
-    def _is_dataclass(file_path: Path, class_name: str) -> bool:
-        """Check if a class has @dataclass decorator (tree-sitter + AST fallback)."""
+    # ── Go dotted name resolution via GoSyntaxProvider ─────────────────────
+    def _go_class_methods_map(
+        self, file_path: Path,
+    ) -> dict[str, list[tuple[str, int, int]]]:
+        """Return ``{class_name: [(method_name, start_line, end_line)]}`` for a
+        Go file, ``(st_mtime_ns, st_size)``-cached in ``_go_file_cache``.
+
+        Same signature rationale as :meth:`_find_in_python_cached` — see there
+        for why a bare ``st_mtime`` let a just-edited file answer from cache.
+        The batch provider call (``find_all_class_methods``) parses the file
+        once regardless of how many structs it has, so repeated dotted
+        lookups like ``find_symbol("TodoList.Add")`` on one file cost one
+        parse total instead of one read + tree-sitter walk per call.
+        """
+        key = self._cache_key(file_path)
+        try:
+            _st = file_path.stat()
+            sig = (_st.st_mtime_ns, _st.st_size)
+        except OSError:
+            return {}
+        if _too_big_to_parse_inproc(_st.st_size, file_path):
+            return {}
+        cached = _cache_get_lru(self._go_file_cache, key)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
         try:
             source = file_path.read_text(encoding="utf-8", errors="replace")
-        except (Exception):
-            return False
-
-        # ── Primary: tree-sitter ───────────────────────────
-        if _HAS_TS:
-            try:
-                tree = _ts_parse_to_tree(source, "python")
-                if tree is not None:
-                    query = f"""
-(decorated_definition
-  decorator: (decorator) @dec
-  definition: (class_definition name: (identifier) @name)
-  (#eq? @name "{class_name}")
-)
-"""
-                    from ..languages.tree_sitter_utils import query_matches as _ts_qm
-                    matches = _ts_qm(source, "python", query)
-                    for match_group in matches:
-                        dec_caps = match_group.get("dec", [])
-                        for dc in dec_caps:
-                            dtext = dc.text.strip()
-                            if dtext.startswith("dataclass") or dtext.startswith("@dataclass"):
-                                return True
-                    return False
-            except Exception:
-                pass  # fall through to AST
-
-        # ── Fallback: AST ──────────────────────────────────
+        except OSError:
+            return {}
+        provider = LanguageRegistry.instance().get(str(file_path))
+        if provider is None:
+            return {}
         try:
-            tree = ast.parse(source)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ClassDef) and node.name == class_name:
-                    for dec in node.decorator_list:
-                        dec_name = ""
-                        if isinstance(dec, ast.Name):
-                            dec_name = dec.id
-                        elif isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name):
-                            dec_name = dec.func.id
-                        elif isinstance(dec, ast.Attribute):
-                            dec_name = dec.attr
-                        if dec_name == "dataclass":
-                            return True
-            return False
-        except (SyntaxError, AttributeError, TypeError):
-            return False
+            methods_map = provider.find_all_class_methods(source)
+        except Exception as _err:
+            logger.debug(
+                "[symbol-search] Go class-methods parse failed for %s (%s)",
+                file_path, _err,
+            )
+            return {}
+        _cache_put_lru(self._go_file_cache, key, (sig, methods_map),
+                       _GO_FILE_CACHE_MAX_ENTRIES)
+        return methods_map
 
-    # ── Go dotted name resolution via GoSyntaxProvider ─────────────────────
     def _find_in_go(
         self, file_path: Path, name: str, kind: str,
         parent_class: str = "",
@@ -1941,32 +2224,32 @@ class SymbolSearcher:
         """Find a Go method scoped to a specific struct.
 
         When ``find_symbol("TodoList.Add")`` is called, *parent_class* is
-        ``"TodoList"`` and *name* is ``"Add"``.  This method reads the file,
-        gets the Go provider, and calls ``find_class_methods()`` to locate
-        only those methods belonging to *parent_class*.
+        ``"TodoList"`` and *name* is ``"Add"``.  The per-file class→methods
+        map (:meth:`_go_class_methods_map`) is parsed once and cached, and
+        the method list for *parent_class* is a dict lookup.
         """
         results: list[SymbolDef] = []
-        try:
-            source = file_path.read_text(encoding="utf-8", errors="replace")
-            rel = str(file_path.relative_to(self.repo_root))
-        except Exception:
-            return results
-
-        provider = LanguageRegistry.instance().get(str(file_path))
-        if provider is None:
-            return results
-
-        try:
-            methods = provider.find_class_methods(source, parent_class)
-        except Exception:
-            return results
-
+        methods = self._go_class_methods_map(file_path).get(parent_class, [])
         for mname, mstart, mend in methods:
             if mname != name:
                 continue
-            # Read the method signature line for context
-            lines = source.split("\n")
-            sig_line = lines[mstart - 1].strip() if 0 <= mstart - 1 < len(lines) else ""
+            try:
+                rel = str(file_path.relative_to(self.repo_root))
+            except ValueError:
+                rel = str(file_path)
+            # Read the method signature line for context (lazy: only on a match).
+            # P26-3: window-read ONE line instead of the whole file — the
+            # class-methods map above already parsed the file, and re-reading
+            # it in full for a single signature line materialized huge
+            # generated Go files (e.g. *.pb.go) on every lookup.
+            # read_line_window is the shared P25-1 primitive (O(1) memory,
+            # \n-only line semantics matching the AST line model).
+            sig_line = ""
+            try:
+                window = read_line_window(file_path, mstart - 1, 1)
+                sig_line = window[0].strip() if window else ""
+            except Exception as e:
+                logger.debug("Go signature line read failed for %s: %s", file_path, e)
             results.append(SymbolDef(
                 file=rel, line=mstart, kind="method",
                 name=name, signature=sig_line,
@@ -1978,37 +2261,52 @@ class SymbolSearcher:
         return results
 
     # ── TS/JS rich symbol search via TSSemanticTracer ──────────────────────
-    _MAX_TS_FILES = _cfg.counts.SYMBOL_MAX_TS_FILES
+    # _MAX_TS_FILES is the module-level constant (L100); _walk_ts_js_files already
+    # uses it, so find_symbol's TS/JS cap reads the same SSOT rather than a class copy.
 
-    # Per-file TS/JS module cache: path -> (mtime, {name -> [SymbolDef]}).
+    # Per-file TS/JS module cache: path -> ((mtime_ns, size), {name -> [SymbolDef]}).
     # analyze_core is ~15ms/file and pure function of content, so caching the
     # full extracted symbol map removes the dominant cost of repeated
-    # find_symbol over TS/JS repos (was ~700ms for 47 files, now ~0ms warm).
+    # find_symbol AND get_file_outline over TS/JS repos (was ~700ms for 47
+    # files, now ~0ms warm). The outline derives from the same map
+    # (_outline_ts_js), so a find+outline pair parses once — Python parity.
+    #
+    # This is the FOURTH cache holding non-Python symbol state, alongside the
+    # two invalidate_nonpy_caches() drops and the Go class→methods map
+    # (_go_file_cache). It is per-file and signature-keyed rather than TTL'd,
+    # so it is cleared by invalidate_file_caches() on the post-write path
+    # instead.
 
     def _ts_module_map(self, file_path: Path) -> dict[str, list[SymbolDef]]:
-        """Return {name -> [SymbolDef]} for a TS/JS file, mtime-cached."""
-        key = str(file_path)
+        """Return {name -> [SymbolDef]} for a TS/JS file, (mtime_ns,size)-cached.
+
+        Same signature rationale as :meth:`_find_in_python_cached` — see there
+        for why a bare ``st_mtime`` let a just-edited file answer from cache.
+        """
+        key = self._cache_key(file_path)
         try:
-            mtime = file_path.stat().st_mtime
+            _st = file_path.stat()
+            sig = (_st.st_mtime_ns, _st.st_size)
         except OSError:
             return {}
-        cached = self._ts_file_cache.get(key)
-        if cached is not None and cached[0] == mtime:
+        if _too_big_to_parse_inproc(_st.st_size, file_path):
+            return {}
+        cached = _cache_get_lru(self._ts_file_cache, key)
+        if cached is not None and cached[0] == sig:
             return cached[1]
         full_map: dict[str, list[SymbolDef]] = {}
-        try:
+        with contextlib.suppress(Exception):  # non-critical — never block execution
             from external_llm.editor.semantic.ts_semantic_tracer import TSSemanticTracer
 
-            from ..languages.models import LanguageId as _LID
+            from ..languages.models import LanguageId as _LID  # noqa: N814 — private lazy-import alias
             content = file_path.read_text(encoding="utf-8", errors="replace")
             rel = str(file_path.relative_to(self.repo_root))
             lang_str = "typescript" if _LID.from_path(str(file_path)) == _LID.TYPESCRIPT else "javascript"
             tracer = TSSemanticTracer(language=lang_str)
             module = tracer.analyze_core(content, str(file_path))
             full_map = self._ts_extract_all(module, rel)
-        except Exception:
-            pass  # non-critical — never block execution
-        self._ts_file_cache[key] = (mtime, full_map)
+        _cache_put_lru(self._ts_file_cache, key, (sig, full_map),
+                       _TS_FILE_CACHE_MAX_ENTRIES)
         return full_map
 
     def _ts_extract_all(self, module, rel: str) -> dict[str, list[SymbolDef]]:
@@ -2026,6 +2324,7 @@ class SymbolSearcher:
                 line=fn.meta.start_line if fn.meta else fn.start_line,
                 kind="async_function" if fn.is_async else "function",
                 name=fn.name, signature=sig,
+                end_line=_ts_node_end_line(fn),
             ))
         for cls in module.classes:
             methods = [m.name for m in cls.methods]
@@ -2038,6 +2337,7 @@ class SymbolSearcher:
                 line=cls.meta.start_line if cls.meta else cls.start_line,
                 kind="class", name=cls.name,
                 methods=methods[:25] or None, bases=bases or None,
+                end_line=_ts_node_end_line(cls),
             ))
             for method in cls.methods:
                 msig = _build_ts_method_signature(cls.name, method)
@@ -2045,6 +2345,7 @@ class SymbolSearcher:
                     file=rel,
                     line=method.meta.start_line if method.meta else method.start_line,
                     kind="method", name=f"{cls.name}.{method.name}", signature=msig,
+                    end_line=_ts_node_end_line(method),
                 ))
         for iface in module.interfaces:
             out.setdefault(iface.name, []).append(SymbolDef(
@@ -2052,18 +2353,21 @@ class SymbolSearcher:
                 line=iface.meta.start_line if iface.meta else iface.start_line,
                 kind="interface", name=iface.name,
                 methods=iface.methods[:25] or None,
+                end_line=_ts_node_end_line(iface),
             ))
         for ta in module.type_aliases:
             out.setdefault(ta.name, []).append(SymbolDef(
                 file=rel,
                 line=ta.meta.start_line if ta.meta else ta.start_line,
                 kind="type", name=ta.name,
+                end_line=_ts_node_end_line(ta),
             ))
         for en in module.enums:
             out.setdefault(en.name, []).append(SymbolDef(
                 file=rel,
                 line=en.meta.start_line if en.meta else en.start_line,
                 kind="enum", name=en.name,
+                end_line=_ts_node_end_line(en),
             ))
         for var in module.variables:
             sig = f"{var.decl_kind} {var.name}"
@@ -2073,6 +2377,7 @@ class SymbolSearcher:
                 file=rel,
                 line=var.meta.start_line if var.meta else var.start_line,
                 kind="variable", name=var.name, signature=sig,
+                end_line=_ts_node_end_line(var),
             ))
         return out
 
@@ -2081,118 +2386,53 @@ class SymbolSearcher:
         full_map = self._ts_module_map(file_path)
         defs = full_map.get(name, [])
         out: list[SymbolDef] = []
+        # Filter loop kept (PERF401 rejected): same rationale as the
+        # non-Python index loop — multi-line kind predicate with per-language
+        # comments, comprehension fold would hurt readability for negligible
+        # gain.
         for d in defs:
-            if kind in ("function", "method", "any") and d.kind in ("function", "async_function", "method"):
-                out.append(d)
-            elif kind in ("class", "interface", "any") and d.kind in ("class", "interface"):
-                out.append(d)
-            elif kind in ("type", "any") and d.kind == "type":
-                out.append(d)
-            elif kind in ("enum", "any") and d.kind == "enum":
-                out.append(d)
-            elif kind in ("variable", "any") and d.kind == "variable":
-                out.append(d)
-            elif kind == "any":
+            if (
+                (kind in ("function", "method", "any") and d.kind in ("function", "async_function", "method"))
+                or (kind in ("class", "interface", "any") and d.kind in ("class", "interface"))
+                or (kind in ("type", "any") and d.kind == "type")
+                or (kind in ("enum", "any") and d.kind == "enum")
+                or (kind in ("variable", "any") and d.kind == "variable")
+                or kind == "any"
+            ):
                 out.append(d)
         return out
 
     def _outline_ts_js(self, file_path: Path, rel: str) -> list[SymbolDef]:
-        """TSSemanticTracer-based file outline for TS/JS files."""
-        try:
-            from external_llm.editor.semantic.ts_semantic_tracer import TSSemanticTracer
+        """Outline for a single TS/JS file, derived from the shared per-file
+        symbol map (the same map ``_find_in_ts_js`` builds via
+        :meth:`_ts_module_map`).
 
-            from ..languages.models import LanguageId
-        except ImportError:
-            return self._outline_ripgrep(file_path, rel)
+        The map is the single source of truth, so outline and lookup share one
+        parse per file: whichever runs first warms ``_ts_file_cache`` and the
+        other reuses it — a ``find_symbol`` immediately followed by
+        ``get_file_outline`` (or vice versa) parses the file once instead of
+        twice. Previously the outline ran its own dedicated TSSemanticTracer
+        walk that ignored the cache entirely. This is the TS/JS side of the
+        Python parity established by ``_outline_python``.
 
-        try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
-        except (ImportError, AttributeError):
-            return []
+        Returns top-level symbols only (``kind != "method"``), sorted by line —
+        the same contract as the former dedicated walk, including the
+        ``end_line`` extent the caller reads ranges with. One deliberate
+        additive change: class entries now carry ``bases``, matching what
+        find_symbol exposes (the same spirit as the Python outline carrying
+        decorators).
 
-        lang_id = LanguageId.from_path(str(file_path))
-        lang_str = "typescript" if lang_id == LanguageId.TYPESCRIPT else "javascript"
-
-        try:
-            tracer = TSSemanticTracer(language=lang_str)
-            module = tracer.analyze_core(content, str(file_path))
-        except Exception:
-            return self._outline_ripgrep(file_path, rel)  # non-critical — never block execution
-
-        results: list[SymbolDef] = []
-
-        def _end(node) -> Optional[int]:
-            """Extent of an IR node, or None when it carries no usable one.
-
-            Mirrors the ``meta or bare attribute`` shape the start line already
-            uses, via getattr because not every IR node declares both (IRImport
-            /IRExport carry only ``meta``). ``or None`` normalises the dataclass
-            default of 0, which would otherwise render as a "line N-0" range.
-            """
-            _m = getattr(node, "meta", None)
-            _e = getattr(_m, "end_line", None) if _m else getattr(node, "end_line", None)
-            return _e or None
-
-        for fn in module.functions:
-            sig = _build_ts_function_signature(fn)
-            results.append(SymbolDef(
-                file=rel,
-                line=fn.meta.start_line if fn.meta else fn.start_line,
-                kind="async_function" if fn.is_async else "function",
-                name=fn.name,
-                signature=sig,
-                end_line=_end(fn),
-            ))
-
-        for cls in module.classes:
-            methods = [m.name for m in cls.methods]
-            results.append(SymbolDef(
-                file=rel,
-                line=cls.meta.start_line if cls.meta else cls.start_line,
-                kind="class",
-                name=cls.name,
-                methods=methods[:25] or None,
-                end_line=_end(cls),
-            ))
-
-        for iface in module.interfaces:
-            results.append(SymbolDef(
-                file=rel,
-                line=iface.meta.start_line if iface.meta else iface.start_line,
-                kind="interface",
-                name=iface.name,
-                end_line=_end(iface),
-            ))
-
-        for ta in module.type_aliases:
-            results.append(SymbolDef(
-                file=rel,
-                line=ta.meta.start_line if ta.meta else ta.start_line,
-                kind="type",
-                name=ta.name,
-                end_line=_end(ta),
-            ))
-
-        for en in module.enums:
-            results.append(SymbolDef(
-                file=rel,
-                line=en.meta.start_line if en.meta else en.start_line,
-                kind="enum",
-                name=en.name,
-                end_line=_end(en),
-            ))
-
-        for var in module.variables:
-            results.append(SymbolDef(
-                file=rel,
-                line=var.meta.start_line if var.meta else var.start_line,
-                kind="variable",
-                name=var.name,
-                end_line=_end(var),
-            ))
-
-        results.sort(key=lambda s: s.line)
-        return results
+        On any failure the map is empty and this returns ``[]``; the caller's
+        fallback chain (``_outline_treesitter`` → ``_outline_ripgrep``) then
+        takes over, exactly as it does when the tracer yields nothing.
+        """
+        full_map = self._ts_module_map(file_path)
+        out = [
+            d for defs in full_map.values() for d in defs
+            if d.kind != "method"
+        ]
+        out.sort(key=lambda s: s.line)
+        return out
 
     def _rg_path_to_rel(self, raw: str) -> str:
         """Normalize an rg-emitted path to a repo-relative string.
@@ -2204,11 +2444,9 @@ class SymbolSearcher:
         _find_in_other_langs path agree on canonical relative paths.
         """
         p = Path(raw)
-        try:
+        with contextlib.suppress(ValueError):
             if p.is_absolute():
                 return str(p.relative_to(self.repo_root))
-        except ValueError:
-            pass
         s = str(p)
         if s.startswith("./"):
             s = s[2:]
@@ -2241,8 +2479,7 @@ class SymbolSearcher:
         glob_lang: list[tuple[str, str]] = []
         for provider in providers:
             lang_id = provider.language_id().value
-            for g in provider.get_file_globs():
-                glob_lang.append((g, lang_id))
+            glob_lang.extend((g, lang_id) for g in provider.get_file_globs())
         if not glob_lang:
             return
 
@@ -2254,6 +2491,7 @@ class SymbolSearcher:
             proc = subprocess.run(
                 cmd, cwd=str(self.repo_root),
                 capture_output=True, text=True, timeout=8,
+                check=False,
             )
         except (OSError, subprocess.SubprocessError) as _err:
             # OSError covers rg-absent FileNotFoundError (rg is OPTIONAL — pyproject
@@ -2276,9 +2514,45 @@ class SymbolSearcher:
             )
             return
 
+        _total_batch_bytes = 0
+        _batch_file_count = 0
+
         for fpath in (proc.stdout or "").splitlines():
             if not fpath:
                 continue
+            try:
+                abs_path = self.repo_root / fpath
+                _size = abs_path.stat().st_size
+            except OSError as _err:
+                logger.debug(
+                    "[symbol-search] stat failed for %s (%s) — skipped",
+                    fpath, _err,
+                )
+                continue
+            # P26-4: sibling _rg_token_in_nonpy_files bounds the indexable set
+            # at _NONPY_INPROC_MAX_BYTES per file and in total; the batch
+            # walker had neither gate — a single minified dist/*.js (tens of
+            # MB is common) was read + tree-sitter-parsed in full.  Skip
+            # oversized files and stop when the cumulative budget is spent.
+            if _size > _NONPY_INPROC_MAX_BYTES:
+                logger.debug(
+                    "[symbol-search] skipping oversized %s (%d bytes > %d)",
+                    fpath, _size, _NONPY_INPROC_MAX_BYTES,
+                )
+                continue
+            if _total_batch_bytes + _size > _NONPY_INPROC_MAX_BYTES:
+                logger.debug(
+                    "[symbol-search] batch byte budget exhausted at %s "
+                    "(cumulative %d bytes) — stopping walk",
+                    fpath, _total_batch_bytes,
+                )
+                break
+            if _batch_file_count >= _NONPY_INPROC_MAX_FILES:
+                logger.debug(
+                    "[symbol-search] batch file cap reached (%d) — stopping walk",
+                    _NONPY_INPROC_MAX_FILES,
+                )
+                break
             _base = PurePosixPath(fpath).name
             lang_id = ""
             for g, lid in glob_lang:
@@ -2295,6 +2569,8 @@ class SymbolSearcher:
                     "[symbol-search] unreadable %s (%s) — skipped", fpath, _err,
                 )
                 continue
+            _total_batch_bytes += _size
+            _batch_file_count += 1
             try:
                 syms = _ts_find_all_symbols(content, lang_id)
             except Exception as _err:
@@ -2368,23 +2644,92 @@ class SymbolSearcher:
         but these two were not among them, so the symptom survived for every
         non-Python language while Python edits were visible at once.
 
-        Two layers, and both must go:
+        Two layers, and both must go — the probe's own memo is a third:
 
         * ``_nonpy_index_cache`` — the built {name: [SymbolDef]} index. Stale for
           an EDITED file.
         * ``_NONPY_FILES_CACHE`` — the shared file-list walk behind the probe.
           Stale for a NEWLY CREATED file: the probe scans that cached list, so a
           new .go file is invisible even once the index above is rebuilt.
+        * ``_NONPY_BLOB_CACHE`` — the probe's content memo. Its per-file
+          signatures already catch edits, and its key carries the file list, so
+          clearing the list cache above would rebuild it on the next probe via
+          a new key — cleared anyway so the two stay coupled in one place.
 
         Kept here rather than reaching into the module from tool_registry so the
         caller does not have to know how many caches there are.
         """
         self._nonpy_index_cache.clear()
         _NONPY_FILES_CACHE.clear()
+        _NONPY_BLOB_CACHE.clear()
+
+    def invalidate_file_caches(self, paths: Optional[Iterable[str]] = None) -> None:
+        """Drop the per-file symbol maps for *paths* after they were written.
+
+        The companion to :meth:`invalidate_nonpy_caches`, for the three
+        per-file caches that method does NOT cover: ``_py_file_cache``
+        (Python), ``_ts_file_cache`` (TS/JS) and ``_go_file_cache`` (Go
+        class→methods). All are per-file and keyed on a
+        ``(st_mtime_ns, st_size)`` signature, which is why they were never in
+        the TTL-drop list — but a signature only detects a change the
+        filesystem bothered to record. Where mtime granularity is coarse
+        (container bind mounts, NFS/SMB) or mtimes were restored wholesale
+        (tar, ``rsync -t``, ``cp -p``), a rewrite can land on the same
+        signature and the cache keeps answering with pre-edit line numbers.
+
+        The agent's own writes are the mutation source that matters here and we
+        know their paths exactly, so this drops them outright instead of hoping
+        the stat differs. Same belt-AND-suspenders split ``insights_manager``
+        makes: signature for drift, explicit bump for our own writes.
+
+        Unknown-scope callers (``bash`` can write anything) pass no paths and
+        get a full clear — cheap, since all three caches refill per file on
+        demand.
+
+        Matching is resolution-independent, and O(1) per path. A key that never
+        matched would make this method a silent no-op — the exact failure mode
+        it exists to close — and there are two ways to miss: the callers
+        disagree on form (``_snapshot_target_files`` builds absolute paths, the
+        patch-mixin's ``touched``/``written`` lists are repo-relative), and
+        either side may carry an unresolved symlink (on macOS ``repo_root`` is
+        resolved to ``/private/var/...`` while a caller-supplied path can still
+        read ``/var/...``). Both are handled by resolving through the same
+        :meth:`_cache_key` the caches are keyed on, rather than by scanning them
+        — an earlier realpath scan over the cache cost ~3 ms per write.
+
+        ``None`` and ``[]`` are NOT the same request. ``None`` means "scope
+        unknown" (the bash path) and drops both caches wholesale; an empty list
+        means "these writes touched nothing cacheable" and must be a no-op —
+        conflating them would evict a live cache on every write that reported no
+        paths, giving back exactly the parse this cache exists to avoid.
+        """
+        if paths is None:
+            self._py_file_cache.clear()
+            self._ts_file_cache.clear()
+            self._go_file_cache.clear()
+            return
+        for p in paths:
+            _p = str(p)
+            if not _p:
+                continue
+            _abs = _p if os.path.isabs(_p) else os.path.join(str(self.repo_root), _p)
+            _key = self._cache_key(_abs)
+            self._py_file_cache.pop(_key, None)
+            self._ts_file_cache.pop(_key, None)
+            self._go_file_cache.pop(_key, None)
 
     def _nonpy_index_for(self, search_root: Path) -> dict[str, list[SymbolDef]]:
         """Build (once, TTL-cached) a {name -> [SymbolDef]} index of ALL
         non-Python definitions under *search_root*.
+
+        Regex-fallback providers are indexed with ONE batched rg spawn per
+        provider (all globs via repeated ``--glob``, all patterns via repeated
+        ``-e``) instead of one spawn per (glob, pattern) pair — spawn count is
+        O(providers), not O(globs x patterns).  Output is bounded per file
+        (``-m 5 x pattern-count``) and per provider (``50 x patterns x
+        globs`` lines) so pathological matches cannot balloon memory; the caps
+        scale with the merged counts so no single pattern is starved of its
+        per-pattern budget.
 
         Invalidation is TTL-based (same scheme as _walk_py_files): an mtime
         fingerprint would itself require a full directory walk (~6s here),
@@ -2447,59 +2792,74 @@ class SymbolSearcher:
                 _ts_providers.append(provider)
                 continue  # skip the provider-regex rg spawn below
 
-            for glob in provider.get_file_globs():
-                for sp in provider.get_symbol_patterns(kind="any"):
-                    # Capture the name with the pattern's own name_capture
-                    # group (default \w+) instead of substituting a literal.
-                    # CSS uses [-\w]+ so kebab-case names like "btn-primary"
-                    # or "--primary-color" are not truncated at the hyphen.
-                    pat = sp.regex.replace("{name}", f"({sp.name_capture})")
-                    try:
-                        cmd = [
-                            "rg", "--no-heading", "--with-filename", "--line-number", "-m", "5",
-                            "--glob", glob,
-                            "--glob", "!node_modules*",
-                            "--glob", "!*.py",
-                            # Pass the pattern via -e so a pattern that starts
-                            # with '-' (e.g. the CSS "--{name}" custom-property
-                            # pattern) is not misparsed as a flag.
-                            "-e", pat, str(search_root),
-                        ]
-                        proc = subprocess.run(
-                            cmd, cwd=str(self.repo_root),
-                            capture_output=True, text=True, timeout=8,
-                        )
-                        for line in (proc.stdout or "").splitlines()[:50]:
-                            parts = line.split(":", 2)
-                            if len(parts) < 3:
-                                continue
-                            try:
-                                rel = self._rg_path_to_rel(parts[0])
-                                lineno = int(parts[1])
-                                ctx = parts[2].strip()
-                                key = (rel, lineno)
-                                if key in seen:
-                                    continue
-                                seen.add(key)
-                                # Prefer the regex's own capture group, then a
-                                # generic identifier heuristic as a fallback.
-                                rm = re.search(pat, ctx)
-                                cap_name = rm.group(1) if (rm and rm.groups()) else ""
-                                if not cap_name:
-                                    m = re.search(r"\b(\w+)\s*[\(\{<]", ctx)
-                                    cap_name = m.group(1) if m else ""
-                                if not cap_name:
-                                    continue
-                                index.setdefault(cap_name, []).append(SymbolDef(
-                                    file=rel, line=lineno, kind=sp.kind, name=cap_name,
-                                    signature=ctx,
-                                ))
-                            except (ValueError, AttributeError, TypeError):
-                                pass
-                    except (AttributeError, TypeError, OSError, subprocess.SubprocessError):
-                        # OSError covers rg-absent FileNotFoundError (rg is OPTIONAL —
-                        # pyproject [search]). Graceful: skip this glob/pattern.
-                        pass
+            globs = provider.get_file_globs()
+            patterns = provider.get_symbol_patterns(kind="any")
+            if not globs or not patterns:
+                continue
+            # ONE batched rg spawn per provider instead of one per (glob,
+            # pattern) pair — the old triple loop spawned 94 rg processes
+            # (~1.1s here), each re-walking the tree; merging cuts that to one
+            # spawn per provider (~0.13s).  All globs and patterns ride in a
+            # single invocation via repeated --glob / -e.
+            pats = [sp.regex.replace("{name}", f"({sp.name_capture})") for sp in patterns]
+            # Caps scale with the merged pattern/glob counts so a single
+            # pattern cannot starve the others of their per-pattern budget:
+            # -m is a per-FILE total across the merged alternation, and the
+            # line slice is a per-provider total.
+            _per_file_cap = 5 * len(pats)
+            _line_cap = 50 * len(pats) * len(globs)
+            cmd = ["rg", "--no-heading", "--with-filename", "--line-number", "-m", str(_per_file_cap)]
+            for glob in globs:
+                cmd += ["--glob", glob]
+            cmd += ["--glob", "!node_modules*", "--glob", "!*.py"]
+            # Pass each pattern via -e so a pattern that starts with '-' (e.g.
+            # the CSS "--{name}" custom-property pattern) is not misparsed as
+            # a flag.
+            for pat in pats:
+                cmd += ["-e", pat]
+            cmd.append(str(search_root))
+            with contextlib.suppress(AttributeError, TypeError, OSError, subprocess.SubprocessError):
+                # OSError covers rg-absent FileNotFoundError (rg is OPTIONAL —
+                # pyproject [search]). Graceful: skip this provider.
+                proc = subprocess.run(
+                    cmd, cwd=str(self.repo_root),
+                    capture_output=True, text=True, timeout=8,
+                    check=False,
+                )
+                for line in (proc.stdout or "").splitlines()[:_line_cap]:
+                    parts = line.split(":", 2)
+                    if len(parts) < 3:
+                        continue
+                    with contextlib.suppress(ValueError, AttributeError, TypeError):
+                        rel = self._rg_path_to_rel(parts[0])
+                        lineno = int(parts[1])
+                        ctx = parts[2].strip()
+                        key = (rel, lineno)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        # Classify the line with the FIRST pattern whose regex
+                        # matches, using that pattern's own name_capture group
+                        # (default \w+).  CSS uses [-\w]+ so kebab-case names
+                        # like "btn-primary" or "--primary-color" are not
+                        # truncated at the hyphen.
+                        cap_name = ""
+                        kind = "any"
+                        for sp, pat in zip(patterns, pats, strict=True):
+                            rm = re.search(pat, ctx)
+                            if rm and rm.groups():
+                                cap_name = rm.group(1)
+                                kind = sp.kind
+                                break
+                        if not cap_name:
+                            m = re.search(r"\b(\w+)\s*[\(\{<]", ctx)
+                            cap_name = m.group(1) if m else ""
+                        if not cap_name:
+                            continue
+                        index.setdefault(cap_name, []).append(SymbolDef(
+                            file=rel, line=lineno, kind=kind, name=cap_name,
+                            signature=ctx,
+                        ))
 
         # One rg --files walk for every tree-sitter-capable provider at once.
         # Runs after the regex loop rather than inside it; the two paths key
@@ -2518,16 +2878,58 @@ class SymbolSearcher:
         """Find names of classes that inherit from base_class."""
         pattern = rf"class\s+(\w+)\s*\(.*\b{re.escape(base_class)}\b"
         names: list[str] = []
-        try:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
             cmd = ["rg", "--no-heading", "-m", "3", pattern, str(self.repo_root)]
             proc = subprocess.run(
                 cmd, cwd=str(self.repo_root),
                 capture_output=True, text=True, timeout=5,
+                check=False,
             )
             for line in (proc.stdout or "").splitlines()[:20]:
                 m = re.search(r"class\s+(\w+)", line)
                 if m and m.group(1) != base_class:
                     names.append(m.group(1))
-        except (OSError, subprocess.SubprocessError):
-            pass
         return list(dict.fromkeys(names))
+
+
+# ── process-shared SymbolSearcher pool ─────────────────────────────────────
+# SymbolSearcher carries five per-instance caches: per-file Python/TS/Go parse
+# maps (_py_file_cache/_ts_file_cache/_go_file_cache), the whole-repo non-
+# Python definition index (_nonpy_index_cache — cold build ~123 ms, see
+# _nonpy_index_worth_building) and the realpath memo. A fresh instance re-pays
+# a cold build on first use. Several call sites construct one PER CALL
+# (patch_engine apply/salvage fallback, service eval fallback, agent_tools
+# helper pack) — repeated tool calls over one repo re-paid that cold build
+# every time. This pool shares a small LRU-capped set of instances across ALL
+# call sites, keyed by the resolved repo root.
+#
+# Bonus: tool_registry's post-write invalidation (invalidate_nonpy_caches /
+# invalidate_file_caches) runs on the POOLED instance, so the per-call sites
+# now see subagent writes immediately instead of after the 30 s non-Python
+# TTL. Previously they built a private instance whose caches no invalidator
+# could reach. Concurrency is unchanged: the tool_registry instance already
+# served parallel read-only tool dispatches, and the module-level walk caches
+# (_NONPY_FILES_CACHE etc.) were already shared across instances.
+_SEARCHER_POOL_MAX_ENTRIES = 4
+_searcher_pool: OrderedDict[str, SymbolSearcher] = OrderedDict()
+_searcher_pool_lock = threading.Lock()
+
+
+def get_symbol_searcher(repo_root: str) -> SymbolSearcher:
+    """Return the process-shared :class:`SymbolSearcher` for *repo_root*.
+
+    Instances are keyed by the RESOLVED root string and LRU-capped at
+    ``_SEARCHER_POOL_MAX_ENTRIES``: a get refreshes recency, so repeated
+    lookups over the same repo reuse warm caches while memory stays bounded.
+    The pool is process-wide, so any invalidator (tool_registry's post-write
+    path) reaches the same instances the per-call sites use.
+    """
+    key = str(Path(repo_root).resolve())
+    with _searcher_pool_lock:
+        searcher = _searcher_pool.get(key)
+        if searcher is not None:
+            _searcher_pool.move_to_end(key)
+            return searcher
+        searcher = SymbolSearcher(key)
+        _capped_put(_searcher_pool, key, searcher, _SEARCHER_POOL_MAX_ENTRIES)
+        return searcher

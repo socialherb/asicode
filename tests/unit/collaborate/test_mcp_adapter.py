@@ -222,7 +222,6 @@ class TestToolExclusion:
         # These should never be exposed via MCP
         assert "delegate_to_helper" in _EXCLUDED_TOOLS
         assert "update_memory" in _EXCLUDED_TOOLS
-        assert "query_experience" in _EXCLUDED_TOOLS
 
     def test_bash_is_in_analysis_safe_tools_not_excluded(self):
         """bash must be available in analysis sessions and not in excluded."""
@@ -416,6 +415,35 @@ class TestTimeoutOrdering:
 
         assert _resolve_mcp_timeout("bash", {"timeout": 99999}) == _resolve_mcp_timeout(
             "bash", {"timeout": SHELL_TIMEOUT_MAX}
+        )
+
+    def test_job_ceiling_clears_its_wait_budget(self):
+        """job(action=output, wait_timeout=N) must get the same protection as bash.
+
+        Without a derived ceiling, the outer asyncio.wait_for (120s default)
+        could fire before wait_timeout=180 elapsed, discarding the result the
+        inner wait was about to produce.
+        """
+        from external_llm.agent.tool_handlers.shell_policy import SHELL_TIMEOUT_MAX
+        from external_llm.repl.collaborate import asi_mcp_adapter as mod
+
+        assert _resolve_mcp_timeout("job", {"wait_timeout": 180}) == 180 + mod._MCP_TIMEOUT_GRACE
+        assert _resolve_mcp_timeout("job", {"wait_timeout": 180}) > 180
+        # No wait_timeout → the inner call returns immediately; the static
+        # default ceiling governs (job stays bounded).
+        assert _resolve_mcp_timeout("job", {}) == mod.CLAUDE_MCP_TOOL_TIMEOUT
+        # Absurd values are clamped to the schema max, matching the tool-side
+        # clamp — the two layers must agree on the bound.
+        assert _resolve_mcp_timeout("job", {"wait_timeout": 99999}) == _resolve_mcp_timeout(
+            "job", {"wait_timeout": SHELL_TIMEOUT_MAX}
+        )
+
+    def test_job_ceiling_does_not_inherit_bash_rerun_multiplier(self):
+        """job has no recovery re-run, so its ceiling must not be inflated 2x."""
+        from external_llm.repl.collaborate import asi_mcp_adapter as mod
+
+        assert _resolve_mcp_timeout("job", {"wait_timeout": 120}) == (
+            120 + mod._MCP_TIMEOUT_GRACE
         )
 
     @pytest.mark.parametrize("bad", [None, 0, "", "abc", -5, 3.7, [], {"nested": 1}])

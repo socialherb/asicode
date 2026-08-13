@@ -1,6 +1,7 @@
 """Tests for WriteSafetyManager (external_llm/agent/tool_safety.py)."""
 import os
 import stat
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -67,11 +68,19 @@ class TestApprovalPreview:
         assert needs is True
         assert len(preview) > 0
 
-    def test_delete_file_always_needs_approval(self, manager):
+    def test_delete_file_raises_no_phantom_approval(self, manager):
+        """``delete_file`` is not a dispatchable tool, so it must not prompt.
+
+        A branch used to return a "DELETE FILE: <path>" preview for it. Nothing
+        can dispatch the name (it is absent from ``_TOOL_HANDLER_MAP``), but
+        ``_gate_check`` runs before dispatch resolves the handler — so a model
+        hallucinating it made the user approve a deletion that then failed with
+        "Unknown tool". Prompting for a no-op teaches users to click through the
+        prompts that are real.
+        """
         preview, needs = manager.approval_preview("delete_file", {"path": "foo.py"})
-        assert needs is True
-        assert "DELETE FILE" in preview
-        assert "foo.py" in preview
+        assert needs is False
+        assert preview == ""
 
     def test_write_plan_needs_approval(self, manager):
         preview, needs = manager.approval_preview("write_plan", {"plan": {"key": "val"}})
@@ -87,23 +96,39 @@ class TestApprovalPreview:
 # ── gate_check ────────────────────────────────────────────────────────────────
 
 class TestGateCheck:
+    # write_plan, not delete_file: these assert what gate_check does for a tool
+    # that ACTUALLY needs approval. delete_file used to serve that role, and once
+    # its (phantom) branch was removed these would have gone on passing for the
+    # wrong reason — returning None because no approval was needed rather than
+    # because it was granted, asserting nothing about the gate.
+    _APPROVING_TOOL = "write_plan"
+    _ARGS: ClassVar[dict] = {"plan": {"kind": "ASICODE_PLAN_V1", "ops": [{"op": "replace_file", "path": "x.py"}]}}
+
+    def test_needs_approval_precondition(self, manager):
+        """Guard the fixture itself: the tool below must require approval."""
+        _preview, needs = manager.approval_preview(self._APPROVING_TOOL, self._ARGS)
+        assert needs is True
+
     def test_no_callback_always_passes(self, manager):
-        result = manager.gate_check("delete_file", {"path": "x.py"}, approval_callback=None)
+        result = manager.gate_check(
+            self._APPROVING_TOOL, self._ARGS, approval_callback=None
+        )
         assert result is None
 
     def test_approved_returns_none(self, manager):
         callback = MagicMock(return_value=True)
-        result = manager.gate_check("delete_file", {"path": "x.py"}, callback)
+        result = manager.gate_check(self._APPROVING_TOOL, self._ARGS, callback)
         assert result is None
+        callback.assert_called_once()
 
     def test_rejected_returns_error_dict(self, manager):
         callback = MagicMock(return_value=False)
-        result = manager.gate_check("delete_file", {"path": "x.py"}, callback)
+        result = manager.gate_check(self._APPROVING_TOOL, self._ARGS, callback)
         assert result is not None
         assert "error" in result
         assert "rejected" in result["error"]
         assert result["metadata"]["gate"] == "rejected"
-        assert result["metadata"]["tool"] == "delete_file"
+        assert result["metadata"]["tool"] == self._APPROVING_TOOL
 
     def test_no_approval_needed_callback_not_called(self, manager):
         callback = MagicMock()
@@ -192,7 +217,8 @@ class TestRestoreSnapshots:
             f.write("changed content\n")
 
         WriteSafetyManager.restore_snapshots({target: original})
-        assert open(target).read() == original
+        with open(target) as f:
+            assert f.read() == original
 
     def test_missing_path_silently_skipped(self):
         # Should not raise even if path doesn't exist
@@ -207,7 +233,8 @@ class TestRestoreSnapshots:
                 f.write("changed\n")
         WriteSafetyManager.restore_snapshots(files)
         for path, original in files.items():
-            assert open(path).read() == original
+            with open(path) as f:
+                assert f.read() == original
 
     def test_missing_snap_removes_created_file(self, tmp_repo):
         """_MISSING_SNAP entry → file should be removed."""
@@ -231,7 +258,8 @@ class TestRestoreSnapshots:
         with open(target, "w") as f:
             f.write("corrupted content\n")
         WriteSafetyManager.restore_snapshots({target: original})
-        assert open(target).read() == original
+        with open(target) as f:
+            assert f.read() == original
 
 
 # ── restore_snapshots: atomic crash-safety ─────────────────────────────────
@@ -261,7 +289,8 @@ class TestRestoreSnapshotsAtomicSafety:
         leftovers = [f for f in os.listdir(tmp_repo) if f.startswith(".asi-revert-")]
         assert leftovers == [], f"temp file leaked on replace failure: {leftovers}"
         # os.replace is atomic: the target is unchanged (not truncated/partial).
-        assert open(target).read() == "old\n"
+        with open(target) as f:
+            assert f.read() == "old\n"
 
     def test_returns_failed_paths_on_oserror(self, tmp_repo, monkeypatch):
         """Bug #2: restore_snapshots now returns list of paths whose restoration
@@ -288,7 +317,8 @@ class TestRestoreSnapshotsAtomicSafety:
         failed = WriteSafetyManager.restore_snapshots({target: original})
         assert isinstance(failed, list)
         assert failed == []
-        assert open(target).read() == original
+        with open(target) as f:
+            assert f.read() == original
 
 
 class TestRestoreSnapshotsPreservesMode:
@@ -310,7 +340,8 @@ class TestRestoreSnapshotsPreservesMode:
 
         WriteSafetyManager.restore_snapshots({target: "restored\n"})
 
-        assert open(target).read() == "restored\n"
+        with open(target) as f:
+            assert f.read() == "restored\n"
         assert self._mode(target) == 0o755, "restore stripped the +x bit"
 
     def test_group_world_read_preserved(self, tmp_repo):
@@ -351,9 +382,10 @@ class TestVerifyAfterWrite:
 class TestTreeSitterSymbolSet:
     """Module-level _treesitter_symbol_set() — error paths."""
 
-    def test_import_failure_returns_none(self):
-        """When tree_sitter_utils import fails, returns None (line 78-79)."""
-        # Use require failed import — patch the function's internal import
+    def test_import_failure_propagates(self):
+        """tree_sitter_utils is first-party and always imports (P26-6 cleanup:
+        the old except ImportError fallback was dead code). If it ever fails,
+        the error must propagate — silent None hid the failure."""
         import builtins
 
         from external_llm.agent.tool_safety import _treesitter_symbol_set
@@ -364,9 +396,9 @@ class TestTreeSitterSymbolSet:
                 raise ImportError("mock: tree_sitter_utils not available")
             return real_import(name, *args, **kwargs)
 
-        with patch("builtins.__import__", side_effect=_mock_import):
-            result = _treesitter_symbol_set("x = 1", "python")
-        assert result is None
+        with patch("builtins.__import__", side_effect=_mock_import), \
+                pytest.raises(ImportError):
+            _treesitter_symbol_set("x = 1", "python")
 
     def test_get_parser_returns_none(self):
         """Cover L82: get_parser returns None for a language."""
@@ -1057,3 +1089,28 @@ class TestAutoRestoreDeclLoss:
             result = f.read()
         assert "def dead()" not in result, "dead() should remain removed"
         assert "def alive()" in result
+
+    def test_pre_content_parsed_once(self, manager, tmp_repo, monkeypatch):
+        """Regression pin: Phase 3 reuses the _python_decl_sets tree — the
+        pre-snapshot text must be ast.parse'd exactly once per file."""
+        import ast
+        target = os.path.join(tmp_repo, "decl_loss_pin.py")
+        pre = "def helper():\n    return 42\n\ndef caller():\n    return helper()\n"
+        post = "def caller():\n    return helper()\n"  # helper() removed, now F821
+        with open(target, "w") as f:
+            f.write(post)
+        calls = []
+        orig_parse = ast.parse
+
+        def counting(*a, **k):
+            calls.append(a)
+            return orig_parse(*a, **k)
+
+        monkeypatch.setattr(ast, "parse", counting)
+        snapshots = {target: pre}
+        count = manager.auto_repair_semantic(snapshots)
+        assert count == 1
+        assert sum(1 for c in calls if c[0] == pre) == 1, (
+            "pre-snapshot text must be parsed exactly once "
+            "(decl_sets + Phase 3 shared tree)"
+        )

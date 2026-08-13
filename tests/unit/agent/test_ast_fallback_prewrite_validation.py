@@ -32,9 +32,10 @@ def _normalize_fb_code_via_unparse(fb_code: str, orig_indent: str) -> str | None
                 (orig_indent + _item_[fn_min:]) if _item_.strip() else ""
                 for _item_ in fn_lines
             )
-        return norm_raw
     except SyntaxError:
         return None
+    else:
+        return norm_raw
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +135,6 @@ class TestPreWriteValidationGate:
         """
         try:
             ast.parse(new_text)
-            return ("write", new_text)
         except SyntaxError as syn:
             is_indent = isinstance(syn, IndentationError) or "indent" in str(syn).lower()
             if not is_indent:
@@ -147,9 +147,12 @@ class TestPreWriteValidationGate:
             # just verify the normalised function compiles standalone.)
             try:
                 ast.parse(norm_fb)
-                return ("write", norm_fb)  # simplified: use normalised func alone
             except SyntaxError as e2:
                 return ("skip", f"norm_still_invalid:{e2}")
+            else:
+                return ("write", norm_fb)  # simplified: use normalised func alone
+        else:
+            return ("write", new_text)
 
     def test_valid_file_passes_through(self):
         valid = "def foo():\n    return 1\n"

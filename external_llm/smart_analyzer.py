@@ -2,14 +2,13 @@
 Smart Request Analyzer for asicode (typed plan policy).
 
 Analyzes general user requests using typed data structures instead of
-ad-hoc keyword/regex matching. Integrates with PlanPolicy taxonomy for
-consistent intent-to-strategy mapping across the system.
+ad-hoc keyword/regex matching for consistent intent-to-strategy mapping.
 
 Features:
 - Typed IntentClassifierRule with priority-scored matching
 - Typed FeaturePattern with language-agnostic keyword matching
 - Tech stack detection via project file inspection
-- Confidence calculation aligned with PlanPolicy confidence semantics
+- Confidence calculation with a normalized 0.0-1.0 score
 """
 from __future__ import annotations
 
@@ -70,13 +69,12 @@ class RequestAnalysis:
     """Result of analyzing a user request (typed).
 
     Provides typed fields for intent, feature, tech stack, and file operations.
-    Aligned with PlanPolicy confidence semantics.
     """
 
     # Original request
     original_request: str
 
-    # Detected intent (aligned with PlanPolicy kind taxonomy)
+    # Detected intent
     intent: str = "general"  # create_feature, fix_bug, refactor, modify_feature, add_test, general
 
     # Feature/component name
@@ -94,7 +92,7 @@ class RequestAnalysis:
     # Enhanced request with context
     enhanced_request: str = ""
 
-    # Confidence score (0.0 - 1.0) — matches PlanPolicy confidence semantics
+    # Confidence score (0.0 - 1.0)
     confidence: float = 0.0
 
     # Whether this requires planning mode
@@ -338,6 +336,7 @@ class SmartRequestAnalyzer:
                                     found = True
                                     break
                             except Exception:
+                                logger.debug("tech probe read failed: %s", fpath, exc_info=True)
                                 continue
                     if found:
                         break
@@ -357,7 +356,7 @@ class SmartRequestAnalyzer:
         """Suggest files to create/modify based on intent and feature.
 
         Uses graph-aware grounding via external integration rather than
-        hardcoded framework×feature→file mappings. Returns empty lists
+        hardcoded frameworkxfeature→file mappings. Returns empty lists
         when no typed file resolution is available.
         """
         files: list[str] = []
@@ -433,7 +432,7 @@ class SmartRequestAnalyzer:
 
     @staticmethod
     def _calculate_confidence(intent: str, feature: Optional[str], suggested_files: list[str]) -> float:
-        """Calculate confidence score aligned with PlanPolicy semantics.
+        """Calculate a normalized confidence score.
 
         - Intent detected: +0.3
         - Feature detected: +0.3
@@ -450,17 +449,3 @@ class SmartRequestAnalyzer:
         if intent in ("create_feature", "fix_bug"):
             score += 0.2
         return min(score, 1.0)
-
-
-def analyze_request(repo_root: str, user_request: str) -> RequestAnalysis:
-    """Convenience function to analyze a request.
-
-    Args:
-        repo_root: Repository root path
-        user_request: User's request
-
-    Returns:
-        RequestAnalysis with typed fields
-    """
-    analyzer = SmartRequestAnalyzer(repo_root)
-    return analyzer.analyze(user_request)

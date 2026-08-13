@@ -33,8 +33,8 @@ import gc
 import pytest
 
 from external_llm.agent.context_manager import (
-    SessionCompressionContext,
     _MODULE_COMPRESS_LOCKS,
+    SessionCompressionContext,
 )
 
 

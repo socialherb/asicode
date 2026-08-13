@@ -31,7 +31,7 @@ from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 def cfg():
     return AgentConfig(
         max_turns=5, run_tests=False, run_lint=False, auto_test_on_patch=False,
-        planning_enabled=False, self_review_enabled=False, rag_enabled=False,
+        self_review_enabled=False, rag_enabled=False,
         vector_cache_enabled=False, parallel_tool_execution_enabled=False,
     )
 
@@ -152,7 +152,7 @@ def test_write_tool_reaches_the_central_invalidation_hook(repo, label, monkeypat
 def test_failed_write_does_not_invalidate(repo, monkeypatch):
     """Invalidation is gated on result.ok — a rejected edit changed nothing, and
     paying the RAG/call-graph re-index for it would be pure waste."""
-    reg, d = repo
+    reg, _d = repo
     calls: list = []
     orig = type(reg)._invalidate_cache_after_write
     monkeypatch.setattr(
@@ -219,7 +219,7 @@ def test_nonpython_symbol_visible_right_after_edit(multilang_repo):
 
 def test_python_and_nonpython_are_symmetric(multilang_repo):
     """Neither language may be the privileged one."""
-    reg, d = multilang_repo
+    reg, _d = multilang_repo
     reg.dispatch("edit_text", {
         "file_path": "a.py", "old_string": "def py_alpha():",
         "new_string": "def PyBeta():\n    return 9\n\n\ndef py_alpha():",
@@ -262,4 +262,39 @@ def test_readonly_bash_does_not_invalidate(multilang_repo):
     again = reg.dispatch("read_file", {"path": "a.py"})
     assert bool((again.metadata or {}).get("cache_hit")) is True, (
         "read-only bash cleared the read cache"
+    )
+
+
+
+def test_mutating_bash_drops_the_facade_rg_graph(multilang_repo):
+    """B1: unknown-scope (bash) invalidation must drop the facade's RG graph.
+
+    ``_invalidate_caches_unknown_scope`` cleared the CallGraphIndexer
+    (``cgi.invalidate()``) but never ``self._call_graph.invalidate()`` — the
+    RepositoryGraph held inside the facade is a SEPARATE build serving
+    get_symbol / get_importers / get_file_dependencies / get_symbols_in_file.
+    A warm RG graph therefore kept serving pre-bash state, i.e. the exact
+    "cannot find a symbol in code it just wrote" class the wholesale drop
+    exists for. The write-tool path has always been symmetric
+    (``_call_graph.invalidate_files``); this restores the unknown-scope mirror.
+    """
+    reg, d = multilang_repo
+    # Warm the facade RG graph so a stale read is possible (the bug is
+    # invisible on a cold graph, which rebuilds lazily on the next query).
+    assert reg._call_graph.get_symbol("py_alpha") is not None, (
+        "precondition: RG graph should serve existing symbols"
+    )
+    assert reg._call_graph._graph is not None, "precondition: RG graph should be warm"
+
+    res = reg.dispatch("bash", {"command": "printf 'def BashGsgSym():\\n    return 1\\n' > bash_gsg.py"})
+    assert res.ok, res.error
+    assert (d / "bash_gsg.py").exists()
+    assert reg._call_graph._graph is None, (
+        "mutating bash left the facade RG graph warm — RG-backed queries "
+        "served pre-bash state (B1)"
+    )
+    # The next RG-backed query rebuilds lazily and must see the new symbol.
+    node = reg._call_graph.get_symbol("BashGsgSym")
+    assert node is not None and node.name == "BashGsgSym", (
+        "RG get_symbol cannot see a symbol created by mutating bash"
     )

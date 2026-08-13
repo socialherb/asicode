@@ -20,7 +20,6 @@ class TestOrchestratorConfig:
 
     def test_default_config(self):
         config = CollaborationOrchestratorConfig()
-        assert config.max_iterations == 1
         from config import CLAUDE_SDK_MAX_TURNS
         assert config.max_turns_per_iteration == CLAUDE_SDK_MAX_TURNS
         assert config.model == "sonnet"
@@ -175,10 +174,12 @@ class TestSessionHandoff:
 
     def _fake_session(self, **kw):
         from types import SimpleNamespace
-        defaults = dict(
-            compressed_summary="", compressed_up_to=0, archived_count=0,
-            turns=[],
-        )
+        defaults = {
+            "compressed_summary": "",
+            "compressed_up_to": 0,
+            "archived_count": 0,
+            "turns": [],
+        }
         defaults.update(kw)
         return SimpleNamespace(**defaults)
 

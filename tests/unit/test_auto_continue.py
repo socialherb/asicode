@@ -15,7 +15,6 @@ turn's instruction, so its safety rests on three pure decisions locked here:
 """
 import asi
 
-
 # ─── _parse_auto_arg ─────────────────────────────────────────────────────────
 
 def test_parse_auto_empty_toggles():
@@ -97,3 +96,31 @@ def test_validator_auto_budget_has_a_ceiling_too():
     assert asi._validate_next_suggestion(
         "y" * (asi._AUTO_SUGGESTION_MAX_LEN + 1), "fix the bug",
         max_len=asi._AUTO_SUGGESTION_MAX_LEN) is None
+
+
+# ─── _AUTO_CONTINUE_DELAY env parsing (misconfig → default, incl. non-finite) ─
+
+import external_llm.repl.repl_impl as _repl_impl
+
+
+def test_auto_continue_delay_parse_valid_values(monkeypatch):
+    for raw, expected in [
+        ("8", 8.0), ("3", 3.0), ("1.5", 2.0), ("0", 2.0), ("600", 600.0),
+    ]:
+        monkeypatch.setenv("ASICODE_AUTO_CONTINUE_DELAY", raw)
+        assert _repl_impl._parse_auto_continue_delay() == expected
+
+
+def test_auto_continue_delay_parse_misconfig_falls_back(monkeypatch):
+    """Misconfig (garbage / empty / NON-FINITE) falls back to the 8s default.
+
+    ``float("inf")`` passes a bare ValueError guard — the old code let it
+    through and the auto-continue Timer(inf) never fired, silently disabling
+    the feature. ``nan``/``-inf``/``inf`` must all fall back to 8s now (nan
+    used to silently clamp to the 2s floor via max()).
+    """
+    monkeypatch.delenv("ASICODE_AUTO_CONTINUE_DELAY", raising=False)
+    assert _repl_impl._parse_auto_continue_delay() == 8.0
+    for raw in ["", "  ", "abc", "1e", "nan", "inf", "-inf"]:
+        monkeypatch.setenv("ASICODE_AUTO_CONTINUE_DELAY", raw)
+        assert _repl_impl._parse_auto_continue_delay() == 8.0

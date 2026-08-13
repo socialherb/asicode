@@ -99,7 +99,7 @@ AFTER_GREET_CHANGE = textwrap.dedent("""\
 """)
 
 
-class TestTolerантPatchVariants:
+class TestTolerantPatchVariants:
     """Tests that tolerant_git_apply handles whitespace-only differences."""
 
     def test_correct_patch_succeeds(self, engine, git_repo):
@@ -247,13 +247,12 @@ class TestConvertPatchToEditBlocks:
         registry = ToolRegistry(repo_root=str(git_repo), config=config)
         mock_client = Mock()
         mock_client.get_provider_name.return_value = "ollama"
-        loop = AgentLoop(
+        return AgentLoop(
             llm_client=mock_client,
             registry=registry,
             config=config,
             model="qwen2.5-coder:7b",
         )
-        return loop
 
     def test_hunk_to_before_after_basic(self, git_repo):
         loop = self._make_loop(git_repo)
@@ -879,3 +878,100 @@ class TestC0PlacementVerification:
         )
         ok, detail = engine._verify_c0_placement(patch)
         assert ok, detail
+
+
+# ── Tests: conflicted --3way rollback (content + index) ───────────────────────
+
+class TestThreeWayConflictRollback:
+    """A conflicted ``--3way`` must leave the tree exactly as it found it.
+
+    ``git apply --check --3way`` returns 0 for a patch that will conflict; the
+    real apply then returns 1 *after* writing ``<<<<<<< ours`` markers into the
+    file and staging the unmerged result. That lands in the "check OK but apply
+    failed" branch, which used to report failure without undoing either half —
+    so the caller's re-anchor pass (``_exact_reanchor_patch``) read the markers
+    back as if they were source, and ``git status`` was left showing ``UU``.
+
+    Restoring bytes alone is not enough: an unmerged index entry survives a
+    byte-identical rewrite, which is why ``_restore_index_entries`` exists.
+    """
+
+    @staticmethod
+    def _conflicting_patch(repo) -> str:
+        """Patch whose pre-image is HEAD, against a differently-edited worktree."""
+        app = repo / "app.py"
+        original = app.read_text()
+        app.write_text(original.replace('msg = "Hello, " + name',
+                                        'msg = "Patched, " + name'))
+        # git diff emits the `index <sha>..<sha>` lines --3way needs to find the
+        # pre-image blob; a hand-written patch would fail before conflicting.
+        patch = subprocess.run(["git", "diff"], cwd=repo, capture_output=True,
+                               text=True, check=True).stdout
+        # A DIFFERENT edit at the same line, staged: --3way requires the
+        # worktree to match the index for its target.
+        app.write_text(original.replace('msg = "Hello, " + name',
+                                        'msg = "Local, " + name'))
+        subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+        return patch
+
+    @staticmethod
+    def _index_state(repo) -> str:
+        return subprocess.run(["git", "ls-files", "-s", "--", "app.py"], cwd=repo,
+                              capture_output=True, text=True, check=True).stdout
+
+    def test_conflicted_3way_rolls_back_content_and_index(self, engine, git_repo):
+        patch = self._conflicting_patch(git_repo)
+        before_content = (git_repo / "app.py").read_text()
+        before_index = self._index_state(git_repo)
+
+        ok, _err, mode = engine._tolerant_git_apply(patch, "app.py", allow_3way=True)
+
+        # Non-vacuity: the conflicted-3way branch is the one under test. If an
+        # earlier variant had applied (or every variant failed at --check), mode
+        # would be another name or "none" and the assertions below would pass
+        # without ever exercising the rollback.
+        assert mode == "3way_merge", f"expected the 3way branch, got mode={mode!r}"
+        assert not ok
+
+        after = (git_repo / "app.py").read_text()
+        assert "<<<<<<<" not in after, "merge markers left in the working tree"
+        assert ">>>>>>>" not in after
+        assert after == before_content, "content not restored to its pre-apply state"
+
+        unmerged = subprocess.run(["git", "ls-files", "-u"], cwd=git_repo,
+                                  capture_output=True, text=True, check=True).stdout
+        assert unmerged == "", f"unmerged index entries left behind:\n{unmerged}"
+        assert self._index_state(git_repo) == before_index, "index entry not restored"
+
+    def test_reanchor_pass_sees_clean_source_after_the_failure(self, engine, git_repo):
+        """The concrete downstream harm: markers must not reach the re-anchorer."""
+        patch = self._conflicting_patch(git_repo)
+        engine._tolerant_git_apply(patch, "app.py", allow_3way=True)
+        # _exact_reanchor_patch reads the file back; it must not find markers.
+        assert "<<<<<<<" not in (git_repo / "app.py").read_text()
+
+    def test_snapshot_index_entries_captures_stage0(self, engine, git_repo):
+        patch = self._conflicting_patch(git_repo)
+        snap = engine._snapshot_index_entries(patch)
+        assert "app.py" in snap
+        mode, sha = snap["app.py"]
+        assert mode == "100644" and len(sha) >= 40
+
+    def test_restore_index_entries_is_a_noop_on_a_healthy_index(self, engine, git_repo):
+        """A successful apply must not have its index rewritten."""
+        patch = self._conflicting_patch(git_repo)
+        snap = engine._snapshot_index_entries(patch)
+        before = self._index_state(git_repo)
+        engine._restore_index_entries(snap)
+        assert self._index_state(git_repo) == before
+
+    def test_untracked_path_is_not_restored(self, engine, git_repo):
+        """No stage-0 entry captured → nothing of ours to put back."""
+        patch = (
+            "diff --git a/brand_new.py b/brand_new.py\n"
+            "--- /dev/null\n"
+            "+++ b/brand_new.py\n"
+            "@@ -0,0 +1,1 @@\n"
+            "+x = 1\n"
+        )
+        assert engine._snapshot_index_entries(patch) == {}

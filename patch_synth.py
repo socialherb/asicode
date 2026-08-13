@@ -6,10 +6,15 @@ from difflib import SequenceMatcher
 from typing import Optional
 
 from common import normalize_rel_path_fast
-from path_security import resolve_inside_repo
 from external_llm.common.indent_utils import detect_indent_char, min_indent, shift_block
+from path_security import resolve_inside_repo
 
 logger = logging.getLogger(__name__)
+
+# P19-4: edit targets larger than this are refused by the file-IO helper
+# (None return → callers treat the file as unreadable → refuse to synthesize).
+# Mirrors llm_execution._REWRITE_FILE_MAX_BYTES.
+_EDIT_TARGET_MAX_BYTES = 64 * 1024 * 1024
 
 
 # ============================================================
@@ -99,7 +104,25 @@ def _read_text_lines_with_eof(
     # Path safety: keep reads strictly inside repo_root
     try:
         fp = resolve_inside_repo(repo_root, rel)
-    except ValueError:
+    except ValueError as e:
+        logger.debug("resolve_inside_repo rejected %r: %s", rel, e)
+        return None
+
+    # P19-4: refuse edit targets larger than the cap before reading — diff
+    # synthesis would otherwise load a multi-hundred-MB file fully into memory
+    # (and produce an unbounded diff). Callers treat None as "cannot read";
+    # for a present file the append/new-file branch refuses to synthesize,
+    # which is exactly the intended policy for oversized targets.
+    try:
+        _sz = fp.stat().st_size
+    except OSError as e:
+        logger.debug("stat failed for %s: %s", fp, e)
+        return None
+    if _sz > _EDIT_TARGET_MAX_BYTES:
+        logger.warning(
+            "edit_target_too_large: rel_path=%r abs_path=%s size=%d (cap %d)",
+            rel_path, str(fp), _sz, _EDIT_TARGET_MAX_BYTES,
+        )
         return None
 
     try:
@@ -117,7 +140,8 @@ def _read_text_lines_with_eof(
                 rel_path,
                 str(fp),
             )
-    except (FileNotFoundError, IsADirectoryError):
+    except (FileNotFoundError, IsADirectoryError) as e:
+        logger.debug("read_text failed for %s: %s", str(fp), e)
         return None
     except OSError:
         logger.warning(
@@ -146,8 +170,7 @@ def _norm_line_for_match(s: str) -> str:
     if s is None:
         return ""
     s = s.replace("\r", "")
-    s = ' '.join(s.split())
-    return s
+    return ' '.join(s.split())
 
 
 def _find_line_matches(lines: list[str], rx: re.Pattern, *, normalized: bool = False) -> list[int]:
@@ -248,8 +271,7 @@ def _resolve_anchor_index(
     if rx2 is None:
         return None
     m3 = _find_multiline_matches(lines, rx2, window_max_lines=multiline_window_max_lines)
-    idx = _pick_unique_or_fail(m3, require_unique)
-    return idx
+    return _pick_unique_or_fail(m3, require_unique)
 
 # ============================================================
 # EOF-no-newline helpers (shared across all synth/difflib paths)
@@ -322,8 +344,8 @@ def _emit_hunk_replace_body(
 
     # Case A: shared trailing context line, both no-newline -> one marker.
     if same_line and old_eof_no_newline and new_eof_no_newline:
-        for i, l in enumerate(body_lines):
-            out.append(l)
+        for i, line in enumerate(body_lines):
+            out.append(line)
             if i == old_idx:
                 out.append(_NO_NL_MARKER)
         return out
@@ -338,14 +360,14 @@ def _emit_hunk_replace_body(
         and body_lines[new_idx][:1] == " "
         and new_eof_no_newline
     ):
-        for i, l in enumerate(body_lines):
+        for i, line in enumerate(body_lines):
             if i == new_idx:
-                content = l[1:]
+                content = line[1:]
                 out.append("-" + content)            # old: had newline (no marker)
                 out.append("+" + content)            # new: no newline
                 out.append(_NO_NL_MARKER)
             else:
-                out.append(l)
+                out.append(line)
         # old-side marker for the removed EOF line, if it was no-newline
         if old_eof_no_newline:
             _insert_marker_after_last_minus(out)
@@ -359,8 +381,8 @@ def _emit_hunk_replace_body(
         need.add(new_idx)
     if not need:
         return list(body_lines)
-    for i, l in enumerate(body_lines):
-        out.append(l)
+    for i, line in enumerate(body_lines):
+        out.append(line)
         if i in need:
             out.append(_NO_NL_MARKER)
     return out
@@ -419,7 +441,7 @@ def _difflib_apply_eof_markers(
         return body
 
     # Locate the last hunk header.
-    hunk_starts = [i for i, l in enumerate(body) if l.startswith("@@")]
+    hunk_starts = [i for i, line in enumerate(body) if line.startswith("@@")]
     if not hunk_starts:
         return body
     hs = hunk_starts[-1]
@@ -450,8 +472,8 @@ def _difflib_apply_eof_markers(
     # Rebuild the hunk inserting markers. Because the same absolute hunk index
     # can be shared (shared context), the set dedups -> one marker.
     new_hunk: list[str] = []
-    for i, l in enumerate(hunk):
-        new_hunk.append(l)
+    for i, line in enumerate(hunk):
+        new_hunk.append(line)
         if i in need:
             new_hunk.append(_NO_NL_MARKER)
     return body[:hs] + new_hunk
@@ -558,10 +580,8 @@ def _synthesize_insert_with_context_unified_diff(
 
     n = len(lines)
     pos = int(insert_pos)
-    if pos < 0:
-        pos = 0
-    if pos > n:
-        pos = n
+    pos = max(pos, 0)
+    pos = min(pos, n)
 
     # Auto-indent (quality-of-life):
     # If insert_line has no leading whitespace, copy indentation from neighbor line
@@ -603,12 +623,9 @@ def _synthesize_insert_with_context_unified_diff(
     out.append(f"@@ -{old_start_1},{old_count} +{new_start_1},{new_count} @@")
 
     # emit: context up to pos, then +line, then remaining context
-    body: list[str] = []
-    for ln in lines[lo:pos]:
-        body.append(" " + ln.rstrip("\r"))
+    body: list[str] = [" " + ln.rstrip("\r") for ln in lines[lo:pos]]
     body.append("+" + line)
-    for ln in lines[pos:hi]:
-        body.append(" " + ln.rstrip("\r"))
+    body.extend(" " + ln.rstrip("\r") for ln in lines[pos:hi])
 
     # EOF markers only matter when the hunk reaches the old file's final line.
     if hi == n and not ends_with_newline:
@@ -807,13 +824,15 @@ def synthesize_replace_first_exact_block_unified_diff(
         for s in reversed(plines):
             ln_stripped = str(s or "").strip()
             ln_lower = ln_stripped.lower()
-            if ln_lower.startswith("start_line_1:") or ln_lower.startswith("start_line:"):
+            if ln_lower.startswith(("start_line_1:", "start_line:")):
                 num_part = ln_stripped.split(":", 1)[1].strip()
                 try:
                     n = int(num_part)
-                    return n if n > 0 else None
-                except Exception:
+                except ValueError as e:
+                    logger.debug("bad start_line_1 hint %r: %s", num_part, e)
                     return None
+                else:
+                    return n if n > 0 else None
 
         # 2) UI marker hint: ASICODE_SELECTED_INDICES then parse first positive integer after it
         seen_marker = False
@@ -824,7 +843,7 @@ def synthesize_replace_first_exact_block_unified_diff(
             if not seen_marker:
                 if ln.lower().startswith("asicode_selected_indices"):
                     rest = ln[26:].strip()
-                    if rest == "" or rest == ":":
+                    if rest in {"", ":"}:
                         seen_marker = True
                 continue
             # stop if another ASICODE_* marker appears
@@ -841,9 +860,11 @@ def synthesize_replace_first_exact_block_unified_diff(
             if num_str:
                 try:
                     n = int(num_str)
-                    return n if n > 0 else None
-                except Exception:
+                except ValueError as e:
+                    logger.debug("bad selected-indices token %r: %s", num_str, e)
                     continue
+                else:
+                    return n if n > 0 else None
 
         return None
 
@@ -853,15 +874,12 @@ def synthesize_replace_first_exact_block_unified_diff(
 
 
     # --- find all exact matches of before_lines in lines ---
-    hits = []
     n = len(lines)
     m = len(before_lines)
     if m == 0:
         return ""
 
-    for i in range(0, n - m + 1):
-        if lines[i : i + m] == before_lines:
-            hits.append(i)
+    hits = [i for i in range(0, n - m + 1) if lines[i : i + m] == before_lines]
 
     # -------------------------------------------------
     # Fallback 1: tolerant whitespace-insensitive match
@@ -881,7 +899,10 @@ def synthesize_replace_first_exact_block_unified_diff(
         def _block_similarity(a: list[str], b: list[str]) -> float:
             sa = "\n".join(a)
             sb = "\n".join(b)
-            return SequenceMatcher(None, sa, sb).ratio()
+            # autojunk=False (P23-2): block-level strings are multi-line;
+            # '\n' alone exceeds autojunk's 1% threshold and collapses
+            # ratio() for blocks that are ~95% identical (P22-1 class).
+            return SequenceMatcher(None, sa, sb, autojunk=False).ratio()
 
         for i in range(0, n - m + 1):
             candidate = lines[i : i + m]
@@ -920,19 +941,18 @@ def synthesize_replace_first_exact_block_unified_diff(
         elif selected_indices_0:
             try:
                 raw0 = int(selected_indices_0[0])
-            except Exception:
+            except (ValueError, TypeError):
                 return ""
 
             # Prefer interpreting as absolute start_line_1 (1-based): raw0-1 must be in hits
             forced0 = raw0 - 1
             if forced0 in hits:
                 hits = [forced0]
+            # Fallback: treat as 0-based hit index into hits[]
+            elif 0 <= raw0 < len(hits):
+                hits = [hits[raw0]]
             else:
-                # Fallback: treat as 0-based hit index into hits[]
-                if 0 <= raw0 < len(hits):
-                    hits = [hits[raw0]]
-                else:
-                    return ""
+                return ""
 
         else:
             return ""
@@ -962,15 +982,10 @@ def synthesize_replace_first_exact_block_unified_diff(
     out.append(f"+++ b/{rel}")
     out.append(f"@@ -{old_start_1},{old_count} +{new_start_1},{new_count} @@")
 
-    body: list[str] = []
-    for ln in lines[lo:start_idx]:
-        body.append(" " + ln)
-    for ln in lines[start_idx:end_idx]:
-        body.append("-" + ln)
-    for ln in after_lines:
-        body.append("+" + ln)
-    for ln in lines[end_idx:hi]:
-        body.append(" " + ln)
+    body: list[str] = [" " + ln for ln in lines[lo:start_idx]]
+    body.extend("-" + ln for ln in lines[start_idx:end_idx])
+    body.extend("+" + ln for ln in after_lines)
+    body.extend(" " + ln for ln in lines[end_idx:hi])
 
     # EOF markers when the hunk reaches the file's final line (hi == n).
     # See synthesize_replace_line_range_unified_diff: an in-place block replace
@@ -1033,7 +1048,7 @@ def synthesize_replace_selected_matching_blocks_unified_diff(
     wanted = []
     try:
         wanted = [int(x) for x in selected_start_lines_1]
-    except Exception:
+    except (ValueError, TypeError):
         return ""
 
     # Validate: must be subset (no unknown indices)
@@ -1100,7 +1115,7 @@ def synthesize_replace_line_range_unified_diff(
     try:
         s1 = int(start_line_1)
         e1 = int(end_line_1)
-    except Exception:
+    except (ValueError, TypeError):
         return ""
 
     n = len(lines)
@@ -1129,15 +1144,10 @@ def synthesize_replace_line_range_unified_diff(
     out.append(f"@@ -{old_start_1},{old_count} +{new_start_1},{new_count} @@")
 
     # Build the body with prefixes, then add EOF markers via the shared helper.
-    body: list[str] = []
-    for ln in lines[lo:start_idx]:
-        body.append(" " + ln)
-    for ln in lines[start_idx:end_idx]:
-        body.append("-" + ln)
-    for ln in after_lines:
-        body.append("+" + ln)
-    for ln in lines[end_idx:hi]:
-        body.append(" " + ln)
+    body: list[str] = [" " + ln for ln in lines[lo:start_idx]]
+    body.extend("-" + ln for ln in lines[start_idx:end_idx])
+    body.extend("+" + ln for ln in after_lines)
+    body.extend(" " + ln for ln in lines[end_idx:hi])
 
     # EOF markers only matter when the hunk reaches the file's final line (hi==n).
     if hi == n:
@@ -1179,7 +1189,7 @@ def synthesize_delete_line_unified_diff(
     if not lines:
         return ""
 
-    # âœ… í•µì‹¬: ë¬¸ìžì—´ì„ "ì •ê·œì‹"ìœ¼ë¡œ ì»´íŒŒì¼í•´ì„œ _find_line_matchesì— ë„˜ê¹€
+    # Core: compile the string as a regex and pass it to _find_line_matches
     needle = _norm_line_for_match(line_text or "")
     if not needle:
         return ""
@@ -1293,8 +1303,7 @@ def _norm_ws_line_for_block_match(s: str) -> str:
     # - treat tabs as spaces
     # - collapse internal whitespace runs to a single space
     s = (s or "").rstrip().lstrip().replace("\t", " ")
-    s = " ".join(s.split())
-    return s
+    return " ".join(s.split())
 
 
 def _split_block_lines(block_text: str) -> list[str]:

@@ -38,6 +38,60 @@ def _get_indent(line: str) -> str:
     return indent
 
 
+def _trim_call_arguments(
+    lines: list[str], idx: int, *, keep_first: bool = False,
+) -> Optional[str]:
+    """Trim the argument list of the call on line *idx*; return new source or None.
+
+    Returns None when the call cannot be trimmed (no parens on the line, empty
+    argument list, or a single argument).  *keep_first=True* keeps only the
+    first argument (Python's "takes 1 positional argument" flavor — self plus
+    the intended args); the default drops the last argument.
+    """
+    line = lines[idx]
+    paren_open = line.find("(")
+    if paren_open == -1:
+        return None
+    paren_close = line.find(")", paren_open)
+    if paren_close == -1:
+        return None
+    inner = line[paren_open + 1:paren_close].strip()
+    if not inner:
+        return None
+    args = [a.strip() for a in inner.split(",")]
+    if len(args) < 2:
+        return None
+    new_inner = args[0] if keep_first else ", ".join(args[:-1])
+    lines[idx] = line[:paren_open + 1] + new_inner + line[paren_close:]
+    return "\n".join(lines)
+
+
+def _repair_argument_mismatch(
+    code: str, error: VerifyError, markers: tuple[str, ...], *,
+    keep_first: bool = False,
+) -> Optional[list[PrimitiveOp]]:
+    """Trim the call's argument list when the message carries a *marker*.
+
+    Shared by the py/java/kotlin/go argument-mismatch strategies — the only
+    language difference is the diagnostic wording and whether to keep the
+    first argument (Python's self-flavored "takes 1 positional argument") or
+    drop the last (the brace-language "too many arguments" flavor).
+    """
+    if error.line is None:
+        return None
+    msg = error.message.lower()
+    if not any(marker in msg for marker in markers):
+        return None
+    lines = code.split("\n")
+    idx = error.line - 1
+    if idx < 0 or idx >= len(lines):
+        return None
+    trimmed = _trim_call_arguments(lines, idx, keep_first=keep_first)
+    if trimmed is not None:
+        return _make_raw_replacement(trimmed)
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Python Repair Strategies
 # ═══════════════════════════════════════════════════════════════════════
@@ -96,10 +150,7 @@ def py_repair_missing_variable(
     if not entry:
         return None
     module, is_name = entry
-    if is_name:
-        stmt = f"from {module} import {symbol}"
-    else:
-        stmt = f"import {module}"
+    stmt = f"from {module} import {symbol}" if is_name else f"import {module}"
     return [PrimitiveOp(
         kind=PrimitiveKind.INSERT_IMPORT,
         payload={"statement": stmt},
@@ -134,70 +185,93 @@ def py_repair_syntax_error(
     return None
 
 
+# Shared by the Python/Java missing-return repairs — the only language
+# differences are the header-line recognizer, comment handling, the body-end
+# marker and the inserted statement. Same pattern as _repair_unknown_symbol.
+def _repair_missing_return(
+    code: str,
+    error: VerifyError,
+    *,
+    is_header: Callable[[str], bool],
+    skip_comments: bool,
+    end_marker: Optional[str],
+    return_stmt_factory: Callable[[str], str],
+    extra_indent: bool = False,
+) -> Optional[list[PrimitiveOp]]:
+    """Insert a return statement into the body containing ``error.line``.
+
+    Walks backward from the error line to find the enclosing function/method
+    header (matched by *is_header*), scans the body for its last line, and
+    inserts the statement returned by *return_stmt_factory* (which receives
+    the stripped header line) at body indent.
+
+    *skip_comments* makes comment lines transparent to the body scan.
+    *end_marker* is the line that ends the body: ``"}"`` for brace languages;
+    ``None`` ends the body on any line that does not start with the body
+    indent (Python's dedent rule).
+
+    The statement is inserted at the body's own indent (the indent of the
+    first body line).  *extra_indent=True* inserts at body indent + 4 — the
+    Kotlin/Go flavor, whose tests pin the deeper offset.  NOTE: the original
+    py/java implementations used the deeper offset too, which produced invalid
+    Python (IndentationError) for plain function bodies — fixed for py/java
+    here; no test pinned the old offset for them.
+    """
+    if error.line is None:
+        return None
+    lines = code.split("\n")
+    # Walk backward from error line to find the function/method header
+    for i in range(error.line - 1, -1, -1):
+        stripped = lines[i].strip()
+        if not is_header(stripped):
+            continue
+        body_start = i + 1
+        if body_start >= len(lines):
+            return None
+        body_indent = _get_indent(lines[body_start])
+        if not body_indent:
+            return None
+        # Find the last non-empty, non-comment line in the body
+        last_body_line = body_start
+        for j in range(body_start, len(lines)):
+            s = lines[j].strip()
+            if not s or (skip_comments and s.startswith("#")):
+                continue
+            if _get_indent(lines[j]).startswith(body_indent):
+                last_body_line = j
+            elif end_marker is None or s == end_marker:
+                # Decreased indent (Python) or closing brace (Java): body ended
+                break
+        stmt_indent = body_indent + ("    " if extra_indent else "")
+        lines.insert(last_body_line + 1, stmt_indent + return_stmt_factory(stripped))
+        return _make_raw_replacement("\n".join(lines))
+    return None
 def py_repair_missing_return(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
     """Add return None to a function missing a return."""
-    if error.line is None:
-        return None
-    lines = code.split("\n")
-    # Walk backward from error line to find function def
-    for i in range(error.line - 1, -1, -1):
-        stripped = lines[i].strip()
-        if stripped.startswith("def ") and stripped.endswith(":"):
-            # Find the last line of the function body
-            body_start = i + 1
-            if body_start >= len(lines):
-                return None
-            body_indent = _get_indent(lines[body_start])
-            if not body_indent:
-                return None
-            # Find last non-empty, non-comment line in the body
-            last_body_line = body_start
-            for j in range(body_start, len(lines)):
-                if lines[j].strip() and not lines[j].strip().startswith("#"):
-                    if _get_indent(lines[j]).startswith(body_indent):
-                        last_body_line = j
-                    else:
-                        # Decreased indent = we left the function body
-                        break
-            return_stmt_indent = body_indent + "    "
-            lines.insert(last_body_line + 1, return_stmt_indent + "return None")
-            return _make_raw_replacement("\n".join(lines))
-    return None
+    return _repair_missing_return(
+        code, error,
+        is_header=lambda s: s.startswith("def ") and s.endswith(":"),
+        skip_comments=True,
+        end_marker=None,
+        return_stmt_factory=lambda _s: "return None",
+    )
 
 
 def py_repair_argument_mismatch(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
     """Fix argument count mismatch — limited case: add/remove self."""
-    if error.line is None:
-        return None
     msg = error.message.lower()
-    lines = code.split("\n")
-    idx = error.line - 1
-    if idx < 0 or idx >= len(lines):
-        return None
-
     if "missing 1 required positional argument" in msg:
         # Could be missing 'self' in a method call → not fixable deterministically
         return None
     if "takes 1 positional argument but" in msg:
-        line = lines[idx]
-        # Try removing extra arguments
-        paren_open = line.find("(")
-        if paren_open == -1:
-            return None
-        paren_close = line.find(")", paren_open)
-        if paren_close == -1:
-            return None
-        # Simple case: only one argument (self) expected, multiple given
-        inner = line[paren_open + 1:paren_close].strip()
-        if inner:
-            # Keep only first argument
-            first_arg = inner.split(",")[0].strip()
-            lines[idx] = line[:paren_open + 1] + first_arg + line[paren_close:]
-            return _make_raw_replacement("\n".join(lines))
+        # Keep only the first argument (self plus the intended args).
+        return _repair_argument_mismatch(
+            code, error, ("takes 1 positional argument but",), keep_first=True,
+        )
     return None
 
 
@@ -235,19 +309,27 @@ _JAVA_IMPORT_MAP: dict[str, str] = {
 }
 
 
-def java_repair_unknown_symbol(
-    code: str, error: VerifyError, classification: Classification,
+# Shared by the Java/Kotlin repair families — the only language difference is
+# the import statement's trailing semicolon and the diagnostic wording.
+def _repair_unknown_symbol(
+    code: str, classification: Classification, import_map: dict[str, str], *,
+    stmt_fmt: str = "import {}",
 ) -> Optional[list[PrimitiveOp]]:
-    """Add import for unknown symbol if it's a known Java type."""
+    """Add an import for an unknown symbol if it maps to a known FQN.
+
+    *stmt_fmt* formats the import statement from the FQN — Java
+    ``"import {};"``, Kotlin ``"import {}"``, Go ``'import "{}"'``.  The
+    existence check matches the same statement form so an already-present
+    import is never re-inserted.
+    """
     symbol = classification.symbol
     if not symbol:
         return None
-    fqn = _JAVA_IMPORT_MAP.get(symbol)
+    fqn = import_map.get(symbol)
     if not fqn:
         return None
-    stmt = f"import {fqn};"
-    # Check if import already exists
-    if f"import {fqn};" in code:
+    stmt = stmt_fmt.format(fqn)
+    if stmt in code:
         return None
     return [PrimitiveOp(
         kind=PrimitiveKind.INSERT_IMPORT,
@@ -255,56 +337,56 @@ def java_repair_unknown_symbol(
     )]
 
 
-def java_repair_syntax_error(
-    code: str, error: VerifyError, classification: Classification,
+def _repair_missing_semicolon(
+    code: str, error: VerifyError, markers: tuple[str, ...], *,
+    skip_ending: tuple[str, ...] = (),
 ) -> Optional[list[PrimitiveOp]]:
-    """Fix common Java syntax errors (missing semicolons, braces)."""
+    """Append ``;`` to the error line when the message carries a *marker*.
+
+    Lines ending with any *skip_ending* suffix are left untouched (Go's
+    ``{``-terminated headers must not receive a semicolon).
+    """
     if error.line is None:
         return None
     msg = error.message.lower()
+    if not any(marker in msg for marker in markers):
+        return None
     lines = code.split("\n")
     idx = error.line - 1
     if idx < 0 or idx >= len(lines):
         return None
-
-    if "';' expected" in msg or "expected ';'" in msg:
-        line = lines[idx].rstrip()
-        if not line.endswith(";"):
-            lines[idx] = line + ";"
-            return _make_raw_replacement("\n".join(lines))
+    line = lines[idx].rstrip()
+    if not line.endswith(";") and not any(line.endswith(s) for s in skip_ending):
+        lines[idx] = line + ";"
+        return _make_raw_replacement("\n".join(lines))
     return None
+def java_repair_unknown_symbol(
+    code: str, error: VerifyError, classification: Classification,
+) -> Optional[list[PrimitiveOp]]:
+    """Add import for unknown symbol if it's a known Java type."""
+    return _repair_unknown_symbol(code, classification, _JAVA_IMPORT_MAP, stmt_fmt="import {};")
+
+
+def java_repair_syntax_error(
+    code: str, error: VerifyError, classification: Classification,
+) -> Optional[list[PrimitiveOp]]:
+    """Fix common Java syntax errors (missing semicolons, braces)."""
+    return _repair_missing_semicolon(code, error, ("';' expected", "expected ';'"))
 
 
 def java_repair_missing_return(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
     """Add return null to method missing a return statement."""
-    if error.line is None:
-        return None
-    lines = code.split("\n")
-    for i in range(error.line - 1, -1, -1):
-        stripped = lines[i].strip()
-        if any(stripped.startswith(kw) for kw in
-               ("public ", "private ", "protected ")):
-            if "{" in stripped:
-                body_start = i + 1
-                if body_start >= len(lines):
-                    return None
-                body_indent = _get_indent(lines[body_start])
-                if not body_indent:
-                    return None
-                # Find last line of method body
-                last_body = body_start
-                for j in range(body_start, len(lines)):
-                    if lines[j].strip():
-                        if _get_indent(lines[j]).startswith(body_indent):
-                            last_body = j
-                        elif lines[j].strip() == "}":
-                            break
-                return_indent = body_indent + "    "
-                lines.insert(last_body + 1, return_indent + "return null;")
-                return _make_raw_replacement("\n".join(lines))
-    return None
+    return _repair_missing_return(
+        code, error,
+        is_header=lambda s: any(
+            s.startswith(kw) for kw in ("public ", "private ", "protected ")
+        ) and "{" in s,
+        skip_comments=False,
+        end_marker="}",
+        return_stmt_factory=lambda _s: "return null;",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -340,39 +422,15 @@ _KOTLIN_IMPORT_MAP: dict[str, str] = {
 def kotlin_repair_unknown_symbol(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
-    """Add import for unknown symbol if known."""
-    symbol = classification.symbol
-    if not symbol:
-        return None
-    fqn = _KOTLIN_IMPORT_MAP.get(symbol)
-    if not fqn:
-        return None
-    stmt = f"import {fqn}"
-    if f"import {fqn}" in code:
-        return None
-    return [PrimitiveOp(
-        kind=PrimitiveKind.INSERT_IMPORT,
-        payload={"statement": stmt},
-    )]
+    """Add import for unknown symbol if known (Kotlin imports carry no semicolon)."""
+    return _repair_unknown_symbol(code, classification, _KOTLIN_IMPORT_MAP, stmt_fmt="import {}")
 
 
 def kotlin_repair_syntax_error(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
-    """Fix common Kotlin syntax errors."""
-    if error.line is None:
-        return None
-    msg = error.message.lower()
-    lines = code.split("\n")
-    idx = error.line - 1
-    if idx < 0 or idx >= len(lines):
-        return None
-    if "expecting ';'" in msg or "expected ';'" in msg:
-        line = lines[idx].rstrip()
-        if not line.endswith(";"):
-            lines[idx] = line + ";"
-            return _make_raw_replacement("\n".join(lines))
-    return None
+    """Fix common Kotlin syntax errors (missing semicolons)."""
+    return _repair_missing_semicolon(code, error, ("expecting ';'", "expected ';'"))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -424,15 +482,13 @@ def go_repair_unknown_symbol(
     if not symbol:
         return None
 
-    # ── Path 1: Known stdlib package → add import ──────────────────
-    pkg = _GO_IMPORT_MAP.get(symbol)
-    if pkg:
-        stmt = f'import "{pkg}"'
-        if f'import "{pkg}"' not in code:
-            return [PrimitiveOp(
-                kind=PrimitiveKind.INSERT_IMPORT,
-                payload={"statement": stmt},
-            )]
+    # ── Path 1: Known stdlib package → add import (shared helper) ──
+    ops = _repair_unknown_symbol(
+        code, classification, _GO_IMPORT_MAP, stmt_fmt='import "{}"',
+    )
+    if ops is not None:
+        return ops
+    if symbol in _GO_IMPORT_MAP:
         return None  # already imported — something else is wrong
 
     # ── Path 2: Try case-correction for local symbols ───────────────
@@ -524,22 +580,19 @@ def go_repair_unused_import(
 def go_repair_syntax_error(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
-    """Fix common Go syntax errors (missing braces, semicolons)."""
+    """Fix common Go syntax errors (missing semicolons, braces)."""
+    semicolon_fix = _repair_missing_semicolon(
+        code, error, ("expected ';'", "expected newline"), skip_ending=("{",),
+    )
+    if semicolon_fix is not None:
+        return semicolon_fix
     if error.line is None:
         return None
-    msg = error.message.lower()
     lines = code.split("\n")
     idx = error.line - 1
     if idx < 0 or idx >= len(lines):
         return None
-    if "expected ';'" in msg or "expected newline" in msg:
-        # Go uses implicit semicolons — usually a newline issue
-        # Add semicolon or newline as appropriate
-        line = lines[idx].rstrip()
-        if not line.endswith(";") and not line.endswith("{"):
-            lines[idx] = line + ";"
-            return _make_raw_replacement("\n".join(lines))
-    if "expected '{'" in msg:
+    if "expected '{'" in error.message.lower():
         line = lines[idx].rstrip()
         if not line.endswith("{"):
             lines[idx] = line + " {"
@@ -555,64 +608,50 @@ def go_repair_syntax_error(
 def java_repair_argument_mismatch(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
-    """Fix Java argument count mismatch by removing extra or adding placeholder args."""
+    """Fix Java argument count mismatch by removing extra arguments."""
+    return _repair_argument_mismatch(
+        code, error, ("actual and formal argument lists differ in length",),
+    )
+
+
+def _repair_duplicate_identifier(
+    code: str, error: VerifyError,
+    markers: tuple[str, ...], patterns: tuple[tuple[str, str], ...],
+) -> Optional[list[PrimitiveOp]]:
+    """Rename a duplicate identifier on the error line by appending a suffix.
+
+    *patterns* is a sequence of ``(regex, suffix)`` pairs tried in order on
+    the stripped error line; the first match wins.  The shared guard block
+    (line bounds, marker check) mirrors the other ``_repair_*`` helpers.
+    """
     if error.line is None:
         return None
     msg = error.message.lower()
+    if not any(marker in msg for marker in markers):
+        return None
     lines = code.split("\n")
     idx = error.line - 1
     if idx < 0 or idx >= len(lines):
         return None
-
-    actual_and_formal = re.search(
-        r"actual and formal argument lists differ in length",
-        msg,
-    )
-    if actual_and_formal:
-        # Count args in the call
-        line = lines[idx]
-        paren_open = line.find("(")
-        if paren_open == -1:
-            return None
-        paren_close = line.find(")", paren_open)
-        if paren_close == -1:
-            return None
-        inner = line[paren_open + 1:paren_close].strip()
-        if not inner:
-            return None
-        args = [a.strip() for a in inner.split(",")]
-        # Try removing last argument if too many
-        if len(args) > 1:
-            new_inner = ", ".join(args[:-1])
-            lines[idx] = line[:paren_open + 1] + new_inner + line[paren_close:]
+    line = lines[idx]
+    stripped = line.strip()
+    for rx, suffix in patterns:
+        m = re.search(rx, stripped)
+        if m:
+            orig = m.group(1)
+            new_line = stripped.replace(orig, orig + suffix, 1)
+            lines[idx] = _get_indent(line) + new_line
             return _make_raw_replacement("\n".join(lines))
     return None
-
-
 def java_repair_duplicate_identifier(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
     """Fix duplicate class/local identifier by appending a suffix."""
-    if error.line is None:
-        return None
-    msg = error.message.lower()
-    lines = code.split("\n")
-    idx = error.line - 1
-    if idx < 0 or idx >= len(lines):
-        return None
-
-    if "duplicate class" in msg:
-        line = lines[idx]
-        stripped = line.strip()
-        # Find class name after "class " keyword
-        m = re.search(r"\bclass\s+(\w+)", stripped)
-        if m:
-            orig = m.group(1)
-            new_name = orig + "Dup"
-            new_line = stripped.replace(orig, new_name, 1)
-            lines[idx] = _get_indent(line) + new_line
-            return _make_raw_replacement("\n".join(lines))
-    return None
+    return _repair_duplicate_identifier(
+        code, error,
+        markers=("duplicate class",),
+        patterns=((r"\bclass\s+(\w+)", "Dup"),),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -620,103 +659,42 @@ def java_repair_duplicate_identifier(
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _kotlin_return_stmt(header: str) -> str:
+    """Pick the Kotlin return statement from a ``fun`` header line."""
+    returns_value = ":" in header and not header.rstrip().endswith("Unit")
+    return "return null" if returns_value else "return"
+
+
 def kotlin_repair_missing_return(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
     """Add return (Unit/null) to a Kotlin function missing a return."""
-    if error.line is None:
-        return None
-    lines = code.split("\n")
-    for i in range(error.line - 1, -1, -1):
-        stripped = lines[i].strip()
-        if stripped.startswith("fun "):
-            body_start = i + 1
-            if body_start >= len(lines):
-                return None
-            body_indent = _get_indent(lines[body_start])
-            if not body_indent:
-                return None
-            # Determine if function returns a value (has explicit return type)
-            returns_value = ":" in stripped and not stripped.rstrip().endswith("Unit")
-            # Find last line of function body
-            last_body = body_start
-            for j in range(body_start, len(lines)):
-                if lines[j].strip():
-                    if _get_indent(lines[j]).startswith(body_indent):
-                        last_body = j
-                    elif lines[j].strip() == "}":
-                        break
-            return_indent = body_indent + "    "
-            stmt = "return null" if returns_value else "return"
-            lines.insert(last_body + 1, return_indent + stmt)
-            return _make_raw_replacement("\n".join(lines))
-    return None
+    return _repair_missing_return(
+        code, error,
+        is_header=lambda s: s.startswith("fun "),
+        skip_comments=False,
+        end_marker="}",
+        return_stmt_factory=_kotlin_return_stmt,
+        extra_indent=True,
+    )
 
 
 def kotlin_repair_argument_mismatch(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
     """Fix Kotlin argument count mismatch — remove extra arguments."""
-    if error.line is None:
-        return None
-    msg = error.message.lower()
-    lines = code.split("\n")
-    idx = error.line - 1
-    if idx < 0 or idx >= len(lines):
-        return None
-
-    # Kotlin: "too many arguments" or "required: X, found: Y"
-    if "too many" in msg or "required" in msg:
-        line = lines[idx]
-        paren_open = line.find("(")
-        if paren_open == -1:
-            return None
-        paren_close = line.find(")", paren_open)
-        if paren_close == -1:
-            return None
-        inner = line[paren_open + 1:paren_close].strip()
-        if not inner:
-            return None
-        args = [a.strip() for a in inner.split(",")]
-        if len(args) > 1:
-            new_inner = ", ".join(args[:-1])
-            lines[idx] = line[:paren_open + 1] + new_inner + line[paren_close:]
-            return _make_raw_replacement("\n".join(lines))
-    return None
+    return _repair_argument_mismatch(code, error, ("too many", "required"))
 
 
 def kotlin_repair_duplicate_identifier(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
     """Fix duplicate Kotlin identifier by appending a suffix."""
-    if error.line is None:
-        return None
-    msg = error.message.lower()
-    lines = code.split("\n")
-    idx = error.line - 1
-    if idx < 0 or idx >= len(lines):
-        return None
-
-    if "duplicate" in msg:
-        line = lines[idx]
-        stripped = line.strip()
-        # Find function name after "fun " keyword
-        m = re.search(r"\bfun\s+(\w+)", stripped)
-        if m:
-            orig = m.group(1)
-            new_name = orig + "Dup"
-            new_line = stripped.replace(orig, new_name, 1)
-            lines[idx] = _get_indent(line) + new_line
-            return _make_raw_replacement("\n".join(lines))
-        # Find class name after "class " keyword
-        m = re.search(r"\bclass\s+(\w+)", stripped)
-        if m:
-            orig = m.group(1)
-            new_name = orig + "Dup"
-            new_line = stripped.replace(orig, new_name, 1)
-            lines[idx] = _get_indent(line) + new_line
-            return _make_raw_replacement("\n".join(lines))
-    return None
+    return _repair_duplicate_identifier(
+        code, error,
+        markers=("duplicate",),
+        patterns=((r"\bfun\s+(\w+)", "Dup"), (r"\bclass\s+(\w+)", "Dup")),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -737,21 +715,9 @@ def go_repair_argument_mismatch(
         return None
 
     if "too many" in msg:
-        line = lines[idx]
-        paren_open = line.find("(")
-        if paren_open == -1:
-            return None
-        paren_close = line.find(")", paren_open)
-        if paren_close == -1:
-            return None
-        inner = line[paren_open + 1:paren_close].strip()
-        if not inner:
-            return None
-        args = [a.strip() for a in inner.split(",")]
-        if len(args) > 1:
-            new_inner = ", ".join(args[:-1])
-            lines[idx] = line[:paren_open + 1] + new_inner + line[paren_close:]
-            return _make_raw_replacement("\n".join(lines))
+        too_many_fix = _repair_argument_mismatch(code, error, ("too many",))
+        if too_many_fix is not None:
+            return too_many_fix
 
     if "not enough" in msg or "not sufficient" in msg:
         line = lines[idx]
@@ -783,73 +749,45 @@ def go_repair_argument_mismatch(
                     _fill_args.append(_go_zero_value(_want_types[_tidx]))
                 else:
                     _fill_args.append("nil")
-            if _existing:
-                new_inner = ", ".join(_existing + _fill_args)
-            else:
-                new_inner = ", ".join(_fill_args)
+            new_inner = ", ".join(_existing + _fill_args) if _existing else ", ".join(_fill_args)
+        # Fallback: add zero value for the missing arg type
+        # (can't use nil for value types like time.Time)
+        elif not inner:
+            new_inner = "nil"  # empty args → use nil as safe default
         else:
-            # Fallback: add zero value for the missing arg type
-            # (can't use nil for value types like time.Time)
-            if not inner:
-                new_inner = "nil"  # empty args → use nil as safe default
-            else:
-                new_inner = inner + ", nil"  # unknown type → nil (will be caught by TYPE_MISMATCH repair)
+            new_inner = inner + ", nil"  # unknown type → nil (will be caught by TYPE_MISMATCH repair)
         lines[idx] = line[:paren_open + 1] + new_inner + line[paren_close:]
         return _make_raw_replacement("\n".join(lines))
     return None
+
+
+def _go_return_stmt(header: str) -> str:
+    """Pick the Go return statement (zero value) from a ``func`` header line."""
+    ret_type = None
+    paren_close = header.rfind(")")
+    if paren_close != -1:
+        after_parens = header[paren_close + 1:].strip()
+        if after_parens and "{" not in after_parens:
+            ret_type = after_parens.split("{")[0].strip()
+    if ret_type:
+        return "return " + _go_zero_value(ret_type)
+    return "return nil"
 
 
 def go_repair_missing_return(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
     """Add return with zero-value to a Go function missing a return statement."""
-    if error.line is None:
+    if "missing return" not in error.message.lower():
         return None
-    msg = error.message.lower()
-    lines = code.split("\n")
-    error.line - 1
-
-    if "missing return" not in msg:
-        return None
-
-    # Walk backward to find the function signature
-    for i in range(error.line - 1, -1, -1):
-        stripped = lines[i].strip()
-        if re.match(r'^func\s+\w+', stripped):
-            func_line = stripped
-            # Determine return type for zero value
-            ret_type = None
-            paren_close = func_line.rfind(")")
-            if paren_close != -1:
-                after_parens = func_line[paren_close + 1:].strip()
-                if after_parens and "{" not in after_parens:
-                    ret_type = after_parens.split("{")[0].strip()
-
-            body_start = i + 1
-            if body_start >= len(lines):
-                return None
-            body_indent = _get_indent(lines[body_start])
-            if not body_indent:
-                return None
-
-            # Find last line of function body
-            last_body = body_start
-            for j in range(body_start, len(lines)):
-                if lines[j].strip():
-                    if _get_indent(lines[j]).startswith(body_indent):
-                        last_body = j
-                    elif lines[j].strip() == "}":
-                        break
-
-            return_indent = body_indent + "    "
-            if ret_type:
-                # Choose zero-value based on type name
-                zero_val = _go_zero_value(ret_type)
-                lines.insert(last_body + 1, return_indent + "return " + zero_val)
-            else:
-                lines.insert(last_body + 1, return_indent + "return nil")
-            return _make_raw_replacement("\n".join(lines))
-    return None
+    return _repair_missing_return(
+        code, error,
+        is_header=lambda s: bool(re.match(r"^func\s+\w+", s)),
+        skip_comments=False,
+        end_marker="}",
+        return_stmt_factory=_go_return_stmt,
+        extra_indent=True,
+    )
 
 
 def _go_zero_value(type_name: str) -> str:
@@ -894,26 +832,34 @@ def go_repair_type_mismatch(
     """Fix Go type mismatch — add explicit type conversion when possible."""
     if error.line is None:
         return None
-    msg = error.message.lower()
     lines = code.split("\n")
     idx = error.line - 1
     if idx < 0 or idx >= len(lines):
         return None
 
-    # Pattern: "cannot use X (type T) as type U in ..."
-    # T and U can be qualified names like "time.Time" or "sql.NullString"
+    # Match both current (Go >= 1.21) and legacy (<= 1.20) compiler formats:
+    #   current: "cannot use t (variable of struct type time.Time) as string value in ..."
+    #            "cannot use nil as time.Time value in ..."
+    #   legacy:  "cannot use t (type time.Time) as type string in ..."
+    # Search the *original* message (like go_repair_argument_mismatch, L774) so
+    # qualified type names keep their casing ("time.Time", "sql.NullString").
     m = re.search(
-        r'cannot use\s+.+?\s+\(type\s+([\w.]+)\)\s+as\s+type\s+([\w.]+)',
-        msg,
+        r'cannot use\s+(?P<expr>nil|\S+?)'
+        r'(?:\s*\(\s*type\s+(?P<from_legacy>[^)]+)\s*\))?'
+        r'(?:\s*\(\s*variable of\s+(?:struct\s+)?type\s+(?P<from_modern>[^)]+)\s*\))?'
+        r'\s+as\s+(?:type\s+)?(?P<to>[^\s]+?)(?:\s+value)?\s+in\b',
+        error.message,
+        re.IGNORECASE,
     )
     if m:
-        from_type = m.group(1)
-        to_type = m.group(2)
+        from_type = m.group("from_modern") or m.group("from_legacy")
+        to_type = m.group("to")
+        expr = m.group("expr")
         line = lines[idx]
 
         # Special case: cannot use nil as type X (X is a value type)
         # Replace nil with Type{} zero-value literal
-        if from_type == "nil" and to_type != "nil":
+        if expr == "nil" and to_type != "nil":
             _zero = _go_zero_value(to_type)
             line = line.replace("nil", _zero, 1)
             lines[idx] = line
@@ -948,34 +894,11 @@ def py_repair_duplicate_identifier(
     code: str, error: VerifyError, classification: Classification,
 ) -> Optional[list[PrimitiveOp]]:
     """Fix duplicate function/class identifier by appending a suffix."""
-    if error.line is None:
-        return None
-    msg = error.message.lower()
-    lines = code.split("\n")
-    idx = error.line - 1
-    if idx < 0 or idx >= len(lines):
-        return None
-
-    if "redefined" in msg or "duplicate" in msg:
-        line = lines[idx]
-        stripped = line.strip()
-        # Find function name after "def "
-        m = re.search(r"\bdef\s+(\w+)", stripped)
-        if m:
-            orig = m.group(1)
-            new_name = orig + "_dup"
-            new_line = stripped.replace(orig, new_name, 1)
-            lines[idx] = _get_indent(line) + new_line
-            return _make_raw_replacement("\n".join(lines))
-        # Find class name after "class "
-        m = re.search(r"\bclass\s+(\w+)", stripped)
-        if m:
-            orig = m.group(1)
-            new_name = orig + "Dup"
-            new_line = stripped.replace(orig, new_name, 1)
-            lines[idx] = _get_indent(line) + new_line
-            return _make_raw_replacement("\n".join(lines))
-    return None
+    return _repair_duplicate_identifier(
+        code, error,
+        markers=("redefined", "duplicate"),
+        patterns=((r"\bdef\s+(\w+)", "_dup"), (r"\bclass\s+(\w+)", "Dup")),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════

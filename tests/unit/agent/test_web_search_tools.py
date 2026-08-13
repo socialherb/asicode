@@ -17,9 +17,13 @@ No network: every HTTP call is stubbed via ``monkeypatch`` on ``httpx.Client``.
 """
 from __future__ import annotations
 
+import json
+import re
+import threading
+import time
+
 import httpx
 import pytest
-import time
 
 import external_llm.agent.tool_handlers.web_search_tools as wst
 from external_llm.agent.tool_handlers.web_search_tools import (
@@ -40,11 +44,51 @@ class _Host(WebSearchToolsMixin):
 
 
 @pytest.fixture(autouse=True)
-def _reset_backend_cooldown():
-    """Isolate the process-wide circuit-breaker state between tests."""
-    wst.WebSearchToolsMixin._backend_cooldown.clear()
+def _reset_backend_cooldown(monkeypatch, tmp_path):
+    """Isolate the process-wide circuit-breaker state between tests.
+
+    Covers BOTH breakers. The wall backoff additionally persists to
+    ``<repo_root>/.asicode/search_backend_walls.json``, and ``_Host.repo_root``
+    is ``"."`` — so without the redirect below, any test that trips a wall writes
+    into the developer's real repo AND the next run loads it back and sidelines a
+    backend that the test never blocked. Observed exactly that: one run persisted
+    a Startpage wall, and the following run's chain-order test failed because
+    Startpage was skipped before it could be called.
+
+    Tests that assert on the state file set their own ``repo_root`` (a later
+    monkeypatch wins); this is the default that keeps everyone else off the real
+    tree.
+    """
+    mixin = wst.WebSearchToolsMixin
+    monkeypatch.setattr(_Host, "repo_root", str(tmp_path), raising=False)
+
+    def _clear():
+        mixin._backend_cooldown.clear()
+        mixin._wall_state.clear()
+        mixin._wall_pending_strikes.clear()
+        mixin._wall_since.clear()
+        mixin._wall_state_loaded = False
+
+    _clear()
     yield
-    wst.WebSearchToolsMixin._backend_cooldown.clear()
+    _clear()
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_exa(monkeypatch):
+    """Default Exa to an empty result set — same no-network contract as Startpage.
+
+    Exa joined tier 1, so without this every ``_tool_search_web`` test issues a
+    real POST to mcp.exa.ai and then waits out its connect timeout before the
+    chain continues. Tests that are ABOUT Exa override this or call the real
+    method unbound via ``_real_search_exa``.
+    """
+    monkeypatch.setattr(_Host, "_search_exa", lambda self, q, m: [], raising=False)
+
+
+def _real_search_exa(host, query: str, max_results: int):
+    """Invoke the genuine ``_search_exa``, bypassing the autouse stub."""
+    return wst.WebSearchToolsMixin._search_exa(host, query, max_results)
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +112,23 @@ def _neutralise_startpage(monkeypatch):
 def _real_search_startpage(host, query: str, max_results: int):
     """Invoke the genuine ``_search_startpage``, bypassing the autouse stub."""
     return wst.WebSearchToolsMixin._search_startpage(host, query, max_results)
+
+
+@pytest.fixture(autouse=True)
+def _stub_dns(monkeypatch):
+    """Resolve hostnames to a public IP so the SSRF guard never touches the network.
+
+    web_fetch's SSRF guard resolves hostnames via ``socket.getaddrinfo``; without
+    this, every web_fetch test would issue a real DNS query, violating the
+    module's "no network" contract. Tests that exercise DNS resolution
+    monkeypatch ``wst.socket.getaddrinfo`` themselves (later patches win).
+    """
+    monkeypatch.setattr(
+        wst.socket, "getaddrinfo",
+        lambda host, port, *a, **k: [
+            (wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0))
+        ],
+    )
 
 
 # ── _DDGResultParser ────────────────────────────────────────────────────
@@ -340,6 +401,108 @@ def _stub_fetch(monkeypatch, response: httpx.Response):
 
 def _html_response(text: str, ctype: str = "text/html; charset=utf-8") -> httpx.Response:
     return httpx.Response(200, request=httpx.Request("GET", "https://x/"), headers={"content-type": ctype}, text=text)
+
+
+# ── web_fetch SSRF guard ─────────────────────────────────────────────────
+
+def test_ssrf_guard_blocks_loopback_ips():
+    for host in ("127.0.0.1", "127.0.0.2", "127.8.8.8", "::1"):
+        with pytest.raises(wst._SSRFBlockedError):
+            wst._assert_public_fetch_host(host)
+
+
+def test_ssrf_guard_blocks_private_link_local_and_special_ips():
+    for host in (
+        "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.0.1",
+        "169.254.169.254", "fe80::1", "fc00::1", "fd12:3456::1",
+        "0.0.0.0", "::", "224.0.0.1", "ff02::1", "240.0.0.1",
+    ):
+        with pytest.raises(wst._SSRFBlockedError):
+            wst._assert_public_fetch_host(host)
+
+
+def test_ssrf_guard_allows_public_ips():
+    for host in ("8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"):
+        wst._assert_public_fetch_host(host)  # must not raise
+
+
+def test_ssrf_guard_unwraps_ipv4_mapped_ipv6():
+    with pytest.raises(wst._SSRFBlockedError):
+        wst._assert_public_fetch_host("::ffff:127.0.0.1")
+
+
+def test_ssrf_guard_blocks_hostname_resolving_to_private(monkeypatch):
+    monkeypatch.setattr(
+        wst.socket, "getaddrinfo",
+        lambda host, port, *a, **k: [
+            (wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("127.0.0.1", port or 0))
+        ],
+    )
+    with pytest.raises(wst._SSRFBlockedError):
+        wst._assert_public_fetch_host("internal.example.com")
+
+
+def test_ssrf_guard_blocks_mixed_resolution_any_private_hit(monkeypatch):
+    monkeypatch.setattr(
+        wst.socket, "getaddrinfo",
+        lambda host, port, *a, **k: [
+            (wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0)),
+            (wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("10.0.0.9", port or 0)),
+        ],
+    )
+    with pytest.raises(wst._SSRFBlockedError):
+        wst._assert_public_fetch_host("dual.example.com")
+
+
+def test_ssrf_guard_allows_public_hostname(monkeypatch):
+    monkeypatch.setattr(
+        wst.socket, "getaddrinfo",
+        lambda host, port, *a, **k: [
+            (wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0)),
+            (wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("93.184.216.35", port or 0)),
+        ],
+    )
+    wst._assert_public_fetch_host("example.com")  # must not raise
+
+
+def test_ssrf_guard_passes_resolution_failure(monkeypatch):
+    def _fail(host, port, *a, **k):
+        raise wst.socket.gaierror("Name or service not known")
+    monkeypatch.setattr(wst.socket, "getaddrinfo", _fail)
+    wst._assert_public_fetch_host("no-such-host.invalid")  # must not raise
+
+
+def test_ssrf_guard_env_hatch_disables(monkeypatch):
+    for value in ("1", "on", "true"):
+        monkeypatch.setenv(wst._SSRF_ALLOW_ENV, value)
+        wst._assert_public_fetch_host("127.0.0.1")  # must not raise
+        wst._assert_public_fetch_host("10.0.0.1")  # must not raise
+
+
+def test_ssrf_request_hook_rejects_private_hop():
+    class _FakeReq:
+        def __init__(self, host):
+            self.url = type("_FakeURL", (), {"host": host})()
+    with pytest.raises(wst._SSRFBlockedError):
+        wst._ssrf_request_hook(_FakeReq("::1"))
+    wst._ssrf_request_hook(_FakeReq("example.com"))  # must not raise (autouse DNS stub)
+
+
+def test_web_fetch_blocks_private_url(monkeypatch):
+    host = _Host()
+    _stub_fetch(monkeypatch, _html_response("<p>hi</p>"))
+    res = host._tool_web_fetch({"url": "http://127.0.0.1:11434/api/tags"})
+    assert not res["ok"]
+    assert "SSRF" in res["error"]
+    assert "127.0.0.1" in res["error"]
+
+
+def test_web_fetch_private_url_allowed_with_env_hatch(monkeypatch):
+    monkeypatch.setenv(wst._SSRF_ALLOW_ENV, "1")
+    host = _Host()
+    _stub_fetch(monkeypatch, _html_response("<p>hi</p>"))
+    res = host._tool_web_fetch({"url": "http://127.0.0.1:8080/health"})
+    assert res["ok"]
 
 
 def test_web_fetch_preserves_paragraph_structure(monkeypatch):
@@ -913,6 +1076,146 @@ def test_guard_block_wall_status_ignored_when_results_present():
     wst.WebSearchToolsMixin._guard_block_wall("DuckDuckGo", "body", hits, status=202)
 
 
+# ── web_fetch: HTTP 200 + bot challenge ──────────────────────────────────────
+#
+# Extracted text (i.e. what _tool_web_fetch actually inspects, after
+# _HTMLTextExtractor) of three pages captured live on 2026-08-05. Each answered
+# HTTP 200. Kept verbatim for the same reason as _DDG_LIVE_CAPTCHA: every one of
+# these was MISSED by the marker list as it stood that morning — "checking your
+# browser" does not match "verifying your browser".
+_LIVE_CHALLENGE_PAGES = {
+    # www.reddit.com — the whole page extracts to just its title.
+    "reddit-www": "Reddit - Please wait for verification",
+    # redlib.privacyredirect.com — Anubis proof-of-work interstitial.
+    "redlib-anubis": (
+        "Making sure you're not a bot!\nMaking sure you're not a bot!\nLoading...\n"
+        "Please wait a moment while we ensure the security of your connection.\n"
+        "Protected by Anubis from Techaro. Made with ❤️ by Xe Iaso."
+    ),
+    # safereddit.com — same Anubis stack, different wording.
+    "safereddit": (
+        "Verifying your browser…\nVerifying your browser…\n"
+        "You are seeing this because the administrator of this website has set up "
+        "Anubis to protect the server against the scourge of AI companies "
+        "aggressively scraping websites."
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_LIVE_CHALLENGE_PAGES))
+def test_fetch_challenge_page_catches_live_200_walls(name):
+    """Each live page must be caught by its own wording.
+
+    These are the pages that make web_fetch dangerous rather than merely broken:
+    HTTP 200, so an unguarded fetch formats the interstitial exactly like a
+    successful read and the caller mistakes a block for the site's content.
+    """
+    assert wst._fetch_is_challenge_page(_LIVE_CHALLENGE_PAGES[name])
+
+
+def test_fetch_challenge_page_ignores_real_content():
+    """The real old.reddit.com thread reached through the same fetch must pass."""
+    real = "Introducing Claude Opus 5 : ClaudeAI\njump to content\nmy subreddits\n" + ("comment body. " * 500)
+    assert not wst._fetch_is_challenge_page(real)
+    assert not wst._fetch_is_challenge_page("")
+    assert not wst._fetch_is_challenge_page("   \n  ")
+
+
+def test_fetch_challenge_page_needs_both_signals():
+    """Length alone and wording alone must each be insufficient.
+
+    This is the property that lets web_fetch consult the markers without the
+    "zero results parsed" gate that _body_is_block_wall's contract requires: a
+    long page keeps its content even if it discusses bot checks, and a short page
+    is not condemned merely for being short.
+    """
+    # Wording present, but on a page long enough to be a real article about it.
+    article = "Why sites are checking your browser: a deep dive. " * 200
+    assert len(article) > wst._FETCH_CHALLENGE_MAX_TEXT
+    assert wst._fetch_is_challenge_page(article) is False
+    # Short page, no challenge wording — a legitimately terse page.
+    assert not wst._fetch_is_challenge_page("404 Not Found\nThe page you requested does not exist.")
+
+
+def test_loose_markers_stay_out_of_the_fetch_path():
+    """"captcha" / "rate limit" must never reach the ungated web_fetch check.
+
+    They are ordinary words in pages ABOUT those topics; _body_is_block_wall is
+    only safe with them because the search path gates on zero parsed results.
+    """
+    for loose in ("captcha", "rate limit", "too many requests", "unusual traffic"):
+        assert loose in wst._BLOCK_WALL_MARKERS
+        assert loose not in wst._CHALLENGE_PAGE_MARKERS
+        assert not wst._fetch_is_challenge_page(f"Our API returns 429 when you hit the {loose}.")
+
+
+def test_challenge_markers_remain_a_subset_of_the_wall_markers():
+    """Splitting the list must not drop a phrase from the search-path detector."""
+    assert set(wst._CHALLENGE_PAGE_MARKERS) <= set(wst._BLOCK_WALL_MARKERS)
+
+
+# ── web_fetch: Reddit host rewrite ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["reddit.com", "www.reddit.com", "np.reddit.com", "new.reddit.com", "m.reddit.com", "amp.reddit.com"],
+)
+def test_rewrite_reddit_url_covers_every_challenge_host(host):
+    """The bare apex 302s to www and lands on the same interstitial, so matching
+    only "www.reddit.com" left the commonest hand-typed form broken."""
+    out = wst._rewrite_reddit_url(f"https://{host}/r/ClaudeAI/comments/abc/title/")
+    assert out == "https://old.reddit.com/r/ClaudeAI/comments/abc/title/"
+
+
+def test_rewrite_reddit_url_preserves_query_and_fragment():
+    out = wst._rewrite_reddit_url("https://www.reddit.com/r/x/search?q=opus&restrict_sr=1#top")
+    assert out == "https://old.reddit.com/r/x/search?q=opus&restrict_sr=1#top"
+
+
+def test_fetch_headers_carry_the_full_browser_fingerprint():
+    """A partial browser header set is itself a bot signature.
+
+    Measured 2026-08-05 against old.reddit.com, 4 requests per variant: UA alone,
+    UA+Accept, and UA+Accept-Language each returned 200 (4/4), while
+    UA+Accept+Accept-Language — exactly what web_fetch used to send — returned 403
+    (4/4). Adding the Sec-Fetch block restored 200 (4/4). Dropping any member here
+    re-creates that fingerprint, so the set is asserted whole.
+    """
+    required = {
+        "Accept", "Accept-Language", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+        "Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Fetch-Site", "Sec-Fetch-User",
+        "Upgrade-Insecure-Requests",
+    }
+    assert required <= set(wst._BROWSER_FETCH_HEADERS)
+    # User-Agent stays out of the constant — it is shared with the search backends.
+    assert "User-Agent" not in wst._BROWSER_FETCH_HEADERS
+
+
+def test_client_hint_version_matches_the_user_agent():
+    """sec-ch-ua must not drift from _BROWSER_UA: a Chrome UA advertising one
+    major while the client hint advertises another is a contradiction no real
+    browser produces, which is the very signature these headers exist to avoid."""
+    ua_major = re.search(r"Chrome/(\d+)", wst._BROWSER_UA).group(1)
+    hint_majors = set(re.findall(r'"Chromium";v="(\d+)"|"Google Chrome";v="(\d+)"',
+                                 wst._BROWSER_FETCH_HEADERS["sec-ch-ua"]))
+    hint_majors = {v for pair in hint_majors for v in pair if v}
+    assert hint_majors == {ua_major}, f"UA says Chrome/{ua_major}, sec-ch-ua says {hint_majors}"
+
+
+def test_rewrite_reddit_url_leaves_other_urls_alone():
+    """Host-based, not substring: a URL that merely mentions the string is not a
+    Reddit fetch, and old.reddit.com must not be rewritten onto itself."""
+    for untouched in (
+        "https://example.com/?ref=www.reddit.com",
+        "https://notreddit.com/r/x",
+        "https://old.reddit.com/r/x",
+        "https://i.redd.it/abc.png",
+        "not a url at all",
+    ):
+        assert wst._rewrite_reddit_url(untouched) == untouched
+
+
 def test_guard_block_wall_plain_200_miss_still_passes():
     """HTTP 200 + zero results + no markers stays a genuine miss."""
     wst.WebSearchToolsMixin._guard_block_wall("Startpage", "<html>no matches</html>", [], status=200)
@@ -1419,7 +1722,7 @@ def test_startpage_parser_strips_control_chars():
 def test_startpage_parser_keeps_result_without_snippet():
     """A title with no following <p class="description"> must still be emitted
     (same three-site flush contract as the DDG parser)."""
-    only_title = _SP_RESULT.split("<style data-emotion=\"css 1507v2l\"")[0]
+    only_title = _SP_RESULT.split("<style data-emotion=\"css 1507v2l\"", maxsplit=1)[0]
     p = wst._StartpageResultParser(max_results=5)
     p.feed(only_title)
     p.close()
@@ -1446,6 +1749,42 @@ def test_attr_helpers_live_in_base_ssot():
                 f"{parser.__name__}.{helper} shadows the base SSOT — delete it and inherit"
             )
             assert getattr(parser, helper) is getattr(base, helper)
+
+
+def test_flush_and_state_init_live_in_base_ssot():
+    """``_flush`` and the common parser-state block must exist ONCE, on the
+    shared base. Both parsers used to carry identical flush skeletons and
+    identical ``__init__`` state blocks; this pins the SSOT the same way the
+    attr helpers are pinned above."""
+    base = wst._ResultParserBase
+    for parser in (wst._DDGResultParser, wst._StartpageResultParser):
+        assert "_flush" not in vars(parser), (
+            f"{parser.__name__}._flush shadows the base SSOT — delete it and inherit"
+        )
+        assert parser._flush is base._flush
+    # The common state must come from the base constructor, not per-parser copies.
+    for parser in (wst._DDGResultParser, wst._StartpageResultParser):
+        p = parser(max_results=7)
+        assert p.max_results == 7 and p.results == []
+        assert p._current is None and p._text_parts == []
+        assert p._capturing is False and p._in_snippet is False
+        assert p._emitted is False
+
+
+def test_flush_required_fields_per_engine():
+    """DDG emits on a title alone (the URL comes from the anchor itself);
+    Startpage additionally demands an explicit URL — the per-engine
+    ``_REQUIRED_FIELDS`` difference, pinned behaviorally."""
+    ddg = wst._DDGResultParser(max_results=5)
+    ddg.feed('<a class="result__a">Title without href</a>')
+    ddg.close()
+    assert len(ddg.results) == 1
+    assert ddg.results[0]["url"] == ""
+
+    sp = wst._StartpageResultParser(max_results=5)
+    sp.feed('<a class="result-title">Title without href</a>')
+    sp.close()
+    assert len(sp.results) == 0     # no destination -> not usable
 
 
 def test_has_class_matches_whole_tokens_only():
@@ -1829,7 +2168,6 @@ def _reset_staleness_check():
 def _proc(stdout="", rc=0):
     class _P:
         returncode = rc
-        pass
     p = _P()
     p.stdout = stdout
     return p
@@ -2057,6 +2395,41 @@ def test_concurrent_install_prompt_is_issued_once(monkeypatch):
     assert results == [False, False]
 
 
+def test_ask_searxng_decision_exception_falls_back_to_no(monkeypatch):
+    """ask_user raising must not propagate: cache False + return False.
+
+    Pins the shared fallback contract of ``_ask_searxng_decision`` (single
+    source for the start/install prompts) — checkpoint/prompting unavailable
+    degrades to 'no' and the decision is cached so we never re-prompt.
+    """
+    host = _Host()
+
+    def _boom(args):
+        raise RuntimeError("checkpoint unavailable")
+
+    monkeypatch.setattr(host, "_tool_ask_user", _boom, raising=False)
+    assert host._ask_start_searxng() is False
+    assert host._searxng_start_decision is False
+    # Second call: served from cache — no second prompt attempt.
+    assert host._ask_start_searxng() is False
+
+
+def test_ask_searxng_decision_cached_fast_path_skips_prompt(monkeypatch):
+    """Once decided, the answer is served from the cache without re-prompting."""
+    host = _Host()
+    calls = []
+
+    def _ask(args):
+        calls.append(args)
+        return _AnswerResult("yes")
+
+    monkeypatch.setattr(host, "_tool_ask_user", _ask, raising=False)
+    assert host._ask_install_searxng() is True
+    assert host._ask_install_searxng() is True  # fast path — no second prompt
+    assert len(calls) == 1
+    assert host._searxng_install_decision is True
+
+
 def test_concurrent_start_searxng_never_overlaps(monkeypatch):
     """Two callers that both got "yes" must not run `docker run` concurrently —
     the second would fail on a duplicate container name. _start_searxng is
@@ -2113,3 +2486,844 @@ def test_web_fetch_truncation_length_excludes_marker(monkeypatch):
         "length must reflect real content (max_chars), not include the marker — "
         f"got {res['metadata']['length']}"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Persistent escalating wall backoff
+#
+# A bot-detection wall is an IP-reputation decision measured in DAYS (Startpage
+# was measured suspended for 14 days straight), so it needs a different breaker
+# than a connect failure: one that survives process exit and escalates, because
+# every re-probe is another flagged request that deepens the block.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_wall_backoff_escalates_per_strike(monkeypatch, tmp_path):
+    """Consecutive walls double the backoff, capped at _WALL_BACKOFF_MAX_SEC."""
+    monkeypatch.setattr(_Host, "repo_root", str(tmp_path), raising=False)
+    host = _Host()
+    seen = []
+    for _ in range(10):
+        host._trip_backend_cooldown("Startpage", wall=True)
+        st = wst.WebSearchToolsMixin._wall_state["Startpage"]
+        seen.append(round(st["until"] - time.time()))
+        # Re-tripping while still walled must keep escalating, so clear only the
+        # in-memory connect cooldown between strikes.
+        wst.WebSearchToolsMixin._backend_cooldown.clear()
+
+    assert seen[0] == pytest.approx(wst._WALL_BACKOFF_BASE_SEC, abs=2)
+    assert seen[1] == pytest.approx(wst._WALL_BACKOFF_BASE_SEC * 2, abs=2)
+    assert seen[2] == pytest.approx(wst._WALL_BACKOFF_BASE_SEC * 4, abs=2)
+    assert seen[-1] == pytest.approx(wst._WALL_BACKOFF_MAX_SEC, abs=2), (
+        f"backoff must cap at {wst._WALL_BACKOFF_MAX_SEC}s so a recovered backend "
+        f"is still re-probed ~daily; got {seen[-1]}"
+    )
+
+
+def test_wall_backoff_survives_process_restart(monkeypatch, tmp_path):
+    """The whole point: a new process must not re-probe a backend it knows is walled.
+
+    Startpage stayed blocked for two weeks while every `asi` start re-probed it —
+    ~1.7s of latency each time AND another bot-flagged request. Simulated here by
+    dropping the in-memory state and forcing a reload, which is exactly what a
+    fresh interpreter does.
+    """
+    monkeypatch.setattr(_Host, "repo_root", str(tmp_path), raising=False)
+    _Host()._trip_backend_cooldown("Startpage", wall=True)
+    assert (tmp_path / ".asicode" / "search_backend_walls.json").exists()
+
+    # ── simulate a fresh process ──
+    wst.WebSearchToolsMixin._wall_state.clear()
+    wst.WebSearchToolsMixin._backend_cooldown.clear()
+    wst.WebSearchToolsMixin._wall_state_loaded = False
+
+    assert _Host()._backend_in_cooldown("Startpage") is True, (
+        "a persisted wall must sideline the backend in a new process"
+    )
+
+
+def test_lapsed_wall_keeps_its_strike_ladder(monkeypatch, tmp_path):
+    """A probe after the deadline must not reset the ladder to strike 1.
+
+    Otherwise a permanently blocked backend oscillates forever at the base
+    interval: probe → wall → 15min → probe → wall → 15min. The ladder may only be
+    reset by a real success (_clear_backend_wall).
+    """
+    monkeypatch.setattr(_Host, "repo_root", str(tmp_path), raising=False)
+    host = _Host()
+    host._trip_backend_cooldown("Startpage", wall=True)
+    wst.WebSearchToolsMixin._backend_cooldown.clear()
+
+    # Expire the backoff, then let the breaker observe the lapse (the probe).
+    wst.WebSearchToolsMixin._wall_state["Startpage"]["until"] = time.time() - 1
+    assert host._backend_in_cooldown("Startpage") is False, "lapsed backoff must allow a probe"
+
+    # The probe walls again → this is strike 2, not strike 1.
+    host._trip_backend_cooldown("Startpage", wall=True)
+    st = wst.WebSearchToolsMixin._wall_state["Startpage"]
+    assert st["strikes"] == 2
+    assert st["until"] - time.time() == pytest.approx(wst._WALL_BACKOFF_BASE_SEC * 2, abs=2)
+
+
+def test_success_clears_wall_ladder(monkeypatch, tmp_path):
+    monkeypatch.setattr(_Host, "repo_root", str(tmp_path), raising=False)
+    host = _Host()
+    host._trip_backend_cooldown("Startpage", wall=True)
+    wst.WebSearchToolsMixin._backend_cooldown.clear()
+
+    host._clear_backend_wall("Startpage")
+    assert "Startpage" not in wst.WebSearchToolsMixin._wall_state
+    assert host._backend_in_cooldown("Startpage") is False
+    with open(tmp_path / ".asicode" / "search_backend_walls.json", encoding="utf-8") as fh:
+        assert json.load(fh) == {}, "recovery must be persisted, not only held in memory"
+
+
+def test_connect_failure_does_not_persist_a_wall(monkeypatch, tmp_path):
+    """Only walls escalate. A connect failure keeps the transient 90s cooldown."""
+    monkeypatch.setattr(_Host, "repo_root", str(tmp_path), raising=False)
+    host = _Host()
+    host._trip_backend_cooldown("SearXNG")  # wall=False (default)
+
+    assert "SearXNG" not in wst.WebSearchToolsMixin._wall_state
+    assert not (tmp_path / ".asicode" / "search_backend_walls.json").exists(), (
+        "a host that is merely down must not be written off for hours"
+    )
+    assert host._backend_in_cooldown("SearXNG") is True
+
+
+def test_walled_backend_notice_only_after_threshold(monkeypatch, tmp_path):
+    """Degraded coverage is invisible in the results, so it is stated in the output.
+
+    But not for a blip — the notice fires only once a backend has been blocked
+    long enough that the user's search quality is genuinely reduced.
+    """
+    monkeypatch.setattr(_Host, "repo_root", str(tmp_path), raising=False)
+    # Pinned: with a browser route available the notice reports substitution
+    # instead (covered below), and whether Playwright is installed is a property
+    # of the machine running the suite, not of the behaviour under test.
+    monkeypatch.setattr(_Host, "_startpage_browser_available", lambda self: False, raising=False)
+    host = _Host()
+    host._trip_backend_cooldown("Startpage", wall=True)
+    assert host._walled_backend_notice() is None, "a fresh wall is not yet newsworthy"
+
+    wst.WebSearchToolsMixin._wall_state["Startpage"]["since"] = time.time() - 3 * 86400
+    notice = host._walled_backend_notice()
+    assert notice is not None and "Startpage" in notice and "3.0d" in notice
+    assert "coverage is reduced" in notice
+
+
+def test_walled_notice_reports_substitution_not_degradation(monkeypatch, tmp_path):
+    """A backend carried by its other transport is NOT degrading coverage.
+
+    Reporting it as blocked would be the same class of misreport this notice was
+    written to prevent, only pointed the other way — the user would be told their
+    general-web coverage dropped while it was in fact intact.
+    """
+    monkeypatch.setattr(_Host, "repo_root", str(tmp_path), raising=False)
+    monkeypatch.setattr(_Host, "_startpage_browser_available", lambda self: True, raising=False)
+    host = _Host()
+    host._trip_backend_cooldown("Startpage", wall=True)
+    wst.WebSearchToolsMixin._wall_state["Startpage"]["since"] = time.time() - 3 * 86400
+
+    notice = host._walled_backend_notice()
+    assert notice is not None and "Startpage" in notice
+    assert "browser route" in notice
+    assert "NOT reduced" in notice
+    assert "skipped" not in notice
+
+
+def test_startpage_browser_route_registers_only_when_the_http_route_is_walled(monkeypatch):
+    """The browser costs ~3s and a Chromium process, so it must stay out of the
+    tier while the ~1s httpx route still works."""
+    monkeypatch.setattr(wst, "HAS_PLAYWRIGHT", True, raising=False)
+    host = _Host()
+    monkeypatch.setattr(_Host, "_backend_in_cooldown", lambda self, name: False, raising=False)
+    assert host._startpage_browser_available() is False
+
+    monkeypatch.setattr(_Host, "_backend_in_cooldown", lambda self, name: name == "Startpage", raising=False)
+    import external_llm.agent.tool_handlers.browser_tools as bt
+
+    monkeypatch.setattr(bt, "HAS_PLAYWRIGHT", True)
+    monkeypatch.setattr(bt, "PLAYWRIGHT_BROWSER_AVAILABLE", True)
+    assert host._startpage_browser_available() is True
+    # No Playwright → no route, and above all no install prompt inside a search.
+    monkeypatch.setattr(bt, "PLAYWRIGHT_BROWSER_AVAILABLE", False)
+    assert host._startpage_browser_available() is False
+
+
+def test_startpage_browser_parses_with_the_shared_parser(monkeypatch):
+    """The browser route must reuse _StartpageResultParser, not grow a second
+    parser that can drift from the httpx one."""
+    html = (
+        '<a class="result-title result-link css-xx" href="https://example.com/a">'
+        '<h2 class="wgl-title">Alpha</h2></a><p class="description">snip a</p>'
+        '<a class="result-title result-link css-yy" href="https://example.com/b">'
+        '<h2 class="wgl-title">Beta</h2></a><p class="description">snip b</p>'
+    )
+    seen = {}
+
+    def _fake_render(self, url, js, **kw):
+        seen.update({"url": url, "js": js, **kw})
+        return html
+
+    monkeypatch.setattr(_Host, "_render_and_eval", _fake_render, raising=False)
+    out = _Host()._search_startpage_browser("claude opus 5", 10)
+
+    assert [r["title"] for r in out] == ["Alpha", "Beta"]
+    assert out[0]["url"] == "https://example.com/a"
+    assert "claude+opus+5" in seen["url"]
+    # Client-hydrated page: without the selector wait the render parses to ZERO
+    # results (measured 5/5 queries), so the wait is a correctness requirement.
+    assert seen["wait_for_selector"] == "a.result-link"
+
+
+def test_startpage_browser_route_reports_its_own_wall(monkeypatch):
+    """If the browser route is ALSO walled it must raise, not return an empty list
+    that the chain would read as an honest 'nothing matched'."""
+    monkeypatch.setattr(
+        _Host, "_render_and_eval",
+        lambda self, url, js, **kw: "<html><body>Verification required</body></html>",
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="Startpage \\(browser\\)"):
+        _Host()._search_startpage_browser("q", 5)
+
+
+def test_wall_state_read_failure_is_survivable(monkeypatch, tmp_path):
+    """Corrupt state must degrade to "no walls known", never break a search."""
+    monkeypatch.setattr(_Host, "repo_root", str(tmp_path), raising=False)
+    path = tmp_path / ".asicode"
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "search_backend_walls.json").write_text("{not json", encoding="utf-8")
+
+    assert _Host()._backend_in_cooldown("Startpage") is False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Exa backend (keyless MCP)
+# ══════════════════════════════════════════════════════════════════════════
+
+_EXA_PAYLOAD = (
+    "Title: Exceptions\n"
+    "URL: https://www.python-httpx.org/exceptions/\n"
+    "Published: 2026-07-28T22:50:35.095Z\n"
+    "Author: N/A\n"
+    "Highlights:\n"
+    "## The exception hierarchy\n"
+    "...\n"
+    "ConnectTimeout is a TimeoutException, not a ConnectError.\n"
+    "\n---\n\n"
+    "Title: docs/exceptions.md at master\n"
+    "URL: https://github.com/encode/httpx/blob/master/docs/exceptions.md\n"
+    "Published: N/A\n"
+    "Author: N/A\n"
+    "Highlights:\n"
+    "Timed out while connecting to the host.\n"
+)
+
+
+def test_parse_exa_results_reads_the_wire_format():
+    out = wst._parse_exa_results(_EXA_PAYLOAD, 5)
+    assert [r["url"] for r in out] == [
+        "https://www.python-httpx.org/exceptions/",
+        "https://github.com/encode/httpx/blob/master/docs/exceptions.md",
+    ]
+    assert out[0]["title"] == "Exceptions"
+    assert "ConnectTimeout is a TimeoutException" in out[0]["excerpt"]
+    assert out[0]["published"] == "2026-07-28T22:50:35.095Z"
+    assert out[1]["published"] == "", "Exa's literal 'N/A' is absence, not a date"
+    assert out[0]["snippet"] == "", "an excerpt must not masquerade as a SERP snippet"
+    assert "..." not in out[0]["excerpt"].splitlines(), "Exa's elision marker carries no information"
+
+
+def test_parse_exa_markdown_rule_does_not_split_a_result():
+    """Highlights are page text and can contain a horizontal rule.
+
+    Splitting on the separator alone would turn one result into two malformed
+    halves — the second with no URL, silently dropping a real hit.
+    """
+    payload = (
+        "Title: Design doc\n"
+        "URL: https://example.com/doc\n"
+        "Published: N/A\n"
+        "Author: N/A\n"
+        "Highlights:\n"
+        "Section one.\n"
+        "\n---\n\n"
+        "Section two, after a markdown rule.\n"
+    )
+    out = wst._parse_exa_results(payload, 5)
+    assert len(out) == 1, f"a markdown rule must not fabricate a second result; got {out}"
+    assert "Section two" in out[0]["excerpt"]
+
+
+def test_parse_exa_skips_untitled_results():
+    """`Title: N/A` entries are dropped downstream anyway — do not spend a slot."""
+    payload = (
+        "Title: N/A\n"
+        "URL: https://example.com/a\n"
+        "Highlights:\nnothing useful\n"
+        "\n---\n\n"
+        "Title: Real\n"
+        "URL: https://example.com/b\n"
+        "Highlights:\nreal content\n"
+    )
+    out = wst._parse_exa_results(payload, 5)
+    assert [r["title"] for r in out] == ["Real"]
+
+
+def test_parse_exa_respects_max_results():
+    payload = "\n---\n\n".join(
+        f"Title: T{i}\nURL: https://example.com/{i}\nHighlights:\nbody {i}\n" for i in range(10)
+    )
+    assert len(wst._parse_exa_results(payload, 3)) == 3
+
+
+def test_parse_exa_tolerates_garbage():
+    assert wst._parse_exa_results("", 5) == []
+    assert wst._parse_exa_results("no headers here at all", 5) == []
+
+
+def test_mcp_result_text_flattens_and_raises():
+    ok = {"result": {"content": [{"type": "text", "text": "hello"}, {"type": "image"}]}}
+    assert wst._mcp_result_text(ok) == "hello"
+
+    with pytest.raises(RuntimeError, match="MCP error"):
+        wst._mcp_result_text({"error": {"message": "quota exceeded"}})
+    with pytest.raises(TypeError, match="no result"):
+        wst._mcp_result_text({"jsonrpc": "2.0"})
+    with pytest.raises(TypeError, match="malformed MCP response"):
+        wst._mcp_result_text(["not", "a", "dict"])
+    with pytest.raises(RuntimeError, match="MCP tool error"):
+        wst._mcp_result_text({"result": {"isError": True, "content": [{"type": "text", "text": "upstream down"}]}})
+
+
+def _mcp_response(body: str, *, sse: bool, status: int = 200) -> httpx.Response:
+    return httpx.Response(
+        status,
+        request=httpx.Request("POST", wst._EXA_MCP_URL),
+        headers={"content-type": "text/event-stream" if sse else "application/json"},
+        text=(f"event: message\ndata: {body}\n\n" if sse else body),
+    )
+
+
+def test_parse_mcp_body_handles_sse_and_plain_json():
+    """The endpoint picks the encoding per response; both must decode identically."""
+    body = json.dumps({"result": {"content": [{"type": "text", "text": "x"}]}})
+    for sse in (True, False):
+        assert wst.WebSearchToolsMixin._parse_mcp_body(_mcp_response(body, sse=sse))["result"]["content"]
+
+    with pytest.raises(RuntimeError, match="no decodable data frame"):
+        wst.WebSearchToolsMixin._parse_mcp_body(
+            httpx.Response(
+                200,
+                request=httpx.Request("POST", wst._EXA_MCP_URL),
+                headers={"content-type": "text/event-stream"},
+                text="event: ping\n\n",
+            )
+        )
+
+
+class _ExaStubClient:
+    """Stub httpx.Client for _search_exa (POST only)."""
+
+    def __init__(self, response: httpx.Response):
+        self._response = response
+        self.calls: list[dict] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def post(self, url, json=None, data=None, headers=None):
+        self.calls.append({"url": url, "json": json})
+        return self._response
+
+
+def test_search_exa_parses_a_live_shaped_response(monkeypatch):
+    body = json.dumps({"result": {"content": [{"type": "text", "text": _EXA_PAYLOAD}]}})
+    stub = _ExaStubClient(_mcp_response(body, sse=True))
+    monkeypatch.setattr(wst.httpx, "Client", lambda *a, **k: stub)
+
+    out = _real_search_exa(_Host(), "httpx exceptions", 5)
+    assert len(out) == 2
+    assert stub.calls[0]["json"]["method"] == "tools/call", (
+        "the endpoint serves tools/call without an initialize handshake — "
+        "sending one would cost an extra round trip on every search"
+    )
+    assert stub.calls[0]["json"]["params"]["arguments"]["numResults"] == 5
+
+
+def test_search_exa_quota_refusal_is_a_wall(monkeypatch):
+    """HTTP 429 from a keyless endpoint is a quota block, not a transient blip.
+
+    It must reach the escalating ladder rather than being retried on the shared
+    ~1.5s policy, which cannot outlast a quota that resets on a timer.
+    """
+    stub = _ExaStubClient(_mcp_response("{}", sse=False, status=429))
+    monkeypatch.setattr(wst.httpx, "Client", lambda *a, **k: stub)
+
+    with pytest.raises(wst._BlockWallError, match="429"):
+        _real_search_exa(_Host(), "anything", 5)
+    assert len(stub.calls) == 1, "a daily quota must not be re-asked 1.5s later"
+
+
+@pytest.mark.parametrize("value,expected", [("off", False), ("0", False), ("no", False),
+                                            ("", True), ("on", True)])
+def test_exa_opt_out_switch(monkeypatch, value, expected):
+    monkeypatch.setenv(wst._EXA_ENV, value)
+    assert wst.WebSearchToolsMixin._should_try_exa() is expected
+
+
+def test_tier1_includes_exa(monkeypatch):
+    """Exa participates in the merge, not as a fallback behind a dead backend."""
+    monkeypatch.delenv("SEARXNG_BASE_URL", raising=False)
+    monkeypatch.setattr(_Host, "_has_docker_or_colima", lambda self: False)
+    called: list[str] = []
+    monkeypatch.setattr(
+        _Host, "_search_startpage",
+        lambda self, q, m: called.append("startpage") or [{"title": "sp", "url": "https://a/", "snippet": "s"}],
+    )
+    monkeypatch.setattr(
+        _Host, "_search_exa",
+        lambda self, q, m: called.append("exa") or [{"title": "exa", "url": "https://b/", "excerpt": "e"}],
+    )
+
+    res = _Host()._tool_search_web({"query": "test"})
+    assert sorted(called) == ["exa", "startpage"], (
+        "Startpage answering must not short-circuit Exa — tier 1 merges"
+    )
+    assert "https://b/" in res["content"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Excerpt rendering
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_excerpt_supersedes_snippet_and_carries_date():
+    res = _Host()._format_search_results(
+        "q",
+        [{"title": "T", "url": "https://x/", "snippet": "short serp line",
+          "excerpt": "the real page text", "published": "2026-07-28T22:50:35.095Z", "sources": "Exa"}],
+        ["Exa"],
+    )
+    assert "the real page text" in res["content"]
+    assert "short serp line" not in res["content"], (
+        "printing both spends tokens twice on the same result"
+    )
+    assert "Published: 2026-07-28" in res["content"]
+
+
+def test_excerpt_falls_back_to_snippet_when_absent():
+    res = _Host()._format_search_results(
+        "q", [{"title": "T", "url": "https://x/", "snippet": "serp line", "sources": "SearXNG"}], ["SearXNG"]
+    )
+    assert "serp line" in res["content"]
+
+
+def test_excerpt_total_budget_is_enforced():
+    """Excerpts are ~8x a snippet; unbounded they dominate every search's cost."""
+    results = [
+        {"title": f"T{i}", "url": f"https://x/{i}", "snippet": "", "excerpt": "y" * 4000, "sources": "Exa"}
+        for i in range(6)
+    ]
+    content = _Host()._format_search_results("q", results, ["Exa"])["content"]
+    spent = content.count("y")
+    assert spent <= wst._EXCERPT_TOTAL_BUDGET, f"budget blown: {spent} chars of excerpt"
+    assert "…" in content or "[…]" in content, "truncation must be visible to the model"
+    for i in range(6):
+        assert f"https://x/{i}" in content, "budget may drop excerpts, never whole results"
+
+
+def test_merge_preserves_excerpt_and_prefers_the_fuller_one():
+    merged = wst._merge_search_results(
+        [
+            ("SearXNG", [{"title": "T", "url": "https://x/", "snippet": "serp"}]),
+            ("Exa", [{"title": "T", "url": "https://x/", "excerpt": "long page text", "published": "2026-01-01"}]),
+        ],
+        5,
+    )
+    assert len(merged) == 1
+    assert merged[0]["excerpt"] == "long page text"
+    assert merged[0]["snippet"] == "serp", (
+        "snippet and excerpt are different fields — merging them lets a snippet "
+        "win on length and discard the better content"
+    )
+    assert merged[0]["published"] == "2026-01-01"
+    assert merged[0]["sources"] == "SearXNG,Exa"
+
+
+def test_wall_state_is_concurrency_safe(monkeypatch, tmp_path):
+    """Searches run concurrently on the shared tool-executor pool.
+
+    The wall bookkeeping is process-wide class state mutated from those threads,
+    and the load path REPLACES the whole dict — so both the load and every
+    read-modify-write must happen under the one lock. Exercised here rather than
+    reasoned about, because the failure mode (a lost strike, a backend briefly
+    seen as un-walled) is silent.
+    """
+    import sys
+    import threading
+
+    monkeypatch.setattr(_Host, "repo_root", str(tmp_path), raising=False)
+    host = _Host()
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(8)
+
+    def worker(i: int) -> None:
+        try:
+            barrier.wait()
+            for _ in range(25):
+                host._backend_in_cooldown("Startpage")
+                host._trip_backend_cooldown("Startpage", wall=True)
+                host._walled_backend_notice()
+                if i == 0:
+                    host._clear_backend_wall("Exa")
+        except BaseException as e:
+            # Collected, not raised: an exception in a worker thread is invisible
+            # to pytest, so without this the test would pass through a crash.
+            errors.append(e)
+
+    # Force the interpreter to preempt INSIDE the read-modify-write. The strike
+    # update is "read prev → +1 → store", which at the default 5ms switch interval
+    # completes between thread switches nearly every time — so an UNLOCKED
+    # implementation passes this test. Confirmed by mutation: removing the lock
+    # survived 5/5 runs at the default interval and is caught at this one. Without
+    # this line the test asserts nothing about locking.
+    prev_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+    finally:
+        sys.setswitchinterval(prev_interval)
+
+    assert not errors, f"concurrent wall bookkeeping raised: {errors[:3]}"
+    assert not any(t.is_alive() for t in threads), "a thread deadlocked on the cooldown lock"
+    st = wst.WebSearchToolsMixin._wall_state["Startpage"]
+    assert st["strikes"] == 200, f"lost strikes under concurrency: {st['strikes']}"
+    assert st["until"] - time.time() == pytest.approx(wst._WALL_BACKOFF_MAX_SEC, abs=2)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Merge relevance tiebreaker
+#
+# Every backend's own #0 arrives at (agreement=1, best_position=0), so before
+# this the winner was decided by which backend was appended to tier1 first.
+# SearXNG leads that list and keyword-matches badly on its top hit, so its junk
+# systematically outranked Exa's correct #0 (measured 2026-08-03, 8 queries:
+# "ruff F821 undefined name" -> Maine Coon on Wikipedia; "postgres index only
+# scan" -> postgresql.org's front page; r/LocalLLaMA... -> r-project.org).
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_relevance_breaks_the_tie_that_backend_order_used_to_decide():
+    """The reported defect, minimised: two #0 results, one of them junk."""
+    per_backend = [
+        # Listed FIRST — under the old key this won on first_backend alone.
+        ("SearXNG", [{"title": "The R Project for Statistical Computing",
+                      "url": "https://www.r-project.org/",
+                      "snippet": "R is a free software environment for statistical computing"}]),
+        ("Exa", [{"title": "r/LocalLLaMA",
+                  "url": "https://www.reddit.com/r/LocalLLaMA/",
+                  "excerpt": "LocalLLaMA subreddit discussing DeepSeek and local models"}]),
+    ]
+    query = "r/LocalLLaMA DeepSeek reddit thread"
+
+    assert _merge_top_url(per_backend, "") == "https://www.r-project.org/", (
+        "precondition: without relevance, declaration order decides"
+    )
+    assert _merge_top_url(per_backend, query) == "https://www.reddit.com/r/LocalLLaMA/"
+
+
+def _merge_top_url(per_backend, query: str) -> str:
+    return wst._merge_search_results(per_backend, 5, query)[0]["url"]
+
+
+def test_relevance_does_not_override_cross_backend_agreement():
+    """Agreement stays the primary signal — relevance only breaks its ties.
+
+    Two independent indexes converging on a page is evidence relevance scoring
+    over ten short documents cannot produce, so a 2-source result must keep
+    outranking a 1-source result that merely shares more query words.
+    """
+    agreed = {"title": "Result", "url": "https://agreed.example/", "snippet": "generic"}
+    per_backend = [
+        ("SearXNG", [agreed]),
+        ("Exa", [agreed, {"title": "postgres index only scan visibility map",
+                          "url": "https://solo.example/postgres-index-only-scan-visibility-map",
+                          "excerpt": "postgres index only scan visibility map"}]),
+    ]
+    top = wst._merge_search_results(per_backend, 5, "postgres index only scan visibility map")[0]
+    assert top["url"] == "https://agreed.example/"
+    assert top["sources"] == "SearXNG,Exa"
+
+
+def test_relevance_does_not_override_engine_position():
+    """Containment: the engines' own ordering still wins above the tie.
+
+    A ten-document BM25 has far less signal than an engine's link graph, click
+    data and freshness, so relevance sits BELOW best_position — a result the
+    engine ranked #0 keeps beating one it ranked #1.
+    """
+    per_backend = [
+        ("Exa", [
+            {"title": "Generic overview page", "url": "https://a.example/", "excerpt": "overview"},
+            {"title": "postgres index only scan visibility map",
+             "url": "https://b.example/", "excerpt": "postgres index only scan visibility map"},
+        ]),
+    ]
+    assert _merge_top_url(per_backend, "postgres index only scan visibility map") == "https://a.example/"
+
+
+def test_relevance_tie_falls_back_to_backend_order():
+    """Determinism when nothing matches: a query sharing no token scores 0.0 for
+    every candidate, and the ordering must stay stable rather than arbitrary."""
+    per_backend = [
+        ("SearXNG", [{"title": "Alpha", "url": "https://alpha.example/", "snippet": "aaa"}]),
+        ("Exa", [{"title": "Beta", "url": "https://beta.example/", "excerpt": "bbb"}]),
+    ]
+    assert _merge_top_url(per_backend, "zzzz qqqq") == "https://alpha.example/"
+
+
+def test_merge_without_a_query_keeps_the_old_ordering():
+    """query='' disables relevance, so existing callers/tests are unaffected."""
+    per_backend = [
+        ("SearXNG", [{"title": "Junk", "url": "https://junk.example/", "snippet": "unrelated"}]),
+        ("Exa", [{"title": "postgres index only scan", "url": "https://good.example/", "excerpt": "postgres"}]),
+    ]
+    assert _merge_top_url(per_backend, "") == "https://junk.example/"
+
+
+def test_relevance_scores_korean_queries():
+    """Hangul must score, or every Korean query silently falls back to backend order.
+
+    This is why the tokenizer is reused from rag_configs rather than written as a
+    ``\\w+``/ASCII split: its regex has a dedicated Hangul-run alternative.
+
+    Deliberately Hangul-ONLY on both sides. An earlier version of this test used
+    "파이썬 asyncio CancelledError 처리 방법" against a doc containing those same
+    Latin tokens — so an ASCII-only tokenizer still ranked it first and the test
+    passed while asserting nothing about Hangul (confirmed by mutation). With no
+    Latin token to fall back on, an ASCII tokenizer yields an empty query, scores
+    every candidate 0.0, and the junk result wins on backend order.
+    """
+    per_backend = [
+        ("SearXNG", [{"title": "Unrelated page", "url": "https://junk.example/",
+                      "snippet": "nothing to do with the question"}]),
+        ("Exa", [{"title": "전세 사기 대처 방법 정리",
+                  "url": "https://ko.example/guide", "excerpt": "전세 사기 피해 대처 절차"}]),
+    ]
+    assert _merge_top_url(per_backend, "전세 사기 대처 방법") == "https://ko.example/guide"
+
+
+def test_relevance_tokens_keep_hangul_and_do_not_split_camel_case():
+    toks = wst._relevance_tokens("파이썬 asyncio CancelledError 처리")
+    assert "파이썬" in toks and "처리" in toks, f"Hangul runs dropped: {toks}"
+    assert "cancellederror" in toks, (
+        "CamelCase must stay whole — splitting it into cancelled/error makes "
+        f"generic pages match a specific API name: {toks}"
+    )
+
+
+def test_url_contributes_relevance():
+    """The URL often names what the title omits (reddit.com/r/LocalLLaMA)."""
+    assert "localllama" in wst._url_text("https://www.reddit.com/r/LocalLLaMA/rising/").lower()
+    assert "index only scans" in wst._url_text(
+        "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+    ).replace("-", " ").lower()
+
+    per_backend = [
+        ("SearXNG", [{"title": "Untitled", "url": "https://a.example/", "snippet": ""}]),
+        # Title says nothing; the path carries the whole signal.
+        ("Exa", [{"title": "Untitled", "url": "https://www.reddit.com/r/LocalLLaMA/", "excerpt": ""}]),
+    ]
+    assert _merge_top_url(per_backend, "LocalLLaMA reddit") == "https://www.reddit.com/r/LocalLLaMA/"
+
+
+def test_relevance_is_not_leaked_into_results():
+    """`relevance` is internal bookkeeping, not part of the tool's output shape."""
+    merged = wst._merge_search_results(
+        [("Exa", [{"title": "T", "url": "https://x/", "excerpt": "body"}])], 5, "body"
+    )
+    assert "relevance" not in merged[0]
+
+
+def test_relevance_scores_empty_inputs_safely():
+    assert wst._relevance_scores("", ["a"]) == [0.0]
+    assert wst._relevance_scores("q", []) == []
+    assert wst._relevance_scores("!!! ???", ["a"]) == [0.0], "punctuation-only query has no tokens"
+
+
+# ── ESC-cancelable retry backoff ────────────────────────────────────────
+# Regression: the tool-layer retry sleeps were raw ``time.sleep``, so ESC was
+# unresponsive for up to the 30s Retry-After cap (the client-layer backoff was
+# made cancelable in the same change family; the tool layer lagged behind).
+
+def test_live_cancel_event_absent_and_present():
+    """``_live_cancel_event`` must be None on duck-typed hosts without a config
+    (plain-sleep legacy behavior) and live on hosts that carry one."""
+    host = _Host()
+    assert host._live_cancel_event() is None
+    import types
+
+    ce = threading.Event()
+    host.config = types.SimpleNamespace(cancel_event=ce)
+    assert host._live_cancel_event() is ce
+
+
+def test_http_retry_cancel_already_set_aborts_before_any_request():
+    """An already-set cancel_event aborts before the first request — no point
+    issuing a request the user no longer wants."""
+    ce = threading.Event()
+    ce.set()
+    client = _SequenceClient([_resp(200, text="ok")])
+    with pytest.raises(wst.AgentCancelled):
+        wst.WebSearchToolsMixin._http_request_with_retry(
+            client, "GET", "https://x/", cancel_event=ce
+        )
+    assert client.calls == 0
+
+
+def test_http_retry_cancel_mid_backoff_aborts_retry():
+    """ESC during a Retry-After wait must abort with AgentCancelled instead of
+    sleeping out the (capped 30s) wait."""
+    ce = threading.Event()
+
+    def _late_set():
+        time.sleep(0.05)
+        ce.set()
+
+    t = threading.Thread(target=_late_set, daemon=True)
+    t.start()
+    client = _SequenceClient([
+        _resp(429, headers={"retry-after": "30"}),
+        _resp(200, text="ok"),
+    ])
+    with pytest.raises(wst.AgentCancelled):
+        wst.WebSearchToolsMixin._http_request_with_retry(
+            client, "GET", "https://x/", cancel_event=ce
+        )
+    t.join(timeout=5)
+    assert client.calls == 1  # no retry after the interrupt
+
+
+def test_http_retry_cancel_mid_transient_backoff_aborts_retry():
+    """Same interruptibility for the transient-error (e.g. slow server) retry
+    sleep."""
+    ce = threading.Event()
+
+    def _late_set():
+        time.sleep(0.05)
+        ce.set()
+
+    t = threading.Thread(target=_late_set, daemon=True)
+    t.start()
+
+    class _C:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, params=None, headers=None):
+            self.calls += 1
+            raise httpx.ReadTimeout("slow")
+
+    c = _C()
+    with pytest.raises(wst.AgentCancelled):
+        wst.WebSearchToolsMixin._http_request_with_retry(
+            c, "GET", "https://x/", retries=3, cancel_event=ce
+        )
+    t.join(timeout=5)
+    assert c.calls == 1
+
+
+def test_http_retry_no_cancel_event_keeps_legacy_plain_sleep(monkeypatch):
+    """Without a cancel_event the helper must keep its exact legacy behavior —
+    plain ``time.sleep`` with the same backoff — so non-cancel callers are
+    unaffected."""
+    sleeps = []
+    monkeypatch.setattr(wst.time, "sleep", lambda s: sleeps.append(s))
+    client = _SequenceClient([
+        _resp(429, headers={"retry-after": "0"}),
+        _resp(200, text="ok"),
+    ])
+    resp = wst.WebSearchToolsMixin._http_request_with_retry(client, "GET", "https://x/")
+    assert resp.status_code == 200
+    assert client.calls == 2
+    assert sleeps  # still backed off
+
+
+def test_wait_for_searxng_cancel_raises(monkeypatch):
+    """ESC during the SearXNG readiness poll must abort with AgentCancelled
+    instead of polling out the full 15s timeout."""
+
+    def _no_server(*a, **k):
+        raise httpx.ConnectError("no server")
+
+    monkeypatch.setattr(wst.httpx, "get", _no_server)
+    ce = threading.Event()
+    ce.set()
+    host = _Host()
+    with pytest.raises(wst.AgentCancelled):
+        host._wait_for_searxng("http://localhost:1", cancel_event=ce)
+
+
+def test_web_fetch_cancel_mid_backoff_aborts(monkeypatch):
+    """ESC during web_fetch's inline retry sleep must abort with AgentCancelled
+    instead of sleeping out the Retry-After cap."""
+    ce = threading.Event()
+
+    def _late_set():
+        time.sleep(0.05)
+        ce.set()
+
+    t = threading.Thread(target=_late_set, daemon=True)
+    t.start()
+    client = _FetchRetryClient([
+        httpx.Response(
+            429,
+            request=httpx.Request("GET", "https://x/rate"),
+            headers={"retry-after": "30", "content-type": "text/plain"},
+        ),
+        httpx.Response(
+            200,
+            request=httpx.Request("GET", "https://x/rate"),
+            headers={"content-type": "text/plain; charset=utf-8"},
+            text="finally ok",
+        ),
+    ])
+    monkeypatch.setattr(wst.httpx, "Client", lambda *a, **k: client)
+    import types
+
+    host = _Host()
+    host.config = types.SimpleNamespace(cancel_event=ce)
+    with pytest.raises(wst.AgentCancelled):
+        host._tool_web_fetch({"url": "https://x/rate"})
+    t.join(timeout=5)
+    assert client.calls == 1  # no retry after the interrupt
+
+
+def test_search_web_propagates_agent_cancelled(monkeypatch):
+    """A cancellation raised by a backend (ESC during SearXNG setup / retry)
+    must propagate out of ``_tool_search_web`` — neither the parallel tier-1
+    collector nor the sequential backend loop may swallow it into a
+    'trying next backend' fallback."""
+    host = _Host()
+
+    def _boom(*a, **k):
+        raise wst.AgentCancelled("cancelled by user")
+
+    # Startpage is the unconditional first tier-1 backend; make it abort and
+    # keep every other backend harmless so no straggler future holds a raised
+    # AgentCancelled.
+    monkeypatch.setattr(host, "_search_startpage", _boom)
+    monkeypatch.setattr(host, "_search_exa", lambda *a, **k: [])
+    monkeypatch.setattr(host, "_search_startpage_browser", lambda *a, **k: [])
+    with pytest.raises(wst.AgentCancelled):
+        host._tool_search_web({"query": "python asyncio"})

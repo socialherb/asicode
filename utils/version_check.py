@@ -24,6 +24,7 @@ Design invariants
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -146,8 +147,9 @@ def _has_editable_distribution(package_name: str = PACKAGE_NAME) -> bool:
                     return True
             except Exception:
                 continue
-        return False
     except Exception:
+        return False
+    else:
         return False
 
 
@@ -219,8 +221,9 @@ def _read_cache() -> dict[str, Any]:
         data = json.loads(raw)
         if isinstance(data, dict):
             return data
-        return {}
     except (OSError, ValueError):
+        return {}
+    else:
         return {}
 
 
@@ -243,19 +246,15 @@ def _atomic_write_text(path: Path, content: str) -> None:
         os.replace(tmp_path, path)
     except BaseException:
         # Best-effort cleanup of the temp file on any failure path.
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(tmp_path)
-        except OSError:
-            pass
         raise
 
 
 def _write_cache(data: dict[str, Any]) -> None:
     """Persist the cache atomally (errors swallowed — fail-open)."""
-    try:
+    with contextlib.suppress(OSError):
         _atomic_write_text(_cache_path(), json.dumps(data))
-    except OSError:
-        pass
 
 
 # ─── version comparison ──────────────────────────────────────────────────────

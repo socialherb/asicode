@@ -7,7 +7,7 @@
 Why lazy: ``external_llm.service`` pulls in the HTTP stack (``requests`` and
 provider clients), costing ~250ms to import. Previously this ran eagerly inside
 the package ``__init__``, so importing ANY submodule — e.g.
-``external_llm.agent.auto_correction``, ``external_llm.agent.operation_models`` —
+``external_llm.agent.operation_models`` —
 paid that cost even though it never touches the service. Sub-agent/IPC workers
 are spawned per agent, so this tax compounded across processes. With lazy
 loading the service module is imported only when ``ExternalLLMService`` is

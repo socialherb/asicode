@@ -17,7 +17,9 @@ Client lifecycle:
   - Browser connects to /agent/proactive/stream → register() → gets a Queue
   - Generator runs while browser is connected, yielding SSE events
   - Browser disconnects → generator's finally block → unregister()
-  - Stale clients (no activity for CLIENT_TTL seconds) can be purged by cleanup_stale()
+  - Abandoned registrations (no live generator for CLIENT_TTL seconds) can be
+    purged by cleanup_stale(); a connected-but-idle client is NEVER pruned
+    (liveness = the generator's wake_loop binding, refreshed keepalives aside)
 
 Known limitation (deferred):
   Unlike the agent SSE path (SequencedEventQueue + ring buffer + Last-Event-ID
@@ -33,6 +35,7 @@ Known limitation (deferred):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import queue
@@ -108,11 +111,9 @@ class PushManager:
         event = info.get("wake_event")
         if loop is None or event is None:
             return
-        try:
+        # loop closed (client gone) — harmless; generator prunes on exit.
+        with contextlib.suppress(RuntimeError):
             loop.call_soon_threadsafe(event.set)
-        except RuntimeError:
-            # loop closed (client gone) — harmless; generator prunes on exit.
-            pass
 
     def unregister(self, client_id: str) -> None:
         """Unregister client (called when SSE connection closes)."""
@@ -179,12 +180,27 @@ class PushManager:
         return delivered
 
     def cleanup_stale(self) -> int:
-        """Remove clients with no activity for > CLIENT_TTL seconds."""
+        """Remove abandoned client entries (called periodically by webapp housekeeping).
+
+        Liveness = the SSE generator's wake binding: while ``make_sse_generator``
+        is running it sets ``wake_loop``, so a connected-but-idle client (only
+        keepalives, no events) is NEVER pruned. This matters because
+        ``last_active`` is refreshed only on event delivery — a TTL sweep on
+        ``last_active`` alone would prune a healthy tab that simply had no
+        proactive events for ``CLIENT_TTL`` seconds, silently cutting it off
+        from future broadcasts.
+
+        An entry whose generator is gone (``wake_loop is None``) is an
+        abandoned registration — ``register()`` ran but the generator never
+        started, or its ``finally``/``unregister`` was skipped — and is pruned
+        once its ``last_active`` is older than ``CLIENT_TTL``.
+        """
         now = time.time()
         with self._lock:
             stale = [
                 cid for cid, info in self._clients.items()
-                if now - info.get("last_active", now) > self.CLIENT_TTL
+                if info.get("wake_loop") is None
+                and now - info.get("last_active", now) > self.CLIENT_TTL
             ]
             for cid in stale:
                 del self._clients[cid]
@@ -245,6 +261,11 @@ class PushManager:
                         try:
                             item = q.get_nowait()
                         except queue.Empty:
+                            # Spurious wake loop: fires on EVERY empty poll while
+                            # a client streams keepalives — no exc_info (nothing
+                            # raised; formatting a traceback here would burn CPU
+                            # per iteration under DEBUG).
+                            logger.debug("keepalive wake spurious — loop again")
                             continue  # spurious; loop again
                 if item is None:
                     # Explicit shutdown sentinel
@@ -284,12 +305,9 @@ class PushManager:
                 q.put_nowait(None)
             except queue.Full:
                 # Drop the oldest pending item to guarantee the sentinel lands.
-                try:
+                with contextlib.suppress(queue.Empty):
                     q.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
+                # lost the freed slot to a concurrent producer; best-effort
+                with contextlib.suppress(queue.Full):
                     q.put_nowait(None)
-                except queue.Full:
-                    pass  # lost the freed slot to a concurrent producer; best-effort
             self._wake_client(info)

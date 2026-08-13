@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import atexit
+import contextlib
 import importlib
 import importlib.util
 import logging
@@ -36,9 +37,12 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as _FutureTimeout
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from external_llm.pip_env import ensure_user_site_importable, pip_install_flags
+
+from ...client import interruptible_sleep
+from ..agent_loop_types import AgentCancelled
 
 if TYPE_CHECKING:
     from ..tool_registry import ToolResult
@@ -140,12 +144,11 @@ def _shutdown_browser_executor_at_exit() -> None:
     the per-executor atexit.register that grew the handler list by one on every
     wedge and held dead executors (with their orphaned worker threads).
     """
-    try:
+    with contextlib.suppress(RuntimeError):  # shutdown() from within its own worker thread
+        # Best-effort: cancel_futures (3.9+) drops queued submits; requires-python
+        # is >=3.10, so no legacy fallback is needed. The *running* future cannot
+        # be interrupted — the worker becomes an orphan by design.
         _BROWSER_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-    except TypeError:  # cancel_futures is 3.9+; older interpreters lack it
-        _BROWSER_EXECUTOR.shutdown(wait=False)
-    except Exception:
-        pass
 
 
 atexit.register(_shutdown_browser_executor_at_exit)
@@ -169,14 +172,10 @@ def _reset_browser_on_wedge() -> None:
     global _BROWSER_EXECUTOR
     with _browser_executor_lock:
         old = _BROWSER_EXECUTOR
-        try:
+        with contextlib.suppress(RuntimeError):  # shutdown() from within its own worker thread
             # cancel_futures (3.9+) drops queued submits; the *running* future
             # cannot be interrupted, so its worker becomes an orphan by design.
             old.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            old.shutdown(wait=False)
-        except Exception:
-            pass
         _BROWSER_EXECUTOR = _new_browser_executor()
         BrowserActionToolsMixin._page = None
         BrowserActionToolsMixin._browser = None
@@ -237,9 +236,18 @@ class BrowserActionToolsMixin:
     _browser = None
     _playwright = None
     _page = None
+    _user_agent = None  # de-headlessed UA, derived once per browser (see _browser_user_agent)
     _pw_install_lock = threading.Lock()  # serialise Playwright install across threads
 
     # ── Public dispatch entry point ───────────────────────────────────── #
+
+    def _live_cancel_event(self) -> Optional[threading.Event]:
+        """The registry's current ``cancel_event`` (None when absent).
+
+        Defensive ``getattr``: the mixin is also mounted on duck-typed test
+        hosts that carry no ``config`` attribute.
+        """
+        return getattr(getattr(self, "config", None), "cancel_event", None)
 
     def _tool_browser_action(self, args: dict[str, Any]) -> "ToolResult":
         """Browser automation: navigate, click, type, extract, screenshot, evaluate, wait, close."""
@@ -289,6 +297,10 @@ class BrowserActionToolsMixin:
         def _run() -> "ToolResult":
             try:
                 return handler(args)
+            except AgentCancelled:
+                # ESC mid-action must abort the turn, not become a generic
+                # "Browser action failed" ToolResult (B904).
+                raise
             except _PlaywrightTimeout:
                 return self._make_result(
                     ok=False,
@@ -373,10 +385,11 @@ class BrowserActionToolsMixin:
                 }
             )
             answer = result.metadata.get("answer", "no").lower().strip()
-            return answer == "yes"
         except Exception as e:
             logger.warning("browser_action: ask_user failed (%s), skipping Playwright install", e)
             return False
+        else:
+            return answer == "yes"
 
     @staticmethod
     def _pip_install_flags() -> list[str]:
@@ -415,14 +428,15 @@ class BrowserActionToolsMixin:
                 capture_output=True,
                 timeout=300,
             )
-            return True
         except subprocess.CalledProcessError as e:
             stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
-            logger.error("Playwright installation failed (rc=%d): %s", e.returncode, stderr)
+            logger.exception("Playwright installation failed (rc=%d): %s", e.returncode, stderr)
             return False
         except Exception as e:
-            logger.error("Playwright installation failed: %s", e)
+            logger.exception("Playwright installation failed: %s", e)
             return False
+        else:
+            return True
 
     def _reload_playwright_module(self) -> bool:
         """Dynamically import Playwright after install and update module-level refs.
@@ -445,10 +459,11 @@ class BrowserActionToolsMixin:
             mod.sync_playwright = sync_mod.sync_playwright
             mod._PlaywrightTimeout = sync_mod.TimeoutError
             mod.HAS_PLAYWRIGHT = True
-            return True
         except ImportError as e:
-            logger.error("Failed to import Playwright after installation: %s", e)
+            logger.exception("Failed to import Playwright after installation: %s", e)
             return False
+        else:
+            return True
 
     # ── Browser lifecycle helpers ─────────────────────────────────────── #
 
@@ -469,11 +484,42 @@ class BrowserActionToolsMixin:
                 # the caller surfaces the real launch error.
                 try:
                     p.stop()
-                except Exception:
-                    pass
+                except Exception as _exc:  # driver teardown must not mask the launch error
+                    logger.debug("playwright driver stop failed: %s", _exc)
                 raise
             BrowserActionToolsMixin._playwright = p
         return BrowserActionToolsMixin._browser
+
+    def _browser_user_agent(self):
+        """The shared browser's UA with the ``Headless`` marker removed.
+
+        Chromium's headless build advertises ``HeadlessChrome/<ver>`` in its
+        User-Agent, and that literal substring is by itself enough for some
+        anti-bot systems to refuse the request. Measured 2026-08-05 against
+        Startpage from one IP within a few minutes: headless with the default UA
+        was blocked 6/6, a HEADED browser passed 3/3, and the same headless
+        browser with only this substring rewritten passed 6/6. So the block was
+        never the IP or "being automated" — it was the UA string.
+
+        Derived from the running browser rather than hardcoded so it tracks
+        whatever Chromium ``playwright install`` put on the machine (149.x here)
+        instead of drifting the way a literal would. Returns None if the probe
+        fails, which simply leaves the page on Playwright's default UA.
+        """
+        if BrowserActionToolsMixin._user_agent is None:
+            browser = self._get_browser()
+            try:
+                # Raw new_page(): this probe must not route back through here.
+                probe = browser.new_page()
+                try:
+                    default_ua = probe.evaluate("navigator.userAgent")
+                finally:
+                    probe.close()
+                BrowserActionToolsMixin._user_agent = default_ua.replace("HeadlessChrome/", "Chrome/")
+            except Exception as e:  # probe is best-effort; never block a render on it
+                logger.debug("browser: user-agent probe failed (%s); using the default", e)
+                return None
+        return BrowserActionToolsMixin._user_agent
 
     def _get_page(self):
         """Get or create a page in the shared browser.
@@ -483,7 +529,7 @@ class BrowserActionToolsMixin:
         browser = self._get_browser()
         page = BrowserActionToolsMixin._page
         if page is None or page.is_closed():
-            BrowserActionToolsMixin._page = browser.new_page()
+            BrowserActionToolsMixin._page = browser.new_page(user_agent=self._browser_user_agent())
         return BrowserActionToolsMixin._page
 
     def _close_shared_browser(self):
@@ -491,21 +537,24 @@ class BrowserActionToolsMixin:
         try:
             if BrowserActionToolsMixin._page:
                 BrowserActionToolsMixin._page.close()
-        except Exception:
-            pass
+        except Exception as _exc:  # teardown must never crash; log for diagnosability
+            logger.debug("browser page close failed: %s", _exc)
         try:
             if BrowserActionToolsMixin._browser:
                 BrowserActionToolsMixin._browser.close()
-        except Exception:
-            pass
+        except Exception as _exc:  # teardown must never crash; log for diagnosability
+            logger.debug("browser close failed: %s", _exc)
         try:
             if BrowserActionToolsMixin._playwright:
                 BrowserActionToolsMixin._playwright.stop()
-        except Exception:
-            pass
+        except Exception as _exc:  # teardown must never crash; log for diagnosability
+            logger.debug("playwright stop failed: %s", _exc)
         BrowserActionToolsMixin._page = None
         BrowserActionToolsMixin._browser = None
         BrowserActionToolsMixin._playwright = None
+        # The next browser may be a different Chromium build, so its UA must be
+        # re-derived rather than inherited from the one just torn down.
+        BrowserActionToolsMixin._user_agent = None
 
     def _render_and_eval(
         self,
@@ -514,6 +563,7 @@ class BrowserActionToolsMixin:
         *,
         timeout_ms: int = 20000,
         wait_until: str = "networkidle",
+        wait_for_selector: str | None = None,
     ) -> Any:
         """Navigate an ISOLATED throwaway page to ``url``, run ``js``, return its value.
 
@@ -525,6 +575,13 @@ class BrowserActionToolsMixin:
           afterwards, NOT the shared ``_page``, so an automated background render
           never clobbers the user's interactive ``browser_action`` session (open
           tabs, login/cookie state).
+
+        ``wait_for_selector`` waits for a specific element after navigation. For a
+        client-hydrated results page this is both the correct and the FAST option:
+        measured on Startpage 2026-08-05, ``domcontentloaded``/``load`` alone
+        returned a page that parsed to 0 results (5/5 queries — the markup had not
+        hydrated yet), ``networkidle`` parsed 10/10 but cost ~6.5s, and
+        ``domcontentloaded`` + this selector wait parsed 10/10 in ~3.1s.
         * **Same executor contract as ``_tool_browser_action``.** Runs on the
           dedicated single-thread ``_BROWSER_EXECUTOR`` (Playwright sync objects
           are thread-affine) under the same ``_BROWSER_HARD_TIMEOUT_SEC`` +
@@ -548,15 +605,18 @@ class BrowserActionToolsMixin:
 
         def _run() -> Any:
             browser = self._get_browser()
-            page = browser.new_page()  # isolated — never the shared _page
+            # isolated — never the shared _page
+            page = browser.new_page(user_agent=self._browser_user_agent())
             try:
                 page.goto(url, timeout=per_call, wait_until=wait_until)
+                if wait_for_selector:
+                    page.wait_for_selector(wait_for_selector, timeout=per_call)
                 return page.evaluate(js)
             finally:
                 try:
                     page.close()
-                except Exception:
-                    pass
+                except Exception as _exc:  # teardown must never crash; log for diagnosability
+                    logger.debug("browser page close failed: %s", _exc)
 
         # Mirrors _tool_browser_action's submit contract: pin to the browser
         # thread, cap with the hard timeout, and on a wedge abandon the stuck
@@ -717,15 +777,18 @@ class BrowserActionToolsMixin:
         if selector:
             page.wait_for_selector(str(selector), timeout=timeout)
             return self._make_result(ok=True, content=f"Selector '{selector}' appeared.")
-        else:
-            # Clamped above, so a no-selector wait can never sleep past the hard
-            # executor ceiling (which would trip the session-resetting wedge).
-            wait_ms = max(timeout, 1)
-            time.sleep(wait_ms / 1000)
-            return self._make_result(
-                ok=True,
-                content=f"Waited {wait_ms / 1000:.1f}s (no selector given).",
-            )
+        # Clamped above, so a no-selector wait can never sleep past the hard
+        # executor ceiling (which would trip the session-resetting wedge).
+        wait_ms = max(timeout, 1)
+        # interruptible_sleep (client.py SSOT): a mid-wait ESC aborts the turn
+        # instead of freezing it for up to the full clamped timeout on the
+        # single browser worker (which would also block every later action).
+        if interruptible_sleep(wait_ms / 1000, self._live_cancel_event()):
+            raise AgentCancelled("browser wait cancelled by user")
+        return self._make_result(
+            ok=True,
+            content=f"Waited {wait_ms / 1000:.1f}s (no selector given).",
+        )
 
     def _browser_close(self, args: dict[str, Any]) -> "ToolResult":
         self._close_shared_browser()

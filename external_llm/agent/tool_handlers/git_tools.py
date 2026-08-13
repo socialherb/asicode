@@ -8,27 +8,25 @@ import logging
 import os
 import re as _re
 import selectors as _selectors
-import time as _time
 import shlex
 import shutil as _shutil
 import subprocess
+import time as _time
 import uuid
-from collections import deque as _deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
+from ...common.subprocess_utils import CANCEL_POLL_INTERVAL as _CANCEL_POLL_INTERVAL
+from ...common.subprocess_utils import run_bounded_subprocess as _run_bounded_subprocess
+from ..agent_loop_types import AgentCancelled
 from ..background_job_manager import (
     BackgroundJobManager,
     get_global_background_job_manager,
     strip_malloc_noise,
 )
-from ...common.subprocess_utils import CANCEL_POLL_INTERVAL as _CANCEL_POLL_INTERVAL
-from ...common.subprocess_utils import run_bounded_subprocess as _run_bounded_subprocess
 
 if TYPE_CHECKING:
     from ..tool_registry import ToolResult
-
-logger = logging.getLogger(__name__)
 
 from .shell_policy import ARG_COMMAND_INTRODUCERS as _ARG_COMMAND_INTRODUCERS
 from .shell_policy import COMMAND_INTRODUCING_KEYWORDS as _COMMAND_INTRODUCING_KEYWORDS
@@ -38,17 +36,21 @@ from .shell_policy import DANGEROUS_EXECUTABLE_PREFIXES as _DANGEROUS_EXECUTABLE
 from .shell_policy import DANGEROUS_FLAG_COMBOS as _DANGEROUS_FLAG_COMBOS
 from .shell_policy import DANGEROUS_SHELL_COMMANDS as _DANGEROUS_SHELL_COMMANDS
 from .shell_policy import EVAL_BUILTINS as _EVAL_BUILTINS
+from .shell_policy import FORBIDDEN_FLAGS as _FORBIDDEN_FLAGS
+from .shell_policy import NON_OVERWRITING_FLAGS as _NON_OVERWRITING_FLAGS
+from .shell_policy import OVERWRITING_EXECUTABLES as _OVERWRITING_EXECUTABLES
 from .shell_policy import PYTHON_DESTRUCTIVE_CALLS as _PY_DESTRUCTIVE_CALLS
 from .shell_policy import PYTHON_INTERPRETERS as _PYTHON_INTERPRETERS
 from .shell_policy import PYTHON_SHELL_ESCAPES as _PY_SHELL_ESCAPES
-from .shell_policy import FORBIDDEN_FLAGS as _FORBIDDEN_FLAGS
 from .shell_policy import SHELL_INTERPRETERS as _SHELL_INTERPRETERS
+from .shell_policy import SHELL_TIMEOUT_DEFAULT as _SHELL_TIMEOUT_DEFAULT
+from .shell_policy import SHELL_TIMEOUT_MAX as _SHELL_TIMEOUT_MAX
 from .shell_policy import STDIN_INTERPRETERS as _STDIN_INTERPRETERS
 from .shell_policy import WRAPPER_POSITIONAL_ARGS as _WRAPPER_POSITIONAL_ARGS
 from .shell_policy import WRAPPER_SHELL_C_PAYLOAD as _WRAPPER_SHELL_C_PAYLOAD
 from .shell_policy import WRAPPER_VALUE_FLAGS as _WRAPPER_VALUE_FLAGS
-from .shell_policy import SHELL_TIMEOUT_DEFAULT as _SHELL_TIMEOUT_DEFAULT
-from .shell_policy import SHELL_TIMEOUT_MAX as _SHELL_TIMEOUT_MAX
+
+logger = logging.getLogger(__name__)
 
 # _CANCEL_POLL_INTERVAL is imported above: the cadence is shared with the search
 # path, since a cancel that feels instant in `bash` and laggy in `grep` is worse
@@ -123,25 +125,66 @@ _SORT_V_RE = _re.compile(r"\bsort\s+-V(\s+[^|&;<>]+)?")
 # The marker is written BEFORE the signal, so a child that died from our TERM
 # always finds it already on disk — no ordering left to lose. Hosts without
 # mktemp keep the old heuristic rather than losing the feature.
+#
+# The leading GNU option block is not decoration. Taking "$1" as the duration
+# outright made every option form silently destroy the command: `timeout -k 2 5
+# cmd` bound dur="-k" and then ran `2 5 cmd`, so the caller got 127 and the
+# command NEVER RAN — the exact silent-failure-in-a-pipeline hazard this
+# prelude exists to prevent (`timeout -k 5 300 pytest ... | tail -20` yields an
+# empty tail that reads as success). `-s`/`-k` are honoured rather than merely
+# skipped, because a caller asking for KILL after a grace period is asking for
+# behaviour, not syntax. Unknown `-*` options are dropped: GNU would reject
+# them, but refusing to run is the failure mode we are removing.
 _SHELL_SHIM_PRELUDE = """# --- timeout: run a command with a wall-clock kill (GNU exit 124 on timeout)
 if ! command -v timeout >/dev/null 2>&1; then
 timeout() {
-    local dur="$1"; shift
+    local sig="TERM" kill_after="" dur
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -k) kill_after="$2"; shift 2;;
+            -k*) kill_after="${1#-k}"; shift;;
+            --kill-after=*) kill_after="${1#*=}"; shift;;
+            --kill-after) kill_after="$2"; shift 2;;
+            -s) sig="$2"; shift 2;;
+            -s*) sig="${1#-s}"; shift;;
+            --signal=*) sig="${1#*=}"; shift;;
+            --signal) sig="$2"; shift 2;;
+            --preserve-status|--foreground) shift;;
+            --) shift; break;;
+            -*) shift;;
+            *) break;;
+        esac
+    done
+    dur="$1"; shift
     [ $# -gt 0 ] || { echo "timeout: missing command" >&2; return 1; }
     local mark
     mark="$(mktemp -t asi_timeout.XXXXXX 2>/dev/null)" || mark=""
+    # Own process group for the child (job control): the escalation below then
+    # signals the GROUP (`kill -N -- -pid`), matching GNU timeout semantics —
+    # a `timeout -k 1 1 bash -c '...; sleep 30'` must take the wrapper's
+    # children with it. Without this the killed wrapper leaves its children
+    # orphaned, and an orphan holding the caller's stdout/stderr pipes blocks
+    # the caller until it finishes on its own (measured: a 2 s timeout turning
+    # into a 30 s hang). Group kill needs the group to exist, which only job
+    # control provides in a non-interactive shell. `kill -N -- -pid pid` keeps
+    # the plain-pid fallback for shells where set -m could not apply.
+    set -m
     "$@" &
     local pid=$!
-    ( sleep "$dur" 2>/dev/null; [ -n "$mark" ] && printf t >"$mark"; kill -TERM "$pid" 2>/dev/null ) &
+    ( sleep "$dur" 2>/dev/null; [ -n "$mark" ] && printf t >"$mark"
+      kill -"$sig" -- -"$pid" "$pid" 2>/dev/null
+      if [ -n "$kill_after" ]; then
+          sleep "$kill_after" 2>/dev/null; kill -KILL -- -"$pid" "$pid" 2>/dev/null
+      fi ) &
     local wpid=$!
     wait "$pid" 2>/dev/null
     local rc=$?
     if [ -n "$mark" ]; then
-        kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+        kill -- -"$wpid" "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
         [ -s "$mark" ] && rc=124
         rm -f "$mark" 2>/dev/null
     elif kill -0 "$wpid" 2>/dev/null; then
-        kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+        kill -- -"$wpid" "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
     else
         rc=124
     fi
@@ -580,82 +623,11 @@ def _close_pipes(proc) -> None:
             logger.debug("bash: pipe close failed: %s", exc)
 
 
-class _BoundedCapture:
-    """Accumulate one stream's text, keeping only its head and its tail.
-
-    ``communicate()`` materialises everything a command prints before any budget
-    can apply, and the budget is ``BASH_OUTPUT_MAX_CHARS`` — ~130 KB. Measured on
-    ``cat`` of a 108 MB log: +360.6 MB of peak RSS, 0.24 s, to produce that 130 KB.
-    Reading into a bounded head plus a tail ring instead costs +0.4 MB and 0.03 s
-    for a byte-identical answer, because the decode and the million allocations
-    behind it never happen.
-
-    Head AND tail, not just a tail, because ``_truncate_bash_output`` needs both:
-    pytest puts its summary at the end and the failing command at the start. Each
-    side retains the FULL ``max_chars``, so anything that truncation would have
-    kept is still present and the rendered result is unchanged — a stream is only
-    ever elided past 2x the cap, where truncation was certain anyway.
-
-    ``total`` counts every character the command produced, so the truncation
-    notice can name the real number rather than what survived.
-    """
-
-    __slots__ = ("_cap", "_head", "_head_len", "_tail", "_tail_len", "total")
-
-    def __init__(self, cap: int) -> None:
-        self._cap = max(1, cap)
-        self._head: list[str] = []
-        self._head_len = 0
-        self._tail: _deque = _deque()
-        self._tail_len = 0
-        self.total = 0
-
-    def feed(self, text: str) -> None:
-        if not text:
-            return
-        self.total += len(text)
-        _room = self._cap - self._head_len
-        if _room > 0:
-            self._head.append(text[:_room])
-            self._head_len += min(_room, len(text))
-            text = text[_room:]
-            if not text:
-                return
-        if len(text) >= self._cap:
-            # One feed already covers the whole tail window, so everything
-            # before it is outside it. Sliced rather than kept whole: the pump
-            # reads at most _PIPE_READ_CHUNK at a time so this is unreachable
-            # from there, but a class whose bound depends on how its caller
-            # happens to chunk is a bound in name only.
-            self._tail.clear()
-            self._tail_len = 0
-            text = text[-self._cap:]
-        self._tail.append(text)
-        self._tail_len += len(text)
-        # Drop whole chunks from the front while the rest still covers the cap,
-        # so the retained tail is never shorter than what truncation will slice.
-        while self._tail and self._tail_len - len(self._tail[0]) >= self._cap:
-            self._tail_len -= len(self._tail.popleft())
-
-    @property
-    def dropped(self) -> int:
-        return self.total - self._head_len - self._tail_len
-
-    def text(self) -> str:
-        """The retained text, with the gap named where one exists.
-
-        The marker matters only on the background-transition path, which hands
-        this string straight to the job's buffer. On the normal path the content
-        is always longer than the cap when anything was dropped, so
-        ``_truncate_bash_output`` cuts the middle out — marker included — and
-        the reader sees exactly one truncation notice.
-        """
-        _head = "".join(self._head)
-        _tail = "".join(self._tail)
-        _gap = self.dropped
-        if not _gap:
-            return _head + _tail
-        return f"{_head}\n... [{_gap:,} chars dropped (middle)] ...\n{_tail}"
+# Bounded stream accumulation is shared with the `run_tests` runner — see
+# external_llm/common/bounded_capture for why it is not local to bash.
+# Re-exported under this name: callers and tests reference
+# ``git_tools._BoundedCapture``.
+from external_llm.common.bounded_capture import _BoundedCapture  # noqa: E402
 
 
 def _truncate_bash_output(content: str, max_chars: int, true_len: int = 0) -> str:
@@ -937,21 +909,29 @@ def _normalize_for_scan(command: str) -> str:
 
         # ── double-quote boundary ──────────────────────────────────
         if ch == '"' and not in_single:
-            if in_dq_backtick and cmdsub_depth == 0:
-                # Inside a backtick body a ``"`` opens a NESTED quote, but the
-                # body still runs as an unquoted command line. Emitting it
-                # verbatim re-wraps the body's commands in a quoted token (hiding
-                # them from the scan), and resetting state orphans the
-                # substitution — both left ``"`echo "$(rm x)"`"`` running
-                # unprompted. A boundary surfaces the body's commands while
-                # leaving quote balance intact: only the backtick's own closer
-                # reopens the surrounding double quote.
+            if in_dq_backtick or cmdsub_depth > 0:
+                # Inside a substitution BODY (backtick or ``$(...)``) a ``"``
+                # opens a NESTED quote, but the body still runs as an unquoted
+                # command line. Emitting it verbatim re-wraps the body's
+                # commands in a quoted token (hiding them from the scan), and
+                # resetting state orphans the substitution — both left
+                # ``"`echo "$(rm x)"`"`` running unprompted. A boundary
+                # surfaces the body's commands while leaving quote balance
+                # intact: only the substitution's own closer reopens the
+                # surrounding double quote.
+                #
+                # The ``$(...)`` arm used to fall through to the toggle below,
+                # whose ``cmdsub_depth = 0`` reset orphaned the still-open
+                # substitution: its real ``)`` closer was then emitted
+                # literally and the reopening ``"`` never came, so the scan
+                # copy ended quote-unbalanced and shlex refused the WHOLE
+                # command ("Invalid command syntax: No closing quotation") —
+                # e.g. ``echo "tip: $(git rev-parse "$b")"``, live incident
+                # 2026-08-02.
                 out.append(" ; ")
                 i += 1
                 continue
             in_double = not in_double
-            cmdsub_depth = 0
-            in_dq_backtick = False
             out.append(ch)
             i += 1
             continue
@@ -1300,14 +1280,14 @@ def _shell_c_payload_index(tokens: list, start: int) -> Optional[int]:
     """Index of the command string of a ``<shell> -c <payload>``, or None.
 
     *start* is the position just past the shell's own name. Scans that segment
-    only — a ``-c`` after the next separator belongs to a different command, and
-    ``bash script.sh; grep -c x`` must not hand grep's count flag to the shell.
+    only — the segment bound comes from :func:`_segment_end_index`, the same
+    primitive ``eval`` uses, so a ``-c`` after the next separator belongs to a
+    different command, and ``bash script.sh; grep -c x`` must not hand grep's
+    count flag to the shell.
     """
-    for i in range(start, len(tokens)):
-        tok = tokens[i]
-        if _SEPARATOR_ONLY_RE.fullmatch(tok):
-            return None
-        if _SHELL_C_FLAG_RE.match(tok):
+    end = _segment_end_index(tokens, start)
+    for i in range(start, end):
+        if _SHELL_C_FLAG_RE.match(tokens[i]):
             return i + 1 if i + 1 < len(tokens) else None
     return None
 
@@ -1392,10 +1372,10 @@ def _expand_exec_slot_var(token: str, assigned: dict) -> Optional[str]:
 def _segment_end_index(tokens: list, start: int) -> int:
     """Index one past the last token of the segment beginning at *start*.
 
-    The `eval` counterpart of :func:`_shell_c_payload_index`'s segment bound:
-    `eval` has no flag marking where its payload begins and ends, so the payload
-    is "everything up to the next separator". ``eval rm -rf x; ls`` must not
-    swallow the ``ls``.
+    Shared segment-bound primitive for ``eval`` payloads and the ``-c`` flag
+    scan of :func:`_shell_c_payload_index`: `eval` has no flag marking where
+    its payload begins and ends, so the payload is "everything up to the next
+    separator". ``eval rm -rf x; ls`` must not swallow the ``ls``.
     """
     for i in range(start, len(tokens)):
         if _SEPARATOR_ONLY_RE.fullmatch(tokens[i]):
@@ -1482,6 +1462,48 @@ def _segment_flag_combo_hit(exe: Optional[str], tokens: list) -> bool:
     return any(combo <= vocab for combo in combos)
 
 
+def _overwrite_targets(exe: Optional[str], tokens: list) -> list:
+    """Files a segment's own ARGUMENTS name as overwrite destinations.
+
+    The redirect gate sees ``echo '' > src/main.py`` because a ``>`` is present.
+    ``echo '' | tee src/main.py``, ``cp /dev/null src/main.py`` and
+    ``mv other src/main.py`` destroy the file just as completely with no
+    redirect for it to see, and no dangerous executable name for the name gate
+    to catch — measured, all three ran unprompted while the ``>`` spelling of
+    the same act prompted.
+
+    Returns raw argument strings; the caller passes them through
+    :func:`_truncating_redirect_targets`, which applies the same narrow scoping
+    it applies to redirects (in-repo, existing, non-empty). So this deliberately
+    does no filesystem work of its own — a target outside the repo, or one that
+    does not exist yet, is still never mentioned.
+
+    ``cp``/``mv`` write only their LAST operand; the leading ones are sources
+    and are read. Two operands are required for that reading to be true at all
+    (``cp f`` is not a command), so a lone operand yields nothing rather than
+    being mistaken for a destination.
+    """
+    mode = _OVERWRITING_EXECUTABLES.get(exe or "")
+    if not mode:
+        return []
+    if any(t in _NON_OVERWRITING_FLAGS.get(exe or "", frozenset()) for t in tokens):
+        return []  # -a / -n turns it into an append or a no-clobber
+    args = []
+    seen_exe = False
+    for tok in tokens:
+        if not seen_exe and (tok == exe or os.path.basename(tok) == exe):
+            # The executable itself is in this list, possibly as a full path
+            # (`/usr/bin/tee`) while *exe* is the reduced basename.
+            seen_exe = True
+            continue
+        if tok.startswith("-"):
+            continue
+        args.append(tok)
+    if mode == "last":
+        return args[-1:] if len(args) >= 2 else []
+    return args
+
+
 def _truncating_redirect_targets(targets: list, repo_root: str) -> list:
     """Existing in-repo files that a ``>`` redirect would truncate to zero.
 
@@ -1544,6 +1566,13 @@ class ShellToolsMixin:
     def _capture_bounded(self, proc, timeout: float, cap: int):
         """Drain a command's pipes to EOF, keeping only ``cap`` head + tail chars.
 
+        The drain also ends as soon as the DIRECT CHILD has exited, even if a
+        grandchild keeps the pipes open (``sleep 200 &`` — "start a dev server
+        in the background, then talk to it" is a routine workflow): EOF would
+        otherwise never arrive, and a command that already finished would be
+        misreported as a timeout and "backgrounded" while dead. See the poll
+        loop below.
+
         Returns ``(stdout_capture, stderr_capture, status)`` where status is
         ``"done"``, ``"cancelled"`` or ``"timeout"``.
 
@@ -1584,14 +1613,9 @@ class ShellToolsMixin:
                     _codecs.getincrementaldecoder("utf-8")("replace"), True,
                 )
 
-            _deadline = _time.monotonic() + timeout
-            while _pending:
-                _remaining = _deadline - _time.monotonic()
-                if _remaining <= 0:
-                    return _out, _err, "timeout"
-                for _key, _ in _sel.select(
-                    timeout=min(_CANCEL_POLL_INTERVAL, _remaining)
-                ):
+            def _pump(_wait: float) -> None:
+                """One select+read round: drain what is ready, handle EOF."""
+                for _key, _ in _sel.select(timeout=_wait):
                     _stream = _key.fileobj
                     try:
                         _chunk = os.read(_stream.fileno(), _PIPE_READ_CHUNK)
@@ -1607,6 +1631,13 @@ class ShellToolsMixin:
                     _pending[_stream].feed(_dec.decode(b"", True))
                     _sel.unregister(_stream)
                     del _pending[_stream]
+
+            _deadline = _time.monotonic() + timeout
+            while _pending:
+                _remaining = _deadline - _time.monotonic()
+                if _remaining <= 0:
+                    return _out, _err, "timeout"
+                _pump(min(_CANCEL_POLL_INTERVAL, _remaining))
                 # Read off the LIVE config every poll — the design-chat REPL
                 # swaps config.cancel_event per turn, so a value captured before
                 # the loop goes stale.
@@ -1614,6 +1645,19 @@ class ShellToolsMixin:
                 if _cancel is not None and _cancel.is_set():
                     _close_pipes(proc)
                     return _out, _err, "cancelled"
+                # The direct child may have exited while a grandchild keeps the
+                # pipes open (`sleep 200 &`): the EOF this loop waits for never
+                # arrives, because the grandchild inherited the write end and
+                # holds it for its whole (long) life. When the child is gone,
+                # everything it will ever write has been written — drain the
+                # group's buffered tail for one grace period and finish, instead
+                # of burning the whole budget and misreporting a dead command
+                # as "timeout → background job".
+                if proc.poll() is not None:
+                    _grace = _time.monotonic() + _EXIT_GRACE
+                    while _pending and _time.monotonic() < _grace:
+                        _pump(min(_CANCEL_POLL_INTERVAL, _grace - _time.monotonic()))
+                    break
         finally:
             _sel.close()
 
@@ -1656,12 +1700,19 @@ class ShellToolsMixin:
             + (err_cap.total if err_cap is not None else 0)
         )
         try:
-            _pgid = os.getpgid(proc.pid)
-            os.killpg(_pgid, _signal.SIGTERM)
+            # The child is its own session leader (Popen start_new_session=True),
+            # so pgid == proc.pid. Kill the stored pid, NOT a re-resolved
+            # getpgid(): a shell that exited early (e.g. `cmd &` backgrounded)
+            # is reaped by the time ESC lands, getpgid() then raises
+            # ProcessLookupError, and the silently-skipped kill would orphan
+            # the grandchildren — the exact leak this teardown exists to
+            # prevent. killpg() targets the GROUP, which outlives its leader
+            # while any member is alive.
+            os.killpg(proc.pid, _signal.SIGTERM)
             try:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                os.killpg(_pgid, _signal.SIGKILL)
+                os.killpg(proc.pid, _signal.SIGKILL)
                 try:
                     proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
@@ -1712,9 +1763,10 @@ class ShellToolsMixin:
                 print(f"      Command: {_format_command_for_approval(command)}")
                 try:
                     _answer = input("      Approve execution? (y/N): ").strip().lower()
-                    return _answer in ("y", "yes")
                 except (EOFError, KeyboardInterrupt):
                     return False
+                else:
+                    return _answer in ("y", "yes")
             return False  # non-interactive: deny by default
 
         _question_data = {
@@ -1737,9 +1789,11 @@ class ShellToolsMixin:
             # This handles natural language variations and multi-language replies.
             from .._user_intent import UserApproval, classify_user_approval
             _verdict = classify_user_approval(_answer)
+        except Exception as _exc:
+            logger.debug("shell danger approval callback failed — denying: %s", _exc)
+            return False  # deny on error (fail-closed)
+        else:
             return _verdict == UserApproval.APPROVED
-        except Exception:
-            return False  # deny on error
 
     def _maybe_recover_pytest_missing_plugin(
         self, command: str, stderr: str, original_command: str,
@@ -1825,10 +1879,24 @@ class ShellToolsMixin:
         # Re-run the ORIGINAL command (the one the caller actually executed), not a
         # rewritten one — the plugins, once installed, make the original succeed.
         try:
-            _install_cmd = f"pip install {' '.join(missing_packages)}"
+            import sys as _sys
+            # `pip` on PATH is not a given (this repo's runtime lacks it), and a
+            # PATH `pip` may belong to a different interpreter than the one the
+            # re-run will use. Install with the interpreter the ORIGINAL command
+            # names when it names one (`python3 -m pytest` → `python3 -m pip`),
+            # else with this process's own interpreter.
+            _m = _re.search(r"(\S*python\S*)\s+-m\s+", original_command)
+            if _m:
+                _pip_cmd = f"{_m.group(1)} -m pip install " + shlex.join(missing_packages)
+            else:
+                _pip_cmd = f"{_sys.executable} -m pip install " + shlex.join(missing_packages)
             _inst = _run_bounded_subprocess(
-                _install_cmd, shell=True,
+                _pip_cmd, shell=True,
                 executable=_BASH_EXECUTABLE, cwd=self.repo_root,
+                # Explicit network-install budget: the bare 120s default would
+                # kill a cold-cache / large-wheel download mid-flight and report
+                # a bogus "pip install failed".
+                timeout=300,
                 env={**__import__("os").environ.copy()},
             )
             if _inst.returncode != 0:
@@ -1959,10 +2027,7 @@ class ShellToolsMixin:
         # below also operate on the raw command, so they inherit this guard.
         _find_in_quotes = bool(_find_match and _match_in_quotes(_find_match.start(), _literal_intervals(command)))
         if _find_match and not _find_in_quotes:
-            _already_excluded = set(
-                m.group(1)
-                for m in _FIND_EXCLUDED_RE.finditer(command)
-            )
+            _already_excluded = {m.group(1) for m in _FIND_EXCLUDED_RE.finditer(command)}
             _missing = [d for d in _FIND_NOISE_DIRS if d not in _already_excluded]
             if _missing:
                 _exclude_flags = " ".join(
@@ -2095,6 +2160,10 @@ class ShellToolsMixin:
         python_opaque_escape = False
         redirect_targets: list = []
         expect_redirect_target = False
+        # Destinations named as arguments rather than after a `>` — see
+        # _overwrite_targets. Collected per segment, checked with the redirect
+        # targets against the same in-repo/existing/non-empty scoping.
+        overwrite_targets: list = []
         # Wrapper state, all scoped to the segment being scanned: which wrapper
         # opened it (its flag table), how many positional operands still precede
         # the real command, and whether the previous token was a flag whose value
@@ -2116,6 +2185,11 @@ class ShellToolsMixin:
             """Evaluate the finished segment's flag combos and procsub (call before reset)."""
             if _segment_flag_combo_hit(segment_exe, segment_tokens):
                 flag_combo_exes.add(segment_exe)
+            # Overwrite destinations named as ARGUMENTS (tee/cp/mv), which carry
+            # no `>` for the redirect collector to have seen. Evaluated here for
+            # the same reason the flag combos are: the segment's full token list
+            # is only complete once it closes.
+            overwrite_targets.extend(_overwrite_targets(segment_exe, segment_tokens))
             # Process substitution is detected mid-segment (the `<` redirect
             # appears AFTER the executable), so the check runs here at segment
             # close, not at the executable-assignment point.
@@ -2416,8 +2490,10 @@ class ShellToolsMixin:
                                 [_token_depth + 1] * len(_repl)
                             )
                 if (
-                    name in _SHELL_INTERPRETERS or name in _STDIN_INTERPRETERS
-                ) and segment_is_piped_into:
+                    (name in _SHELL_INTERPRETERS or name in _STDIN_INTERPRETERS)
+                    and segment_is_piped_into
+                    and _shell_c_payload_index(_tokens, _ti) is None
+                ):
                     # `curl -s url | sh` — the interpreter runs whatever the
                     # upstream produced, which is not in this string and cannot
                     # be recovered by any amount of parsing. Unlike the other
@@ -2427,8 +2503,7 @@ class ShellToolsMixin:
                     # Excluded when a `-c` payload is present — then the code IS
                     # visible, was spliced above, and stdin is ignored, so the
                     # prompt would be noise.
-                    if _shell_c_payload_index(_tokens, _ti) is None:
-                        piped_interpreters.add(name)
+                    piped_interpreters.add(name)
                 if name in _PYTHON_INTERPRETERS and _token_depth < _SHELL_C_MAX_DEPTH:
                     # A `python -c` payload is not shell, so it is not spliced —
                     # but it IS readable, with Python's own parser. What comes
@@ -2518,6 +2593,15 @@ class ShellToolsMixin:
         if _truncated:
             _effect_reasons.append(
                 "output redirection truncates " + ", ".join(sorted(set(_truncated)))
+            )
+        # Same check, same scoping, for destinations named as arguments. Kept a
+        # separate reason so the prompt says which act it is — "cp overwrites
+        # src/main.py" is a different sentence from "redirection truncates" it,
+        # and the user is being asked to recognise the command they got.
+        _overwritten = _truncating_redirect_targets(overwrite_targets, self.repo_root)
+        if _overwritten:
+            _effect_reasons.append(
+                "overwrites " + ", ".join(sorted(set(_overwritten)))
             )
         if _effect_reasons:
             _danger_str = "; ".join(_effect_reasons)
@@ -2744,11 +2828,25 @@ class ShellToolsMixin:
             wait_timeout = float(wait_timeout)
         except (TypeError, ValueError):
             wait_timeout = 0.0
+        # Clamp to the same bound bash's `timeout` uses (SHELL_TIMEOUT_MAX=300),
+        # which the schema advertises and the MCP layer derives its ceiling
+        # from (asi_mcp_adapter._INNER_TIMEOUT_TOOLS). Unclamped, a model-
+        # supplied wait_timeout=99999 would pin this thread — and since `job`
+        # is in _SERIAL_TOOLS, the whole turn — for hours.
+        wait_timeout = max(0.0, min(wait_timeout, float(_SHELL_TIMEOUT_MAX)))
 
         _bg_mgr = self._get_bg_manager()
 
         if wait_timeout > 0:
-            info = _bg_mgr.wait_for_completion(job_id, timeout=wait_timeout)
+            # Read the LIVE cancel event (the design-chat REPL swaps
+            # config.cancel_event per turn, so a value captured earlier goes
+            # stale — same pattern as _capture_bounded's poll loop).
+            _cancel = getattr(self.config, "cancel_event", None)
+            info = _bg_mgr.wait_for_completion(
+                job_id, timeout=wait_timeout, cancel_event=_cancel
+            )
+            if _cancel is not None and _cancel.is_set():
+                raise AgentCancelled("job wait cancelled by user") from None
         else:
             info = _bg_mgr.get_info(job_id)
 

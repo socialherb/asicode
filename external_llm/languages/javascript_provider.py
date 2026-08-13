@@ -87,6 +87,7 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
                     _cmd,
                     capture_output=True, text=True, timeout=10,
                     cwd=os.path.dirname(_tmp_path) or ".",
+                    check=False,
                 )
             except FileNotFoundError:
                 logger.debug("node not installed; falling back to tree-sitter")
@@ -209,7 +210,7 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
         if kind in ("function", "any"):
             patterns.append(SymbolPattern(
                 kind="function",
-                regex=r"(?:export\s+)?(?:async\s+)?function\s+{name}\s*\(",
+                regex=r"(?:export\s+)?(?:async\s+)?function\s*\*?\s*{name}\s*\(",
                 description="JS function declaration",
             ))
             patterns.append(SymbolPattern(
@@ -257,21 +258,7 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
             if result:
                 return result
 
-        return self._find_symbol_regex(file_path, symbol_name, content)
-
-    def _find_symbol_regex(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
-        """Fallback: regex + brace counting (same heuristic as TS)."""
-        esc = re.escape(symbol_name)
-        for sp in self.get_symbol_patterns("any"):
-            pat = sp.regex.replace("{name}", esc)
-            for m in re.finditer(pat, content, re.MULTILINE):
-                start_offset = m.start()
-                start_line = content[:start_offset].count("\n") + 1
-                end_line = TypeScriptSyntaxProvider._find_block_end(content, start_offset)
-                return (start_line, end_line)
-        return None
+        return self._find_symbol_regex(symbol_name, content)
 
     # ── Definition keywords ───────────────────────────────────────────────
 
@@ -289,12 +276,6 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
     ) -> list[tuple[str, int, int]]:
         """Regex fallback: delegate to TS provider (same patterns)."""
         return self._ts._find_class_methods_regex(content, class_name)
-
-    def _find_symbol_body_range_regex(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
-        """Regex fallback: delegate to TS provider (same patterns)."""
-        return self._ts._find_symbol_body_range_regex(content, symbol_name)
 
     # ── Structural query methods (tree-sitter → regex fallback) ────────────
 

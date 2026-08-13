@@ -10,15 +10,18 @@ async — uses asyncio.get_running_loop().run_in_executor() under the hood.
 """
 from __future__ import annotations
 
-import atexit
 import asyncio
+import atexit
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from typing import Any, Optional
 
 from config import CLAUDE_MCP_TOOL_TIMEOUT, CLAUDE_SDK_MAX_TURNS
 from external_llm.agent.tool_handlers.shell_policy import (
     SHELL_TIMEOUT_DEFAULT as _SHELL_TIMEOUT_DEFAULT,
+)
+from external_llm.agent.tool_handlers.shell_policy import (
     SHELL_TIMEOUT_MAX as _SHELL_TIMEOUT_MAX,
 )
 from external_llm.agent.tool_registry import ToolRegistry
@@ -97,6 +100,7 @@ def build_collaborate_install_spec() -> list[str]:
             try:
                 info = json.loads(raw)
             except Exception:  # malformed — try the next asicode metadata source
+                logger.debug("malformed direct_url.json", exc_info=True)
                 continue
             url = info.get("url", "")
             editable = info.get("dir_info", {}).get("editable", False)
@@ -159,14 +163,25 @@ _TOOL_SPECIFIC_TIMEOUTS: dict[str, int] = {
 _INNER_TIMEOUT_TOOLS: dict[str, tuple[str, int, int]] = {
     # tool: (args key holding the inner timeout, default, schema max)
     "bash": ("timeout", _SHELL_TIMEOUT_DEFAULT, _SHELL_TIMEOUT_MAX),
+    # job(action=output) blocks up to wait_timeout, clamped to the same schema
+    # max as bash (git_tools._job_output) — without a derived ceiling here, the
+    # outer asyncio.wait_for (120s default) would fire first and discard the
+    # result while the executor thread keeps waiting, the same race the comment
+    # above documents for bash.
+    "job": ("wait_timeout", 0, _SHELL_TIMEOUT_MAX),
 }
-_INNER_TIMEOUT_RERUNS: int = 2  # first run + missing-plugin recovery re-run
+# How many consecutive inner runs a single call may perform; the derived
+# ceiling must clear the WORST case. bash re-runs once for the pytest
+# missing-plugin recovery; job is a single wait with no recovery re-run.
+_INNER_TIMEOUT_RERUNS: dict[str, int] = {
+    "bash": 2,  # first run + missing-plugin recovery re-run
+    "job": 1,
+}
 _MCP_TIMEOUT_GRACE: int = 30    # bg transition + result formatting headroom
 
 _EXCLUDED_TOOLS: set[str] = {
     "delegate_to_helper",       # internal sub-agent delegation
     "update_memory",            # asicode internal memory
-    "query_experience",         # asicode learning system internal
     "read_image",               # LLM sees OCR text via system; schema overhead not worth it
     "grep",                     # overlaps native Grep; low MCP added value (but Bash is now MCP-exposed since native Bash is disallowed)
     "glob",                     # overlaps native Glob; same reasoning as grep
@@ -196,7 +211,7 @@ _DESTRUCTIVE_TOOLS: set[str] = {
 }
 
 # Not strictly read-only, but safe to expose to analysis sessions.
-# Read-only sessions are exposed via whitelist (_READ_ONLY_TOOLS ∪ this set) only —
+# Read-only sessions are exposed via whitelist (_READ_ONLY_TOOLS U this set) only —
 # the blacklist (_DESTRUCTIVE_TOOLS) approach is fail-open: if a new handler is
 # misclassified, write tools leak into the analysis session.
 _ANALYSIS_SAFE_TOOLS: set[str] = {
@@ -282,15 +297,14 @@ def _get_tool_annotations(tool_name: str) -> Optional[Any]:
 
     Returns None for neutral tools, or a ToolAnnotations instance.
     """
-    try:
+    with suppress(ImportError):
         from claude_agent_sdk import ToolAnnotations
         return ToolAnnotations(
             readOnlyHint=tool_name in _READ_ONLY_TOOLS,
             destructiveHint=tool_name in _DESTRUCTIVE_TOOLS,
             openWorldHint=tool_name in _OPEN_WORLD_TOOLS,
         )
-    except ImportError:
-        return None
+    return None
 
 
 def _convert_schema_to_input_type(schema: dict) -> dict:
@@ -306,8 +320,7 @@ def _convert_schema_to_input_type(schema: dict) -> dict:
     """
     params = schema.get("parameters", {})
     # Copy the full parameters block — SDK accepts JSON Schema format
-    result = dict(params)
-    return result
+    return dict(params)
 
 
 def build_asr_mcp_server(
@@ -325,7 +338,7 @@ def build_asr_mcp_server(
         excluded_tools: Tools to skip; defaults to internal-only tools.
         version: Server version string.
         read_only: If True, only whitelist-classified tools
-            (_READ_ONLY_TOOLS ∪ _ANALYSIS_SAFE_TOOLS) are exposed —
+            (_READ_ONLY_TOOLS U _ANALYSIS_SAFE_TOOLS) are exposed —
             fail-closed against unclassified new handlers.
 
     Returns:
@@ -424,7 +437,8 @@ def _resolve_mcp_timeout(tool_name: str, args: Any) -> int:
     except (AttributeError, TypeError, ValueError):
         inner = default
     inner = max(1, min(inner, maximum))
-    return max(static, inner * _INNER_TIMEOUT_RERUNS + _MCP_TIMEOUT_GRACE)
+    reruns = _INNER_TIMEOUT_RERUNS.get(tool_name, 1)
+    return max(static, inner * reruns + _MCP_TIMEOUT_GRACE)
 
 
 def _make_async_handler(registry: ToolRegistry, tool_name: str):
@@ -461,20 +475,10 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
                         {"type": "text", "text": result.content or ""},
                     ]
                 }
-            else:
-                error_msg = result.error or "Unknown error"
-                logger.warning(
-                    "MCP tool %s failed (%.2fs): %s", tool_name, elapsed, error_msg,
-                )
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"ERROR: {error_msg}",
-                        }
-                    ],
-                    "isError": True,
-                }
+            error_msg = result.error or "Unknown error"
+            logger.warning(
+                "MCP tool %s failed (%.2fs): %s", tool_name, elapsed, error_msg,
+            )
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - t0
             # CPython cannot forcefully terminate a running thread — wait_for only
@@ -492,7 +496,7 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
                 if tool_name in _FAST_READ_TOOLS
                 else " (orphaned worker may still run on default pool)"
             )
-            logger.error(
+            logger.exception(
                 "MCP tool %s timed out after %.1fs (limit %ss)%s",
                 tool_name, elapsed, timeout, pool_note,
             )
@@ -516,6 +520,16 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
             return {
                 "content": [
                     {"type": "text", "text": f"EXCEPTION: {ex}"},
+                ],
+                "isError": True,
+            }
+        else:
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"ERROR: {error_msg}",
+                    }
                 ],
                 "isError": True,
             }

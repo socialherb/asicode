@@ -8,6 +8,8 @@ The prefilter's correctness contract is a three-way distinction:
 Mixing up "empty set" and "None" would either silently drop symbol
 definitions or needlessly parse the whole repo. These tests pin the contract.
 """
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -434,6 +436,58 @@ class TestNonPyProbeInProcessFastPath:
         assert ss._word_in_files([str(p), str(tmp_path / "gone.go")], "GoThing") is True
         assert ss._word_in_files([str(tmp_path / "gone.go")], "GoThing") is False
 
+    def test_token_spanning_chunk_boundary_is_found(self, tmp_path, monkeypatch):
+        """A token split by a stream boundary must still match — carrying
+        ``len(token) + 2`` trailing bytes across the seam exists for this.
+        Without the carry, chunk 1 holds only ``GoTh`` and chunk 2 only
+        ``ing zzz``, so a per-chunk search would miss it."""
+        monkeypatch.setattr(ss, "_NONPY_SCAN_CHUNK", 8)
+        p = tmp_path / "big.go"
+        p.write_text("yyy GoThing zzz", encoding="utf-8")
+        assert ss._word_in_files([str(p)], "GoThing") is True
+
+    def test_word_boundary_enforced_across_chunk_seam(self, tmp_path, monkeypatch):
+        """The (?<!\\w) lookbehind must still see the word char that chunk 1
+        ends with — ``GoThing`` flanked by ``y``/``z`` is not a whole word,
+        so the seam must not turn it into a false positive."""
+        monkeypatch.setattr(ss, "_NONPY_SCAN_CHUNK", 8)
+        p = tmp_path / "big.go"
+        p.write_text("yyyyyyGoThingzzzzzzzz", encoding="utf-8")
+        assert ss._word_in_files([str(p)], "GoThing") is False
+
+    def test_match_early_stops_reading(self, tmp_path, monkeypatch):
+        """The point of streaming: a hit in the first chunk must return
+        without reading the rest of the file (the old ``fh.read()`` slurped
+        the whole file before searching at all)."""
+        monkeypatch.setattr(ss, "_NONPY_SCAN_CHUNK", 64)
+        p = tmp_path / "big.go"
+        p.write_text("GoThing " + "y" * 8192, encoding="utf-8")
+        reads = []
+
+        class _Recording:
+            def __init__(self, fh):
+                self._fh = fh
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._fh.__exit__(*exc)
+
+            def read(self, size=-1):
+                data = self._fh.read(size)
+                reads.append(len(data))
+                return data
+
+        def recording_open(*args, **kwargs):
+            return _Recording(real_open(*args, **kwargs))
+
+        real_open = open
+        monkeypatch.setattr("builtins.open", recording_open)
+        assert ss._word_in_files([str(p)], "GoThing") is True
+        assert reads, "file was never read"
+        assert sum(reads) <= 64, f"read {sum(reads)} bytes for a first-chunk hit"
+
 
 class TestNonpyFilesCacheCap:
     """``_NONPY_FILES_CACHE`` is the ONLY per-root cache that was not using
@@ -501,8 +555,8 @@ class TestNonpyFilesCacheCap:
         """Greps the three assignment sites — they must call _capped_put,
         not plain ``=``. A plain ``=`` would leak entries forever.
         """
-        import inspect
         import ast
+        import inspect
 
         src = inspect.getsource(ss._nonpy_indexable_files)
         tree = ast.parse(src)
@@ -587,3 +641,225 @@ def test_nonpy_probe_failure_falls_back_inline(tmp_path, monkeypatch):
     # Must not propagate, and must have retried inline.
     ss.SymbolSearcher(tmp_path).find_symbol("Widget")
     assert len(calls) == 2, f"no inline retry after probe failure: {calls}"
+
+
+def test_nonpy_probe_timeout_falls_back_inline(tmp_path, monkeypatch):
+    """A probe that does not finish in time must not wedge the caller.
+
+    P1 audit: dispatch (and therefore find_symbol) can run ON
+    _thread_pool.shared_pool, and the speculative probe is submitted to the
+    SAME pool — if every worker were blocked on a still-queued probe, the pool
+    would deadlock. The timeout caps the wait; the inline retry keeps the
+    answer. Asserted by wall-clock behavior: with the cap, find_symbol returns
+    (and retries inline) long before the blocked probe would have finished.
+    """
+    (tmp_path / "a.py").write_text("x = 1\n")
+    calls: list[str] = []
+
+    def _slow_probe(self, root, token):
+        calls.append("called")
+        if len(calls) == 1:
+            time.sleep(2)  # longer than the monkeypatched 50 ms cap below
+        return False
+
+    monkeypatch.setattr(
+        ss.SymbolSearcher, "_nonpy_index_worth_building", _slow_probe, raising=True
+    )
+    monkeypatch.setattr(ss, "_NONPY_PROBE_TIMEOUT_SEC", 0.05)
+    # The pooled probe is still sleeping; find_symbol must time out, retry
+    # inline (2nd call), and return without ever seeing the probe's answer.
+    ss.SymbolSearcher(tmp_path).find_symbol("Widget")
+    assert len(calls) == 2, f"no inline retry after probe timeout: {calls}"
+
+
+class TestNonPyBlobMemo:
+    """``_word_in_files`` re-reads the whole (capped) file set on every probe;
+    after the first MISS the content memo answers later tokens from memory,
+    re-verified per probe by (mtime_ns, size) signatures so a just-written
+    file is visible without waiting for the TTL."""
+
+    @staticmethod
+    def _two_files(tmp_path):
+        (tmp_path / "a.go").write_text("package main\nfunc Alpha() {}\n", encoding="utf-8")
+        (tmp_path / "b.go").write_text("package main\nvar Beta = 1\n", encoding="utf-8")
+
+    def test_second_probe_answers_from_memory(self, tmp_path, monkeypatch):
+        """After a miss builds the blob, later tokens must not reopen any file."""
+        self._two_files(tmp_path)
+        orig = _use_real_rg()
+        try:
+            # Hit: early-exit streaming, builds nothing.
+            assert ss._rg_token_in_nonpy_files(tmp_path, "Alpha") is True
+            # Miss: full scan, then the content memo is cached.
+            assert ss._rg_token_in_nonpy_files(tmp_path, "Gamma") is False
+            opened: list[str] = []
+            real_open = open
+
+            def recording_open(*args, **kwargs):
+                opened.append(str(args[0]))
+                return real_open(*args, **kwargs)
+
+            monkeypatch.setattr("builtins.open", recording_open)
+            assert ss._rg_token_in_nonpy_files(tmp_path, "Delta") is False
+            assert ss._rg_token_in_nonpy_files(tmp_path, "Alpha") is True
+            assert not opened, f"memo probe reopened files: {opened}"
+        finally:
+            ss.shutil.which = orig
+
+    def test_edited_file_invalidates_blob_by_signature(self, tmp_path):
+        """An mtime/size change must be visible on the very next probe."""
+        self._two_files(tmp_path)
+        orig = _use_real_rg()
+        try:
+            assert ss._rg_token_in_nonpy_files(tmp_path, "Gamma") is False  # miss -> blob
+            (tmp_path / "a.go").write_text(
+                "package main\nfunc Alpha() {}\nfunc GammaMarker() {}\n",
+                encoding="utf-8",
+            )
+            assert ss._rg_token_in_nonpy_files(tmp_path, "GammaMarker") is True
+        finally:
+            ss.shutil.which = orig
+
+    def test_new_file_invalidates_blob_via_list_key(self, tmp_path):
+        """A newly created file changes the file list — and with it the memo key."""
+        self._two_files(tmp_path)
+        orig = _use_real_rg()
+        try:
+            assert ss._rg_token_in_nonpy_files(tmp_path, "Gamma") is False
+            (tmp_path / "c.go").write_text(
+                "package main\nfunc ZedNewFile() {}\n", encoding="utf-8"
+            )
+            # Exactly what invalidate_nonpy_caches does to the walk cache.
+            ss._NONPY_FILES_CACHE.pop(str(tmp_path), None)
+            assert ss._rg_token_in_nonpy_files(tmp_path, "ZedNewFile") is True
+        finally:
+            ss.shutil.which = orig
+
+    def test_hit_probe_builds_blob_too(self, tmp_path):
+        """The cold probe caches on the first call regardless of the answer —
+        the early-exit trade is deliberate: the extra read is hidden behind
+        the speculative probe and the cold index build a hit triggers."""
+        self._two_files(tmp_path)
+        orig = _use_real_rg()
+        try:
+            _files = ss._nonpy_indexable_files(tmp_path)
+            assert _files is not None
+            key = (str(tmp_path), tuple(_files[0]))
+            ss._NONPY_BLOB_CACHE.pop(key, None)
+            assert ss._rg_token_in_nonpy_files(tmp_path, "Alpha") is True
+            assert key in ss._NONPY_BLOB_CACHE, "the cold probe must build the memo"
+        finally:
+            ss.shutil.which = orig
+
+    def test_newline_token_falls_back_to_streaming(self, tmp_path, monkeypatch):
+        """A newline token must not use the ``\\n``-joined blob (seam semantics)."""
+        self._two_files(tmp_path)
+        orig = _use_real_rg()
+        try:
+            called = []
+            real = ss._word_in_files
+            monkeypatch.setattr(
+                ss, "_word_in_files", lambda *a: called.append(a) or real(*a)
+            )
+            assert ss._rg_token_in_nonpy_files(tmp_path, "a\nb") is False
+            assert called, "newline token must take the streaming path"
+        finally:
+            ss.shutil.which = orig
+
+    def test_unreadable_file_keeps_memo_effective(self, tmp_path, monkeypatch):
+        """A file that cannot be opened must not invalidate the memo on every
+        probe — its real signature is stored even though its content is not."""
+        self._two_files(tmp_path)
+        p = tmp_path / "a.go"
+        orig = _use_real_rg()
+        try:
+            os.chmod(p, 0)
+            try:
+                assert ss._rg_token_in_nonpy_files(tmp_path, "Gamma") is False
+            finally:
+                os.chmod(p, 0o644)
+            called = []
+            real = ss._word_in_files
+            monkeypatch.setattr(
+                ss, "_word_in_files", lambda *a: called.append(a) or real(*a)
+            )
+            assert ss._rg_token_in_nonpy_files(tmp_path, "Delta") is False
+            assert not called, "unreadable file forced a rebuild on every probe"
+        finally:
+            os.chmod(p, 0o644)
+            ss.shutil.which = orig
+
+    def test_blob_contains_word_boundary_semantics(self):
+        """Literal search + manual boundary must equal the lookarounds —
+        including bad-boundary skips, blob edges, and empty tokens."""
+        blob = "xxGoThingyy\nGoThing\nzz"
+        cases = [
+            ("GoThing", True),      # 1st flanked by x/y (bad), 2nd clean
+            ("xxGoThingyy", True),  # blob start
+            ("zz", True),           # blob end
+            ("GoThin", False),      # partial inside GoThing (followed by g)
+            ("GoThingy", False),    # literal hit but bad boundary on both sides
+            ("Thing", False),       # both occurrences preceded by G
+            ("xx", False),          # blob start but followed by G
+            ("Nope", False),
+            ("", False),            # must terminate, not loop
+        ]
+        for tok, exp in cases:
+            assert ss._blob_contains_word(blob, tok) is exp, tok
+
+    def test_blob_matches_streaming_core_on_joined_files(self, tmp_path):
+        """``_blob_contains_word`` on a ``\\n``-joined blob must agree with the
+        per-file streaming scan — a seam must behave exactly like a file
+        boundary, never creating or destroying a match."""
+        (tmp_path / "a.go").write_text("yyy GoThing zzz", encoding="utf-8")
+        (tmp_path / "b.go").write_text("GoOther\n", encoding="utf-8")
+        files = [str(tmp_path / "a.go"), str(tmp_path / "b.go")]
+        blob = "\n".join(
+            p.read_text(encoding="utf-8")
+            for p in (tmp_path / "a.go", tmp_path / "b.go")
+        )
+        for tok in ["GoThing", "GoOther", "Thing", "GoTh", "Other", "yyy", "zzz", "Nope"]:
+            got = ss._blob_contains_word(blob, tok)
+            exp = ss._word_in_files(files, tok)
+            assert got is exp, f"{tok!r}: blob={got} streaming={exp}"
+
+    def test_blob_store_site_uses_capped_put(self):
+        """AST grep: the memo's only store site must be _capped_put, not ``=``."""
+        import ast
+        import inspect
+
+        src = inspect.getsource(ss._word_in_files_cached)
+        tree = ast.parse(src)
+        plain = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Subscript):
+                        value = ast.get_source_segment(src, target.value)
+                        if value and "_NONPY_BLOB_CACHE" in value:
+                            plain.append(target.lineno)
+        assert not plain, (
+            f"_word_in_files_cached stores the memo with plain `=` at {plain} — "
+            "use _capped_put"
+        )
+
+    def test_blob_cache_stays_fifo_capped(self, tmp_path):
+        """cap+2 roots through the real probe leave _NONPY_BLOB_MAX_ENTRIES."""
+        orig = _use_real_rg()
+        saved = dict(ss._NONPY_BLOB_CACHE)
+        ss._NONPY_BLOB_CACHE.clear()
+        try:
+            cap = ss._NONPY_BLOB_MAX_ENTRIES
+            for i in range(cap + 2):
+                root = tmp_path / f"r{i}"
+                root.mkdir()
+                (root / "a.go").write_text("package main\n", encoding="utf-8")
+                assert ss._rg_token_in_nonpy_files(root, f"MissToken{i}") is False
+            assert len(ss._NONPY_BLOB_CACHE) <= cap
+            assert str(tmp_path / "r0") not in {k[0] for k in ss._NONPY_BLOB_CACHE}, (
+                "oldest root survived FIFO eviction"
+            )
+        finally:
+            ss._NONPY_BLOB_CACHE.clear()
+            ss._NONPY_BLOB_CACHE.update(saved)
+            ss.shutil.which = orig

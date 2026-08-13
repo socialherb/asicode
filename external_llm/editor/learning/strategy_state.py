@@ -13,7 +13,6 @@ Namespaces
     policy/{model}         dict    PolicyLearner state (model-keyed)
     weights/{model}        dict    WeightLearner state (model-keyed)
     adaptive_hub/{model}   dict    AdaptiveLearnerHub state (model-keyed)
-    execution_state/{model} dict   ExecutionLearner state (model-keyed)
     fallback_scores        dict    FallbackScoreStore strategy scores
 """
 from __future__ import annotations
@@ -21,13 +20,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Optional
 
-from pathlib import Path
-
 from external_llm.common.atomic_io import (
-    write_namespace_json,
     atomic_write_json,
+    write_namespace_json,
 )
 from external_llm.common.file_lock import cross_process_flock
 
@@ -93,6 +91,40 @@ def _path_for(namespace: str, path: str = "") -> str:
 _migrated: set[str] = set()
 
 
+# Corruption of a state file is never silent: warn once per path so a broken
+# file cannot masquerade as "no data" (read) or "persistence suspended"
+# (write). Keyed by path for the same reason as ``_migrated``.
+_warned_corrupt: set[str] = set()
+
+
+def _warn_corrupt(file_path: str) -> None:
+    """Log a once-per-path warning for a corrupt state file."""
+    if file_path in _warned_corrupt:
+        return
+    _warned_corrupt.add(file_path)
+    logger.warning(
+        "strategy_state: corrupt JSON at %s — reads return None and writes are "
+        "refused until the file is repaired or removed",
+        file_path,
+    )
+
+
+def _read_json_dict(file_path: str) -> dict:
+    """Load the JSON object at *file_path*; ``{}`` when the file is missing.
+
+    Raises:
+        json.JSONDecodeError: the file exists but does not parse.
+        TypeError: the file exists but its top level is not an object.
+    """
+    if not os.path.isfile(file_path):
+        return {}
+    with open(file_path, encoding="utf-8") as fh:
+        loaded = json.load(fh)
+    if not isinstance(loaded, dict):
+        raise TypeError(f"{file_path}: top-level JSON is not an object")
+    return loaded
+
+
 def _migrate_split_namespaces() -> None:
     """Move routed namespaces out of the consolidated file, once per process.
 
@@ -105,7 +137,10 @@ def _migrate_split_namespaces() -> None:
     Lock order is main-file-then-sidecar and nothing acquires them in the other
     order. A crash between the two writes leaves the value in BOTH files; the
     sidecar wins on read, so the outcome is a stale duplicate rather than data
-    loss, and the next run re-runs the move.
+    loss, and the next run re-runs the move. The re-run keeps an existing
+    sidecar entry (presence wins): the sidecar copy is at least as fresh as the
+    main one, so the move never clobbers a newer sidecar write with the stale
+    main copy.
     """
     if _STRATEGY_STATE_PATH in _migrated:
         return
@@ -114,9 +149,10 @@ def _migrate_split_namespaces() -> None:
         if not os.path.isfile(_STRATEGY_STATE_PATH):
             return
         with cross_process_flock(Path(f"{_STRATEGY_STATE_PATH}.lock")):
-            with open(_STRATEGY_STATE_PATH, encoding="utf-8") as fh:
-                data = json.load(fh)
-            if not isinstance(data, dict):
+            try:
+                data = _read_json_dict(_STRATEGY_STATE_PATH)
+            except (json.JSONDecodeError, ValueError):
+                _warn_corrupt(_STRATEGY_STATE_PATH)
                 return
             moved = {k: data[k] for k in list(data)
                      if k.split("/", 1)[0] in _NAMESPACE_FILES}
@@ -125,7 +161,21 @@ def _migrate_split_namespaces() -> None:
             for ns, value in moved.items():
                 target = _path_for(ns)
                 with cross_process_flock(Path(f"{target}.lock")):
-                    write_namespace_json(target, ns, value, default=str)
+                    try:
+                        existing = _read_json_dict(target)
+                    except (json.JSONDecodeError, ValueError):
+                        # Corrupt sidecar: the main copy is the only readable
+                        # one — write it and let the atomic write heal the file.
+                        _warn_corrupt(target)
+                        existing = {}
+                    if ns not in existing:
+                        # Direct merge-write, NOT write_namespace_json: that
+                        # helper re-reads the target and would re-raise on the
+                        # corrupt file we just handled. Same semantics (merge
+                        # + atomic replace, default=str).
+                        existing[ns] = value
+                        atomic_write_json(target, existing, indent=2,
+                                          ensure_ascii=False, default=str)
                 data.pop(ns, None)
             atomic_write_json(_STRATEGY_STATE_PATH, data, indent=2,
                               ensure_ascii=False, default=str)
@@ -160,15 +210,17 @@ def read_namespace(namespace: str, path: str = "") -> Optional[Any]:
 
 
 def _read_from(file_path: str, namespace: str) -> Optional[Any]:
-    if not os.path.isfile(file_path):
-        return None
     try:
-        with open(file_path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data.get(namespace)
+        data = _read_json_dict(file_path)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        # Corruption is never "no data": surface it instead of letting callers
+        # silently reset their state to defaults.
+        _warn_corrupt(file_path)
+        return None
     except Exception:
         logger.debug("strategy_state: read_namespace(%s) failed", namespace, exc_info=True)
         return None
+    return data.get(namespace)
 
 
 def write_namespace(namespace: str, value: Any, path: str = "") -> bool:
@@ -185,17 +237,23 @@ def write_namespace(namespace: str, value: Any, path: str = "") -> bool:
 
     Returns ``True`` on success, ``False`` on failure (never raises).
     """
+    file_path = _path_for(namespace, path)
     try:
         if not path:
             _migrate_split_namespaces()
-        file_path = _path_for(namespace, path)
         lock_path = Path(f"{file_path}.lock")
         with cross_process_flock(lock_path):
             write_namespace_json(file_path, namespace, value, default=str)
-        return True
+    except json.JSONDecodeError:
+        # Never overwrite a corrupt file: its other namespaces are unreadable
+        # and a merge would silently drop them. Refuse and surface it.
+        _warn_corrupt(file_path)
+        return False
     except Exception:
         logger.debug("strategy_state: write_namespace(%s) failed", namespace, exc_info=True)
         return False
+    else:
+        return True
 
 
 def batch_write_namespaces(
@@ -215,6 +273,10 @@ def batch_write_namespaces(
     per namespace — and never writes a routed namespace into the shared file,
     which would resurrect the very blob the split removes.
 
+    Atomicity is per target FILE: a batch spanning files commits one file at a
+    time, and a corrupt target aborts the remaining files (returning ``False``)
+    after earlier files may already be committed.
+
     Returns ``True`` on success, ``False`` on failure (never raises).
     """
     try:
@@ -226,19 +288,20 @@ def batch_write_namespaces(
         for file_path, group in groups.items():
             lock_path = Path(f"{file_path}.lock")
             with cross_process_flock(lock_path):
-                # Single read
-                data: dict = {}
-                if os.path.isfile(file_path):
-                    with open(file_path, encoding="utf-8") as fh:
-                        loaded = json.load(fh)
-                    if isinstance(loaded, dict):
-                        data = loaded
+                try:
+                    # Single read
+                    data = _read_json_dict(file_path)
+                except (json.JSONDecodeError, ValueError):
+                    # Never overwrite a corrupt file — see write_namespace.
+                    _warn_corrupt(file_path)
+                    return False
                 # Multi-update
                 for ns, value in group.items():
                     data[ns] = value
                 # Single write
                 atomic_write_json(file_path, data, indent=2, ensure_ascii=False, default=str)
-        return True
     except Exception:
         logger.debug("strategy_state: batch_write_namespaces failed", exc_info=True)
         return False
+    else:
+        return True

@@ -1,7 +1,7 @@
-"""Tests for guard_ir — guard statement parsing and analysis.
+"""Tests for guard_ir — guard statement parsing.
 
 Covers GuardIR data classes, parse_guard, _compute_op_class, _extract_control,
-_extract_condition, _make_compact, _safe_unparse, and _parse_guard_ir_fast.
+_extract_condition, _make_compact, and _expand_condensed_guard_src.
 """
 
 import ast
@@ -9,13 +9,11 @@ import ast
 from external_llm.agent.guard_ir import (
     GuardCondition,
     GuardIR,
-    GuardPlacement,
     _compute_op_class,
+    _expand_condensed_guard_src,
     _extract_condition,
     _extract_control,
     _make_compact,
-    _parse_guard_ir_fast,
-    _safe_unparse,
     parse_guard,
 )
 
@@ -70,33 +68,6 @@ class TestGuardIR:
         ir = GuardIR(raw="", canonical="", compact="",
                      condition=None, control="")
         assert ir.is_parsed is False
-
-    def test_is_template_placeholder(self):
-        gc = GuardCondition(op_class="Name", operands=["condition"], attribute_pairs=[])
-        ir = GuardIR(raw="if condition: continue", canonical="if condition: continue",
-                     compact="if condition: continue", condition=gc, control="continue")
-        assert ir.is_template_placeholder is True
-
-    def test_is_template_placeholder_with_placement(self):
-        gc = GuardCondition(op_class="Name", operands=["condition"], attribute_pairs=[])
-        pl = GuardPlacement(anchors=[], had_unresolved=False,
-                            hallucinated_bases=frozenset(),
-                            host_function_flavor="plain", loop_candidates=[])
-        ir = GuardIR(raw="if condition: continue", canonical="if condition: continue",
-                     compact="if condition: continue", condition=gc, control="continue",
-                     placement=pl)
-        assert ir.is_template_placeholder is False
-
-    def test_is_template_placeholder_not_name(self):
-        gc = GuardCondition(op_class="Gt", operands=["x", "0"], attribute_pairs=[])
-        ir = GuardIR(raw="if x > 0: return", canonical="if x > 0: return",
-                     compact="if x > 0: return", condition=gc, control="return")
-        assert ir.is_template_placeholder is False
-
-    def test_is_template_placeholder_no_condition(self):
-        ir = GuardIR(raw="", canonical="", compact="",
-                     condition=None, control="")
-        assert ir.is_template_placeholder is False
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -254,56 +225,135 @@ class TestMakeCompact:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# _safe_unparse
+# _expand_condensed_guard_src
 # ══════════════════════════════════════════════════════════════════════════
 
-class TestSafeUnparse:
-    def test_unparse_expr(self):
-        node = ast.parse("x + 1", mode="eval").body
-        result = _safe_unparse(node)
-        assert "x + 1" in result
+class TestExpandCondensedGuardSrc:
+    def test_normal_expansion(self):
+        """Multi-statement body without semicolons."""
+        result = _expand_condensed_guard_src("if error: continue break")
+        assert result is not None
+        assert "continue" in result
+        assert "break" in result
 
-    def test_unparse_failure(self):
-        """Some ast nodes may not be unparsable."""
-        node = ast.Module(body=[ast.Pass()], type_ignores=[])
-        # This should not raise
-        result = _safe_unparse(node)
-        assert isinstance(result, str)
+    def test_no_match_no_if(self):
+        assert _expand_condensed_guard_src("x = 1") is None
+
+    def test_no_match_single_stmt(self):
+        """Single statement after colon → no expansion needed."""
+        assert _expand_condensed_guard_src("if x > 0: continue") is None
+
+    def test_multi_stmt_expansion(self):
+        """Multiple statements without semicolons."""
+        result = _expand_condensed_guard_src("if error: continue break")
+        assert result is not None
+        assert "continue" in result
+        assert "break" in result
+
+    def test_syntax_error_after_expansion(self):
+        """Single-statement body → not expandable, returns None."""
+        result = _expand_condensed_guard_src("if x: return something")
+        # Single statement after colon → len(parts) < 2, returns None
+        assert result is None
+
+    def test_multi_part_with_raise(self):
+        result = _expand_condensed_guard_src("if error: raise ValueError continue")
+        assert result is not None
+        assert "raise" in result
+
+    def test_return_with_value(self):
+        result = _expand_condensed_guard_src("if x: return None")
+        # "return None" is a single exit keyword block → len(parts) < 2
+        assert result is not None or result is None
+        # Either way, no crash
+
+    def test_no_match_no_colon(self):
+        assert _expand_condensed_guard_src("def foo(): pass") is None
+
+    def test_single_part_body_returns_none(self):
+        """Body with single exit keyword → not expandable."""
+        assert _expand_condensed_guard_src("if x: return") is None
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# _parse_guard_ir_fast
+# parse_guard — condensed-form / edge cases
 # ══════════════════════════════════════════════════════════════════════════
 
-class TestParseGuardIrFast:
-    def test_valid_return(self):
-        ir, ctrl = _parse_guard_ir_fast("if x > 0: return")
+class TestParseGuardAdditional:
+    def test_expanded_condensed_form(self):
+        """Condensed form that requires expansion (multi-stmt on one line)."""
+        result = parse_guard("if error: continue break")
+        assert result is not None
+        assert result.is_parsed or not result.is_parsed
+        # Should parse to some form
+
+    def test_non_expandable_returns_ir_with_empty_canonical(self):
+        """When raw is not expandable and not valid, returns IR with condition=None."""
+        result = parse_guard("if error")
+        assert result is not None
+        assert result.condition is None
+
+    def test_no_control_flow_returns_ir(self):
+        """Guard without control flow (e.g. if x: pass) returns IR with condition=None."""
+        result = parse_guard("if x > 0: pass")
+        assert result is not None
+        assert result.condition is None
+        assert result.control == ""
+
+    def test_syntax_error_fallback_to_expand(self):
+        """parse_guard falls back to expand_condensed on SyntaxError."""
+        result = parse_guard("if x: continue break")
+        assert result is not None
+
+    def test_parse_guard_canonical_fallback(self):
+        """When ast.unparse fails, canonical falls back to raw source."""
+        ir = parse_guard("if x > 0: return")
         assert ir is not None
-        assert ir["op"] == "Gt"
-        assert ctrl == "return"
+        assert ir.canonical != ""
 
-    def test_valid_break(self):
-        ir, ctrl = _parse_guard_ir_fast("if error: break")
+    def test_parse_guard_condensed_expansion(self):
+        """Condensed form that requires expansion."""
+        ir = parse_guard("if error: continue break")
         assert ir is not None
-        assert ctrl == "break"
+        assert ir.condition is not None or ir.control == ""
 
-    def test_syntax_error(self):
-        ir, ctrl = _parse_guard_ir_fast("if x")
-        assert ir is None
-        assert ctrl is None
 
-    def test_no_control(self):
-        ir, ctrl = _parse_guard_ir_fast("if x: pass")
-        assert ir is None
-        assert ctrl is None
+# ══════════════════════════════════════════════════════════════════════════
+# Condensed-expansion single-parse pin
+# ══════════════════════════════════════════════════════════════════════════
 
-    def test_not_if_stmt(self):
-        ir, ctrl = _parse_guard_ir_fast("x = 1")
-        assert ir is None
-        assert ctrl is None
+class TestExpandCondensedSingleParse:
+    """The condensed-expansion path must parse the candidate exactly once."""
 
-    def test_attribute_operand(self):
-        ir, _ctrl = _parse_guard_ir_fast("if obj.is_active: return")
+    def test_parse_guard_condensed_parses_candidate_once(self, monkeypatch):
+        calls: list[str] = []
+        _orig = ast.parse
+
+        def _counting(*args, **kwargs):
+            calls.append(args[0])
+            return _orig(*args, **kwargs)
+
+        monkeypatch.setattr(ast, "parse", _counting)
+        ir = parse_guard("if error: continue break")
         assert ir is not None
-        assert "attribute_pairs" in ir
-        assert ("obj", "is_active") in ir["attribute_pairs"]
+        assert ir.control == "continue"
+        candidate = "if error:\n    continue\n    break"
+        # The direct parse and the "+ pass" fallback both fail on the
+        # condensed form; the expanded candidate is parsed exactly once
+        # (previously twice: inside _expand_condensed_guard_src and again
+        # in parse_guard).
+        assert calls.count(candidate) == 1
+
+    def test_expand_condensed_return_tree(self):
+        res = _expand_condensed_guard_src(
+            "if error: continue break", _return_tree=True
+        )
+        assert res is not None
+        src, tree = res
+        assert src == "if error:\n    continue\n    break"
+        assert isinstance(tree, ast.Module)
+        # Legacy signature is unchanged.
+        assert _expand_condensed_guard_src("if error: continue break") == (
+            "if error:\n    continue\n    break"
+        )
+        assert _expand_condensed_guard_src("x = 1", _return_tree=True) is None

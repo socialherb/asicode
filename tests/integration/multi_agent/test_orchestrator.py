@@ -522,9 +522,11 @@ class TestOrchestratorAgent:
                 metadata={}
             )
 
-        with patch.object(orchestrator, '_run_subagent', side_effect=mock_execute_subtask):
-            with patch.object(orchestrator, '_decompose_task', return_value=subtasks):
-                result = orchestrator.run("Test parallel tasks")
+        with (
+            patch.object(orchestrator, "_run_subagent", side_effect=mock_execute_subtask),
+            patch.object(orchestrator, "_decompose_task", return_value=subtasks),
+        ):
+            result = orchestrator.run("Test parallel tasks")
 
         # With parallel execution and max_subagents=2, 3 tasks should complete
         assert result.status in ("success", "partial", "error")
@@ -607,9 +609,11 @@ class TestOrchestratorAgent:
                 metadata={}
             )
 
-        with patch.object(orchestrator, '_run_subagent', side_effect=mock_execute_subtask):
-            with patch.object(orchestrator, '_decompose_task', return_value=subtasks):
-                result = orchestrator.run("Test partial failure")
+        with (
+            patch.object(orchestrator, "_run_subagent", side_effect=mock_execute_subtask),
+            patch.object(orchestrator, "_decompose_task", return_value=subtasks),
+        ):
+            result = orchestrator.run("Test partial failure")
 
         # Orchestrator should complete with results
         assert result.status in ("success", "partial", "error")

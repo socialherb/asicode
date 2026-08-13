@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+from contextlib import suppress
 from typing import Optional
 
 from .base import (
@@ -119,6 +120,38 @@ def _parse_cc_diagnostics(
     return errors
 
 
+def _same_path(a: str, base_dir: str, b: str) -> bool:
+    """True when *a* (relative to *base_dir* unless already absolute) denotes *b*.
+
+    Compiler diagnostics and ``compile_commands.json`` entries may spell the
+    same file as a bare basename, ``./src/x.c``, or an absolute path. Raw-string
+    equality would drop equivalent spellings (false negatives); basename-only
+    equality would admit same-named files in sibling directories (false
+    positives). Normalizing both sides to absolute paths avoids both failure
+    modes. Symlinked spellings of the same file are NOT conflated (no
+    ``realpath``) — that would require the target to exist on disk.
+    """
+    if not a or not b:
+        return False
+    if not os.path.isabs(a):
+        a = os.path.join(base_dir, a)
+    return os.path.normpath(os.path.abspath(a)) == os.path.normpath(os.path.abspath(b))
+
+
+def _keep_only_target_diagnostics(
+    errors: list[SyntaxError_], file_path: str, cwd: str,
+) -> list[SyntaxError_]:
+    """Keep only diagnostics located in *file_path*.
+
+    A directory compile surfaces errors from sibling TUs; those must not roll
+    back an edit to *file_path*. Diagnostics are matched by normalized path
+    (see :func:`_same_path`), not by basename — a same-named file in another
+    directory must be dropped, while equivalent spellings of the target
+    (``util.c`` vs ``./util.c`` vs the absolute path) must all be kept.
+    """
+    return [e for e in errors if _same_path(e.file, cwd, file_path)]
+
+
 def _find_compile_commands(file_path: str) -> str | None:
     """Walk upward from *file_path* looking for ``compile_commands.json``."""
     cur = os.path.dirname(os.path.abspath(file_path)) or "."
@@ -173,6 +206,28 @@ def _extract_include_flags(entry: dict) -> list[str]:
             resolved.append(flag)
         return resolved
     return flags
+
+
+def _match_compile_commands_entry(
+    entries: list[dict], file_path: str,
+) -> dict | None:
+    """Return the ``compile_commands.json`` entry that compiles *file_path*.
+
+    Exact normalized-path match first (an entry's ``file`` is absolute or
+    relative to its ``directory`` field). Falls back to basename equality for
+    databases whose ``file`` spells the path differently (build-system virtual
+    paths, symlinked trees) — same-basename ambiguity is then possible, but
+    only as a last resort instead of the primary match.
+    """
+    for entry in entries:
+        entry_file = entry.get("file", "")
+        if _same_path(entry_file, entry.get("directory", ""), file_path):
+            return entry
+    target_base = os.path.basename(file_path)
+    for entry in entries:
+        if os.path.basename(entry.get("file", "")) == target_base:
+            return entry
+    return None
 
 
 def _collect_I_flags(tokens: list[str]) -> list[str]:
@@ -257,6 +312,7 @@ class _CFamilySyntaxProvider(SyntaxProvider):
                 proc = subprocess.run(
                     _cmd, capture_output=True, text=True, timeout=30,
                     env=_compile_env(),
+                    check=False,
                 )
             except FileNotFoundError:
                 logger.debug("%s vanished mid-run; falling back to tree-sitter", cc)
@@ -338,6 +394,7 @@ class _CFamilySyntaxProvider(SyntaxProvider):
                 _cmd,
                 capture_output=True, text=True, timeout=30, cwd=cwd,
                 env=_compile_env(),
+                check=False,
             )
         except FileNotFoundError:
             logger.debug("%s not installed; skipping semantic validation", cc)
@@ -353,18 +410,15 @@ class _CFamilySyntaxProvider(SyntaxProvider):
             # The compile SUCCEEDED — a real clean verdict, not a skip.
             return SyntaxValidationResult(ok=True, language=lang)
 
-        errors: list[SyntaxError_] = []
-        for e in _parse_cc_diagnostics(
-            proc.stdout + proc.stderr, lang, filter_resolution=True,
-        ):
-            # A directory compile surfaces errors from sibling TUs; report only
-            # diagnostics located in the file we asked about.
-            if os.path.basename(e.file) != target:
-                continue
-            errors.append(SyntaxError_(
+        errors: list[SyntaxError_] = [SyntaxError_(
                 file=file_path, line=e.line, col=e.col,
                 message=e.message, severity=e.severity,
-            ))
+            ) for e in _keep_only_target_diagnostics(
+            _parse_cc_diagnostics(
+                proc.stdout + proc.stderr, lang, filter_resolution=True,
+            ),
+            file_path, cwd,
+        )]
         return SyntaxValidationResult(
             ok=not errors, errors=errors, language=lang,
         )
@@ -395,16 +449,12 @@ class _CFamilySyntaxProvider(SyntaxProvider):
         _include_flags: list[str] = []
         _ccdb_path = _find_compile_commands(file_path)
         if _ccdb_path:
-            try:
+            with suppress(json.JSONDecodeError, OSError, KeyError, TypeError):
                 with open(_ccdb_path, encoding="utf-8") as _f:
                     _entries = json.load(_f)
-                for _entry in _entries:
-                    _entry_file = _entry.get("file", "")
-                    if os.path.basename(_entry_file) == target or _entry_file == file_path:
-                        _include_flags = _extract_include_flags(_entry)
-                        break
-            except (json.JSONDecodeError, OSError, KeyError, TypeError):
-                pass
+                _entry = _match_compile_commands_entry(_entries, file_path)
+                if _entry:
+                    _include_flags = _extract_include_flags(_entry)
 
         result = self._run_semantics_compile(
             file_path, target, cwd, _include_flags, self._compilers, self._lang,
@@ -482,24 +532,9 @@ class _CFamilySyntaxProvider(SyntaxProvider):
             result = find_symbol_range(content, symbol_name, self._lang.value)
             if result:
                 return result
-        return self._find_symbol_regex(file_path, symbol_name, content)
+        return self._find_symbol_regex(symbol_name, content)
 
-    def _find_symbol_regex(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
-        esc = re.escape(symbol_name)
-        for sp in self.get_symbol_patterns("any"):
-            pat = sp.regex.replace("{name}", esc)
-            for m in re.finditer(pat, content, re.MULTILINE):
-                start_offset = m.start()
-                start_line = content[:start_offset].count("\n") + 1
-                if sp.kind in ("macro", "typedef"):
-                    end_pos = content.find("\n", m.end())
-                    end_line = (content[:end_pos].count("\n") + 1) if end_pos != -1 else start_line
-                else:
-                    end_line = self._find_block_end(content, start_offset)
-                return (start_line, end_line)
-        return None
+    _LINE_BASED_KINDS = frozenset({"macro", "typedef"})
 
     @staticmethod
     def _find_block_end(content: str, offset: int) -> int:
@@ -542,21 +577,6 @@ class _CFamilySyntaxProvider(SyntaxProvider):
             end_line = content[:end_pos].count("\n") + 1
             results.append((m.group(1), "macro", start_line, end_line))
         return results
-
-    def _find_symbol_body_range_regex(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
-        esc = re.escape(symbol_name)
-        for sp in self.get_symbol_patterns("any"):
-            pat = sp.regex.replace("{name}", esc)
-            for m in re.finditer(pat, content, re.MULTILINE):
-                body_start = content.find("{", m.end())
-                if body_start == -1:
-                    continue
-                body_start_line = content[:body_start].count("\n") + 1
-                body_end_line = self._find_block_end(content, body_start)
-                return (body_start_line, body_end_line)
-        return None
 
     # ── Structural query methods (tree-sitter → regex fallback) ────────────
 

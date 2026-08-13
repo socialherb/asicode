@@ -27,5 +27,12 @@ class GraphBuilder:
         """
         root = repo_root or self.repo_root
         graph = RepositoryGraph(root)
-        graph.build()
+        # P3 Stage 3 (2026-08-12): agent-side RG builds write the on-disk
+        # snapshot (collect_imported_names=True) — the release-gate snapshot
+        # then self-heals on repos where no gate ever runs (third-party repos
+        # using the agent), which is the precondition for CallGraphIndexer
+        # having no disk tier of its own.  Warm/served builds pay ≈0 for the
+        # name pass (_imported_names_for serves from cache/disk); the snapshot
+        # rewrite itself is hint-gated (re-parse or count drift only).
+        graph.build(collect_imported_names=True)
         return graph

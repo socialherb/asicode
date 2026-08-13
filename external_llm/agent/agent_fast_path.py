@@ -6,6 +6,8 @@ AgentLoop inherits FastPathMixin, so all methods have full access to
 self.config, self.registry, etc.
 """
 from __future__ import annotations
+
+
 def _is_trivial_request(request: str) -> bool:
     """Lightweight triviality check — fallback when RouteDecision unavailable.
 
@@ -17,9 +19,13 @@ def _is_trivial_request(request: str) -> bool:
         return False
 
     # Variable-name-like requests (e.g. "_max_tokens", "400_000")
-    if len(req) < 40 and "_" in req and req.replace("_", "").isalnum():
-        if any(c.isascii() and c.isalpha() for c in req):
-            return True  # looks like a code reference
+    if (
+        len(req) < 40
+        and "_" in req
+        and req.replace("_", "").isalnum()
+        and any(c.isascii() and c.isalpha() for c in req)
+    ):
+        return True  # looks like a code reference
 
     # Trivial edit patterns (set-based, no regex)
     _TRIVIAL_TRIGGERS = {"header", "typo", "spelling", "rename"}
@@ -30,10 +36,7 @@ def _is_trivial_request(request: str) -> bool:
     # "only change X" / "constant" — 2+ word phrases
     if "only change" in req or "only modify" in req:
         return True
-    if "constant" in req and len(req.split()) < 10:
-        return True
-
-    return False
+    return "constant" in req and len(req.split()) < 10
 
 
 class FastPathMixin:

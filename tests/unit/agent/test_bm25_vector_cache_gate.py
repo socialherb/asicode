@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import external_llm.agent.design_chat_loop as _dcl
 from external_llm.agent.design_chat_loop import (
     _ARCHIVED_BM25_CACHE,
     _ARCHIVED_BM25_CACHE_LOCK,
@@ -21,8 +22,6 @@ from external_llm.agent.design_chat_loop import (
     _VECTOR_CACHE_LOCK,
     _archived_bm25_entries,
 )
-
-import external_llm.agent.design_chat_loop as _dcl
 
 
 class _FakeSessionMgr:
@@ -47,12 +46,14 @@ def _clean_state():
 
 
 def _make_archive(lines: list[str]) -> Path:
-    f = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".jsonl", delete=False, encoding="utf-8",
-    )
-    for line in lines:
-        f.write(line + "\n")
-    f.close()
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".jsonl",
+        delete=False,
+        encoding="utf-8",
+    ) as f:
+        for line in lines:
+            f.write(line + "\n")
     return Path(f.name)
 
 
@@ -65,7 +66,7 @@ class TestVectorCacheGate:
         try:
             mgr = _FakeSessionMgr(p)
             archived = [{"content": "hello world"}]
-            entries, sig, from_cache = _archived_bm25_entries(mgr, "s1", archived)
+            _entries, sig, from_cache = _archived_bm25_entries(mgr, "s1", archived)
             assert sig is not None
             assert not from_cache
             assert isinstance(sig, tuple)
@@ -74,7 +75,7 @@ class TestVectorCacheGate:
             assert isinstance(sig[1], int)  # size
             assert isinstance(sig[2], int)  # mtime_ns
             # Same archive → same sig (deterministic)
-            entries2, sig2, fc2 = _archived_bm25_entries(mgr, "s1", archived)
+            _entries2, sig2, _fc2 = _archived_bm25_entries(mgr, "s1", archived)
             assert sig == sig2
         finally:
             os.unlink(p)
@@ -105,8 +106,8 @@ class TestVectorCacheGate:
             m1, m2 = _FakeSessionMgr(p1), _FakeSessionMgr(p2)
             archived = [{"content": "dummy"}]
 
-            r1, s1, fc1 = _archived_bm25_entries(m1, "s1", archived)
-            r2, s2, fc2 = _archived_bm25_entries(m2, "s2", archived)
+            _r1, s1, fc1 = _archived_bm25_entries(m1, "s1", archived)
+            _r2, s2, fc2 = _archived_bm25_entries(m2, "s2", archived)
 
             assert s1 != s2          # different file sizes → different sigs
             assert fc1 is False
@@ -129,8 +130,8 @@ class TestVectorCacheGate:
             archived = [{"content": "dummy"}]
 
             # Insert s1, s2 → cache has 2 entries
-            r1, sig1, _ = _archived_bm25_entries(m1, "s1", archived)
-            r2, sig2, _ = _archived_bm25_entries(m2, "s2", archived)
+            _r1, sig1, _ = _archived_bm25_entries(m1, "s1", archived)
+            _r2, sig2, _ = _archived_bm25_entries(m2, "s2", archived)
 
             # Manually record both sigs in VECTOR_CACHE_INDEXED_ARCHIVES (as
             # index_docs would do in production)
@@ -144,7 +145,7 @@ class TestVectorCacheGate:
 
             # Touch s1 to make it MRU, then insert s3 → evicts s2 (LRU)
             _archived_bm25_entries(m1, "s1", archived)
-            r3, sig3, _ = _archived_bm25_entries(m3, "s3", archived)
+            _r3, sig3, _ = _archived_bm25_entries(m3, "s3", archived)
             # Simulate index_docs recording sig3 (as production does)
             with _VECTOR_CACHE_LOCK:
                 _VECTOR_CACHE_INDEXED_ARCHIVES[sig3] = None

@@ -13,6 +13,7 @@ across the transition, which is what most of this file pins.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -26,8 +27,10 @@ def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     main = tmp_path / "strategy_state.json"
     monkeypatch.setattr(ss, "_STRATEGY_STATE_PATH", str(main))
     ss._migrated.discard(str(main))
+    ss._warned_corrupt.clear()
     yield tmp_path
     ss._migrated.discard(str(main))
+    ss._warned_corrupt.clear()
 
 
 def _main(state_dir: Path) -> dict:
@@ -171,3 +174,78 @@ def test_hot_file_stays_small_after_split(state_dir: Path):
     cold = (state_dir / "experience_store.json").stat().st_size
     assert hot < cold / 10, f"hot file {hot} B is not decisively smaller than cold {cold} B"
     assert os.path.getsize(state_dir / "strategy_state.json") < 4096
+
+
+class TestMigrationPreservation:
+    """A re-run migration must never clobber a newer sidecar write.
+
+    The crash window documented on ``_migrate_split_namespaces`` leaves the
+    value in BOTH files; the sidecar is then the fresher one, so the move must
+    keep it (presence wins) instead of overwriting it with the stale main copy.
+    """
+
+    def test_migration_keeps_newer_sidecar_value(self, state_dir: Path):
+        (state_dir / "strategy_state.json").write_text(json.dumps({
+            "experience_store": [{"r": i} for i in range(200)],
+            "adaptive_hub": {"a": 1},
+        }), encoding="utf-8")
+        # A crashed migration already wrote the sidecar, and a later write
+        # updated it with NEWER records than main still holds.
+        (state_dir / "experience_store.json").write_text(json.dumps({
+            "experience_store": [{"r": "newer"}],
+        }), encoding="utf-8")
+        ss.write_namespace("adaptive_hub", {"a": 2})  # triggers the migration
+        assert _sidecar(state_dir)["experience_store"] == [{"r": "newer"}]
+        assert "experience_store" not in _main(state_dir)
+
+    def test_migration_heals_corrupt_sidecar_from_main_copy(self, state_dir: Path):
+        """A corrupt sidecar cannot be merged; main's copy is the only readable
+        one, so the move writes it and the atomic write heals the file."""
+        (state_dir / "strategy_state.json").write_text(json.dumps({
+            "experience_store": [{"r": i} for i in range(5)],
+            "adaptive_hub": {"a": 1},
+        }), encoding="utf-8")
+        (state_dir / "experience_store.json").write_text("{not json", encoding="utf-8")
+        ss.write_namespace("adaptive_hub", {"a": 2})
+        assert _sidecar(state_dir)["experience_store"] == [{"r": i} for i in range(5)]
+        assert "experience_store" not in _main(state_dir)
+
+
+class TestCorruption:
+    """A broken state file must never masquerade as empty state (A113)."""
+
+    LOGGER = "external_llm.editor.learning.strategy_state"
+
+    def test_corrupt_read_returns_none_with_warning(self, state_dir: Path, caplog):
+        (state_dir / "strategy_state.json").write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            assert ss.read_namespace("adaptive_hub") is None
+        assert any("corrupt JSON" in r.message and "strategy_state.json" in r.message
+                   for r in caplog.records)
+
+    def test_corrupt_write_is_refused_and_file_untouched(self, state_dir: Path, caplog):
+        """A corrupt file is never overwritten: its other namespaces would be
+        silently dropped by the merge, so writes refuse and surface it."""
+        p = state_dir / "strategy_state.json"
+        p.write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            assert ss.write_namespace("adaptive_hub", {"a": 1}) is False
+        assert p.read_text(encoding="utf-8") == "{not json"
+        assert any("corrupt JSON" in r.message for r in caplog.records)
+
+    def test_corrupt_warning_fires_once_per_path(self, state_dir: Path, caplog):
+        p = state_dir / "strategy_state.json"
+        p.write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            ss.read_namespace("adaptive_hub")
+            ss.read_namespace("adaptive_hub")
+            ss.write_namespace("adaptive_hub", {"a": 1})
+        assert sum("corrupt JSON" in r.message for r in caplog.records) == 1
+
+    def test_batch_aborts_on_corrupt_target(self, state_dir: Path, caplog):
+        p = state_dir / "strategy_state.json"
+        p.write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            assert ss.batch_write_namespaces({"adaptive_hub": {"a": 1}}) is False
+        assert p.read_text(encoding="utf-8") == "{not json"
+        assert any("corrupt JSON" in r.message for r in caplog.records)

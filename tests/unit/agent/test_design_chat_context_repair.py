@@ -15,7 +15,6 @@ design_chat_loop.py:993 -> the API call at :1010).
 import external_llm.agent.design_chat_loop as dcl
 from external_llm.client import LLMMessage
 
-
 # ── helpers ────────────────────────────────────────────────────────────────
 
 def _asst(call_ids: list[str], content: str = "") -> LLMMessage:

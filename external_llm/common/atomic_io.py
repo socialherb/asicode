@@ -8,10 +8,10 @@ Provides three primitives for crash-safe JSON writes:
 * :func:`write_namespace_json` -- read-merge-write a single key of a shared
   multi-namespace JSON file atomically, preserving other top-level keys.
 
-Both use the tempfile + ``os.replace`` (POSIX atomic rename) pattern that was
-previously duplicated -- with subtle, inconsistent differences -- across:
+All three writers share one pipeline (:func:`_atomic_replace`): sibling temp
+file + fsync + ``os.replace`` (POSIX atomic rename), which was previously
+duplicated -- with subtle, inconsistent differences -- across:
 
-  - external_llm/agent/session_state.py            (whole-file)
   - external_llm/agent/checkpoint_store.py          (whole-file, index)
   - external_llm/editor/learning/strategy_state.py  (namespace merge)
 
@@ -28,12 +28,16 @@ motivated this module.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import tempfile
 import time
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Optional, TextIO
+
+from .repo_files import invalidate_for_written_path
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +104,57 @@ def _sweep_once(base_dir: str) -> None:
     sweep_stale_temp_files(base_dir)
 
 
+def _atomic_replace(
+    path: Any,
+    suffix: str,
+    write_body: Callable[[TextIO], None],
+    *,
+    finalize: Optional[Callable[[str, str], None]] = None,
+    binary: bool = False,
+) -> None:
+    """Shared crash-safe write pipeline behind every public atomic writer.
+
+    Sibling temp file (same directory, so the rename stays on one filesystem)
+    -> *write_body* -> flush + fsync -> optional *finalize* (tmp_path, target)
+    -> ``os.replace`` -> repo-cache invalidation.  On ANY failure the temp file
+    is removed and the exception is re-raised, so the target is never left
+    truncated/partial if the process is interrupted mid-write (SIGKILL, disk
+    full, power loss).  Creates the parent directory if missing.
+
+    Args:
+        path: Target file path (``str`` or :class:`~pathlib.Path`).
+        suffix: Suffix for the temp file (``".tmp"``, ``".jsonl"``, ...).
+        write_body: Serializes the payload into the open temp handle.
+        finalize: Optional post-write hook called with ``(tmp_path, target)``
+            before the rename (e.g. mode preservation in
+            :func:`atomic_write_text`).
+        binary: Open the temp in binary mode (``"wb"``) and pass a bytes
+            payload to *write_body* (used by :func:`atomic_write_bytes`).
+    """
+    file_path = os.fspath(path)
+    base_dir = os.path.dirname(file_path) or "."
+    os.makedirs(base_dir, exist_ok=True)
+    _sweep_once(base_dir)  # reclaim leftovers from a previously killed process
+    fd, tmp_path = tempfile.mkstemp(dir=base_dir, prefix=".atomic_", suffix=suffix)
+    try:
+        if binary:
+            with os.fdopen(fd, "wb") as fh:
+                write_body(fh)
+                fh.flush()
+                os.fsync(fh.fileno())  # durability: ensure data is on disk before rename
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                write_body(fh)
+                fh.flush()
+                os.fsync(fh.fileno())  # durability: ensure data is on disk before rename
+        if finalize is not None:
+            finalize(tmp_path, file_path)
+        os.replace(tmp_path, file_path)
+        invalidate_for_written_path(file_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
 def atomic_write_json(
     path: Any,
     data: Any,
@@ -110,9 +165,9 @@ def atomic_write_json(
 ) -> None:
     """Atomically write ``data`` as JSON to ``path`` (whole-file replacement).
 
-    Writes to a sibling temp file then ``os.replace``-s it into place, so the
-    target is never left truncated/partial if the process is interrupted
-    mid-write (SIGKILL, disk full, power loss). Creates the parent directory if
+    Uses the shared :func:`_atomic_replace` pipeline — sibling temp file +
+    fsync + atomic rename — so the target is never left truncated/partial if
+    the process is interrupted mid-write. Creates the parent directory if
     missing.
 
     Args:
@@ -126,25 +181,15 @@ def atomic_write_json(
     Raises:
         OSError/IOError: on write or rename failure (temp file is cleaned up).
     """
-    file_path = os.fspath(path)
-    base_dir = os.path.dirname(file_path) or "."
-    os.makedirs(base_dir, exist_ok=True)
-    _sweep_once(base_dir)  # reclaim leftovers from a previously killed process
-    fd, tmp_path = tempfile.mkstemp(dir=base_dir, prefix=".atomic_", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(
-                data, fh, indent=indent, ensure_ascii=ensure_ascii, default=default,
-            )
-            fh.flush()
-            os.fsync(fh.fileno())  # durability: ensure data is on disk before rename
-        os.replace(tmp_path, file_path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    # NOTE: intentional near-duplicate of atomic_write_text's wrapper below
+    # (structural scanner: sim 0.85 shared-prefix -- both are the 3-line
+    # "def _write_body + _atomic_replace(path, .tmp, ...)" skeleton). Merging
+    # further would push format-specific serialization (json.dump kwargs vs
+    # plain write) into the shared core as knobs, for zero behavior gain.
+    def _write_body(fh: TextIO) -> None:
+        json.dump(data, fh, indent=indent, ensure_ascii=ensure_ascii, default=default)
+
+    _atomic_replace(path, ".tmp", _write_body)
 
 
 def atomic_write_jsonl(
@@ -159,9 +204,7 @@ def atomic_write_jsonl(
     Like :func:`atomic_write_json`, but for line-delimited JSON where each line
     is a separate JSON object and the file as a whole is *not* a single JSON
     value (e.g. ``run_history.jsonl``). Each record is serialized on its own
-    line into a sibling temp file, which is then ``os.replace``-d into place, so
-    a crash mid-write (SIGKILL, disk full, power loss) never leaves the target
-    truncated/partial. Creates the parent directory if missing.
+    line via the shared :func:`_atomic_replace` pipeline.
 
     Args:
         path: Target JSONL file path (``str`` or :class:`~pathlib.Path`).
@@ -174,36 +217,22 @@ def atomic_write_jsonl(
     Raises:
         OSError/IOError: on write or rename failure (temp file is cleaned up).
     """
-    file_path = os.fspath(path)
-    base_dir = os.path.dirname(file_path) or "."
-    os.makedirs(base_dir, exist_ok=True)
-    _sweep_once(base_dir)  # reclaim leftovers from a previously killed process
-    fd, tmp_path = tempfile.mkstemp(dir=base_dir, prefix=".atomic_", suffix=".jsonl")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            for rec in records:
-                fh.write(
-                    json.dumps(rec, ensure_ascii=ensure_ascii, default=default) + "\n"
-                )
-            fh.flush()
-            os.fsync(fh.fileno())  # durability: ensure data is on disk before rename
-        os.replace(tmp_path, file_path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    def _write_body(fh: TextIO) -> None:
+        for rec in records:
+            fh.write(
+                json.dumps(rec, ensure_ascii=ensure_ascii, default=default) + "\n"
+            )
+
+    _atomic_replace(path, ".jsonl", _write_body)
 
 
 def atomic_write_text(path: Any, content: str, *, mode: Any = None) -> None:
     """Atomically replace ``path`` with ``content`` (UTF-8 text, whole-file).
 
-    Sibling temp file → ``os.replace`` (POSIX atomic rename): a crash / SIGKILL /
-    disk-full mid-write never leaves the target truncated or partially written.
-    The temp is created in the SAME directory as the target (so the rename stays
-    on one filesystem), the parent directory is created if missing, and the temp
-    is always removed on failure.
+    Uses the shared :func:`_atomic_replace` pipeline — sibling temp file +
+    fsync + atomic rename — so a crash / SIGKILL / disk-full mid-write never
+    leaves the target truncated or partially written. Creates the parent
+    directory if missing, and the temp is always removed on failure.
 
     This is the plain-text analogue of :func:`atomic_write_json` and a faithful
     drop-in for ``open(path, "w")``-then-``write``: callers that rewrite a file's
@@ -235,35 +264,77 @@ def atomic_write_text(path: Any, content: str, *, mode: Any = None) -> None:
     Raises:
         OSError/IOError: on write or rename failure (temp file is cleaned up).
     """
-    file_path = os.fspath(path)
-    base_dir = os.path.dirname(file_path) or "."
-    os.makedirs(base_dir, exist_ok=True)
-    _sweep_once(base_dir)  # reclaim leftovers from a previously killed process
-    fd, tmp_path = tempfile.mkstemp(dir=base_dir, prefix=".atomic_", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
-            fh.flush()
-            os.fsync(fh.fileno())  # durability: data on disk before rename
-        if os.path.exists(file_path):
+    # Same intentional wrapper skeleton as atomic_write_json's (see the note
+    # there): identical structure, different body (plain write vs json.dump).
+    def _write_body(fh: TextIO) -> None:
+        fh.write(content)
+
+    def _finalize(tmp_path: str, target_path: str) -> None:
+        if os.path.exists(target_path):
             # Existing target: preserve its mode (exec bit, group/world perms):
             # see the permission note in the docstring above.
-            os.chmod(tmp_path, os.stat(file_path).st_mode)
+            os.chmod(tmp_path, os.stat(target_path).st_mode)
+        elif mode is None:
+            # New target: mirror open(path,"w") = 0o666 & ~umask so this is a
+            # faithful drop-in for the truncating write it replaces.
+            _um = os.umask(0)
+            os.umask(_um)
+            os.chmod(tmp_path, 0o666 & ~_um)
         else:
-            # New target: caller mode, or mirror open(path,"w") = 0o666 & ~umask
-            # so this is a faithful drop-in for the truncating write it replaces.
-            if mode is None:
-                _um = os.umask(0)
-                os.umask(_um)
-                mode = 0o666 & ~_um
             os.chmod(tmp_path, mode)
-        os.replace(tmp_path, file_path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+
+    _atomic_replace(path, ".tmp", _write_body, finalize=_finalize)
+
+
+def atomic_write_bytes(path: Any, data: bytes, *, mode: Any = None) -> None:
+    """Atomically replace ``path`` with ``data`` (raw bytes, whole-file).
+
+    The bytes analogue of :func:`atomic_write_text` — sibling temp file +
+    fsync + atomic rename — so a crash / SIGKILL / disk-full mid-write never
+    leaves the target truncated or partially written. Creates the parent
+    directory if missing, and the temp is always removed on failure.
+
+    Use when the caller already holds the exact bytes (e.g. text re-encoded
+    with the file's detected non-UTF-8 encoding) and must not round-trip them
+    through a UTF-8 text writer, which would alter every non-ASCII byte.
+    Encoding is the CALLER's responsibility: unlike :func:`atomic_write_text`
+    there is no implicit encode, so an encode failure happens before any file
+    I/O and never touches the target.
+
+    Permission handling mirrors :func:`atomic_write_text`:
+
+    * Existing target — the original mode (exec bit, group/world perms) is
+      preserved, so an executable script or a shared file keeps its bits.
+    * New target — ``0o666 & ~umask`` (pass ``mode`` to force specific bits).
+
+    Args:
+        path: Target file path (``str`` or :class:`~pathlib.Path`).
+        data: Full replacement payload (raw bytes).
+        mode: Optional permission bits for a NEWLY CREATED target (ignored when
+            the target already exists).
+
+    Raises:
+        OSError/IOError: on write or rename failure (temp file is cleaned up).
+    """
+    # Same intentional wrapper skeleton as atomic_write_text's (see the note
+    # there): identical structure, different body (raw bytes vs text).
+    def _write_body(fh) -> None:
+        fh.write(data)
+
+    def _finalize(tmp_path: str, target_path: str) -> None:
+        if os.path.exists(target_path):
+            # Existing target: preserve its mode (exec bit, group/world perms).
+            os.chmod(tmp_path, os.stat(target_path).st_mode)
+        elif mode is None:
+            # New target: mirror open(path,"wb") = 0o666 & ~umask so this is a
+            # faithful drop-in for the truncating write it replaces.
+            _um = os.umask(0)
+            os.umask(_um)
+            os.chmod(tmp_path, 0o666 & ~_um)
+        else:
+            os.chmod(tmp_path, mode)
+
+    _atomic_replace(path, ".tmp", _write_body, finalize=_finalize, binary=True)
 
 
 def write_namespace_json(
@@ -307,3 +378,4 @@ def write_namespace_json(
     atomic_write_json(
         file_path, data, indent=indent, ensure_ascii=ensure_ascii, default=default,
     )
+

@@ -112,8 +112,7 @@ def diff_plans(prev: Optional[dict[str, Any]], new: dict[str, Any]) -> str:
             changes.append(f"+'{_short_title(it['title'])}'")
         elif old != status:
             changes.append(f"'{_short_title(it['title'])}' {old}→{status}")
-    for title in prev_status:
-        changes.append(f"-'{_short_title(title)}'")
+    changes.extend(f"-'{_short_title(title)}'" for title in prev_status)
 
     head = "; ".join(changes) if changes else "no status changes"
     return f"Plan updated — {head} {tail}"

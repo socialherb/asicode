@@ -71,15 +71,77 @@ class TestPerformanceMetrics:
         assert cache_metrics["rag_cache"]["misses"] == 1
         assert cache_metrics["rag_cache"]["hit_rate"] == 2/3
 
-    @pytest.mark.skip(reason="record_agent_result not implemented in PerformanceCollector")
     def test_record_agent_result(self):
         """Test recording agent result metrics."""
-        pass
+        collector = PerformanceCollector()
 
-    @pytest.mark.skip(reason="record_agent_result not implemented in PerformanceCollector")
+        collector.record_agent_result(execution_time_ms=1000.0)
+        collector.record_agent_result(execution_time_ms=3000.0)
+
+        summary = collector.get_summary()
+        assert "agent_result" in summary
+        agent_result = summary["agent_result"]
+        assert agent_result["turns"] == 2
+        assert agent_result["failed_turns"] == 0
+        assert agent_result["truncated_turns"] == 0
+        assert agent_result["failure_rate"] == 0.0
+        assert agent_result["truncation_rate"] == 0.0
+        assert agent_result["avg_time_ms"] == 2000.0
+        assert agent_result["total_time_ms"] == 4000.0
+        # Recent window: 2 recorded success turns → healthy.
+        assert agent_result["recent_turns"] == 2
+        assert agent_result["recent_failed_turns"] == 0
+        assert agent_result["recent_truncated_turns"] == 0
+        assert agent_result["recent_failure_rate"] == 0.0
+        assert agent_result["recent_truncation_rate"] == 0.0
+
     def test_agent_result_failure(self):
-        """Test recording failed agent result."""
-        pass
+        """Test recording failed/truncated agent result."""
+        collector = PerformanceCollector()
+
+        collector.record_agent_result(failed=True, execution_time_ms=1500.0)
+        collector.record_agent_result(failed=True, truncated=True, execution_time_ms=500.0)
+        collector.record_agent_result(execution_time_ms=2500.0)
+
+        summary = collector.get_summary()
+        agent_result = summary["agent_result"]
+        assert agent_result["turns"] == 3
+        assert agent_result["failed_turns"] == 2
+        assert agent_result["truncated_turns"] == 1
+        assert agent_result["failure_rate"] == 2/3
+        assert agent_result["truncation_rate"] == 1/3
+        assert agent_result["avg_time_ms"] == 1500.0
+        assert agent_result["recent_turns"] == 3
+        # 3-value window encoding (0=success, 1=failed, 2=truncated): the
+        # failed+truncated turn classifies as truncated (precedence), so the
+        # window breakdown is 1 failed + 1 truncated + 1 success.
+        assert agent_result["recent_failed_turns"] == 1
+        assert agent_result["recent_truncated_turns"] == 1
+        assert agent_result["recent_failure_rate"] == 1/3
+        assert agent_result["recent_truncation_rate"] == 1/3
+
+    def test_agent_result_truncation_storm_recent_window(self):
+        """B1 regression: a truncation storm must NOT read as success in the
+        recent live-health window.
+
+        Before the 3-value window encoding, ``record_agent_result(truncated=True)``
+        recorded ``1 if failed else 0`` → truncated turns landed as 0 (success)
+        and ``recent_failure_rate`` stayed healthy while the run was being
+        silently cut off at every turn.
+        """
+        collector = PerformanceCollector()
+        for _ in range(10):
+            collector.record_agent_result(truncated=True, execution_time_ms=800.0)
+
+        summary = collector.get_summary()
+        agent_result = summary["agent_result"]
+        assert agent_result["turns"] == 10
+        assert agent_result["truncated_turns"] == 10
+        assert agent_result["recent_turns"] == 10
+        assert agent_result["recent_failed_turns"] == 0
+        assert agent_result["recent_truncated_turns"] == 10
+        assert agent_result["recent_failure_rate"] == 0.0
+        assert agent_result["recent_truncation_rate"] == 1.0
 
     def test_tool_call_error_recording(self):
         """Test recording tool call errors (failed=not result.ok path).

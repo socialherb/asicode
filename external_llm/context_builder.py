@@ -17,15 +17,56 @@ Compatibility:
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import time
-import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Optional
 
-from .languages.capabilities import AnalysisCapability, is_supported
 from common import normalize_rel_path_fast
+from path_security import resolve_inside_repo
+from utils.string_helper import utf8_trailing_incomplete_len
+
+from .agent.agent_context_manager import get_git_snapshot
+from .languages.capabilities import AnalysisCapability, is_supported
+
 logger = logging.getLogger(__name__)
+
+# P21-3: file-context blocks are head-bounded. The builder used to read,
+# line-number and embed the WHOLE file (and each related file) into the LLM
+# context — a multi-hundred-MB target flooded the prompt. Same class as
+# P19-1/P21-1 (webapp + service.py snippet paths); truncated reads carry an
+# explicit marker so the model knows it only sees the head.
+_FILE_CONTEXT_MAX_BYTES = 1024 * 1024  # 1 MiB
+
+# P21-3: line-numbering expands the head (~1.6-2.5x with the "N | " prefix),
+# so the OUTPUT is capped too — a 1 MiB head of short lines would otherwise
+# still grow into a multi-MB prompt block. 5000 numbered lines ≈ 70-90 KB.
+_FILE_CONTEXT_MAX_LINES = 5000
+
+
+def _bounded_file_text(p: Path, max_bytes: int = _FILE_CONTEXT_MAX_BYTES) -> tuple[str, bool]:
+    """Read up to ``max_bytes`` of ``p`` (UTF-8, latin-1 fallback).
+
+    Returns ``(text, truncated)``; never loads more than ``max_bytes`` into
+    memory and never splits a multi-byte UTF-8 char at the cut.
+    """
+    size = p.stat().st_size
+    if size <= max_bytes:
+        try:
+            return p.read_text(encoding="utf-8"), False
+        except UnicodeDecodeError:
+            return p.read_text(encoding="latin-1"), False
+    with p.open("rb") as f:
+        raw = f.read(max_bytes)
+    trim = utf8_trailing_incomplete_len(raw)
+    if trim:
+        raw = raw[:-trim]
+    try:
+        return raw.decode("utf-8"), True
+    except UnicodeDecodeError:
+        return raw.decode("latin-1"), True
 
 # Process-wide TTL cache for project-structure hints.  Computing this scans
 # every top-level directory recursively via rglob (~95ms on a ~900-file repo)
@@ -40,6 +81,46 @@ _STRUCTURE_HINTS_TTL_S = 300.0
 # runners spinning up temp dirs); single-repo services never reach it.
 _STRUCTURE_HINTS_GC_THRESHOLD = 16
 _structure_hints_cache: dict[str, tuple[str, float]] = {}
+
+# Process-wide TTL cache for the recent-commits fetch
+# (`git log -N --oneline --decorate`, one subprocess spawn per miss).  The git
+# STATUS half of build_context() delegates to agent_context_manager's
+# get_git_snapshot SSOT (10s per-root TTL, invalidated after every successful
+# mutating tool call) — but that snapshot only carries the single last_commit,
+# so the decorated N-commit log keeps this small cache of its own.  Commits
+# change rarely (and only via mutating tool calls); 2s of advisory staleness is
+# far below any agent-visible threshold, and the (repo_root, count) key
+# isolates projects exactly like _structure_hints_cache.
+_GIT_LOG_TTL_S = 2.0
+# Opportunistic-eviction trigger, same shape as _STRUCTURE_HINTS_GC_THRESHOLD.
+_GIT_LOG_GC_THRESHOLD = 32
+_git_log_cache: dict[tuple[str, int], tuple[str, float]] = {}
+
+
+def _cached_git_log(repo_root: Path, count: int, fetch: Callable[[int], str]) -> str:
+    """TTL-cached wrapper around a ``git log -N`` fetch.
+
+    ``fetch`` runs only on a miss; its result (including the empty-string
+    failure sentinel) is cached for ``_GIT_LOG_TTL_S`` seconds.  Expired
+    entries are purged opportunistically once the cache exceeds the GC
+    threshold, mirroring _structure_hints_cache to bound memory in processes
+    that touch many distinct repo roots (e.g. test runners).
+    """
+    key = (str(repo_root), count)
+    now = time.monotonic()
+    cached = _git_log_cache.get(key)
+    if cached is not None:
+        value, expiry = cached
+        if expiry > now:
+            return value
+        _git_log_cache.pop(key, None)
+    if len(_git_log_cache) > _GIT_LOG_GC_THRESHOLD:
+        for _k, (_v, _exp) in list(_git_log_cache.items()):
+            if _exp <= now:
+                _git_log_cache.pop(_k, None)
+    value = fetch(count)
+    _git_log_cache[key] = (value, now + _GIT_LOG_TTL_S)
+    return value
 
 
 class EnhancedContextBuilder:
@@ -127,23 +208,19 @@ class EnhancedContextBuilder:
         return "\n".join(parts) if parts else ""
 
     def _get_git_status(self) -> str:
-        try:
-            result = subprocess.run(
-                # core.quotePath=false: this block goes into the model's
-                # context, and git C-quotes non-ASCII paths by default.
-                ["git", "-c", "core.quotePath=false", "status", "--short"],
-                cwd=str(self.repo_root),
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
-        except Exception as e:
-            logger.debug(f"Git status failed: {e}")
-        return ""
+        # Delegate to the shared get_git_snapshot SSOT (agent_context_manager):
+        # it already runs `git -c core.quotePath=false status --short` with a
+        # 10s per-root TTL that is invalidated after every successful mutating
+        # tool call — fresher than any private cache, and one subprocess spawn
+        # fewer per build_context() call.
+        return get_git_snapshot(str(self.repo_root)).get("status", "")
 
     def _get_recent_commits(self, count: int = 3) -> str:
+        # The SSOT snapshot carries only the single last_commit; the decorated
+        # N-commit log keeps its own small TTL cache (see _cached_git_log).
+        return _cached_git_log(self.repo_root, count, self._fetch_recent_commits)
+
+    def _fetch_recent_commits(self, count: int) -> str:
         try:
             result = subprocess.run(
                 ["git", "log", f"-{count}", "--oneline", "--decorate"],
@@ -151,24 +228,27 @@ class EnhancedContextBuilder:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                check=False,
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()
         except Exception as e:
-            logger.debug(f"Git log failed: {e}")
+            logger.debug("Git log failed: %s", e)
         return ""
 
     def _build_file_context(self, rel_path: str) -> str:
         try:
             file_path = self.repo_root / rel_path
             if not file_path.exists():
-                logger.warning(f"File not found: {rel_path}")
+                logger.warning("File not found: %s", rel_path)
                 return ""
 
+            # P21-3: head-bounded read — see _FILE_CONTEXT_MAX_BYTES.
             try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                content = file_path.read_text(encoding="latin-1")
+                content, truncated = _bounded_file_text(file_path)
+            except OSError:
+                logger.warning("File read failed: %s", rel_path)
+                return ""
 
             lines = content.split("\n")
             total = len(lines)
@@ -176,15 +256,20 @@ class EnhancedContextBuilder:
 
             out: list[str] = []
             out.append(f"```{lang}")
-            for i, line in enumerate(lines, 1):
+            for i, line in enumerate(lines[:_FILE_CONTEXT_MAX_LINES], 1):
                 out.append(f"{i:4d} | {line}")
+            if len(lines) > _FILE_CONTEXT_MAX_LINES:
+                out.append(f"    ... (more lines omitted — showing first {_FILE_CONTEXT_MAX_LINES})")
             out.append("```")
             out.append("")
-            out.append(f"**Total lines**: {total}")
+            if truncated or len(lines) > _FILE_CONTEXT_MAX_LINES:
+                out.append(f"**Total lines**: >={total} (head only — file exceeds 1 MiB)")
+            else:
+                out.append(f"**Total lines**: {total}")
 
             return "\n".join(out)
         except Exception as e:
-            logger.error(f"Failed to build file context for {rel_path}: {e}")
+            logger.exception("Failed to build file context for %s: %s", rel_path, e)
             return ""
 
     def _build_related_files_context(
@@ -204,14 +289,15 @@ class EnhancedContextBuilder:
                     continue
 
                 try:
-                    try:
-                        content = file_path.read_text(encoding="utf-8")
-                    except UnicodeDecodeError:
-                        content = file_path.read_text(encoding="latin-1")
+                    # P21-3: head-bounded read per related file.
+                    content, truncated = _bounded_file_text(file_path)
                 except Exception:
+                    logger.debug("related file read failed: %s", rel_file, exc_info=True)
                     continue
 
                 snippet = content
+                if truncated:
+                    snippet += "\n...[TRUNCATED — head only]..."
 
                 lang = self._detect_language(rel_file)
 
@@ -224,7 +310,7 @@ class EnhancedContextBuilder:
 
             return "\n".join(parts) if parts else ""
         except Exception as e:
-            logger.debug(f"Failed to build related files context: {e}")
+            logger.debug("Failed to build related files context: %s", e)
             return ""
 
     def _find_related_files(self, target_file: str, max_files: int) -> list[str]:
@@ -244,11 +330,15 @@ class EnhancedContextBuilder:
             if related:
                 return related[:max_files]
         except Exception as e:
-            logger.debug(f"context_collector unavailable or failed, falling back: {e}")
+            logger.debug("context_collector unavailable or failed, falling back: %s", e)
 
         # 2) Fallback: simple Python import parsing
         try:
-            file_path = self.repo_root / target_file
+            # P22-2: containment guard — target_file must not escape the repo.
+            try:
+                file_path = resolve_inside_repo(str(self.repo_root), str(target_file))
+            except ValueError:
+                return []
             if not file_path.exists() or not file_path.is_file():
                 return []
 
@@ -256,9 +346,10 @@ class EnhancedContextBuilder:
                 return []
 
             try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                content = file_path.read_text(encoding="latin-1")
+                # P21-3: import scanning only needs the head.
+                content, _trunc = _bounded_file_text(file_path)
+            except (OSError, UnicodeDecodeError, ValueError):  # unreadable target
+                return []
 
             related: list[str] = []
 
@@ -291,7 +382,7 @@ class EnhancedContextBuilder:
 
             return related[:max_files]
         except Exception as e:
-            logger.debug(f"Failed to find related files: {e}")
+            logger.debug("Failed to find related files: %s", e)
             return []
 
     def _get_project_structure_hints(self) -> str:
@@ -315,7 +406,7 @@ class EnhancedContextBuilder:
         try:
             dirs: list[str] = []
             files: list[str] = []
-            for item in self.repo_root.iterdir():
+            for item in sorted(self.repo_root.iterdir(), key=lambda p: p.name.lower()):
                 if item.name.startswith("."):
                     continue
                 if item.is_dir():
@@ -339,7 +430,7 @@ class EnhancedContextBuilder:
                 parts.extend(files[:5])
                 parts.append("```")
         except Exception as e:
-            logger.debug(f"Failed to get project structure: {e}")
+            logger.debug("Failed to get project structure: %s", e)
             # Don't cache failures — let the next call retry.
             return ""
         result = "\n".join(parts) if parts else ""

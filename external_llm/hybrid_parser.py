@@ -43,7 +43,7 @@ class HybridOutputParser:
     def parse(self, llm_output: str, expected_mode: OutputMode) -> ParseResult:
         """Parse LLM output"""
 
-        logger.info(f"Parsing (expected={expected_mode.value})")
+        logger.info("Parsing (expected=%s)", expected_mode.value)
 
         #NEEDS_DISAMBIGUATION check
         if "NEEDS_DISAMBIGUATION" in llm_output:
@@ -114,10 +114,7 @@ class HybridOutputParser:
         pattern = r'```diff\s*\n(.*?)\n```'
         matches = re.findall(pattern, text, re.DOTALL)
 
-        if matches:
-            diff = matches[0].strip()
-        else:
-            diff = text.strip()
+        diff = matches[0].strip() if matches else text.strip()
 
         if not diff:
             return ParseResult(success=False, error="No diff found")

@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from plan_compiler import PlanCompileError, compile_plan_to_unified_diff
+from plan_compiler import (
+    PlanCompileError,
+    _has_lno_prefix,
+    _strip_lno_prefix,
+    _strip_lno_prefix_no_space,
+    _strip_lno_prefixes,
+    compile_plan_to_unified_diff,
+)
 from tests.integration.helpers import create_test_file, git_add_and_commit
 
 
@@ -877,3 +884,48 @@ class TestReplaceFileGuardHonorsStagedState:
         }
         with pytest.raises(PlanCompileError, match="accidental content loss"):
             compile_plan_to_unified_diff(plan=plan, repo_root=temp_repo_root)
+
+
+@pytest.mark.integration
+class TestLnoPrefixStrip:
+    """Unit coverage for the shared line-number-prefix helpers.
+
+    R3: _has_lno_prefix / _strip_lno_prefix / _strip_lno_prefix_no_space were
+    consolidated around one prefix-detection helper (_lno_prefix_colon_idx);
+    these tests pin the exact strip semantics so the consolidation cannot
+    change behavior (esp. the allow_space=False variant used by
+    insert_after_line).
+    """
+
+    def test_has_lno_prefix_detects_digit_colon(self):
+        assert _has_lno_prefix("  28: code") is True
+        assert _has_lno_prefix("28:\tcode") is True
+        assert _has_lno_prefix("28:code") is True
+
+    def test_has_lno_prefix_rejects_non_prefix(self):
+        assert _has_lno_prefix("code: here") is False   # colon not preceded by digits
+        assert _has_lno_prefix(":code") is False        # colon at index 0
+        assert _has_lno_prefix("plain line") is False
+        assert _has_lno_prefix("") is False
+
+    def test_strip_lno_prefix_default_strips_space(self):
+        assert _strip_lno_prefix("  28: code") == "code"
+        assert _strip_lno_prefix("28: code") == "code"
+        assert _strip_lno_prefix("28:\tcode") == "code"
+        assert _strip_lno_prefix("28:  code") == " code"   # only ONE space consumed
+
+    def test_strip_lno_prefix_no_prefix_unchanged(self):
+        assert _strip_lno_prefix("plain line") == "plain line"
+        assert _strip_lno_prefix("28 : code") == "28 : code"   # space before colon
+
+    def test_strip_lno_prefix_no_space_keeps_space(self):
+        """insert_after_line payload indentation must survive verbatim."""
+        assert _strip_lno_prefix_no_space("28: code") == " code"
+        assert _strip_lno_prefix_no_space("  28: code") == " code"
+        assert _strip_lno_prefix_no_space("28:\tcode") == "code"
+        assert _strip_lno_prefix_no_space("plain line") == "plain line"
+
+    def test_strip_lno_prefixes_majority_gate(self):
+        """_strip_lno_prefixes only strips when >=50% of non-empty lines match."""
+        assert _strip_lno_prefixes("  28: a\n  29: b\n") == "a\nb\n"
+        assert _strip_lno_prefixes("  28: a\nplain b\nplain c\n") == "  28: a\nplain b\nplain c\n"  # 1/3 < 50%

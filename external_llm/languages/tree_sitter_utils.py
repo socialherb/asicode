@@ -7,30 +7,43 @@ so callers can fall back to regex-based heuristics.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
 import threading
-from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional
+
+from external_llm.languages.models import _EXT_MAP, LanguageId
 
 logger = logging.getLogger(__name__)
 
 # ── Optional import ──────────────────────────────────────────────────────────
 
 _HAS_TREE_SITTER = False
-try:
+with contextlib.suppress(ImportError):
     import tree_sitter as _ts
 
     _HAS_TREE_SITTER = True
-except ImportError:
-    pass
 
 # Language module cache: language name → tree_sitter.Language object (thread-safe)
 _LANG_CACHE: dict[str, object] = {}
 _LANG_CACHE_LOCK = threading.RLock()
+
+# One lock per language, so a cold resolve serialises only the threads asking
+# for THAT language. _LANG_CACHE_LOCK guards this dict itself and nothing slow;
+# see _get_language for why the resolve must not run under it.
+#
+# Growth matches _LANG_CACHE exactly — one entry per distinct language string
+# ever requested, both unbounded by the same argument (a failed resolve is
+# negative-cached, so a given string is only ever resolved once). Entries are
+# not reclaimed after resolution on purpose: dropping one lets a thread that
+# arrives before the cache store build a second lock and duplicate a resolve
+# that can cost half a second.
+_LANG_RESOLVE_LOCKS: dict[str, threading.Lock] = {}
 
 # Parser cache: per-thread. tree-sitter's TSParser is stateful and NOT thread-safe
 # ("not safe to call ts_parser_parse from multiple threads at once" — api.h).
@@ -78,8 +91,8 @@ _MAX_CACHED_SOURCE_CHARS = 64 * 1024
 
 
 # Memoised UTF-8 encoding: the same content is encoded by query_captures,
-# query_matches, extract_import_names, and find_anchor_node.  Caching avoids
-# re-encoding the same file 4 times per scan pipeline.
+# query_matches, and extract_import_names.  Caching avoids
+# re-encoding the same file multiple times per scan pipeline.
 @lru_cache(maxsize=32)
 def _encode_content_cached(content: str) -> bytes:
     return content.encode("utf-8")
@@ -101,96 +114,13 @@ def _encode_content(content: str) -> bytes:
 _IMPORT_KW_RE = re.compile(r"^import\s+")
 
 
-# Map our language ids to the tree-sitter language module import path
-_LANG_MODULE_MAP = {
-    "typescript": "tree_sitter_typescript",
-    "tsx": "tree_sitter_typescript",  # same package exports language_tsx()
-    "javascript": "tree_sitter_javascript",
-    "go": "tree_sitter_go",
-    "java": "tree_sitter_java",
-    "kotlin": "tree_sitter_kotlin",
-    "python": "tree_sitter_python",
-    "html": "tree_sitter_html",
-    "css": "tree_sitter_css",
-    # Full AST support (symbol/call/import queries available)
-    "rust": "tree_sitter_rust",
-    "c": "tree_sitter_c",
-    "cpp": "tree_sitter_cpp",
-    "ruby": "tree_sitter_ruby",
-    "php": "tree_sitter_php",
-    "c_sharp": "tree_sitter_c_sharp",
-    "swift": "tree_sitter_swift",
-    "scala": "tree_sitter_scala",
-    "lua": "tree_sitter_lua",
-    "bash": "tree_sitter_bash",
-}
-# JS/TS file-extension → tree-sitter grammar key mapping.
-# Single source of truth so that code_integrity.py, base.py, and other callers
-# don't duplicate this logic.
-_EXT_TO_GRAMMAR_KEY: dict[str, str] = {
-    # JS/TS
-    ".ts": "typescript",
-    ".tsx": "tsx",
-    ".mts": "typescript",
-    ".cts": "typescript",
-    ".js": "javascript",
-    ".jsx": "javascript",
-    ".mjs": "javascript",
-    ".cjs": "javascript",
-    # Go / Java / Kotlin / Python
-    ".go": "go",
-    ".java": "java",
-    ".kt": "kotlin",
-    ".kts": "kotlin",
-    ".py": "python",
-    ".pyi": "python",
-    # C / C++ family
-    ".c": "c",
-    ".h": "c",
-    ".cpp": "cpp",
-    ".cc": "cpp",
-    ".cxx": "cpp",
-    ".hpp": "cpp",
-    ".hh": "cpp",
-    # Other full-AST languages (symbol / call / import queries available)
-    ".rs": "rust",
-    ".rb": "ruby",
-    ".php": "php",
-    ".cs": "c_sharp",
-    ".swift": "swift",
-    ".scala": "scala",
-    ".sc": "scala",
-    ".lua": "lua",
-    ".sh": "bash",
-    ".bash": "bash",
-    ".zsh": "bash",
-    ".ksh": "bash",
-}
-
-
-def grammar_key_for_path(file_path: str) -> str | None:
-    """Return tree-sitter grammar key for *file_path*, or ``None`` for unknown extensions.
-
-    Single canonical mapping for file extension → tree-sitter grammar key.
-    Covers all languages with full AST query support (symbol, call, import, reference queries).
-
-    ``None`` tells the caller to use its own default (typically ``"typescript"``
-    or ``lang_id.value``), so this function stays a pure extension-to-key mapper
-    without imposing a fallback policy.
-    """
-    if not file_path:
-        return None
-    return _EXT_TO_GRAMMAR_KEY.get(os.path.splitext(file_path)[1].lower())
-
-
-def grammar_key_for_ext(ext: str) -> str | None:
-    """Return tree-sitter grammar key for a file *ext* (including leading dot), or ``None``.
-
-    Same canonical mapping as :func:`grammar_key_for_path` but takes a bare extension
-    (e.g. ``.tsx``, ``.go``) instead of a full file path.  Use when the caller already
-    has the extension and wants to avoid constructing a dummy path.
-    """
-    return _EXT_TO_GRAMMAR_KEY.get(ext.lower())
+# The grammar key → tree-sitter module import path map (_LANG_MODULE_MAP) is
+# DERIVED below, after the per-language query maps — its domain is defined by
+# them (see the "grammar key → tree-sitter module map (DERIVED)" section).
+# extension → grammar-key map (_EXT_TO_GRAMMAR_KEY) and the
+# grammar_key_for_path / grammar_key_for_ext helpers: DERIVED from _EXT_MAP
+# after the per-language query maps below (the query maps define which
+# languages have full AST support, so the map must follow them).
 
 
 # ── tree-sitter-language-pack fallback ───────────────────────────────────────
@@ -217,6 +147,7 @@ def _resolve_lang_pack():
 
         _LANG_PACK_GET_LANGUAGE = _gl
     except ImportError:
+        logger.debug("tree_sitter_language_pack unavailable; grammar lookups will fail", exc_info=True)
         _LANG_PACK_GET_LANGUAGE = None
     return _LANG_PACK_GET_LANGUAGE
 
@@ -258,6 +189,13 @@ _SYMBOL_NODE_TYPES = {
     # Java / Kotlin
     "constructor_declaration",
     "object_declaration",
+    # C# — the active tree-sitter-csharp grammar emits method_declaration
+    # (shared with Go, above) for class methods and local_function_statement
+    # for top-level methods / local functions (both carry a "name" field,
+    # probed). Without local_function_statement C# top-level methods were
+    # never extracted, so Allman/K&R method headers were invisible to
+    # _find_block_end_line.
+    "local_function_statement",
     # Python
     "function_definition",
     "class_definition",
@@ -616,6 +554,140 @@ _REFERENCE_QUERIES: dict[str, str] = {
 
 
 _REFERENCE_QUERIES["tsx"] = _REFERENCE_QUERIES["typescript"]
+
+
+# ── extension → grammar key (DERIVED) ───────────────────────────────────────
+# _EXT_TO_GRAMMAR_KEY used to be a hand-written parallel of _EXT_MAP
+# (languages/models.py — the package's canonical extension → language map).
+# It is now DERIVED so the ext → language → grammar-key chain cannot drift:
+#   * domain — extensions whose language has full AST query support, defined
+#     by the four query maps above (a grammar key present in all four is
+#     full-AST; parse-only JSON/CSS/HTML get no entry);
+#   * key — the LanguageId value, except the single documented override
+#     (.tsx parses with the separate "tsx" grammar of the same package).
+# Import-time fail-fast (see _derive_ext_to_grammar_key): an override key
+# with no query maps, or a derived key missing from _LANG_MODULE_MAP, is a
+# hard error — the latter would otherwise resolve through the language-pack
+# download fallback AND read as unavailable to is_language_available(), so
+# the gate's fail-closed probe would fail on a resolvable grammar.
+_GRAMMAR_KEY_OVERRIDES: dict[str, str] = {".tsx": "tsx"}
+
+_FULL_AST_GRAMMAR_KEYS: frozenset[str] = (
+    frozenset(_SYMBOL_QUERIES)
+    & frozenset(_CALL_QUERIES)
+    & frozenset(_IMPORT_QUERIES)
+    & frozenset(_REFERENCE_QUERIES)
+)
+
+
+# ── grammar key → tree-sitter module map (DERIVED) ──────────────────────────
+# _LANG_MODULE_MAP used to be a hand-written 19-entry literal.  It is now
+# DERIVED so its key set cannot drift from the query maps:
+#   * domain — every full-AST grammar key (the four query maps' intersection,
+#     _FULL_AST_GRAMMAR_KEYS) plus the parse-only keys editing/symbol tooling
+#     still parses with tree-sitter (_PARSE_ONLY_GRAMMAR_KEYS: html/css walk
+#     the syntax tree without queries).  JSON is deliberately NOT included —
+#     nothing parses .json with tree-sitter (see is_language_available).
+#   * value — the standard tree_sitter_<key> import convention, except the
+#     single documented override (tsx's grammar lives in the typescript
+#     package, which exports language_typescript() AND language_tsx()).
+# Import-time fail-fast: a domain key that is neither a LanguageId value nor
+# the tsx alias is a hard error — a typo'd query-map key or parse-only entry
+# would otherwise build a phantom tree_sitter_<typo> module path that only
+# fails at first parse.
+_PARSE_ONLY_GRAMMAR_KEYS: frozenset[str] = frozenset({"html", "css"})
+
+_MODULE_NAME_OVERRIDES: dict[str, str] = {"tsx": "typescript"}
+
+
+def _derive_lang_module_map() -> dict[str, str]:
+    """Derive the grammar key → tree-sitter module import path map.
+
+    Domain: _FULL_AST_GRAMMAR_KEYS | _PARSE_ONLY_GRAMMAR_KEYS; values follow
+    the tree_sitter_<key> convention except _MODULE_NAME_OVERRIDES.  Raises
+    ValueError (import time) on a domain key that is neither a LanguageId
+    value nor the tsx alias.
+    """
+    language_values = {member.value for member in LanguageId}
+    out: dict[str, str] = {}
+    for key in sorted(_FULL_AST_GRAMMAR_KEYS | _PARSE_ONLY_GRAMMAR_KEYS):
+        if key != "tsx" and key not in language_values:
+            raise ValueError(
+                f"grammar key {key!r} is not a LanguageId value — a typo'd "
+                "query-map key or _PARSE_ONLY_GRAMMAR_KEYS entry "
+                "(LanguageId, external_llm/languages/models.py)"
+            )
+        out[key] = f"tree_sitter_{_MODULE_NAME_OVERRIDES.get(key, key)}"
+    return out
+
+
+_LANG_MODULE_MAP: dict[str, str] = _derive_lang_module_map()
+
+
+def _derive_ext_to_grammar_key() -> dict[str, str]:
+    """Derive the extension → grammar-key map from ``_EXT_MAP``.
+
+    Every extension whose language has full AST query support (present in all
+    four query maps) maps to that language's value, except the ``.tsx``
+    override.  Raises ValueError (import time) on an override key without
+    query maps or a derived key missing from ``_LANG_MODULE_MAP``.
+    """
+    out: dict[str, str] = {}
+    for ext, name in _EXT_MAP.items():
+        try:
+            value = LanguageId[name].value
+        except KeyError:
+            raise ValueError(
+                f"_EXT_MAP[{ext!r}] = {name!r} is not a LanguageId member "
+                "(external_llm/languages/models.py)"
+            ) from None
+        if value not in _FULL_AST_GRAMMAR_KEYS:
+            continue  # parse-only language (JSON/CSS/HTML): no grammar-key entry
+        key = _GRAMMAR_KEY_OVERRIDES.get(ext, value)
+        if key not in _FULL_AST_GRAMMAR_KEYS:
+            raise ValueError(
+                f"grammar-key override {ext!r} -> {key!r} has no query maps "
+                "(tree_sitter_utils _SYMBOL/_CALL/_IMPORT/_REFERENCE_QUERIES)"
+            )
+        if key not in _LANG_MODULE_MAP:
+            raise ValueError(
+                f"grammar key {key!r} (for {ext!r}) has no entry in "
+                "_LANG_MODULE_MAP — is_language_available() would report it "
+                "missing and the gate would fail closed on a resolvable grammar"
+            )
+        out[ext] = key
+    return out
+
+
+_EXT_TO_GRAMMAR_KEY: dict[str, str] = _derive_ext_to_grammar_key()
+
+
+def grammar_key_for_path(file_path: str) -> str | None:
+    """Return tree-sitter grammar key for *file_path*, or ``None`` for unknown extensions.
+
+    Single canonical mapping for file extension → tree-sitter grammar key
+    (derived from ``_EXT_MAP``; see above).
+    Covers all languages with full AST query support (symbol, call, import, reference queries).
+
+    ``None`` tells the caller to use its own default (typically ``"typescript"``
+    or ``lang_id.value``), so this function stays a pure extension-to-key mapper
+    without imposing a fallback policy.
+    """
+    if not file_path:
+        return None
+    return _EXT_TO_GRAMMAR_KEY.get(os.path.splitext(file_path)[1].lower())
+
+
+def grammar_key_for_ext(ext: str) -> str | None:
+    """Return tree-sitter grammar key for a file *ext* (including leading dot), or ``None``.
+
+    Same canonical mapping as :func:`grammar_key_for_path` but takes a bare extension
+    (e.g. ``.tsx``, ``.go``) instead of a full file path.  Use when the caller already
+    has the extension and wants to avoid constructing a dummy path.
+    """
+    return _EXT_TO_GRAMMAR_KEY.get(ext.lower())
+
+
 def get_available_languages() -> set[str]:
     """Return set of language names whose tree-sitter bindings are installed.
 
@@ -658,63 +730,128 @@ def is_available() -> bool:
     return _HAS_TREE_SITTER
 
 
+def _resolve_language_uncached(language: str) -> object | None:
+    """Import and build the Language object for *language*. Never touches a cache.
+
+    Split out of :func:`_get_language` so the slow part runs with NO lock held.
+
+    The cost that motivates the split is the FIRST-EVER resolve of a language on
+    a given machine, which the language-pack fallback pays to materialise the
+    prebuilt grammar before caching it on disk. Measured here, first ever:
+    ocaml 660 ms, nim 587 ms, crystal 583 ms, erlang 550 ms. Every later
+    process loads the same grammars in well under 1 ms, so this is a first-run
+    effect and not a steady-state one — do not quote these numbers as a
+    recurring per-process cost.
+
+    It still matters, for two reasons. pyproject declares only
+    ``tree-sitter-language-pack`` (no standalone ``tree_sitter_<lang>``
+    packages), so on a clean user install EVERY language resolves through the
+    except-branch below and pays this once — a dev machine with standalone
+    grammar packages installed takes the fast branch and hides it entirely.
+    And a mixed-language repo indexed in parallel hits several of these at
+    once, which under a global lock serialised them AND every unrelated cache
+    hit behind them.
+    """
+    # All languages are imported in the order registered in _LANG_MODULE_MAP.
+    # Unregistered languages also fall back via standard naming convention (tree_sitter_<lang>).
+    # Also handles non-standard modules using language_<lang>() naming like PHP.
+    module_name = _LANG_MODULE_MAP.get(language) or f"tree_sitter_{language}"
+
+    try:
+        import importlib
+
+        mod = importlib.import_module(module_name)
+        # tree-sitter-typescript exposes .language_typescript() and .language_tsx()
+        if language == "typescript":
+            raw = mod.language_typescript()
+        elif language == "tsx":
+            raw = mod.language_tsx()
+        else:
+            # Standard convention: module.language()
+            try:
+                raw = mod.language()
+            except AttributeError:
+                # Fallback for modules (e.g., tree-sitter-php) that use
+                # module.language_<lang>() naming convention
+                raw = getattr(mod, f"language_{language}")()
+        # tree-sitter ≥0.23 returns PyCapsule; wrap with Language()
+        if not isinstance(raw, _ts.Language):
+            raw = _ts.Language(raw)
+    except (ImportError, AttributeError, TypeError) as e:
+        # Fallback: tree-sitter-language-pack bundles 300+ prebuilt grammars
+        # behind a unified get_language() API. Used when individual
+        # tree_sitter_<lang> modules are not installed. (c_sharp → csharp
+        # is the only id that differs from our naming.)
+        lp = _resolve_lang_pack()
+        if lp is not None:
+            try:
+                raw = lp(_LANG_PACK_ALIASES.get(language, language))
+            except Exception as e2:  # pack may lack the grammar
+                logger.debug(
+                    "tree-sitter language-pack %s not available: %s", language, e2
+                )
+            else:
+                if not isinstance(raw, _ts.Language):
+                    raw = _ts.Language(raw)
+                return raw
+        logger.debug("tree-sitter language %s not available: %s", language, e)
+        return None
+    else:
+        return raw
+
+
 def _get_language(language: str) -> object | None:
-    """Get a tree-sitter Language object for *language*, or None (thread-safe)."""
+    """Get a tree-sitter Language object for *language*, or None (thread-safe).
+
+    The resolution runs OUTSIDE ``_LANG_CACHE_LOCK``. Holding that global lock
+    across the import made one thread's first-ever resolve of a language block
+    every other thread's *cache hit* for an unrelated language: measured, a
+    first-ever ``haskell`` resolve blocked an already-cached ``python`` lookup
+    on another thread for 587 ms. That is the hot parse path — ``get_parser``
+    is called from thread-pool workers, and a mixed-language repo resolves
+    several grammars concurrently. See :func:`_resolve_language_uncached` for
+    why the expensive case is first-run rather than per-process.
+
+    Concurrency is handled in two layers instead:
+
+      * a per-language resolve lock, so N threads asking for the same cold
+        language do the work once rather than N times — while a thread asking
+        for a DIFFERENT language is never blocked by it;
+      * a generation re-check before storing. ``invalidate_caches()`` clears
+        ``_LANG_CACHE`` (after a late pip-install of a grammar) and bumps
+        ``_PARSER_GENERATION`` under the same lock. A clear landing while a
+        resolve is in flight would otherwise be undone by the store that
+        follows, resurrecting the very Language the invalidation discarded —
+        the "read → slow collect → store" hazard this repo's other per-root
+        caches guard the same way.
+    """
     if not _HAS_TREE_SITTER:
         return None
 
     with _LANG_CACHE_LOCK:
         if language in _LANG_CACHE:
             return _LANG_CACHE[language]
+        resolve_lock = _LANG_RESOLVE_LOCKS.get(language)
+        if resolve_lock is None:
+            resolve_lock = _LANG_RESOLVE_LOCKS[language] = threading.Lock()
+        generation = _PARSER_GENERATION
 
-        # All languages are imported in the order registered in _LANG_MODULE_MAP.
-        # Unregistered languages also fall back via standard naming convention (tree_sitter_<lang>).
-        # Also handles non-standard modules using language_<lang>() naming like PHP.
-        module_name = _LANG_MODULE_MAP.get(language) or f"tree_sitter_{language}"
+    with resolve_lock:
+        # Another thread may have finished this exact language while we queued.
+        with _LANG_CACHE_LOCK:
+            if language in _LANG_CACHE:
+                return _LANG_CACHE[language]
 
-        try:
-            import importlib
+        result = _resolve_language_uncached(language)
 
-            mod = importlib.import_module(module_name)
-            # tree-sitter-typescript exposes .language_typescript() and .language_tsx()
-            if language == "typescript":
-                raw = mod.language_typescript()
-            elif language == "tsx":
-                raw = mod.language_tsx()
-            else:
-                # Standard convention: module.language()
-                try:
-                    raw = mod.language()
-                except AttributeError:
-                    # Fallback for modules (e.g., tree-sitter-php) that use
-                    # module.language_<lang>() naming convention
-                    raw = getattr(mod, f"language_{language}")()
-            # tree-sitter ≥0.23 returns PyCapsule; wrap with Language()
-            if not isinstance(raw, _ts.Language):
-                raw = _ts.Language(raw)
-            _LANG_CACHE[language] = raw
-            return raw
-        except (ImportError, AttributeError, TypeError) as e:
-            # Fallback: tree-sitter-language-pack bundles 300+ prebuilt grammars
-            # behind a unified get_language() API. Used when individual
-            # tree_sitter_<lang> modules are not installed. (c_sharp → csharp
-            # is the only id that differs from our naming.)
-            lp = _resolve_lang_pack()
-            if lp is not None:
-                try:
-                    raw = lp(_LANG_PACK_ALIASES.get(language, language))
-                except Exception as e2:  # pack may lack the grammar
-                    logger.debug(
-                        "tree-sitter language-pack %s not available: %s", language, e2
-                    )
-                else:
-                    if not isinstance(raw, _ts.Language):
-                        raw = _ts.Language(raw)
-                    _LANG_CACHE[language] = raw
-                    return raw
-            logger.debug("tree-sitter language %s not available: %s", language, e)
-            _LANG_CACHE[language] = None  # type: ignore[assignment]
-            return None
+        with _LANG_CACHE_LOCK:
+            if generation != _PARSER_GENERATION:
+                # Invalidated mid-resolve: hand this caller its (correct, freshly
+                # built) object but do not re-populate the cache the invalidation
+                # just emptied.
+                return result
+            _LANG_CACHE[language] = result  # type: ignore[assignment]
+            return result
 
 
 def get_parser(language: str):
@@ -842,31 +979,73 @@ def _compile_query(language: str, lang_obj, query_string: str):
     return query
 
 
+def _prepare_query(
+    content: str, language: str, query_string: str, tree=None,
+) -> Optional[tuple]:
+    """Shared scaffolding for ``query_captures`` and ``query_matches``.
+
+    Resolves the language, parses the source, compiles the query, and encodes
+    the content as UTF-8 bytes.  ``parse_to_tree`` is memoised (@lru_cache):
+    callers that run several queries against the same source (imports,
+    exports, symbols, calls) share a single parse instead of re-parsing.
+    *tree*, when given, must be ``parse_to_tree(content, language)`` — the
+    caller parsed once and wants every query to share that tree (P5,
+    2026-08-11: sources above ``_MAX_CACHED_SOURCE_CHARS`` bypass the memo, so
+    a multi-query extraction used to parse them once per query).
+
+    Returns ``(tree, query, code_bytes)`` or ``None`` if tree-sitter is
+    unavailable, the language grammar is missing, parsing fails, or the query
+    is invalid.
+    """
+    lang_obj = _get_language(language)
+    if lang_obj is None:
+        return None
+
+    if tree is None:
+        tree = parse_to_tree(content, language)
+    if tree is None:
+        return None
+
+    query = _compile_query(language, lang_obj, query_string)
+    if query is None:
+        return None
+
+    return tree, query, _encode_content(content)
+
+
+def _make_capture(
+    capture_name: str, node, code_bytes: bytes,
+) -> QueryCapture:
+    """Build a ``QueryCapture`` from a tree-sitter node + encoded source."""
+    return QueryCapture(
+        capture_name=capture_name,
+        node_type=node.type,
+        text=code_bytes[node.start_byte:node.end_byte].decode("utf-8"),
+        start_line=node.start_point.row + 1,
+        end_line=node.end_point.row + 1,
+        start_byte=node.start_byte,
+        end_byte=node.end_byte,
+    )
+
+
 def query_captures(
-    content: str, language: str, query_string: str,
+    content: str, language: str, query_string: str, tree=None,
 ) -> list[QueryCapture]:
     """Run a tree-sitter query and return all captured nodes.
 
     Each capture includes metadata (capture name, node type, source text,
     1-indexed line range, byte offsets).
 
+    *tree* optionally supplies a pre-parsed tree for *content* (see
+    ``_prepare_query``) so several queries share one parse.
+
     Returns an empty list if tree-sitter is unavailable, the language grammar
     is missing, parsing fails, or the query is invalid.
     """
-    lang_obj = _get_language(language)
-    if lang_obj is None:
+    prepared = _prepare_query(content, language, query_string, tree=tree)
+    if prepared is None:
         return []
-
-    # parse_to_tree is memoised (@lru_cache): callers that run several
-    # queries against the same source (imports, exports, symbols, calls)
-    # share a single parse instead of re-parsing each time.
-    tree = parse_to_tree(content, language)
-    if tree is None:
-        return []
-
-    query = _compile_query(language, lang_obj, query_string)
-    if query is None:
-        return []
+    tree, query, code_bytes = prepared
 
     try:
         cursor = _ts.QueryCursor(query)
@@ -874,27 +1053,16 @@ def query_captures(
     except Exception:
         return []
 
-    code_bytes = _encode_content(content)
     results: list[QueryCapture] = []
-
     for capture_name, nodes in captures_raw.items():
-        for node in nodes:
-            results.append(QueryCapture(
-                capture_name=capture_name,
-                node_type=node.type,
-                text=code_bytes[node.start_byte:node.end_byte].decode("utf-8"),
-                start_line=node.start_point.row + 1,
-                end_line=node.end_point.row + 1,
-                start_byte=node.start_byte,
-                end_byte=node.end_byte,
-            ))
+        results.extend(_make_capture(capture_name, node, code_bytes) for node in nodes)
 
     results.sort(key=lambda c: c.start_byte)
     return results
 
 
 def query_matches(
-    content: str, language: str, query_string: str,
+    content: str, language: str, query_string: str, tree=None,
 ) -> list[dict[str, list[QueryCapture]]]:
     """Run a tree-sitter query and return matches grouped by pattern.
 
@@ -903,21 +1071,14 @@ def query_matches(
     that capture within the match.  This is useful when captures within
     the same pattern need to be associated (e.g., ``@def`` and ``@name``
     from the same function definition).
+
+    *tree* optionally supplies a pre-parsed tree for *content* (see
+    ``_prepare_query``) so several queries share one parse.
     """
-    lang_obj = _get_language(language)
-    if lang_obj is None:
+    prepared = _prepare_query(content, language, query_string, tree=tree)
+    if prepared is None:
         return []
-
-    # parse_to_tree is memoised (@lru_cache): callers that run several
-    # queries against the same source (imports, exports, symbols, calls)
-    # share a single parse instead of re-parsing each time.
-    tree = parse_to_tree(content, language)
-    if tree is None:
-        return []
-
-    query = _compile_query(language, lang_obj, query_string)
-    if query is None:
-        return []
+    tree, query, code_bytes = prepared
 
     try:
         cursor = _ts.QueryCursor(query)
@@ -925,22 +1086,13 @@ def query_matches(
     except Exception:
         return []
 
-    code_bytes = _encode_content(content)
     results: list[dict[str, list[QueryCapture]]] = []
 
     for (_pattern_idx, captures_dict) in matches_raw:
         match_result: dict[str, list[QueryCapture]] = {}
         for capture_name, nodes in captures_dict.items():
             match_result[capture_name] = [
-                QueryCapture(
-                    capture_name=capture_name,
-                    node_type=node.type,
-                    text=code_bytes[node.start_byte:node.end_byte].decode("utf-8"),
-                    start_line=node.start_point.row + 1,
-                    end_line=node.end_point.row + 1,
-                    start_byte=node.start_byte,
-                    end_byte=node.end_byte,
-                )
+                _make_capture(capture_name, node, code_bytes)
                 for node in nodes
             ]
         results.append(match_result)
@@ -967,14 +1119,11 @@ def has_error(content: str, language: str) -> Optional[bool]:
     # Fast-path: root_node.has_error is an O(1) cached flag maintained by
     # tree-sitter internally, covering both ERROR and MISSING descendant nodes.
     # Benchmarked ~99,000x faster than a full DFS for a 2000-line valid file.
-    if not tree.root_node.has_error:
-        return False
-
     # has_error is definitionally equivalent to "any descendant is ERROR or
     # MISSING" — verified empirically across C/Java/Go error variants (see
     # test_tree_sitter_utils.py for exhaustive coverage).  The remaining DFS
     # would always yield the same True, so we short-circuit to the return.
-    return True
+    return bool(tree.root_node.has_error)
 
 
 @dataclass(frozen=True)
@@ -987,7 +1136,6 @@ class SyntaxErrorNode:
     missing_token: str   # MISSING node's expected token (e.g. ";", ")")
     line: int            # 0-based line number
     column: int          # 0-based column number
-    context_snippet: str # Surrounding source code (for repair prompts)
 
 
 def find_error_nodes(content: str, language: str) -> Optional[list[SyntaxErrorNode]]:
@@ -1006,24 +1154,15 @@ def find_error_nodes(content: str, language: str) -> Optional[list[SyntaxErrorNo
         return None
 
     errors: list[SyntaxErrorNode] = []
-    lines = content.splitlines()
-
-    # Iterative DFS: collect all ERROR/MISSING nodes
     stack = [tree.root_node]
     while stack:
         node = stack.pop()
         if node.type == "ERROR" or node.is_missing:
-            # Extract context snippet (surrounding lines)
-            start_line = node.start_point[0]
-            end_line = min(node.end_point[0] + 1, len(lines))
-            context = "\n".join(lines[max(0, start_line - 1):end_line + 1])
-
             errors.append(SyntaxErrorNode(
                 kind="MISSING" if node.is_missing else "ERROR",
                 missing_token=node.type if node.is_missing else "",
                 line=node.start_point[0],  # 0-based
                 column=node.start_point[1],
-                context_snippet=context,
             ))
         stack.extend(node.children)
 
@@ -1067,73 +1206,85 @@ def extract_symbol_at_position(
     return None
 
 
-def extract_calls(
+def _extract_query_pairs(
     content: str, language: str,
+    query_map: dict[str, str], capture_name: str,
+    clean: Optional[Callable[[str], str]] = None,
+    tree=None,
+) -> list[tuple[str, int]]:
+    """Run a query and collect ``(value, line)`` pairs for *capture_name*.
+
+    Shared scaffolding for ``extract_calls`` and ``extract_imports``.
+    *query_map* selects the per-language query string; *capture_name* filters
+    which captures to keep; *clean* optionally transforms each captured text
+    (e.g. stripping quotes / selectors from module paths); *tree* optionally
+    supplies a pre-parsed tree for *content* so several queries share one
+    parse (P5, 2026-08-11).  Results are de-duplicated by ``(value, line)``
+    and lines are 1-indexed.
+    """
+    query_str = query_map.get(language)
+    if query_str is None:
+        return []
+
+    caps = query_captures(content, language, query_str, tree=tree)
+    results: list[tuple[str, int]] = []
+    seen: set = set()
+    for c in caps:
+        if c.capture_name != capture_name:
+            continue
+        value = clean(c.text) if clean is not None else c.text
+        key = (value, c.start_line)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append((value, c.start_line))
+    return results
+
+
+def extract_calls(
+    content: str, language: str, tree=None,
 ) -> list[tuple[str, int]]:
     """Extract call sites: ``[(callee_name, line), ...]``.
 
     Lines are 1-indexed.  Returns an empty list if tree-sitter is unavailable
-    or no call query is defined for *language*.
+    or no call query is defined for *language*.  *tree* optionally supplies a
+    pre-parsed tree for *content* so several queries share one parse (P5,
+    2026-08-11).
     """
-    query_str = _CALL_QUERIES.get(language)
-    if query_str is None:
-        return []
-
-    caps = query_captures(content, language, query_str)
-    results: list[tuple[str, int]] = []
-    seen: set = set()
-    for c in caps:
-        if c.capture_name != "callee":
-            continue
-        key = (c.text, c.start_line)
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append((c.text, c.start_line))
-    return results
+    return _extract_query_pairs(content, language, _CALL_QUERIES, "callee", tree=tree)
 
 
 def extract_imports(
-    content: str, language: str,
+    content: str, language: str, tree=None,
 ) -> list[tuple[str, int]]:
     """Extract import statements: ``[(imported_module, line), ...]``.
 
     The module string is cleaned: surrounding quotes and trailing semicolons
-    are stripped.
+    are stripped.  *tree* optionally supplies a pre-parsed tree for *content*
+    so several queries share one parse (P5, 2026-08-11).
 
     Lines are 1-indexed.  Returns an empty list if tree-sitter is unavailable
     or no import query is defined for *language*.
     """
-    query_str = _IMPORT_QUERIES.get(language)
-    if query_str is None:
-        return []
-
-    caps = query_captures(content, language, query_str)
-    results: list[tuple[str, int]] = []
-    seen: set = set()
-    for c in caps:
-        if c.capture_name != "source":
-            continue
-        # Clean module path: strip surrounding whitespace, quotes, and semicolons.
-        module = c.text.strip().strip('\"\';')
+    def _clean_module(module: str) -> str:
+        module = module.strip().strip('\"\';')
         # Scala captures the whole import_declaration node, which includes the
         # leading `import`/`using` keyword; strip it.  Every other language's
         # @source capture is a child node that already excludes the keyword, so
         # the strip is a no-op there — but scope it to Scala to avoid corrupting
         # a pathological module path such as lua `require("import foo")`.
-        if language == "scala":
-            module = _IMPORT_KW_RE.sub("", module)
-            # Strip namespace selectors and wildcard suffixes from module path.
-            # tree-sitter-scala has no scoped_identifier node, so @source captures
-            # the entire declaration including selectors like `{c, d}` / `_` / `*`.
-            #   e.g., "a.b.{c, d}" → "a.b",  "a.b._" → "a.b",  "a.b.*" → "a.b"
-            module = re.sub(r"\.(?:\{[^}]*\}|_|\*)\s*$", "", module)
-        key = (module, c.start_line)
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append((module, c.start_line))
-    return results
+        if language != "scala":
+            return module
+        module = _IMPORT_KW_RE.sub("", module)
+        # Strip namespace selectors and wildcard suffixes from module path.
+        # tree-sitter-scala has no scoped_identifier node, so @source captures
+        # the entire declaration including selectors like `{c, d}` / `_` / `*`.
+        #   e.g., "a.b.{c, d}" → "a.b",  "a.b._" → "a.b",  "a.b.*" → "a.b"
+        return re.sub(r"\.(?:\{[^}]*\}|_|\*)\s*$", "", module)
+
+    return _extract_query_pairs(
+        content, language, _IMPORT_QUERIES, "source", _clean_module, tree=tree,
+    )
 
 
 def extract_import_names(
@@ -1171,9 +1322,7 @@ def extract_import_names(
             if sub.type == "identifier":  # default import binding
                 results.append((module, _text(sub)))
             elif sub.type == "namespace_import":  # import * as ns
-                for nch in sub.children:
-                    if nch.type == "identifier":
-                        results.append((module, _text(nch)))
+                results.extend((module, _text(nch)) for nch in sub.children if nch.type == "identifier")
             elif sub.type in ("named_imports", "export_clause"):
                 for spec in sub.children:
                     if spec.type not in ("import_specifier", "export_specifier"):
@@ -1323,6 +1472,7 @@ _BASE_KIND_MAP = {
     "function_declaration": "function",
     "method_definition": "function",
     "method_declaration": "function",
+    "local_function_statement": "function",
     "field_definition": "assignment",
     "public_field_definition": "assignment",
     "expression_statement": "assignment",
@@ -1426,9 +1576,8 @@ def find_symbol_range(
         for match_group in matches:
             name_caps = match_group.get("name", [])
             def_caps = match_group.get("def", [])
-            if name_caps and def_caps:
-                if name_caps[0].text == symbol_name:
-                    return (def_caps[0].start_line, def_caps[0].end_line)
+            if name_caps and def_caps and name_caps[0].text == symbol_name:
+                return (def_caps[0].start_line, def_caps[0].end_line)
         return None
 
     # Manual traversal fallback for languages without a query defined.
@@ -1456,7 +1605,7 @@ def find_symbol_range(
 
 
 def find_all_symbols(
-    content: str, language: str
+    content: str, language: str, tree=None,
 ) -> list[tuple[str, str, int, int]]:
     """Extract all top-level symbols: ``[(name, kind, start_line, end_line), ...]``.
 
@@ -1467,13 +1616,16 @@ def find_all_symbols(
     (e.g., ``field_definition`` in TypeScript, which breaks multi-pattern
     queries when included).
 
+    *tree* optionally supplies a pre-parsed tree for *content* so the query
+    phase and the manual walk share the caller's single parse (P5, 2026-08-11).
+
     Duplicates (same name + same line range) are removed.
     """
     # Phase 1: Declarative query (fast, handles standard constructs)
     results: list[tuple[str, str, int, int]] = []
     query_str = _SYMBOL_QUERIES.get(language)
     if query_str is not None:
-        _query_results = _find_all_symbols_via_query(content, language, query_str)
+        _query_results = _find_all_symbols_via_query(content, language, query_str, tree=tree)
         results.extend(_query_results)
 
     # Phase 2: Manual tree walk (catches field_definition and other
@@ -1481,7 +1633,8 @@ def find_all_symbols(
     # multi-pattern matching in tree-sitter).
     # parse_to_tree is memoised (@lru_cache), so this shares a single parse
     # with Phase 1's query (which also goes through parse_to_tree).
-    tree = parse_to_tree(content, language)
+    if tree is None:
+        tree = parse_to_tree(content, language)
     if tree is None:
         return results
 
@@ -1532,10 +1685,10 @@ def find_all_symbols(
 
 
 def _find_all_symbols_via_query(
-    content: str, language: str, query_str: str,
+    content: str, language: str, query_str: str, tree=None,
 ) -> list[tuple[str, str, int, int]]:
     """Extract top-level symbols using a declarative tree-sitter query."""
-    matches = query_matches(content, language, query_str)
+    matches = query_matches(content, language, query_str, tree=tree)
     results: list[tuple[str, str, int, int]] = []
     seen: set = set()
 
@@ -1571,116 +1724,6 @@ def _node_kind_from_type(node_type: str) -> str:
     return _BASE_KIND_MAP.get(node_type, "function")
 
 
-# ── CST utility functions (new in Phase 1) ──────────────────────────────────
-
-
-def find_anchor_node(
-    content: str, language: str, line: int,
-) -> Optional[dict]:
-    """Find the enclosing statement node at *line* (1-indexed).
-
-    Uses tree-sitter to locate the syntax node covering *line*.
-    Returns a dict with keys:
-      - start_line, end_line (1-indexed)
-      - start_byte, end_byte
-      - text: exact source text of the node
-      - node_type: tree-sitter node type (e.g. "if_statement", "expression_statement")
-    Returns None if tree-sitter is unavailable or no suitable node found.
-
-    ★ Resolution strategy: first finds the deepest named node at *line*, then
-      walks UP the tree to the nearest enclosing statement node (if_statement,
-      else_clause, expression_statement, etc.). This ensures that when multiple
-      nodes occupy the same line (e.g. "} else if (…) {"), the enclosing
-      statement is used as the anchor rather than a child body node.
-
-    This is the anchor-resolution primitive for structural editing.
-    Instead of regex-matching text lines, we resolve the anchor to a real AST
-    node — eliminating hallucination (non-existent anchors), non-unique matches,
-    and block-structure corruption by design.
-    """
-    if not content.strip():
-        return None
-    tree = parse_to_tree(content, language)
-    if tree is None:
-        return None
-    root = tree.root_node
-    zero_line = line - 1  # convert to 0-indexed
-
-    def _descend(n):
-        if n.start_point[0] <= zero_line <= n.end_point[0]:
-            for child in n.children:
-                result = _descend(child)
-                if result is not None:
-                    return result
-            if n.is_named and n.start_point[0] <= zero_line <= n.end_point[0]:
-                return n
-        return None
-
-    node = _descend(root)
-    if node is None:
-        return None
-
-    # ── Walk UP to nearest enclosing statement node ──────────────────────
-    # When multiple AST nodes share the same line (e.g. "} else if (cond) {"),
-    # the deepest named node may be a punctuation-like block body. We need
-    # the enclosing if_statement/else_clause/expression_statement instead.
-    _ENCLOSING_TYPES = frozenset({
-        "if_statement", "else_clause", "for_statement", "while_statement",
-        "do_statement", "expression_statement", "switch_expression",
-        "switch_case", "labeled_statement", "try_statement",
-        "catch_clause", "finally_clause", "function_declaration",
-        "method_definition", "class_declaration", "program", "module",
-        "statement_block", "lexical_declaration", "variable_declaration",
-        "return_statement", "throw_statement", "break_statement",
-        "continue_statement", "debugger_statement",
-    })
-    _parent = node.parent
-    while _parent is not None:
-        if _parent.type in _ENCLOSING_TYPES:
-            # Only promote if parent still covers the target line
-            if _parent.start_point[0] <= zero_line <= _parent.end_point[0]:
-                node = _parent
-                break
-        _parent = _parent.parent
-    # (If no enclosing statement found, keep the original node)
-
-    # Skip punctuation-only nodes (bare braces, semicolons)
-    if node.type in ("{", "}", "(", ")", "[", "]", ";", ","):
-        return None
-
-    # ── Parent & sibling info for placement validation ──────────────────
-    # Used by _handle_insert_after_line to detect "end-of-block" ambiguity:
-    # when insert_after targets the LAST statement in a block, the inserted
-    # code lands INSIDE the block, which may not be the intent (the planner
-    # may have meant "after the entire block").
-    _parent_node = node.parent
-    _parent_type = _parent_node.type if _parent_node is not None else None
-    _parent_end_line = None
-    # Check if this node has a next_named_sibling — if it's the last named
-    # child of its parent, insert_after means "insert at end of block body"
-    # (inside the block), not "after the block closing brace".
-    _has_next_named = False
-    if _parent_node is not None:
-        _next = node.next_named_sibling
-        if _next is not None:
-            _has_next_named = True
-        _parent_end_line = _parent_node.end_point[0] + 1  # 1-indexed
-
-    code_bytes = _encode_content(content)
-    return {
-        "start_line": node.start_point[0] + 1,
-        "end_line": node.end_point[0] + 1,
-        "start_byte": node.start_byte,
-        "end_byte": node.end_byte,
-        "text": code_bytes[node.start_byte:node.end_byte].decode("utf-8"),
-        "node_type": node.type,
-        "parent_type": _parent_type,
-        "has_next_named_sibling": _has_next_named,
-        "parent_end_line": _parent_end_line,
-        "_ts_node": node,  # raw tree-sitter node for sibling walking etc.
-    }
-
-
 def _parse_to_tree_uncached(content: str, language: str):
     parser = get_parser(language)
     if parser is None:
@@ -1688,6 +1731,7 @@ def _parse_to_tree_uncached(content: str, language: str):
     try:
         return parser.parse(_encode_content(content))
     except Exception:
+        logger.debug("tree_sitter parse failed for %s", language, exc_info=True)
         return None
 
 
@@ -1727,74 +1771,6 @@ _encode_content.cache_clear = _encode_content_cached.cache_clear  # type: ignore
 _encode_content.cache_info = _encode_content_cached.cache_info  # type: ignore[attr-defined]
 
 
-def structural_hash(node) -> str:
-    """Compute a structural hash from node types and field names.
-
-    Walks the CST tree and builds a SHA-256 digest from:
-      - node types
-      - field names of named children (via ``field_name_for_child``)
-    Leaf text content (variable names, string literals), whitespace, and
-    comments are excluded.  Two trees that differ in variable naming,
-    literal values, or formatting produce the *same* hash, but different
-    node structure or field assignments yield different hashes.
-
-    This granularity catches structural regressions (missing body,
-    swapped children, wrong node type) while tolerating the naming and
-    formatting variation that gate comparisons need to survive.
-
-    Returns a 16-character hex digest string.  Callers should compare
-    for equality.
-
-    The traversal is iterative (explicit stack) rather than recursive so
-    that deeply nested / machine-generated inputs — which can exceed
-    Python's default recursion limit (1000) — are handled safely.
-    """
-    import hashlib
-
-    # Iterative post-order walk. Each frame holds:
-    #   parts  — signature fragments accumulated so far for this node
-    #            (starts as [node.type])
-    #   children — pending list of (child, field_prefix) not yet folded in
-    # When a frame's children are exhausted we join its parts into a
-    # signature string. If a parent exists, that signature is appended to the
-    # parent's parts (with the parent's field prefix); otherwise it is the
-    # final result.
-    root_children = deque(
-        (ch, (node.field_name_for_child(i) or ""))
-        for i, ch in enumerate(node.children)
-        if ch.is_named
-    )
-    # Each frame: (parts, pending_children, field_prefix)
-    #   field_prefix — this frame's own field name (prefixed onto its
-    #                  signature when appended to the parent)
-    stack: list[tuple[list[str], deque, str]] = [
-        ([node.type], root_children, ""),
-    ]
-    final_sig = None
-
-    while stack:
-        parts, children, field_prefix = stack[-1]
-        if children:
-            child, child_field = children.popleft()
-            child_children = deque(
-                (ch, (child.field_name_for_child(j) or ""))
-                for j, ch in enumerate(child.children)
-                if ch.is_named
-            )
-            stack.append(([child.type], child_children, child_field))
-            continue
-        # All children consumed: finalize this node's signature.
-        stack.pop()
-        sig = "|".join(parts)
-        if stack:
-            parent_parts, _parent_children, _ = stack[-1]
-            parent_parts.append(f"{field_prefix}:{sig}" if field_prefix else sig)
-        else:
-            final_sig = sig
-
-    return hashlib.sha256(final_sig.encode("utf-8")).hexdigest()[:16]
-
-
 def get_node_text(code_bytes: bytes, node) -> str:
     """Extract exact source text for *node* using byte-range slicing.
 
@@ -1813,290 +1789,76 @@ def get_node_text(code_bytes: bytes, node) -> str:
 # ── Structural analysis helpers (replace numeric/regex guards) ──────────
 
 
-def count_method_statements(
-    code: str, method_name: str, language: str,
-) -> Optional[int]:
-    """Count AST statements in a method's body using tree-sitter.
+def _extract_go_class_methods(
+    tree: "_ts.Tree",
+) -> dict[str, list[tuple[str, int, int]]]:
+    """Group Go ``method_declaration`` nodes by normalized receiver type.
 
-    Walks the tree for ``method_definition`` or ``function_declaration``
-    nodes whose name matches *method_name*, then counts the children of
-    the ``statement_block`` that are actual statements (not braces).
+    One iterative DFS (explicit stack — avoids Python recursion-limit blow-up
+    on deeply nested / machine-generated inputs).  The receiver normalization
+    matches ``extract_class_methods``'s former inline rules exactly:
 
-    Returns the statement count, or None if tree-sitter is unavailable
-    or the method is not found.
+      ``(r *MyStruct)`` / ``(r MyStruct)`` / ``(r pkg.MyStruct)``
+      → strip parens, take last space-delimited token, strip ``*``.
 
-    This replaces numeric line-count heuristics (``_new_nonempty <= 2``
-    or ``< 30%`` of old line count) with a structural AST measurement.
+    Methods stay in source order within each class (the DFS visits nodes in
+    document order).
+    """
+    grouped: dict[str, list[tuple[str, int, int]]] = {}
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type == "method_declaration":
+            _receiver_node = node.child_by_field_name("receiver")
+            if _receiver_node is not None:
+                _recv_text = _receiver_node.text.decode("utf-8")
+                _recv_clean = _recv_text.strip("()").strip()
+                _parts = _recv_clean.split()
+                _recv_type = _parts[-1] if len(_parts) >= 2 else _recv_clean
+                _recv_type = _recv_type.replace("*", "").strip()
+                _name_node = node.child_by_field_name("name")
+                if _name_node is not None:
+                    grouped.setdefault(_recv_type, []).append((
+                        _name_node.text.decode("utf-8"),
+                        node.start_point.row + 1,
+                        node.end_point.row + 1,
+                    ))
+        stack.extend(reversed(node.named_children))
+    return grouped
+
+
+def _filter_go_class_methods(
+    grouped: dict[str, list[tuple[str, int, int]]],
+    class_name: str,
+) -> list[tuple[str, int, int]]:
+    """Pick the methods whose receiver type matches *class_name*."""
+    results: list[tuple[str, int, int]] = []
+    for _recv_type, _methods in grouped.items():
+        if class_name in (_recv_type, _recv_type.split(".")[-1]):
+            results.extend(_methods)
+    return results
+
+
+def extract_all_class_methods(
+    code: str, language: str,
+) -> Optional[dict[str, list[tuple[str, int, int]]]]:
+    """Return ``{class_name: [(method_name, start_line, end_line), ...]}``.
+
+    Batch variant of :func:`extract_class_methods`: parses *code* once and
+    groups every class's methods, so N per-class lookups on one file cost one
+    parse + one walk instead of N parses.  Currently implemented for Go
+    (receiver-based ``method_declaration`` grouping); other languages return
+    ``None`` and callers fall back to the per-class path.
+
+    Returns ``None`` when tree-sitter is unavailable or the parse fails —
+    distinct from ``{}``, a valid "no methods in this file" answer.
+    Lines are 1-indexed.
     """
     tree = parse_to_tree(code, language)
     if tree is None:
         return None
-
-    # Iterative DFS (explicit stack) — avoids Python recursion-limit blow-up
-    # on deeply nested / machine-generated inputs. First-match wins (mirrors
-    # the original recursive _walk).
-    stack = [tree.root_node]
-    while stack:
-        node = stack.pop()
-        # method_definition — class methods in TS/JS
-        if node.type == "method_definition":
-            _name_node = None
-            _body_node = None
-            for child in node.named_children:
-                if child.type == "property_identifier":
-                    _name_node = child
-                elif child.type == "statement_block":
-                    _body_node = child
-            if (_name_node is not None and _body_node is not None
-                    and _name_node.text.decode("utf-8") == method_name):
-                stmts = [c for c in _body_node.children
-                         if c.type not in ("{", "}")]
-                return len(stmts)
-
-        # function_declaration — top-level functions, also arrow-function
-        # assigned to const/let/var
-        elif node.type == "function_declaration":
-            _name_node = node.child_by_field_name("name")
-            _body_node = None
-            for child in node.named_children:
-                if child.type == "statement_block":
-                    _body_node = child
-            if (_name_node is not None and _body_node is not None
-                    and _name_node.text.decode("utf-8") == method_name):
-                stmts = [c for c in _body_node.children
-                         if c.type not in ("{", "}")]
-                return len(stmts)
-
-        # arrow_function — const fn = () => { ... }
-        elif node.type == "arrow_function":
-            _body_node = None
-            for child in node.named_children:
-                if child.type == "statement_block":
-                    _body_node = child
-            if _body_node is not None:
-                stmts = [c for c in _body_node.children
-                         if c.type not in ("{", "}")]
-                return len(stmts)
-
-        stack.extend(reversed(node.named_children))
-
-    return None
-
-
-def get_class_member_names(
-    code: str, class_name: str, language: str,
-) -> Optional[tuple[set[str], set[str]]]:
-    """Get (method_names, field_names) for a class using tree-sitter.
-
-    Returns unique member name sets (duplicates collapsed).
-    Returns None if tree-sitter is unavailable or the class is not found.
-
-    Use this instead of count_class_members when you need to detect
-    duplicate definitions within a class (Pattern 3).
-    """
-    tree = parse_to_tree(code, language)
-    if tree is None:
-        return None
-
-    # Iterative DFS (explicit stack) — avoids Python recursion-limit blow-up
-    # on deeply nested / machine-generated inputs. First-match wins (mirrors
-    # the original recursive _walk).
-    stack = [tree.root_node]
-    while stack:
-        node = stack.pop()
-        if node.type == "class_declaration":
-            _name_node = node.child_by_field_name("name")
-            if (_name_node is not None
-                    and _name_node.text.decode("utf-8") == class_name):
-                _body_node = None
-                for child in node.named_children:
-                    if child.type == "class_body":
-                        _body_node = child
-                        break
-                if _body_node is None:
-                    # Class found but has no body — original returned None here
-                    # (resumes search at siblings, does NOT descend). `continue`
-                    # mirrors that by not pushing this node's children.
-                    continue
-                _method_names: set[str] = set()
-                _field_names: set[str] = set()
-                for c in _body_node.named_children:
-                    if c.type == "method_definition":
-                        _prop = c.child_by_field_name("name")
-                        if _prop is not None:
-                            _method_names.add(_prop.text.decode("utf-8"))
-                    elif c.type in ("field_definition", "public_field_definition"):
-                        _prop = c.child_by_field_name("name")
-                        if _prop is not None:
-                            _field_names.add(_prop.text.decode("utf-8"))
-                return (_method_names, _field_names)
-
-        stack.extend(reversed(node.named_children))
-
-    return None
-
-
-def count_unique_class_members(
-    code: str, class_name: str, language: str,
-) -> Optional[tuple[int, int]]:
-    """Count unique (method_count, field_count) for a class using tree-sitter.
-
-    Unlike count_class_members, this deduplicates members with the same name.
-    If a class has two methods named 'lockPiece', the unique method count will
-    be 1 (not 2), enabling duplicate detection (Pattern 3).
-
-    Returns (unique_method_count, unique_field_count) or None if tree-sitter
-    is unavailable or the class is not found.
-    """
-    _names = get_class_member_names(code, class_name, language)
-    if _names is None:
-        return None
-    return (len(_names[0]), len(_names[1]))
-
-
-def extract_this_references(code: str, language: str) -> list[str]:
-    """Extract all `this.xxx` member access expressions from code.
-
-    Walks the AST for `member_expression` nodes where the object is `this`,
-    and returns the property names. This is used to detect hallucinated
-    method/field calls (Pattern 4).
-
-    Examples::
-
-      this.board.forEach(...)  → ["board"]
-      this.lockPiece()         → ["lockPiece"]
-      this.tryRotate(current)  → ["tryRotate"]
-
-    Returns an empty list if tree-sitter is unavailable or no references found.
-    """
-    tree = parse_to_tree(code, language)
-    if tree is None:
-        return []
-
-    _refs: list[str] = []
-
-    # Iterative DFS (explicit stack) — avoids Python recursion-limit blow-up
-    # on deeply nested / machine-generated inputs. When a member_expression
-    # matches (this.prop), we do NOT descend into it (mirrors the original).
-    stack = [tree.root_node]
-    while stack:
-        node = stack.pop()
-        descend = True
-        if node.type == "member_expression":
-            _obj = node.child_by_field_name("object")
-            _prop = node.child_by_field_name("property")
-            if (_obj is not None and _prop is not None
-                    and _obj.type == "this"):
-                _refs.append(_prop.text.decode("utf-8"))
-                descend = False  # Don't descend into matched expression
-        if descend:
-            stack.extend(reversed(node.named_children))
-
-    return _refs
-
-
-def symbol_exists_deep(code: str, name: str, language: str) -> bool:
-    """Check if a symbol name exists ANYWHERE in the AST (deep traversal).
-
-    Unlike ``find_all_symbols`` which skips descent into matched symbols
-    (class bodies, etc.), this function walks ALL nodes in the tree,
-    including class body children such as ``field_definition`` and
-    ``method_definition``.
-
-    This is the correct check for "does this symbol exist in the code?"
-    and replaces regex-based fallback patterns that were prone to
-    false positives with string contents and type annotations.
-
-    Returns False if tree-sitter is unavailable or the name is not found.
-    """
-    tree = parse_to_tree(code, language)
-    if tree is None:
-        return False
-
-    # Iterative DFS (explicit stack) — avoids Python recursion-limit blow-up
-    # on deeply nested / machine-generated inputs. Returns True on the first
-    # matching node (short-circuit, mirrors the original recursive _walk).
-    stack = [tree.root_node]
-    while stack:
-        node = stack.pop()
-        # Check if this node defines a name
-        _name_node = node.child_by_field_name("name")
-        if _name_node is not None:
-            _text = _name_node.text.decode("utf-8")
-            if _text == name or _text == name.split(".")[-1]:
-                return True
-
-        # For method_definition, the name is a property_identifier child
-        if node.type == "method_definition":
-            for child in node.named_children:
-                if child.type == "property_identifier":
-                    if child.text.decode("utf-8") == name:
-                        return True
-
-        # For lexical_declaration (const/let/var), check variable name
-        if node.type == "lexical_declaration":
-            for child in node.named_children:
-                if child.type == "variable_declarator":
-                    _vn = child.child_by_field_name("name")
-                    if _vn is not None and _vn.text.decode("utf-8") == name:
-                        return True
-
-        stack.extend(reversed(node.named_children))
-
-    return False
-
-
-def count_class_members(
-    code: str, class_name: str, language: str,
-) -> Optional[tuple[int, int]]:
-    """Count (method_count, field_count) for a class using tree-sitter.
-
-    Walks the tree for ``class_declaration`` with *class_name*, then
-    counts ``method_definition`` children (= methods) and ``field_definition``
-    children (= fields) directly from the AST.
-
-    Returns ``(method_count, field_count)`` or None if tree-sitter is
-    unavailable or the class is not found.
-
-    This replaces character-count ratio (F3: ``< 30%``) and line-count
-    threshold (F5: ``> 10`` and ``<= 3``) with exact AST member counting.
-    """
-    tree = parse_to_tree(code, language)
-    if tree is None:
-        return None
-
-    # Iterative DFS (explicit stack) — avoids Python recursion-limit blow-up
-    # on deeply nested / machine-generated inputs. First-match wins (mirrors
-    # the original recursive _walk).
-    stack = [tree.root_node]
-    while stack:
-        node = stack.pop()
-        if node.type == "class_declaration":
-            _name_node = node.child_by_field_name("name")
-            if (_name_node is not None
-                    and _name_node.text.decode("utf-8") == class_name):
-                # Found the class — count members from the class body
-                _body_node = None
-                for child in node.named_children:
-                    if child.type == "class_body":
-                        _body_node = child
-                        break
-                if _body_node is None:
-                    # Class found but has no body — resumes search at siblings
-                    # without descending (mirrors original `return None`).
-                    continue
-                _methods = sum(
-                    1 for c in _body_node.named_children
-                    if c.type == "method_definition"
-                )
-                _fields = sum(
-                    1 for c in _body_node.named_children
-                    if c.type in ("field_definition", "public_field_definition")
-                )
-                return (_methods, _fields)
-
-        stack.extend(reversed(node.named_children))
-
+    if language == "go":
+        return _extract_go_class_methods(tree)
     return None
 
 
@@ -2124,34 +1886,14 @@ def extract_class_methods(
     if language == "go":
         # Go methods are declared externally with a receiver:
         #   func (r *MyStruct) Method() { ... }
-        # Iterative DFS (explicit stack) — avoids Python recursion-limit
-        # blow-up on deeply nested / machine-generated inputs.
-        stack = [tree.root_node]
-        while stack:
-            node = stack.pop()
-            if node.type == "method_declaration":
-                _receiver_node = node.child_by_field_name("receiver")
-                if _receiver_node is not None:
-                    _recv_text = _receiver_node.text.decode("utf-8")
-                    # Check if receiver type matches class_name.
-                    # Format: (r *MyStruct) or (r MyStruct) or (r pkg.MyStruct)
-                    # Strip parens, take last space-delimited token, strip star
-                    _recv_clean = _recv_text.strip("()").strip()
-                    _parts = _recv_clean.split()
-                    _recv_type = _parts[-1] if len(_parts) >= 2 else _recv_clean
-                    _recv_type = _recv_type.replace("*", "").strip()
-                    if class_name in (_recv_type, _recv_type.split(".")[-1]):
-                        _name_node = node.child_by_field_name("name")
-                        if _name_node is not None:
-                            _name = _name_node.text.decode("utf-8")
-                            results.append((
-                                _name,
-                                node.start_point.row + 1,
-                                node.end_point.row + 1,
-                            ))
-            stack.extend(reversed(node.named_children))
-
-        return results
+        # One walk groups every method by receiver type; the class filter is
+        # then a dict lookup. _extract_go_class_methods is the single source
+        # of the receiver-normalization rules (shared with
+        # extract_all_class_methods), so per-class and batch queries cannot
+        # drift.
+        return _filter_go_class_methods(
+            _extract_go_class_methods(tree), class_name
+        )
 
     # For class_body-based languages: find the class, then scan its body.
     # Iterative DFS (explicit stack) — avoids Python recursion-limit blow-up
@@ -2282,136 +2024,3 @@ def extract_symbol_body(
     return None
 
 
-# ── Close-brace depth analysis (structural replacement for text-level lstrip) ──
-
-# Block-statement types that contribute to brace depth when they end at a line.
-# These are the types whose closing `}` adds one level of structure to close.
-_BLOCK_DEPTH_TYPES = frozenset({
-    "if_statement", "else_clause", "for_statement", "while_statement",
-    "do_statement", "try_statement", "catch_clause", "finally_clause",
-    "function_declaration", "method_definition", "class_declaration",
-    "switch_expression", "switch_case", "labeled_statement",
-    "statement_block", "lexical_declaration",
-})
-
-
-def find_collection_literal_closing_brace(
-    content: str, language: str, symbol_name: str,
-) -> Optional[int]:
-    """Find the closing brace line of a collection literal assigned to *symbol_name*.
-
-    For map/array/struct literals like:
-        var handlers = map[string]Handler{
-            "add": cmdAdd,
-            "list": cmdList,
-        }
-    This returns the 1-indexed line of the closing ``}`` (line 5 in this example).
-
-    Returns None if tree-sitter is unavailable, symbol not found, or the symbol
-    is not a collection literal.
-    """
-    if not _HAS_TREE_SITTER or not content.strip():
-        return None
-    tree = parse_to_tree(content, language)
-    if tree is None:
-        return None
-
-    # Composite literal node types by language
-    _COMPOSITE_LITERAL_TYPES = frozenset({
-        "composite_literal",   # Go: map[string]X{...}, []X{...}, X{...}
-        "object",              # JS/TS: {...}
-        "array",               # JS/TS: [...]
-        "object_literal_expression",  # Kotlin
-        "array_literal_expression",   # Kotlin
-    })
-
-    # Walk the tree to find the symbol's var_declaration (or equivalent)
-    # that contains a composite literal, then find the literal's closing brace.
-    root = tree.root_node
-
-    def _find_symbol_decl(node) -> Optional[int]:
-        """Find the declaration node for *symbol_name*, search its subtree
-        for a composite literal, and return the closing brace line (1-indexed).
-        Returns None if symbol not found or not a collection literal."""
-        if node.type in _SYMBOL_NODE_TYPES:
-            name = _extract_name(node)
-            if name == symbol_name:
-                # Recursively search the declaration's subtree for composite literal
-                def _find_literal_in_subtree(n) -> Optional[int]:
-                    if n.type in _COMPOSITE_LITERAL_TYPES:
-                        return n.end_point[0] + 1
-                    for child in n.children:
-                        result = _find_literal_in_subtree(child)
-                        if result is not None:
-                            return result
-                    return None
-                return _find_literal_in_subtree(node)
-            # Container types: descend into children to find nested symbols
-            if node.type not in _CONTAINER_NODE_TYPES:
-                return None
-        for child in node.children:
-            result = _find_symbol_decl(child)
-            if result is not None:
-                return result
-        return None
-
-    return _find_symbol_decl(root)
-
-
-def compute_close_brace_depth(
-    content: str, language: str, line: int,
-) -> Optional[int]:
-    """Compute how many block-statement levels end at *line* (1-indexed).
-
-    For a closing-brace line like ``}`` (pure brace), this returns the
-    number of enclosing block-statement ancestors whose span ends at this
-    same line.  This represents the structural "depth of closure" at the
-    anchor point.
-
-    Example — for ``}`` closing an ``if_statement`` inside a function::
-
-        function foo() {       // function_declaration start
-            if (cond) {        // if_statement start
-                // body        // (statement_block body)
-            }                   // ← both statement_block AND if_statement end here
-        }                       //   → close_brace_depth = 2 at this line
-                                //   → close_brace_depth = 1 (function_declaration only)
-
-    This is used by the close-brace merge (insert_after_line) to validate
-    that the snippet's leading ``}}`` count is structurally consistent with
-    the anchor's nesting depth.
-
-    Returns an int (≥ 0), or None if tree-sitter is unavailable.
-    """
-    if not _HAS_TREE_SITTER or not content.strip():
-        return None
-    tree = parse_to_tree(content, language)
-    if tree is None:
-        return None
-    root = tree.root_node
-    zero_line = line - 1
-
-    # Step 1: find the deepest named node covering *line*
-    def _deepest(n):
-        if n.start_point[0] <= zero_line <= n.end_point[0]:
-            for child in n.children:
-                result = _deepest(child)
-                if result is not None:
-                    return result
-            if n.is_named and n.start_point[0] <= zero_line <= n.end_point[0]:
-                return n
-        return None
-
-    node = _deepest(root)
-    if node is None:
-        return 0
-
-    # Step 2: walk up the ancestry; count block types whose span ends at *line*
-    depth = 0
-    current = node
-    while current is not None:
-        if current.type in _BLOCK_DEPTH_TYPES and current.end_point[0] == zero_line:
-            depth += 1
-        current = current.parent
-
-    return depth

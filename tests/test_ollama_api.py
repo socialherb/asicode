@@ -15,8 +15,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-import external_llm.ollama_api as ollama_api
-from external_llm.ollama_api import query_ollama_num_ctx
+from external_llm import ollama_api
+from external_llm.ollama_api import query_ollama_capabilities, query_ollama_num_ctx
 
 _TEST_URL = "http://test-ollama:11434"
 _MODEL = "llama3:8b"
@@ -33,11 +33,11 @@ def _ok_resp(payload: dict) -> MagicMock:
 @pytest.fixture(autouse=True)
 def _clear_cache():
     """Isolate each test from prior cache state (manual dicts are module-global)."""
-    ollama_api._num_ctx_cache.clear()
-    ollama_api._num_ctx_negative_cache.clear()
+    ollama_api._ollama_show_cache.clear()
+    ollama_api._ollama_show_negative_cache.clear()
     yield
-    ollama_api._num_ctx_cache.clear()
-    ollama_api._num_ctx_negative_cache.clear()
+    ollama_api._ollama_show_cache.clear()
+    ollama_api._ollama_show_negative_cache.clear()
 
 
 def _age_past_ttl() -> None:
@@ -47,15 +47,15 @@ def _age_past_ttl() -> None:
     monotonic timestamp, guaranteeing the freshness check fails.
     """
     key = (_MODEL, _TEST_URL)
-    val, ts = ollama_api._num_ctx_cache[key]
-    ollama_api._num_ctx_cache[key] = (val, ts - ollama_api._NUM_CTX_CACHE_TTL_SECONDS - 1)
+    val, ts = ollama_api._ollama_show_cache[key]
+    ollama_api._ollama_show_cache[key] = (val, ts - ollama_api._SHOW_CACHE_TTL_SECONDS - 1)
 
 
 def _age_negative_past_ttl() -> None:
     """Rewind the negative-cache timestamp so the next read treats it as expired."""
     key = (_MODEL, _TEST_URL)
-    ts = ollama_api._num_ctx_negative_cache[key]
-    ollama_api._num_ctx_negative_cache[key] = ts - ollama_api._NUM_CTX_NEGATIVE_CACHE_TTL_SECONDS - 1
+    ts = ollama_api._ollama_show_negative_cache[key]
+    ollama_api._ollama_show_negative_cache[key] = ts - ollama_api._SHOW_NEGATIVE_CACHE_TTL_SECONDS - 1
 
 
 # ── TTL-bounded cache (the fix) ────────────────────────────────────────────
@@ -118,7 +118,7 @@ class TestTTLCache:
 
     def test_default_ttl_is_300(self):
         """Sanity anchor: documented TTL window."""
-        assert ollama_api._NUM_CTX_CACHE_TTL_SECONDS == 300
+        assert ollama_api._SHOW_CACHE_TTL_SECONDS == 300
 
 
 # ── Failure paths: short negative cache (storm-collapse + expiry) ───────────
@@ -128,20 +128,19 @@ class TestNegativeCache:
     retry storms while still expiring so a server restart is detected promptly."""
 
     @patch("external_llm.ollama_api.requests.post")
-    def test_connection_error_negative_cached_within_ttl(self, mock_post):
-        """A ConnectionError is cached for the short negative TTL — the second
-        call within the window skips the HTTP request entirely (storm collapse)."""
-        mock_post.side_effect = requests.ConnectionError("refused")
+    @pytest.mark.parametrize(
+        "exc",
+        [requests.ConnectionError("refused"), requests.Timeout("slow")],
+        ids=["connection_error", "timeout"],
+    )
+    def test_transient_error_negative_cached_within_ttl(self, mock_post, exc):
+        """Transient failures (ConnectionError/Timeout) are cached for the short
+        negative TTL — the second call within the window skips the HTTP request
+        entirely (storm collapse)."""
+        mock_post.side_effect = exc
         assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
         assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
         assert mock_post.call_count == 1  # second call served from negative cache
-
-    @patch("external_llm.ollama_api.requests.post")
-    def test_timeout_negative_cached_within_ttl(self, mock_post):
-        mock_post.side_effect = requests.Timeout("slow")
-        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
-        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) is None
-        assert mock_post.call_count == 1
 
     @patch("external_llm.ollama_api.requests.post")
     def test_http_404_positive_cached_within_ttl(self, mock_post):
@@ -156,8 +155,8 @@ class TestNegativeCache:
         assert mock_post.call_count == 1  # served from positive cache
         # Distinguishing assertion: 404 landed in the POSITIVE cache, NOT negative.
         key = (_MODEL, _TEST_URL)
-        assert key in ollama_api._num_ctx_cache
-        assert key not in ollama_api._num_ctx_negative_cache
+        assert key in ollama_api._ollama_show_cache
+        assert key not in ollama_api._ollama_show_negative_cache
 
     @patch("external_llm.ollama_api.requests.post")
     def test_http_404_outlasts_negative_ttl(self, mock_post):
@@ -188,8 +187,8 @@ class TestNegativeCache:
         assert mock_post.call_count == 1
         # Distinguishing: a transient HTTP error lands in NEGATIVE, NOT positive.
         key = (_MODEL, _TEST_URL)
-        assert key in ollama_api._num_ctx_negative_cache
-        assert key not in ollama_api._num_ctx_cache
+        assert key in ollama_api._ollama_show_negative_cache
+        assert key not in ollama_api._ollama_show_cache
 
     @patch("external_llm.ollama_api.requests.post")
     def test_generic_exception_negative_cached_within_ttl(self, mock_post):
@@ -226,7 +225,7 @@ class TestNegativeCache:
 
     def test_default_negative_ttl_is_short(self):
         """Negative TTL must be short so a server restart is detected promptly."""
-        assert 0 < ollama_api._NUM_CTX_NEGATIVE_CACHE_TTL_SECONDS <= 60
+        assert 0 < ollama_api._SHOW_NEGATIVE_CACHE_TTL_SECONDS <= 60
 
 
 # ── FIFO entry cap (parity with _shared_utils._capped_put) ──────────────────
@@ -238,21 +237,21 @@ class TestCacheCap:
     @patch("external_llm.ollama_api.requests.post")
     def test_positive_cache_fifo_bounded(self, mock_post):
         mock_post.return_value = _ok_resp({"parameters": {"num_ctx": 8192}})
-        cap = ollama_api._NUM_CTX_CACHE_MAX_ENTRIES
+        cap = ollama_api._SHOW_CACHE_MAX_ENTRIES
         for i in range(cap + 5):
             query_ollama_num_ctx(f"model-{i}:latest", base_url_hint=_TEST_URL)
         # Exactly ``cap`` entries retained; the 5 oldest evicted (FIFO).
-        assert len(ollama_api._num_ctx_cache) == cap
-        assert ("model-0:latest", _TEST_URL) not in ollama_api._num_ctx_cache
-        assert (f"model-{cap + 4}:latest", _TEST_URL) in ollama_api._num_ctx_cache
+        assert len(ollama_api._ollama_show_cache) == cap
+        assert ("model-0:latest", _TEST_URL) not in ollama_api._ollama_show_cache
+        assert (f"model-{cap + 4}:latest", _TEST_URL) in ollama_api._ollama_show_cache
 
     @patch("external_llm.ollama_api.requests.post")
     def test_negative_cache_fifo_bounded(self, mock_post):
         mock_post.side_effect = requests.ConnectionError("server down")
-        cap = ollama_api._NUM_CTX_CACHE_MAX_ENTRIES
+        cap = ollama_api._SHOW_CACHE_MAX_ENTRIES
         for i in range(cap + 5):
             query_ollama_num_ctx(f"model-{i}:latest", base_url_hint=_TEST_URL)
-        assert len(ollama_api._num_ctx_negative_cache) == cap
+        assert len(ollama_api._ollama_show_negative_cache) == cap
 
 
 # ── Ollama-format model-name guard ─────────────────────────────────────────
@@ -359,3 +358,137 @@ class TestNumCtxForModelFallback:
         msgs = [LLMMessage(role="user", content="x" * 50000)]
         est = self._client()._num_ctx_for_model("test:latest", messages=msgs)
         assert est == 6144  # Registry wins, estimation not applied
+
+
+# ── Consolidation: ONE /api/show POST serves both queries ──────────────────
+
+class TestShowPayloadConsolidation:
+    """num_ctx and capabilities are BOTH fields of a single /api/show response.
+    The unified _query_ollama_show caches the full payload, so querying num_ctx
+    then capabilities (or vice versa) issues exactly ONE POST on a cold cache —
+    the second query is a free field extraction over the cached payload.
+
+    Before consolidation each query maintained its own positive cache and issued
+    its own POST, doubling (tripling when the tools path ran) per-turn /api/show
+    traffic on a cold cache or after the 5-min TTL.
+    """
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_num_ctx_then_capabilities_one_post(self, mock_post):
+        mock_post.return_value = _ok_resp(
+            {"parameters": {"num_ctx": 8192}, "capabilities": ["tools", "vision"]}
+        )
+        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) == 8192
+        assert query_ollama_capabilities(_MODEL, base_url_hint=_TEST_URL) == ("tools", "vision")
+        assert mock_post.call_count == 1  # ONE POST serves BOTH queries
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_capabilities_then_num_ctx_one_post(self, mock_post):
+        mock_post.return_value = _ok_resp(
+            {"parameters": {"num_ctx": 4096}, "capabilities": ["completion"]}
+        )
+        assert query_ollama_capabilities(_MODEL, base_url_hint=_TEST_URL) == ("completion",)
+        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) == 4096
+        assert mock_post.call_count == 1
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_shared_payload_requeries_once_after_ttl(self, mock_post):
+        """Past TTL both extractors see a single fresh POST (one initial + one
+        re-query), not one-per-extractor."""
+        mock_post.return_value = _ok_resp({"parameters": {"num_ctx": 8192}, "capabilities": ["tools"]})
+        query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL)
+        assert mock_post.call_count == 1
+        _age_past_ttl()
+        query_ollama_capabilities(_MODEL, base_url_hint=_TEST_URL)
+        assert mock_post.call_count == 2  # one initial + ONE re-query (not +2)
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_absent_field_still_caches_full_payload(self, mock_post):
+        """A payload lacking capabilities still caches the full dict, so a
+        follow-up num_ctx query is a free lookup (num_ctx IS present)."""
+        mock_post.return_value = _ok_resp({"parameters": {"num_ctx": 16384}})  # no capabilities
+        assert query_ollama_capabilities(_MODEL, base_url_hint=_TEST_URL) is None
+        assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) == 16384
+        assert mock_post.call_count == 1
+
+
+# ── Cache-key model-name normalisation (버그-2b) ────────────────────────────
+
+class TestCacheKeyNormalization:
+    """providers.py passes the raw model string while context_budget.py passes
+    an already-lowercased name. The cache key normalises both to lowercase so an
+    uppercase tag does not force a duplicate POST.  num_ctx and capabilities are
+    model properties (not name-spelling properties), so a case-insensitive key is
+    correct."""
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_case_insensitive_cache_key(self, mock_post):
+        mock_post.return_value = _ok_resp({"parameters": {"num_ctx": 4096}})
+        assert query_ollama_num_ctx("Llama3:8b", base_url_hint=_TEST_URL) == 4096
+        # Same model, different case spelling → cache hit, no second POST.
+        assert query_ollama_num_ctx("llama3:8b", base_url_hint=_TEST_URL) == 4096
+        assert mock_post.call_count == 1
+        # Both spellings converge on one canonical (lowercased) key.
+        assert ("llama3:8b", _TEST_URL) in ollama_api._ollama_show_cache
+        assert ("Llama3:8b", _TEST_URL) not in ollama_api._ollama_show_cache
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_case_insensitive_across_num_ctx_and_capabilities(self, mock_post):
+        mock_post.return_value = _ok_resp({"parameters": {"num_ctx": 8192}, "capabilities": ["vision"]})
+        assert query_ollama_num_ctx("Qwen3:8b", base_url_hint=_TEST_URL) == 8192
+        assert query_ollama_capabilities("qwen3:8b", base_url_hint=_TEST_URL) == ("vision",)
+        assert mock_post.call_count == 1
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_post_body_preserves_original_name(self, mock_post):
+        """The cache KEY is lowercased, but the POST body must carry the original
+        spelling so an exact-match Ollama server resolves the model."""
+        mock_post.return_value = _ok_resp({"parameters": {"num_ctx": 4096}})
+        query_ollama_num_ctx("Llama3:8b", base_url_hint=_TEST_URL)
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"]["model"] == "Llama3:8b"  # original case preserved in POST
+
+
+# ── base_url threading through _resolve_context_limit (버그-2a) ──────────────
+
+class TestResolveContextLimitBaseUrl:
+    """_resolve_context_limit forwards base_url to the Ollama /api/show query so
+    context_budget hits the SAME (model, server) cache entry providers.py uses,
+    instead of resolving a different server (OLLAMA_BASE_URL env / default) and
+    cache-missing / querying the wrong server in a multi-Ollama setup."""
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_base_url_threaded_to_show_query(self, mock_post):
+        from external_llm.agent.context_budget import (
+            _context_window_overrides,
+            _resolve_context_limit,
+        )
+
+        _context_window_overrides.clear()
+        ollama_api._ollama_show_cache.clear()
+        ollama_api._ollama_show_negative_cache.clear()
+        mock_post.return_value = _ok_resp({"parameters": {"num_ctx": 32768}})
+        custom = "http://my-ollama:11434"
+        limit = _resolve_context_limit("llama3:8b", base_url=custom)
+        assert limit == 32768
+        # The POST targeted the custom server, not the env/default URL.
+        posted_url = mock_post.call_args[0][0]
+        assert posted_url.startswith(custom)
+        # And the canonical cache key recorded the custom server.
+        assert ("llama3:8b", custom) in ollama_api._ollama_show_cache
+
+    @patch("external_llm.ollama_api.requests.post")
+    def test_default_base_url_none_preserves_old_behaviour(self, mock_post):
+        """Backward compat: omitting base_url (default None) resolves via env/default,
+        exactly as before the threading was added."""
+        from external_llm.agent.context_budget import (
+            _context_window_overrides,
+            _resolve_context_limit,
+        )
+
+        _context_window_overrides.clear()
+        ollama_api._ollama_show_cache.clear()
+        ollama_api._ollama_show_negative_cache.clear()
+        mock_post.return_value = _ok_resp({"parameters": {"num_ctx": 4096}})
+        _resolve_context_limit("llama3:8b")  # no base_url — old call style
+        assert mock_post.call_count == 1

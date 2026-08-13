@@ -32,15 +32,19 @@ and it never silently skips verification because a name didn't resolve.
 from __future__ import annotations
 
 import ast
+import logging
 import subprocess
 import time
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Optional
 
 from ._shared_utils import _capped_put
 
 if TYPE_CHECKING:  # avoid hard import at module load
     from .call_graph import CallGraphIndexer
+
+logger = logging.getLogger(__name__)
 # ── index cache ─────────────────────────────────────────────────────────────
 # The stem+import index is built by walking all tests/ files (~476).
 # Cache it so repeated select_affected_tests calls within a short window
@@ -77,6 +81,33 @@ _MAX_TEST_FILES = 60       # cap so a "fix everything" edit doesn't select the w
 
 # ── symbol extraction ────────────────────────────────────────────────────────
 
+def _parse_module(path: Path) -> Optional[ast.Module]:
+    """Parse *path* as UTF-8 Python source, tolerating unreadable/broken files.
+
+    Returns ``None`` when the file cannot be read or parsed so callers can
+    degrade to an empty result — a half-edited file must never break selection.
+    """
+    try:
+        return ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
+    except (OSError, SyntaxError, ValueError):
+        logger.debug("Could not parse %s; treating module as empty", path)
+        return None
+
+
+def _iter_top_level_nodes(path: Path) -> Iterator[ast.stmt]:
+    """Parse *path* and yield its top-level statements.
+
+    Yields nothing when the file cannot be read or parsed — a half-edited
+    file must never break selection (the tolerance policy lives in
+    ``_parse_module``).  Shared by ``_defined_names`` and ``_extract_imports``
+    so both collectors degrade to empty results through the same path.
+    """
+    tree = _parse_module(path)
+    if tree is None:
+        return
+    yield from ast.iter_child_nodes(tree)
+
+
 def _defined_names(path: Path) -> set[str]:
     """Top-level defs/classes and methods defined in ``path``.
 
@@ -86,11 +117,7 @@ def _defined_names(path: Path) -> set[str]:
     half-edited file never breaks selection.
     """
     names: set[str] = set()
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
-    except (OSError, SyntaxError, ValueError):
-        return names
-    for node in ast.iter_child_nodes(tree):
+    for node in _iter_top_level_nodes(path):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             names.add(node.name)
         elif isinstance(node, ast.ClassDef):
@@ -145,8 +172,9 @@ def git_status_test_files(repo_root: str | Path) -> list[str]:
             ["git", "-C", str(root), "status", "--porcelain", "-z",
              "--untracked-files=all"],
             capture_output=True, timeout=5,
+             check=False,
         )
-    except Exception:  # noqa: BLE001 — best-effort augmentation only
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):  # best-effort augmentation only
         return []
     if r.returncode != 0:
         return []
@@ -182,18 +210,13 @@ def _extract_imports(path: Path) -> set[str]:
     everything to a single top-level key.
     """
     imports: set[str] = set()
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
-    except (OSError, SyntaxError, ValueError):
-        return imports
-    for node in ast.iter_child_nodes(tree):
+    for node in _iter_top_level_nodes(path):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name:
                     imports.add(alias.name)  # full dotted path
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imports.add(node.module)  # full dotted path
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(node.module)  # full dotted path
     return imports
 
 
@@ -240,6 +263,7 @@ def _build_test_stem_index(repo_root: Path) -> tuple[dict[str, list[str]], dict[
         try:
             rel = py.relative_to(repo_root).as_posix()
         except ValueError:
+            logger.debug("test path relative_to failed", exc_info=True)
             continue
         stem = py.stem
         # test_foo.py → stem='foo'  (strip leading test_)
@@ -283,7 +307,8 @@ def _caller_files(call_graph: "CallGraphIndexer", symbol: str, depth: int) -> se
             visited.add(sym)
             try:
                 edges = call_graph.get_callers(sym)
-            except Exception:  # noqa: BLE001 — indexer must never break selection
+            except Exception:  # indexer must never break selection
+                logger.debug("call graph lookup failed", exc_info=True)
                 continue
             for edge in edges:
                 f = getattr(edge, "caller_file", None)

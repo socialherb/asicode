@@ -12,7 +12,6 @@ import logging
 import os
 import subprocess
 import types
-
 from unittest.mock import Mock
 
 import pytest
@@ -260,7 +259,8 @@ class TestRevertBatching:
 
         assert set(reverted) == {"tracked_other.txt", "new_a.txt", "new_b.txt", "new_c.txt"}
         # tracked file restored to HEAD content
-        assert open(os.path.join(repo, "tracked_other.txt")).read() == "tracked-original\n"
+        with open(os.path.join(repo, "tracked_other.txt")) as f:
+            assert f.read() == "tracked-original\n"
         # untracked files removed
         for name in ("new_a.txt", "new_b.txt", "new_c.txt"):
             assert not os.path.exists(os.path.join(repo, name))
@@ -315,4 +315,5 @@ class TestRevertBatching:
         # The file must be RESTORED to HEAD content, NOT deleted by unlink.
         assert name in reverted
         assert os.path.exists(os.path.join(repo, name))
-        assert open(os.path.join(repo, name)).read() == "tracked-original\n"
+        with open(os.path.join(repo, name)) as f:
+            assert f.read() == "tracked-original\n"

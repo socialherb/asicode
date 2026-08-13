@@ -13,6 +13,7 @@ Design:
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import subprocess
@@ -20,7 +21,9 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from typing import Optional
+from typing import Any, Optional
+
+from ..client import interruptible_sleep
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +39,7 @@ _TRUNCATION_MARKER = "…[oldest output truncated]…\n"
 _REAPED_RESULTS_MAX = 20
 # Per-stream output kept per reaped job. Generous because the whole point of
 # the ring is that this is the ONLY surviving copy of a finished job's result:
-# 20 jobs × 2 streams × 32 KiB ≈ 1.3 MiB worst case, which is nothing next to
+# 20 jobs x 2 streams x 32 KiB ≈ 1.3 MiB worst case, which is nothing next to
 # the 2 MiB a single *live* job's buffer is already allowed.
 _REAPED_OUTPUT_CAP = 32 * 1024
 
@@ -111,6 +114,21 @@ class BackgroundJob:
         self.start_time = start_time
         self.status: str = "running"
         self._lock = threading.Lock()
+        # Resolve the process group ONCE, here, while the child is certainly
+        # alive (start() registers the job immediately after the Popen). A
+        # later kill() must NOT re-resolve: the leader may have exited and been
+        # reaped by then — getpgid() raises ProcessLookupError, the fallback
+        # proc.kill() then no-ops on the dead leader, and the grandchildren are
+        # orphaned. The GROUP, which killpg targets, outlives its leader while
+        # any member (e.g. `cmd &` children) is still alive, so the stored
+        # pgid stays valid. Job spawners use start_new_session=True, making
+        # this equal to proc.pid.
+        try:
+            self._pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            # Leader already gone / no process groups: fall back to the pid —
+            # with start_new_session=True the two are identical anyway.
+            self._pgid = proc.pid
         # Accumulated stdout/stderr buffers — read_output() drains into these
         # so that pipe data is never lost between calls.  get_info() reads the
         # accumulated buffer.  The reaper tick also drains periodically to
@@ -160,15 +178,11 @@ class BackgroundJob:
                 self.proc._recovered_stderr = ""
 
             if self.proc.stdout:
-                try:
+                with contextlib.suppress(UnicodeDecodeError, OSError):  # binary output / closed pipe
                     stdout += self._read_fd(self.proc.stdout)
-                except Exception:
-                    pass
             if self.proc.stderr:
-                try:
+                with contextlib.suppress(UnicodeDecodeError, OSError):
                     stderr += self._read_fd(self.proc.stderr)
-                except Exception:
-                    pass
             self._stdout_buf = _cap_tail(self._stdout_buf + stdout)
             self._stderr_buf = _cap_tail(self._stderr_buf + stderr)
             return stdout, stderr
@@ -181,9 +195,18 @@ class BackgroundJob:
         fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
         try:
             data = fd.read()
-            return data if data else ""
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
+            # TypeError is the "no data available yet" signal on CPython < 3.14.
+            # A non-blocking read that would block makes the raw layer return
+            # None; a text-mode pipe then feeds that None to the incremental
+            # decoder, which fails with "can't concat NoneType to bytes"
+            # (measured: 3.12.13 raises TypeError, 3.14.3 raises BlockingIOError).
+            # Only 3.14+ raises an OSError subclass, so on every supported
+            # version below it this except clause is what keeps an empty pipe
+            # from propagating out of get_info() and failing the job_output tool.
             return ""
+        else:
+            return data if data else ""
         finally:
             fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
 
@@ -210,15 +233,17 @@ class BackgroundJob:
             if self.status in ("completed", "failed", "killed"):
                 return
             try:
-                # Kill the process group to catch children
+                # Kill the process group to catch children. Uses the pgid
+                # resolved at registration (see __init__) — re-resolving via
+                # getpgid() here fails once the leader exited and was reaped,
+                # silently skipping the kill and orphaning the grandchildren.
                 import signal
-                pgid = os.getpgid(self.proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
+                os.killpg(self._pgid, signal.SIGTERM)
                 # Give it a moment, then SIGKILL
                 try:
                     self.proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
-                    os.killpg(pgid, signal.SIGKILL)
+                    os.killpg(self._pgid, signal.SIGKILL)
                     try:
                         self.proc.wait(timeout=3)
                     except subprocess.TimeoutExpired:
@@ -396,16 +421,14 @@ class BackgroundJobManager:
 
         # ── I/O outside the lock ──
         status = job.poll_status()
-        try:
-            job.read_output()  # drain pipe → accumulates into _stdout_buf/_stderr_buf
-        except Exception:
-            pass
+        # drain pipe → accumulates into _stdout_buf/_stderr_buf
+        with contextlib.suppress(UnicodeDecodeError, OSError):  # binary output / closed pipe
+            job.read_output()
 
         if status in ("completed", "failed", "killed"):
-            try:
-                job.read_output()  # final drain (process is dead, pipe is flushing)
-            except Exception:
-                pass
+            # final drain (process is dead, pipe is flushing)
+            with contextlib.suppress(UnicodeDecodeError, OSError):
+                job.read_output()
 
         stdout = job._stdout_buf
         stderr = strip_malloc_noise(job._stderr_buf)
@@ -421,7 +444,8 @@ class BackgroundJobManager:
         )
 
     def wait_for_completion(self, job_id: str, timeout: float = 120.0,
-                                poll_interval: float = 1.0) -> Optional[BackgroundJobInfo]:
+                                poll_interval: float = 1.0,
+                                cancel_event: Optional[Any] = None) -> Optional[BackgroundJobInfo]:
         """Wait for a background job to finish (completed/failed/killed).
 
         Polls at *poll_interval* seconds until the job terminates or
@@ -430,6 +454,12 @@ class BackgroundJobManager:
 
         If the timeout expires while the job is still running, returns
         the current snapshot (status == "running").
+
+        If *cancel_event* is set mid-wait (e.g. the user pressed ESC while a
+        ``job(action=output, wait_timeout=...)`` call was blocking the turn),
+        the wait is abandoned at the next poll tick and the current snapshot
+        is returned so the caller can surface the cancellation — a raw
+        ``time.sleep`` here would otherwise ignore ESC for the whole budget.
         """
         deadline = time.monotonic() + timeout
         while True:
@@ -441,7 +471,8 @@ class BackgroundJobManager:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return info  # timeout — return current snapshot
-            time.sleep(min(poll_interval, remaining))
+            if interruptible_sleep(min(poll_interval, remaining), cancel_event):
+                return info  # cancelled — return current snapshot
 
     def list_jobs(self, include_completed: bool = True) -> list[BackgroundJobInfo]:
         """List all tracked jobs, lazily reaping old completed ones first.
@@ -463,10 +494,9 @@ class BackgroundJobManager:
             status = job.poll_status()
             if not include_completed and status in ("completed", "failed", "killed"):
                 continue
-            try:
-                job.read_output()  # drain pipe → accumulates into buffer
-            except Exception:
-                pass
+            # drain pipe → accumulates into buffer
+            with contextlib.suppress(UnicodeDecodeError, OSError):  # binary output / closed pipe
+                job.read_output()
             stdout = job._stdout_buf
             stderr = strip_malloc_noise(job._stderr_buf)
             infos.append(BackgroundJobInfo(
@@ -658,10 +688,8 @@ class BackgroundJobManager:
                 jobs = list(self._jobs.items())
             for _job_id, job in jobs:
                 if job.poll_status() == "running":
-                    try:
+                    with contextlib.suppress(UnicodeDecodeError, OSError):  # binary output / closed pipe
                         job.read_output()
-                    except Exception:
-                        pass
         except Exception:
             logger.debug("Reaper pipe drain failed", exc_info=True)
 

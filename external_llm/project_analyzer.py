@@ -16,8 +16,9 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import ClassVar, Optional
 
+from .common.walk_policy import _walk_should_skip_dir
 from .languages import LanguageId
 
 logger = logging.getLogger(__name__)
@@ -44,9 +45,6 @@ class ProjectStructure:
 
     # Directory structure
     directories: dict[str, list[str]] = field(default_factory=dict)  # {purpose: [paths]}
-
-    # File patterns
-    file_patterns: dict[str, str] = field(default_factory=dict)  # {pattern_name: template}
 
     # Naming conventions
     naming_style: str = "snake_case"  # snake_case, camelCase, PascalCase
@@ -85,7 +83,7 @@ class ProjectAnalyzer:
     # ``MIN_FRAMEWORK_SCORE`` to be reported, so a lone generic marker can no
     # longer confirm a framework on its own (e.g. an Alembic ``migrations/``
     # dir must not imply Django).  See ``_detect_frameworks``.
-    FRAMEWORK_MARKERS = {
+    FRAMEWORK_MARKERS: ClassVar[dict] = {
         'django': [
             ('file', 'manage.py', 3),
             ('import', 'from django.', 3),
@@ -241,7 +239,7 @@ class ProjectAnalyzer:
     # in the repo, which prevents cross-language false positives (e.g. a Go
     # repo can never match a Python/JS framework). Frameworks omitted here are
     # not language-gated.
-    FRAMEWORK_LANGUAGES = {
+    FRAMEWORK_LANGUAGES: ClassVar[dict] = {
         'django': {'python'},
         'fastapi': {'python'},
         'flask': {'python'},
@@ -270,6 +268,22 @@ class ProjectAnalyzer:
     # above this means a single generic marker (weight 1) is never enough.
     MIN_FRAMEWORK_SCORE = 2
 
+    # P23-3: bounds for _read_gradle_text — framework detection only needs
+    # marker substrings, so cap per-file reads and the cached total (the
+    # cache lives for the instance lifetime).
+    _GRADLE_FILE_MAX_BYTES = 1024 * 1024
+    _GRADLE_TOTAL_MAX_BYTES = 8 * 1024 * 1024
+
+    # P28-2: bound for the cached source-file walk (_walk_source_files /
+    # _iter_source_files).  The walk materializes EVERY file path as a tuple
+    # for the instance lifetime — on a repo with millions of files that is
+    # unbounded memory, and framework markers live near the tree top anyway,
+    # so anything beyond the cap is noise for detection/sampling.  The walk
+    # stops at the cap (a prefix of the tree); callers that break early are
+    # unaffected.  Detection/sampling may be incomplete past the cap — logged
+    # at debug level.
+    _WALK_MAX_FILES = 50_000
+
     # A language must account for at least this share of recognized source
     # files (and at least MIN_LANGUAGE_FILES files) to count as "present".
     # Guards against a couple of stray scripts (e.g. build .py files in a Go
@@ -277,17 +291,18 @@ class ProjectAnalyzer:
     MIN_LANGUAGE_SHARE = 0.05
     MIN_LANGUAGE_FILES = 2
 
-    # Directories never worth scanning for language/framework signals.
-    SKIP_DIRS = frozenset({
-        '.git', 'node_modules', 'vendor', 'dist', 'build', '.next', '.nuxt',
-        '__pycache__', '.venv', 'venv', 'env', '.mypy_cache', '.pytest_cache',
-        'target', '.idea', '.vscode', 'site-packages',
-    })
+    # Analyzer-specific directories never worth scanning for language/framework
+    # signals.  The UNIVERSAL vendored/build/VCS skip-set lives in
+    # walk_policy._walk_should_skip_dir (B2'/F5/F7 parity contract: venv*/,
+    # *.egg-info, site-packages, .tox, ...) — this set keeps ONLY the
+    # analyzer-only extras that predicate does not cover: ``target`` (JVM
+    # build output, unique to this walker's purpose).  Walk pruning below
+    # applies the union, so this walker can never drift from the others again.
+    _EXTRA_SKIP_DIRS = frozenset({'target'})
 
-    TS_JS_EXTS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']
 
     # Common directory purposes
-    DIRECTORY_PURPOSES = {
+    DIRECTORY_PURPOSES: ClassVar[dict] = {
         'models': frozenset(['model', 'models', 'db', 'database']),
         'views': frozenset(['view', 'views', 'controller', 'controllers', 'handler', 'handlers']),
         'routes': frozenset(['route', 'routes', 'router', 'routers', 'urls', 'api']),
@@ -303,10 +318,12 @@ class ProjectAnalyzer:
     def __init__(self, repo_root: str, max_depth: int = 5):
         self.repo_root = Path(repo_root).resolve()
         self.max_depth = max_depth
-        # Lazily-materialized list of repo source files; walked once and reused by
+        # Lazily-materialized tuple of repo source files; walked once and reused by
         # _detect_languages + every _sample_files caller during one analyze() pass
         # (see _iter_source_files), so the repo tree is no longer re-walked ~7x.
-        self._source_files_cache: Optional[list[Path]] = None
+        # Stored as an immutable tuple so the shared cache cannot be silently
+        # corrupted by a caller mutating the returned collection in place.
+        self._source_files_cache: Optional[tuple[Path, ...]] = None
         # Lazily-populated cache for _read_pyproject_deps(); shared across all
         # py_dep marker lookups during one analyze() pass so the manifest is
         # parsed at most once.
@@ -342,15 +359,12 @@ class ProjectAnalyzer:
         structure.directories = self._analyze_directories()
 
         # Find entry points (before project_types — entry_points needed as input)
-        structure.entry_points = self._find_entry_points(structure.framework)
+        structure.entry_points = self._find_entry_points()
 
         # Detect project types (web, cli, library, package)
         structure.project_types = self._detect_project_types(
-            structure.frameworks, structure.entry_points, structure.languages
+            structure.frameworks, structure.languages
         )
-
-        # Detect file patterns
-        structure.file_patterns = self._detect_file_patterns(structure.framework)
 
         # Detect naming style
         structure.naming_style = self._detect_naming_style()
@@ -369,7 +383,15 @@ class ProjectAnalyzer:
         return structure
 
     def _walk_source_files(self):
-        """Generator: yield repo files, skipping vendored/build/VCS directories."""
+        """Generator: yield repo files, skipping vendored/build/VCS directories.
+
+        Bounded at ``_WALK_MAX_FILES`` yields — framework markers live near
+        the tree top, so a huge vendored blob (or a repo with millions of
+        files) beyond the cap is overwhelmingly noise for detection and
+        sampling.  The cache in ``_iter_source_files`` is a prefix of the
+        tree walk.
+        """
+        count = 0
         try:
             stack = [self.repo_root]
             while stack:
@@ -377,16 +399,25 @@ class ProjectAnalyzer:
                 try:
                     entries = list(current.iterdir())
                 except (OSError, PermissionError):
+                    logger.debug("project_analyzer: cannot list %s — skipping", current)
                     continue
                 for entry in entries:
                     if entry.is_dir():
-                        if entry.name in self.SKIP_DIRS or entry.name.startswith('.'):
+                        if _walk_should_skip_dir(entry.name) or entry.name in self._EXTRA_SKIP_DIRS:
                             continue
                         stack.append(entry)
                     elif entry.is_file():
+                        count += 1
+                        if count > self._WALK_MAX_FILES:
+                            logger.debug(
+                                "project_analyzer: source-file walk capped at "
+                                "%d files — framework detection may be incomplete",
+                                self._WALK_MAX_FILES,
+                            )
+                            return
                         yield entry
         except Exception as e:
-            logger.debug(f"Error walking source files: {e}")
+            logger.debug("Error walking source files: %s", e)
 
     def _iter_source_files(self):
         """Return the cached list of repo source files (walked once per instance).
@@ -400,7 +431,10 @@ class ProjectAnalyzer:
         old generator.
         """
         if self._source_files_cache is None:
-            self._source_files_cache = list(self._walk_source_files())
+            self._source_files_cache = tuple(self._walk_source_files())
+        # Returned tuple is the shared cache itself (immutable by type); callers
+        # iterate/read only. A copy would re-pay the walk's memory cost on every
+        # call, defeating the whole point of caching the walk.
         return self._source_files_cache
 
     def _dir_exists_pruned(self, name: str) -> bool:
@@ -408,7 +442,7 @@ class ProjectAnalyzer:
 
             Pruned descent: each directory entry is TESTED against *name* (so a
             marker like ``('dir','node_modules')`` still matches), but os.walk never
-            DESCENDS into vendored/build/VCS dirs (SKIP_DIRS / dotdirs) afterwards.
+            DESCENDS into vendored/build/VCS dirs (walk_policy / dotdirs) afterwards.
             The former ``rglob(name)`` walked the entire tree — including a huge
             node_modules — once per ``dir`` marker per ``_detect_frameworks`` pass,
             and could match a vendored nested copy (false positive). This caps the
@@ -421,6 +455,7 @@ class ProjectAnalyzer:
                     try:
                         entries = list(current.iterdir())
                     except (OSError, PermissionError):
+                        logger.debug("project_analyzer: cannot list %s — skipping", current)
                         continue
                     for entry in entries:
                         if not entry.is_dir():
@@ -428,11 +463,11 @@ class ProjectAnalyzer:
                         if entry.name == name:
                             return True
                         # Test the entry, but do not descend into vendor/build/VCS.
-                        if entry.name in self.SKIP_DIRS or entry.name.startswith('.'):
+                        if _walk_should_skip_dir(entry.name) or entry.name in self._EXTRA_SKIP_DIRS:
                             continue
                         stack.append(entry)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Error walking pruned dirs (name=%r): %s", name, e)
             return False
     def _sample_files(self, suffixes, limit: int) -> list[Path]:
         """Sample up to ``limit`` repo files with the given suffix(es),
@@ -533,6 +568,7 @@ class ProjectAnalyzer:
                                 scores[framework] += weight
                                 break
                         except Exception:
+                            logger.debug("project_analyzer: cannot read %s — skipping marker scan", py_file)
                             continue
 
                 elif marker_type == 'pkg_dep':
@@ -544,8 +580,8 @@ class ProjectAnalyzer:
                             all_deps = {**pkg.get('dependencies', {}), **pkg.get('devDependencies', {})}
                             if marker_value in all_deps:
                                 scores[framework] += weight
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug("Error parsing %s (JS deps): %s", pkg_path, e)
 
                 elif marker_type == 'go_dep':
                     if self._go_mod_requires(marker_value):
@@ -588,6 +624,7 @@ class ProjectAnalyzer:
                                 scores[framework] += weight
                                 break
                         except Exception:
+                            logger.debug("project_analyzer: cannot read %s — skipping marker scan", src_file)
                             continue
 
         # Drop frameworks that never cleared the minimum-evidence bar.
@@ -598,13 +635,12 @@ class ProjectAnalyzer:
         # Multi-framework: include any framework scoring >= 50% of top score
         max_score = max(scores.values())
         threshold = max(self.MIN_FRAMEWORK_SCORE, max_score * 0.5)
-        sorted_frameworks = sorted(
+        return sorted(
             [fw for fw, sc in scores.items() if sc >= threshold],
             key=lambda fw: scores[fw],
             reverse=True,
         )
 
-        return sorted_frameworks
 
     def _go_mod_requires(self, module_prefix: str) -> bool:
         """Return True if go.mod has a *direct* require matching module_prefix.
@@ -627,7 +663,7 @@ class ProjectAnalyzer:
                 token = stripped.split()[0] if stripped.split() else ''
                 if token == module_prefix or token.startswith(module_prefix):
                     return True
-        except Exception:
+        except (OSError, UnicodeDecodeError):  # unreadable go.mod
             return False
         return False
 
@@ -641,31 +677,55 @@ class ProjectAnalyzer:
         — the real plugin id then lives in ``libs.versions.toml``. Build
         output dirs (``build/``, ``.gradle/``) are skipped to avoid generated
         files. Cached per instance.
+
+        P23-3: reads are bounded — per file at ``_GRADLE_FILE_MAX_BYTES`` and
+        in total at ``_GRADLE_TOTAL_MAX_BYTES``. Detection only needs marker
+        substrings, so oversized files are skipped and the cached string can
+        never grow unbounded for the instance lifetime.
         """
         if self._gradle_text_cache is not None:
             return self._gradle_text_cache
         chunks: list[str] = []
+        total = 0
         try:
             # Reuse the cached, pruned source-file walk (_walk_source_files never
-            # descends into SKIP_DIRS or dotdirs, so build/ and .gradle/ output
+            # descends into walk_policy-skipped dirs or dotdirs, so build/ and .gradle/ output
             # are already excluded — the former per-path post-filter is now
             # redundant). The old rglob walked the whole tree twice (once per
             # extension), descending into node_modules/build each time.
             for path in self._iter_source_files():
                 name = path.name
-                if not (name.endswith(".gradle.kts") or name.endswith(".gradle")):
+                if not (name.endswith((".gradle.kts", ".gradle"))):
                     continue
+                if total >= self._GRADLE_TOTAL_MAX_BYTES:
+                    break
                 try:
-                    chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+                    if path.stat().st_size > self._GRADLE_FILE_MAX_BYTES:
+                        continue
+                    text = path.read_text(encoding="utf-8", errors="replace")
                 except Exception:
+                    logger.debug("project_analyzer: cannot read gradle file %s — skipping", path)
                     continue
+                if total + len(text) > self._GRADLE_TOTAL_MAX_BYTES:
+                    text = text[: self._GRADLE_TOTAL_MAX_BYTES - total]
+                chunks.append(text)
+                total += len(text)
             for path in self.repo_root.glob("gradle/*.toml"):
+                if total >= self._GRADLE_TOTAL_MAX_BYTES:
+                    break
                 try:
-                    chunks.append(path.read_text(encoding="utf-8"))
+                    if path.stat().st_size > self._GRADLE_FILE_MAX_BYTES:
+                        continue
+                    text = path.read_text(encoding="utf-8", errors="replace")
                 except Exception:
+                    logger.debug("project_analyzer: cannot read gradle toml %s — skipping", path)
                     continue
+                if total + len(text) > self._GRADLE_TOTAL_MAX_BYTES:
+                    text = text[: self._GRADLE_TOTAL_MAX_BYTES - total]
+                chunks.append(text)
+                total += len(text)
         except Exception as e:
-            logger.debug(f"Error reading gradle files: {e}")
+            logger.debug("Error reading gradle files: %s", e)
         self._gradle_text_cache = "\n".join(chunks)
         return self._gradle_text_cache
 
@@ -704,7 +764,7 @@ class ProjectAnalyzer:
                         names.add(self._normalize_dep_name(dep))
                 # Poetry deps
                 poetry = (data.get('tool') or {}).get('poetry') or {}
-                for dep in (poetry.get('dependencies') or {}).keys():
+                for dep in (poetry.get('dependencies') or {}):
                     # Skip Python version constraint keys like 'python = "^3.9"'.
                     if dep.lower() == 'python':
                         continue
@@ -717,13 +777,16 @@ class ProjectAnalyzer:
                 content = setup_py.read_text(encoding="utf-8", errors="replace")
                 tree = _ast.parse(content)
                 for node in _ast.walk(tree):
-                    if isinstance(node, _ast.keyword) and node.arg == 'install_requires':
-                        if isinstance(node.value, (_ast.List, _ast.Tuple)):
-                            for elt in node.value.elts:
-                                if isinstance(elt, _ast.Constant) and isinstance(elt.value, str):
-                                    names.add(self._normalize_dep_name(elt.value))
-            except Exception:
-                pass
+                    if (
+                        isinstance(node, _ast.keyword)
+                        and node.arg == "install_requires"
+                        and isinstance(node.value, (_ast.List, _ast.Tuple))
+                    ):
+                        for elt in node.value.elts:
+                            if isinstance(elt, _ast.Constant) and isinstance(elt.value, str):
+                                names.add(self._normalize_dep_name(elt.value))
+            except Exception as e:
+                logger.debug("Error parsing %s install_requires: %s", setup_py, e)
 
         return names
 
@@ -812,7 +875,7 @@ class ProjectAnalyzer:
                 if buf:
                     items.append(buf)
                 current_table[key] = [s.strip() for s in items if s.strip()]
-            elif value.startswith('"') or value.startswith("'"):
+            elif value.startswith(('"', "'")):
                 current_table[key] = value.strip('"').strip("'")
             else:
                 current_table[key] = value
@@ -821,7 +884,6 @@ class ProjectAnalyzer:
     def _detect_project_types(
         self,
         frameworks: list[str],
-        entry_points: list[str],
         languages: Optional[list[str]] = None,
     ) -> list[str]:
         """Detect project type(s): 'web', 'cli', 'library', 'package'"""
@@ -865,13 +927,13 @@ class ProjectAnalyzer:
                         types.append('cli')
                         break
                 except Exception:
+                    logger.debug("project_analyzer: cannot read %s — skipping CLI detection", py_file)
                     continue
 
         # Go fallback: a `package main` executable with no web framework is a
         # CLI/binary, not a web service or library.
-        if 'go' in languages and 'web' not in types and 'cli' not in types:
-            if self._go_has_main_package():
-                types.append('cli')
+        if 'go' in languages and 'web' not in types and 'cli' not in types and self._go_has_main_package():
+            types.append('cli')
 
         # Android / mobile: an Android app or library module. ('mobile' is the
         # platform-agnostic type — extensible to iOS/Flutter/RN later.)
@@ -907,6 +969,7 @@ class ProjectAnalyzer:
                             return True
                         break  # only the package clause matters
             except Exception:
+                logger.debug("project_analyzer: cannot read %s — skipping go main check", go_file)
                 continue
         return False
 
@@ -933,77 +996,9 @@ class ProjectAnalyzer:
                     categorized['other'].append(item.name)
 
         except Exception as e:
-            logger.debug(f"Error analyzing directories: {e}")
+            logger.debug("Error analyzing directories: %s", e)
 
         return dict(categorized)
-
-    def _detect_file_patterns(
-        self, framework: Optional[str], language: Optional[str] = None
-    ) -> dict[str, str]:
-        """Detect file naming patterns"""
-
-        patterns = {}
-
-        if framework == 'django':
-            patterns['model'] = '{app}/models.py or {app}/models/{model}.py'
-            patterns['view'] = '{app}/views.py or {app}/views/{view}.py'
-            patterns['url'] = '{app}/urls.py'
-            patterns['form'] = '{app}/forms.py'
-            patterns['admin'] = '{app}/admin.py'
-
-        elif framework == 'fastapi':
-            patterns['router'] = 'routers/{feature}.py or api/{feature}.py'
-            patterns['model'] = 'models/{model}.py'
-            patterns['schema'] = 'schemas/{schema}.py'
-            patterns['service'] = 'services/{service}.py'
-
-        elif framework == 'flask':
-            patterns['route'] = 'routes/{feature}.py or {feature}/routes.py'
-            patterns['model'] = 'models/{model}.py or models.py'
-            patterns['form'] = 'forms/{form}.py or forms.py'
-
-        elif framework == 'react':
-            patterns['component'] = 'components/{Component}.tsx or components/{Component}.jsx'
-            patterns['page'] = 'pages/{route}.tsx or app/{route}/page.tsx'
-            patterns['hook'] = 'hooks/{useHook}.ts or hooks/{useHook}.js'
-            patterns['service'] = 'services/{service}.ts or lib/{service}.ts'
-
-        elif framework == 'nextjs':
-            patterns['page'] = 'app/{route}/page.tsx or pages/{route}.tsx'
-            patterns['component'] = 'components/{Component}.tsx'
-            patterns['api'] = 'app/api/{route}/route.ts or pages/api/{route}.ts'
-            patterns['layout'] = 'app/layout.tsx'
-
-        elif framework == 'vue':
-            patterns['component'] = 'components/{Component}.vue'
-            patterns['page'] = 'pages/{route}.vue or views/{View}.vue'
-
-        elif framework == 'nuxt':
-            patterns['page'] = 'pages/{route}.vue'
-            patterns['component'] = 'components/{Component}.vue'
-            patterns['layout'] = 'layouts/{layout}.vue'
-
-        elif framework == 'astro':
-            patterns['page'] = 'pages/{route}.astro'
-            patterns['component'] = 'components/{Component}.astro or components/{Component}.tsx'
-
-        elif language == 'go':
-            patterns['package'] = 'internal/{pkg}/{file}.go or pkg/{pkg}/{file}.go'
-            patterns['command'] = 'cmd/{command}/main.go or internal/cmd/{command}.go'
-            patterns['test'] = '{file}_test.go'
-
-        elif language in ('javascript', 'typescript'):
-            patterns['module'] = '{feature}.ts or {feature}.js'
-
-        elif language in (None, 'python'):
-            # Generic Python (also the no-language fallback)
-            patterns['module'] = '{feature}.py'
-            patterns['class'] = '{feature}_class.py or {feature}.py'
-
-        # Other languages: no reliable generic template — leave empty rather
-        # than emit misleading guidance.
-
-        return patterns
 
     def _detect_naming_style(self) -> Optional[str]:
         """Detect naming convention from existing files.
@@ -1040,7 +1035,7 @@ class ProjectAnalyzer:
                         camel_count += 1
 
         except Exception as e:
-            logger.debug(f"Error detecting naming style: {e}")
+            logger.debug("Error detecting naming style: %s", e)
 
         # No files of a recognized language → no basis to claim a convention.
         if seen == 0:
@@ -1056,9 +1051,9 @@ class ProjectAnalyzer:
         # Determine majority
         if snake_count > camel_count and snake_count > pascal_count:
             return "snake_case"
-        elif pascal_count > snake_count:
+        if pascal_count > snake_count:
             return "PascalCase"
-        elif camel_count > 0:
+        if camel_count > 0:
             return "camelCase"
 
         return "snake_case"  # Default for Python (snake ties/leads)
@@ -1089,6 +1084,7 @@ class ProjectAnalyzer:
                                 if module:
                                     import_counts[module] += 1
                 except Exception:
+                    logger.debug("project_analyzer: cannot read %s — skipping import scan", py_file)
                     continue
 
             # JS/TS imports (ESM + CJS)
@@ -1122,16 +1118,17 @@ class ProjectAnalyzer:
                                         if not _mod.startswith('.'):
                                             import_counts[_mod.split('/')[0]] += 1
                     except Exception:
+                        logger.debug("project_analyzer: cannot read %s — skipping import scan", ts_file)
                         continue
 
         except Exception as e:
-            logger.debug(f"Error finding imports: {e}")
+            logger.debug("Error finding imports: %s", e)
 
         # Return top 10
         sorted_imports = sorted(import_counts.items(), key=lambda x: x[1], reverse=True)
         return [imp for imp, _ in sorted_imports[:10]]
 
-    def _find_entry_points(self, framework: Optional[str]) -> list[str]:
+    def _find_entry_points(self) -> list[str]:
         """Find main entry point files
 
         Scans in priority order:
@@ -1164,8 +1161,8 @@ class ProjectAnalyzer:
                                or data.get('tool', {}).get('poetry', {}).get('scripts', {}))
                     for _name, _target in scripts.items():
                         entry_points.append(f"{_name} ({_target})")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Error parsing %s entry_points: %s", pyproject_path, e)
 
         # --- Priority 2: setup.py (parse console_scripts via regex) ---
         setup_py_path = self.repo_root / 'setup.py'
@@ -1182,10 +1179,10 @@ class ProjectAnalyzer:
                                     ep_dict = _ast.literal_eval(kw.value)
                                     console_scripts = ep_dict.get('console_scripts', [])
                                     entry_points.extend(console_scripts)
-                                except Exception:
-                                    pass
-            except Exception:
-                pass
+                                except Exception as e:
+                                    logger.debug("Error evaluating entry_points in %s: %s", setup_py_path, e)
+            except Exception as e:
+                logger.debug("Error parsing %s entry_points: %s", setup_py_path, e)
 
         # --- Priority 3: setup.cfg ---
         setup_cfg_path = self.repo_root / 'setup.cfg'
@@ -1198,8 +1195,8 @@ class ProjectAnalyzer:
                     for k, v in cfg['options.entry_points'].items():
                         if k == 'console_scripts':
                             entry_points.extend(line.strip() for line in v.split('\n') if line.strip())
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Error parsing %s entry_points: %s", setup_cfg_path, e)
 
         # --- Priority 4: package.json ---
         pkg_json = self.repo_root / 'package.json'
@@ -1216,8 +1213,8 @@ class ProjectAnalyzer:
                 main_ = pkg.get('main')
                 if main_ and main_ not in entry_points:
                     entry_points.append(main_)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Error parsing %s bin/main: %s", pkg_json, e)
 
         # --- Priority 5: Well-known filename fallback (always checked) ---
         # Strong candidates: include immediately if file exists
@@ -1239,17 +1236,15 @@ class ProjectAnalyzer:
         ]
 
         for candidate in strong_candidates:
-            if (self.repo_root / candidate).exists():
-                if candidate not in entry_points:
-                    entry_points.append(candidate)
+            if (self.repo_root / candidate).exists() and candidate not in entry_points:
+                entry_points.append(candidate)
 
         # Weak candidates: include only if file contains a real entry pattern
         weak_candidates = ['cli.py']
         for candidate in weak_candidates:
             path = self.repo_root / candidate
-            if path.exists() and candidate not in entry_points:
-                if self._has_entry_pattern(path):
-                    entry_points.append(candidate)
+            if path.exists() and candidate not in entry_points and self._has_entry_pattern(path):
+                entry_points.append(candidate)
 
         return entry_points
 
@@ -1258,11 +1253,12 @@ class ProjectAnalyzer:
         """Check if a Python file contains a real entry point pattern"""
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        else:
             return ("if __name__ == '__main__'" in content
                     or 'if __name__ == "__main__"' in content
                     or 'def main():' in content)
-        except Exception:
-            return False
 
     def _find_test_dir(self) -> Optional[str]:
         """Find test directory"""
@@ -1327,7 +1323,7 @@ class ProjectAnalyzer:
                         examples[match.parent.name] = str(match.relative_to(self.repo_root))
 
         except Exception as e:
-            logger.debug(f"Error finding example files: {e}")
+            logger.debug("Error finding example files: %s", e)
 
         return examples
 

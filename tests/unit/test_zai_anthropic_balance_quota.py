@@ -25,7 +25,6 @@ from external_llm.client import (
     is_balance_quota_signal,
 )
 
-
 # ── canonical helper (client.py) ────────────────────────────────────────────
 
 def test_balance_signal_true_for_zai_code_1113():

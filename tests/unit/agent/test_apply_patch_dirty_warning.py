@@ -139,3 +139,38 @@ class TestApplyPatchSessionEditGuard:
         stub._record_text_edit(str(tmp_path / "sample.py"))  # absolute
         stub._record_text_edit("sample.py")                   # relative
         assert stub._text_edited_files == {"sample.py"}
+
+    def test_refuse_session_edited_helper_contract(self, tmp_path):
+        """The shared helper is the single source of the Opt D refusal: None for
+        clean touches; ok=False ToolResult naming ONLY the session-edited files
+        (with canonical reason + refused_dirty_files metadata) for mixed touches."""
+        stub = _init_repo(tmp_path)
+        # clean touches → None so the caller proceeds with the apply
+        assert stub._refuse_session_edited(["sample.py"], 0.0) is None
+        stub._record_text_edit("sample.py")
+        res = stub._refuse_session_edited(["sample.py", "other.py"], 0.0)
+        assert res is not None and not res.ok
+        assert "sample.py" in (res.error or "")
+        assert "other.py" not in (res.error or "")  # only session-edited files named
+        meta = res.metadata or {}
+        assert meta.get("reason") == "session_text_edit_overwrite_risk"
+        assert meta.get("refused_dirty_files") == ["sample.py"]
+        assert (res.execution_time or 0) >= 0
+
+    def test_entry_points_consult_shared_helper(self, tmp_path, monkeypatch):
+        """Both public apply entry points (main _tool_apply_patch and internal
+        _apply_patch_text) must consult the shared helper — pins the dedup
+        contract so an inline guard copy can't silently reappear in one path
+        while the others route through the helper."""
+        stub = _init_repo(tmp_path)
+        calls = []
+        monkeypatch.setattr(
+            type(stub),
+            "_refuse_session_edited",
+            lambda self, touched, start_time: calls.append(touched) or None,
+        )
+        stub._tool_apply_patch({"patch": _PATCH, "path": "sample.py"})
+        assert len(calls) >= 1
+        calls.clear()
+        stub._apply_patch_text(_PATCH, path_hint="sample.py")
+        assert len(calls) >= 1

@@ -71,7 +71,7 @@ class TestRender:
         out = render_interrupt_tool_results([_entry("read_file", big_args, "c")])
         # args get capped at MAX_ARGS_CHARS (400)
         idx = out.find("args:")
-        assert 0 <= idx
+        assert idx >= 0
         line_end = out.find("\n", idx)
         assert line_end - idx <= 410
 

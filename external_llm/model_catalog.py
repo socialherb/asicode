@@ -78,7 +78,9 @@ KNOWN_MODELS: dict[str, list[str]] = {
         "qwen/qwen3.6",
     ],
     "opencode": [
-        # Complete list from https://opencode.ai/zen/go/v1/models (20 models)
+        # Curated list from https://opencode.ai/zen/go/v1/models.
+        # Verified 2026-08-04 against the live API (25 ids returned). hy3-preview
+        # is served but handled via MODEL_ALIASES (→ hy3), so it is omitted here.
         "glm-5.2",
         "glm-5.1",
         "glm-5",
@@ -95,11 +97,14 @@ KNOWN_MODELS: dict[str, list[str]] = {
         "minimax-m3",
         "minimax-m2.7",
         "minimax-m2.5",
+        "qwen3.8-max",
         "qwen3.7-max",
         "qwen3.7-plus",
         "qwen3.6-plus",
         "qwen3.5-plus",
         "hy3",
+        "gpt-5.6-luna",
+        "grok-4.5",
     ],
 }
 
@@ -187,11 +192,10 @@ def webapp_external_model_groups() -> list[dict]:
         options: list[dict] = []
         for provider, provider_label in providers:
             models = WEBAPP_MODEL_OVERRIDES.get(provider) or KNOWN_MODELS.get(provider, [])
-            for m in models:
-                options.append({
+            options.extend({
                     "value": f"external_{provider}:{m}",
                     "label": f"{provider_label} · {m}",
-                })
+                } for m in models)
         groups.append({"label": group_label, "options": options})
     return groups
 
@@ -200,8 +204,8 @@ __all__ = [
     "KNOWN_MODELS",
     "LEGACY_MODELS",
     "MODEL_ALIASES",
-    "valid_models",
-    "WEBAPP_PROVIDER_GROUPS",
     "WEBAPP_MODEL_OVERRIDES",
+    "WEBAPP_PROVIDER_GROUPS",
+    "valid_models",
     "webapp_external_model_groups",
 ]

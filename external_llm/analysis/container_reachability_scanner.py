@@ -214,9 +214,8 @@ def _is_container_ref(
     """
     if isinstance(node, ast.Name):
         return node.id == container_name
-    if isinstance(node, ast.Attribute) and node.attr == container_name:
-        if isinstance(node.value, ast.Name):
-            return node.value.id in ("self", "cls") or node.value.id == enclosing_class
+    if isinstance(node, ast.Attribute) and node.attr == container_name and isinstance(node.value, ast.Name):
+        return node.value.id in ("self", "cls") or node.value.id == enclosing_class
     return False
 
 
@@ -250,12 +249,11 @@ def _collect_dict_literals(
                     name = tgt.id
                     # Cross-file referenced names are skipped regardless of
                     # privacy — private dicts get imported across modules too
-                    # (e.g. `from .edit_prompts import _USER_PROMPT_BUILDERS`).
+                    # (e.g. `from .config.thresholds import config`).
                     if cross_file_referenced_names and name in cross_file_referenced_names:
                         continue
-                    if not _is_private_name(name):
-                        if cross_file_referenced_names is None:
-                            continue  # conservative: private only
+                    if not _is_private_name(name) and cross_file_referenced_names is None:
+                        continue  # conservative: private only
                     if not isinstance(value, ast.Dict):
                         continue
                     keys = _extract_string_keys(value)
@@ -270,9 +268,8 @@ def _collect_dict_literals(
                 name = node.target.id
                 if cross_file_referenced_names and name in cross_file_referenced_names:
                     continue  # externally referenced (incl. imported private names)
-                if not _is_private_name(name):
-                    if cross_file_referenced_names is None:
-                        continue  # conservative: private only
+                if not _is_private_name(name) and cross_file_referenced_names is None:
+                    continue  # conservative: private only
                 if node.value is None or not isinstance(node.value, ast.Dict):
                     continue
                 keys = _extract_string_keys(node.value)
@@ -380,9 +377,8 @@ def _find_method_in_class(
     method_name: str,
 ) -> Optional[ast.FunctionDef]:
     for node in class_node.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name == method_name:
-                return node  # type: ignore[return-value]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == method_name:
+            return node  # type: ignore[return-value]
     return None
 
 
@@ -396,17 +392,22 @@ def _resolve_class_constant(class_node: ast.ClassDef, attr_name: str) -> Optiona
     for node in class_node.body:
         if isinstance(node, ast.Assign):
             for tgt in node.targets:
-                if isinstance(tgt, ast.Name) and tgt.id == attr_name:
-                    if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                        return node.value.value
-        elif isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name) and node.target.id == attr_name:
                 if (
-                    node.value is not None
+                    isinstance(tgt, ast.Name)
+                    and tgt.id == attr_name
                     and isinstance(node.value, ast.Constant)
                     and isinstance(node.value.value, str)
                 ):
                     return node.value.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == attr_name
+            and node.value is not None
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            return node.value.value
     return None
 
 
@@ -534,7 +535,6 @@ def _compute_reachability(
     read_sites: list[ContainerReadSite],
     tree: ast.Module,
     enclosing_class: str | None,
-    lineno_to_method: dict[int, str],
     method_nodes: dict[str, ast.FunctionDef],
 ) -> tuple:
     """Return (keys_unreachable, keys_possibly_unreachable, keys_reachable, domain, evidence).
@@ -633,9 +633,7 @@ def _compute_reachability(
                 keys_reachable.append(key)
             else:
                 keys_unreachable.append(key)
-        elif key in known_reachable or key in partial_domain:
-            keys_reachable.append(key)
-        elif has_unknown_domain_site:
+        elif key in known_reachable or key in partial_domain or has_unknown_domain_site:
             keys_reachable.append(key)
         else:
             keys_possibly_unreachable.append(key)
@@ -729,7 +727,7 @@ def scan_container_reachability(
                 reach_evidence,
             ) = _compute_reachability(
                 keys, read_sites, tree, enclosing_class,
-                lineno_to_method, method_nodes,
+                method_nodes,
             )
 
             # Skip if nothing interesting (caller can lower min_unreachable_keys=0)
@@ -781,7 +779,7 @@ def scan_container_reachability(
             "[CONTAINER_REACH] %d container(s) across %d file(s); "
             "structurally_unreachable keys=%d",
             len(candidates),
-            len(set(c.file for c in candidates)),
+            len({c.file for c in candidates}),
             unreachable_count,
         )
 

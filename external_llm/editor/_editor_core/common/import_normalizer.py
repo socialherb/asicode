@@ -19,11 +19,15 @@ handled by the existing _strip_hallucinated_imports + F821 repair chain.
 """
 from __future__ import annotations
 
+import ast
+import logging
 import os
 from typing import Optional
 
 from external_llm.common.atomic_io import atomic_write_text
 from external_llm.languages import LanguageId
+
+logger = logging.getLogger(__name__)
 
 # ── F821-protected imports cache ──────────────────────────────────────
 # When F821 auto-repair inserts a typing import (e.g. `from typing import
@@ -85,6 +89,7 @@ def mark_f821_protected(file_path: str, name: str) -> None:
         with open(_abs, encoding='utf-8') as _fh:
             _lines = _fh.readlines()
     except OSError:
+        logger.debug("f821-protect marker read failed: %s", _abs, exc_info=True)
         return
 
     _modified = False
@@ -106,11 +111,6 @@ def mark_f821_protected(file_path: str, name: str) -> None:
                 file_path, _exc,
             )
 
-
-import ast
-import logging
-
-logger = logging.getLogger(__name__)
 
 # ── Known typing symbols ─────────────────────────────────────────────────────
 # Covers Python 3.8+ stdlib typing. Deliberately conservative — only symbols
@@ -166,12 +166,14 @@ def collect_typing_usage(source: str) -> set[str]:
             for arg in all_args:
                 if arg.annotation and isinstance(arg.annotation, ast.Constant):
                     annotation_node_ids.add(id(arg.annotation))
-            if node.args.vararg and node.args.vararg.annotation:
-                if isinstance(node.args.vararg.annotation, ast.Constant):
-                    annotation_node_ids.add(id(node.args.vararg.annotation))
-            if node.args.kwarg and node.args.kwarg.annotation:
-                if isinstance(node.args.kwarg.annotation, ast.Constant):
-                    annotation_node_ids.add(id(node.args.kwarg.annotation))
+            if (
+                node.args.vararg
+                and node.args.vararg.annotation
+                and isinstance(node.args.vararg.annotation, ast.Constant)
+            ):
+                annotation_node_ids.add(id(node.args.vararg.annotation))
+            if node.args.kwarg and node.args.kwarg.annotation and isinstance(node.args.kwarg.annotation, ast.Constant):
+                annotation_node_ids.add(id(node.args.kwarg.annotation))
             # Return annotation
             if node.returns and isinstance(node.returns, ast.Constant):
                 annotation_node_ids.add(id(node.returns))
@@ -195,25 +197,23 @@ def collect_typing_usage(source: str) -> set[str]:
 
         # Attribute: typing.List, typing.Optional (less common but valid)
         elif isinstance(node, ast.Attribute):
-            if isinstance(node.value, ast.Name) and node.value.id == "typing":
-                if node.attr in _TYPING_SYMBOLS:
-                    used.add(node.attr)
+            if isinstance(node.value, ast.Name) and node.value.id == "typing" and node.attr in _TYPING_SYMBOLS:
+                used.add(node.attr)
 
         # String annotations — ONLY if in annotation context (not docstrings).
         # e.g. `def foo(x: "Dict[str, Any]") -> "Optional[str]":` is valid.
         # e.g. `"""Returns Optional value"""` is NOT an annotation.
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if id(node) in annotation_node_ids:
-                for sym in _TYPING_SYMBOLS:
-                    sv = node.value
-                    idx = sv.find(sym)
-                    while idx != -1:
-                        before = idx == 0 or not (sv[idx-1].isalnum() or sv[idx-1] == '_')
-                        after = idx + len(sym) >= len(sv) or not (sv[idx+len(sym)].isalnum() or sv[idx+len(sym)] == '_')
-                        if before and after:
-                            used.add(sym)
-                            break
-                        idx = sv.find(sym, idx + 1)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) in annotation_node_ids:
+            for sym in _TYPING_SYMBOLS:
+                sv = node.value
+                idx = sv.find(sym)
+                while idx != -1:
+                    before = idx == 0 or not (sv[idx-1].isalnum() or sv[idx-1] == '_')
+                    after = idx + len(sym) >= len(sv) or not (sv[idx+len(sym)].isalnum() or sv[idx+len(sym)] == '_')
+                    if before and after:
+                        used.add(sym)
+                        break
+                    idx = sv.find(sym, idx + 1)
 
     return used
 
@@ -243,15 +243,10 @@ def normalize_typing_imports(file_path: str) -> bool:
         return False
 
     # ── Step 1: Find existing 'from typing import ...' nodes ─────────────
-    typing_nodes: list = []
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.ImportFrom)
+    typing_nodes: list = [node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
             and node.module == "typing"
             and node.names  # not "from typing import *"
-            and not any(a.name == "*" for a in node.names)
-        ):
-            typing_nodes.append(node)
+            and not any(a.name == "*" for a in node.names)]
 
     existing_names: set[str] = set()
     for node in typing_nodes:
@@ -338,7 +333,7 @@ def normalize_typing_imports(file_path: str) -> bool:
     # No existing import but symbols needed → find first non-docstring import
     # line and insert before it.
     if not replaced and new_import_line:
-        insert_at = _find_first_import_line(tree, lines)
+        insert_at = _find_first_import_line(tree)
         new_lines.insert(insert_at, new_import_line)
 
     new_source = "".join(new_lines)
@@ -362,13 +357,14 @@ def normalize_typing_imports(file_path: str) -> bool:
             "normalize_typing_imports: updated %s (%s → %s)",
             file_path, sorted(existing_names), sorted(needed),
         )
-        return True
     except OSError as exc:
         logger.warning("normalize_typing_imports: write failed for %s: %s", file_path, exc)
         return False
+    else:
+        return True
 
 
-def _find_first_import_line(tree: ast.Module, lines: list) -> int:
+def _find_first_import_line(tree: ast.Module) -> int:
     """Return 0-indexed line number of first import statement, or 0."""
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):

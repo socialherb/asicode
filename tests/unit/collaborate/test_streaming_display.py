@@ -270,6 +270,7 @@ class TestTickerConcurrency:
         _ticker_thread, orphaning the first ticker.
         """
         import threading
+
         from external_llm.repl.collaborate import streaming_display as mod
 
         RealThread = threading.Thread
@@ -315,6 +316,7 @@ class TestTickerConcurrency:
     def test_start_ticker_idempotent_sequential(self):
         """Consecutive calls from the same thread don't create a second thread."""
         import threading
+
         from external_llm.repl.collaborate import streaming_display as mod
 
         RealThread = threading.Thread
@@ -415,11 +417,12 @@ class TestMarkdownTableFoldPatch:
         proc = subprocess.run(
             ["grep", "-rn", r'from rich\.markdown import', "external_llm", "asi.py", "webapp"],
             capture_output=True, text=True, timeout=10,
+            check=False,
         )
         # Only legitimate site: the shared module itself (which uses it inside markdown_cls)
-        lines = [l for l in proc.stdout.splitlines() if l.strip() and "rich_markdown.py" not in l]
+        lines = [line for line in proc.stdout.splitlines() if line.strip() and "rich_markdown.py" not in line]
         assert not lines, (
-            f"Direct `from rich.markdown import` bypasses the shared module — "
-            f"use `markdown_cls()` from `external_llm.common.rich_markdown` instead. Found:\n"
+            "Direct `from rich.markdown import` bypasses the shared module — "
+            "use `markdown_cls()` from `external_llm.common.rich_markdown` instead. Found:\n"
             + "\n".join(lines)
         )

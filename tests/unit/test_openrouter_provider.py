@@ -212,3 +212,26 @@ def test_create_intelligent_service_explicit_key(monkeypatch):
     svc = create_intelligent_service_from_env(api_key="sk-or-explicit")
     assert svc is not None
     assert svc.provider == "openrouter"
+
+
+def test_create_service_from_env_explicit_api_key_wins(monkeypatch):
+    """api_key param must take precedence over the env var lookup."""
+    monkeypatch.setenv("EXTERNAL_LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-env-should-lose")
+    from external_llm.service import create_service_from_env
+    svc = create_service_from_env(api_key="sk-explicit")
+    assert svc is not None
+    assert svc.provider == "openrouter"
+    assert svc.client.api_key == "sk-explicit"
+
+
+def test_create_service_from_env_api_key_param_rescues_missing_env(monkeypatch):
+    """Without the api_key param a missing env key returns None; with it, the
+    service is still created — the plan_json parity fix depends on this."""
+    monkeypatch.setenv("EXTERNAL_LLM_PROVIDER", "openrouter")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    from external_llm.service import create_service_from_env
+    assert create_service_from_env() is None
+    svc = create_service_from_env(api_key="sk-explicit")
+    assert svc is not None
+    assert svc.client.api_key == "sk-explicit"

@@ -13,6 +13,7 @@ import subprocess
 
 import pytest
 
+from external_llm.agent.tool_handlers.write_tools_core import _extract_truncated_op_path
 from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -49,7 +50,6 @@ def registry(git_repo):
         run_tests=False,
         run_lint=False,
         auto_test_on_patch=False,
-        planning_enabled=False,
         self_review_enabled=False,
         rag_enabled=False,
                             parallel_tool_execution_enabled=False)
@@ -392,7 +392,7 @@ class TestBeforeTextIndentEnrichment:
         cfg = AgentConfig(
             max_turns=1,
             run_tests=False, run_lint=False, auto_test_on_patch=False,
-            planning_enabled=False, self_review_enabled=False,
+            self_review_enabled=False,
             rag_enabled=False,
             parallel_tool_execution_enabled=False,
         )
@@ -412,7 +412,7 @@ class TestBeforeTextIndentEnrichment:
             encoding="utf-8",
         )
         cfg = AgentConfig(max_turns=1, run_tests=False, run_lint=False,
-                          auto_test_on_patch=False, planning_enabled=False,
+                          auto_test_on_patch=False,
                           self_review_enabled=False, rag_enabled=False,
                           parallel_tool_execution_enabled=False,
                         )
@@ -584,3 +584,83 @@ class TestLineNumberPrefixStripping:
         result = registry.dispatch("write_plan", {"plan": plan})
         assert result.ok, f"Expected success but got error: {result.error}"
         assert "return 1" in target.read_text()
+
+
+class TestExtractTruncatedOpPath:
+    """Pure-function tests for the write_plan truncation hint scanner.
+
+    The helper is invoked from the truncation branch of ``_tool_write_plan``
+    only when the raw JSON has unbalanced braces (cut mid-value). These cases
+    cover the realistic truncation shapes an LLM produces.
+    """
+
+    def test_truncated_mid_content_returns_op_and_path(self):
+        # The canonical case: create_file with a huge content field cut mid-stream.
+        raw = (
+            '{"plan": {"kind": "ASICODE_PLAN_V1", "ops": ['
+            '{"op": "create_file", "path": "src/foo.py", "content": "import os\n'
+        )
+        hint = _extract_truncated_op_path(raw)
+        assert hint == "op=create_file path=src/foo.py"
+
+    def test_path_inside_content_value_not_mistaken_for_key(self):
+        # The content string literally contains '"path": "...' text — it must NOT
+        # be captured because the scanner tracks string boundaries.
+        raw = (
+            '{"plan":{"ops":[{"op":"create_file","path":"real.py","content":"'
+            'note: do not match {\"path\": \"decoy.py\"} here\\n still content'
+        )
+        hint = _extract_truncated_op_path(raw)
+        assert hint == "op=create_file path=real.py"
+        assert "decoy" not in hint
+
+    def test_reports_most_recent_op_when_multiple_ops(self):
+        # First op completes; second op's content is where truncation hits —
+        # the SECOND op's path must be reported.
+        raw = (
+            '{"plan":{"ops":['
+            '{"op":"create_file","path":"a.py","content":"x"},'
+            '{"op":"edit_blocks","path":"b.py","before":"<huge'
+        )
+        hint = _extract_truncated_op_path(raw)
+        assert hint == "op=edit_blocks path=b.py"
+
+    def test_truncated_before_path_returns_op_only(self):
+        # op emitted, but the stream cut before its path key.
+        raw = '{"plan":{"ops":[{"op":"create_file"'
+        hint = _extract_truncated_op_path(raw)
+        assert hint == "op=create_file"
+
+    def test_single_quotes_are_not_strings(self):
+        # Single-quoted values are not JSON strings; they should not be parsed
+        # as values. The scanner must not pick up 'create_file' here.
+        raw = "{'op': 'create_file', 'path': 'foo.py', 'content': 'xxxx"
+        hint = _extract_truncated_op_path(raw)
+        assert hint is None
+
+    def test_balanced_payload_returns_last_path(self):
+        # Even a well-formed (balanced) payload should return its last op/path
+        # — the helper does not itself check brace balance; caller does.
+        raw = '{"ops":[{"op":"create_file","path":"ok.py","content":"x"}]}'
+        hint = _extract_truncated_op_path(raw)
+        assert hint == "op=create_file path=ok.py"
+
+    def test_no_identifiable_target_returns_none(self):
+        raw = '{"plan":{"ops":['
+        hint = _extract_truncated_op_path(raw)
+        assert hint is None
+
+    def test_escaped_quote_inside_content_does_not_close_string(self):
+        # A \" (backslash-quote) inside the content value is a JSON-escaped
+        # quote and must NOT terminate the content literal early. The scanner
+        # reads the whole content run to EOF and reports a.py, never b.py.
+        #   - In the single-quoted Python source below, \\" yields the two-char
+        #     sequence backslash+quote (the JSON escape) and " is literal.
+        raw = (
+            '{"ops":[{"op":"create_file","path":"a.py",'
+            '"content":"he said \\"hi\\" then \\"path\\": \\"b.py\\" more'
+        )
+        hint = _extract_truncated_op_path(raw)
+        assert hint == "op=create_file path=a.py"
+        assert "b.py" not in (hint or "")
+

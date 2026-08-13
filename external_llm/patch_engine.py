@@ -12,6 +12,7 @@ Design principles:
 4. Output mode synthesis: converts LLM outputs (UNIFIED_DIFF, FULL_FILE, ASICODE_BLOCK, TARGETED_BLOCK, PLAN_JSON) to unified diff
 """
 
+import contextlib
 import difflib
 import logging
 import os
@@ -22,24 +23,26 @@ from pathlib import Path
 from typing import Any, Optional
 
 from common import normalize_rel_path_fast
+from path_security import resolve_inside_repo
 
 from .code_structure_utils import extract_symbol_name, is_python_definition
+from .output_modes import OutputMode
+from .output_parser import parse_file_blocks
 
 logger = logging.getLogger(__name__)
 
-# Output mode enumeration
-try:
-    from .output_modes import OutputMode
-except ImportError:
-    logger.warning("output_modes module not found, OutputMode enum unavailable")
-    OutputMode = None  # type: ignore
-
-# File block parsing
-try:
-    from .output_parser import parse_file_blocks
-except ImportError:
-    logger.warning("output_parser module not found, parse_file_blocks unavailable")
-    parse_file_blocks = None  # type: ignore
+# ── Precompiled patch-parse regexes (hot apply path) ─────────────────────────
+# Hoisted module-level: these static patterns are compiled once instead of per
+# patch parse/repair call (the re module's internal cache alone is not a
+# guarantee — heavy dynamic-pattern load elsewhere can evict them).
+_RE_DIFF_GIT = re.compile(r"^diff --git a/(.+?) b/(.+?)\s*$")
+_RE_HUNK_HEADER_RECOUNT = re.compile(
+    r'^(@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@)(.*)',
+    re.DOTALL,
+)
+_RE_HUNK_HEADER_FIX = re.compile(
+    r'^(@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@)(.*)', re.DOTALL
+)
 
 # ─── Patch Context ────────────────────────────────────────────────────────────
 
@@ -90,7 +93,9 @@ class PatchEngine:
     _MAX_PATCH_CHARS = 350_000
     _MAX_FILE_REWRITE_CHANGE_RATIO = 0.8  # reject if >80% of file changed
     _MAX_FILE_REWRITE_CHANGED_LINES = 1000  # reject if >1000 lines changed
-    _MAX_FILE_RETRY_FILE_CHARS = 10_000  # maximum file size for FILE retry
+    # P22-4: bytes proxy for the >2000-line salvage skip — avoids loading a file
+    # we are about to skip anyway (~2000 lines x ~128 bytes/line).
+    _SALVAGE_SKIP_MAX_BYTES = 256 * 1024
 
     # Regex for parsing FILE blocks (legacy fallback)
     _RE_FILE_BLOCK = re.compile(
@@ -105,54 +110,32 @@ class PatchEngine:
         self._setup_components()
 
     def _setup_components(self):
-        """Lazy import and setup of component modules."""
+        """Import and set up component modules (all first-party — imports
+        cannot fail, so the old try/except ImportError fallbacks were dead
+        code; the ``is None`` defensive checks in callers are retained)."""
         # Diff applier (shared with agent path)
-        try:
-            from diff_apply import apply_patch as diff_apply_patch
-            self._diff_apply = diff_apply_patch
-        except ImportError:
-            logger.warning("diff_apply module not found, patch application may be limited")
-            self._diff_apply = None
+        from diff_apply import apply_patch as diff_apply_patch
+        self._diff_apply = diff_apply_patch
 
         # AST rewriter
-        try:
-            from .ast_rewrite import ASTRewriter
-            self.ast_rewriter = ASTRewriter(self.repo_root)
-        except ImportError:
-            logger.warning("ast_rewrite module not found, AST rewrite fallback disabled")
-            self.ast_rewriter = None
+        from .ast_rewrite import ASTRewriter
+        self.ast_rewriter = ASTRewriter(self.repo_root)
 
         # Semantic patcher
-        try:
-            from .semantic_patch import SemanticPatchEngine
-            self.semantic_patcher = SemanticPatchEngine(self.repo_root)
-        except ImportError:
-            logger.warning("semantic_patch module not found, semantic patch fallback disabled")
-            self.semantic_patcher = None
+        from .semantic_patch import SemanticPatchEngine
+        self.semantic_patcher = SemanticPatchEngine(self.repo_root)
 
         # Symbol searcher (already used by agent tools)
-        try:
-            from .agent.symbol_search import SymbolSearcher
-            self.symbol_searcher = SymbolSearcher(self.repo_root)
-        except ImportError:
-            logger.warning("symbol_search module not found, symbol search fallback disabled")
-            self.symbol_searcher = None
+        from .agent.symbol_search import get_symbol_searcher
+        self.symbol_searcher = get_symbol_searcher(self.repo_root)
 
         # Patch synthesizer
-        try:
-            from .patch_synthesizer import PatchSynthesizer
-            self.patch_synthesizer = PatchSynthesizer(self.repo_root)
-        except ImportError:
-            logger.warning("patch_synthesizer module not found, synthesis disabled")
-            self.patch_synthesizer = None
+        from .patch_synthesizer import PatchSynthesizer
+        self.patch_synthesizer = PatchSynthesizer(self.repo_root)
 
         # Hybrid parser
-        try:
-            from .hybrid_parser import HybridOutputParser
-            self.hybrid_parser = HybridOutputParser()
-        except ImportError:
-            logger.warning("hybrid_parser module not found, output mode parsing disabled")
-            self.hybrid_parser = None
+        from .hybrid_parser import HybridOutputParser
+        self.hybrid_parser = HybridOutputParser()
 
     def _output_mode_to_enum(self, output_mode: str) -> Optional[OutputMode]:
         """Convert output mode string to OutputMode enum."""
@@ -228,12 +211,17 @@ class PatchEngine:
         # Resolve check path: explicit target_file or parsed from patch header
         _check_target = target_file
         if not _check_target and not _patch_is_new_file:
+            # split('\t') because `diff -u` and `git diff --no-prefix` put a
+            # tab-separated timestamp after the path. Without it the target
+            # resolved to "app.py\t2020-01-02 …" and the engine rejected an
+            # ordinary `diff -u` patch with "Target file does not exist",
+            # naming a file nobody asked for.
             for _pl in work_patch.splitlines():
                 if _pl.startswith("+++ b/"):
-                    _check_target = _pl[6:].strip()
+                    _check_target = _pl[6:].split("\t")[0].strip()
                     break
-                elif _pl.startswith("+++ ") and not _pl.startswith("+++ /dev/null"):
-                    _check_target = _pl[4:].strip()
+                if _pl.startswith("+++ ") and not _pl.startswith("+++ /dev/null"):
+                    _check_target = _pl[4:].split("\t")[0].strip()
                     break
         if not _patch_is_new_file and _check_target:
             _tf_full = Path(self.repo_root) / _check_target
@@ -265,7 +253,7 @@ class PatchEngine:
             metadata["target_git_state"] = _target_git_state
             if _target_git_state in ("untracked", "gitignored", "freshly_edited"):
                 _skip_3way = True
-            elif _target_git_state == "tracked":
+            elif _target_git_state == "tracked" and self._patch_index_shas_are_fake(work_patch):
                 # Mode B: tracked+clean, but the patch's `index` line carries a
                 # fabricated SHA (LLM cannot compute real git blob hashes). This
                 # gate has NO effect on correctness: when the patch context
@@ -276,9 +264,8 @@ class PatchEngine:
                 # die with "repository lacks the necessary blob" because the
                 # fabricated old-SHA is absent from the object store. Non-3way
                 # variants patch purely by context-line matching.
-                if self._patch_index_shas_are_fake(work_patch):
-                    _skip_3way = True
-                    metadata["skip_3way_reason"] = "fake_index_sha"
+                _skip_3way = True
+                metadata["skip_3way_reason"] = "fake_index_sha"
 
         # Step 2: Try git apply (primary path)
         self._add_step(metadata, "git_apply", "Attempting git apply")
@@ -297,8 +284,7 @@ class PatchEngine:
                         patch_applied=work_patch,
                         metadata=metadata
                     )
-                else:
-                    metadata["first_fail_reason"] = _ga_msg or _ga_reason or "git apply failed"
+                metadata["first_fail_reason"] = _ga_msg or _ga_reason or "git apply failed"
             except Exception as e:
                 metadata["first_fail_reason"] = f"git apply exception: {e}"
         elif not self._diff_apply:
@@ -373,51 +359,48 @@ class PatchEngine:
                         patch_applied=repair_result.patch_applied,
                         metadata=merged_metadata
                     )
-                else:
-                    # Repaired patch failed to apply
-                    merged_metadata["reason"] = "repaired_patch_apply_failed"
-                    merged_metadata["second_fail_reason"] = apply_err
-                    return PatchResult(
-                        success=False,
-                        error=f"Repaired patch failed to apply: {apply_err}",
-                        metadata=merged_metadata
-                    )
-            else:
-                # No patch produced (should not happen)
-                merged_metadata["reason"] = "repaired_patch_missing"
+                # Repaired patch failed to apply
+                merged_metadata["reason"] = "repaired_patch_apply_failed"
+                merged_metadata["second_fail_reason"] = apply_err
                 return PatchResult(
                     success=False,
-                    error="Repair succeeded but no patch produced",
+                    error=f"Repaired patch failed to apply: {apply_err}",
                     metadata=merged_metadata
                 )
-        else:
-            metadata["reason"] = "repair_failed"
-            metadata["fallback_used"] = repair_result.metadata.get("fallback_used", [])
-            metadata["second_fail_reason"] = repair_result.metadata.get("error", "repair failed")
-            _final_err = f"Patch application failed and repair attempts exhausted: {metadata['first_fail_reason']}"
-            # Actionable guidance for the known blob-deficient states. The 3-way merge
-            # path (which the repair ladder would otherwise rely on) cannot find a
-            # pre-image blob for these, so steer the caller to a tool that works without
-            # one. This turns a confusing "lacks the necessary blob" into a concrete
-            # next step.
-            if _target_git_state == "freshly_edited":
-                _final_err += (
-                    f" (target '{_check_target}' is freshly-edited: its working tree differs "
-                    f"from git, so 3-way merge has no usable pre-image blob. Re-read the file "
-                    f"and regenerate the patch against its CURRENT content, or use "
-                    f"'modify_symbol'/'edit_text' for a single-symbol change.)"
-                )
-            elif _target_git_state in ("untracked", "gitignored"):
-                _final_err += (
-                    f" (target '{_check_target}' is {_target_git_state}: git has no pre-image "
-                    f"blob for it, so 3-way merge cannot work. Use 'modify_symbol' or "
-                    f"'edit_text' instead, or stage the file with 'git add' first.)"
-                )
+            # No patch produced (should not happen)
+            merged_metadata["reason"] = "repaired_patch_missing"
             return PatchResult(
                 success=False,
-                error=_final_err,
-                metadata=metadata
+                error="Repair succeeded but no patch produced",
+                metadata=merged_metadata
             )
+        metadata["reason"] = "repair_failed"
+        metadata["fallback_used"] = repair_result.metadata.get("fallback_used", [])
+        metadata["second_fail_reason"] = repair_result.metadata.get("error", "repair failed")
+        _final_err = f"Patch application failed and repair attempts exhausted: {metadata['first_fail_reason']}"
+        # Actionable guidance for the known blob-deficient states. The 3-way merge
+        # path (which the repair ladder would otherwise rely on) cannot find a
+        # pre-image blob for these, so steer the caller to a tool that works without
+        # one. This turns a confusing "lacks the necessary blob" into a concrete
+        # next step.
+        if _target_git_state == "freshly_edited":
+            _final_err += (
+                f" (target '{_check_target}' is freshly-edited: its working tree differs "
+                f"from git, so 3-way merge has no usable pre-image blob. Re-read the file "
+                f"and regenerate the patch against its CURRENT content, or use "
+                f"'modify_symbol'/'edit_text' for a single-symbol change.)"
+            )
+        elif _target_git_state in ("untracked", "gitignored"):
+            _final_err += (
+                f" (target '{_check_target}' is {_target_git_state}: git has no pre-image "
+                f"blob for it, so 3-way merge cannot work. Use 'modify_symbol' or "
+                f"'edit_text' instead, or stage the file with 'git add' first.)"
+            )
+        return PatchResult(
+            success=False,
+            error=_final_err,
+            metadata=metadata
+        )
 
     def synthesize_and_apply(self, llm_output: str, target_file: str,
                              output_mode: str = "auto") -> PatchResult:
@@ -530,8 +513,6 @@ class PatchEngine:
             if not path.exists():
                 return None
 
-            path.read_text(encoding="utf-8")
-
             # Improved diff parsing: handle unified diff format properly
             lines = patch.splitlines()
             new_lines = []
@@ -540,10 +521,9 @@ class PatchEngine:
                 if line.startswith("@@"):
                     in_hunk = True
                     continue
-                if in_hunk and line.startswith("+"):
+                if in_hunk and line.startswith("+") and not line.startswith("+++"):
                     # Skip header lines (+++ b/file)
-                    if not line.startswith("+++"):
-                        new_lines.append(line[1:])  # Remove leading '+'
+                    new_lines.append(line[1:])  # Remove leading '+'
 
             new_code = "\n".join(new_lines).strip()
 
@@ -594,12 +574,23 @@ class PatchEngine:
           - cap file/patched size
           - output is still validated later via validate_diff(..., target_file=target_file)
         """
-        rr = Path(repo_root).resolve()
         tgt_rel = normalize_rel_path_fast(str(target_file))
-        tgt_path = (rr / tgt_rel).resolve()
+        # P22-2: containment guard — prompt-derived paths must not escape the repo.
+        try:
+            tgt_path = resolve_inside_repo(repo_root, tgt_rel)
+        except ValueError:
+            return ("", "target_missing")
 
         if not tgt_path.exists() or not tgt_path.is_file():
             return ("", "target_missing")
+
+        # P22-4: reject over-size targets before reading — old_text was previously
+        # read unbounded (only new_text was capped); the bytes proxy is fail-safe.
+        try:
+            if tgt_path.stat().st_size > int(self._MAX_FILE_CHARS):
+                return ("", "file_too_large")
+        except OSError:
+            return ("", "read_failed")
 
         try:
             old_text = tgt_path.read_text(encoding="utf-8", errors="replace")
@@ -676,15 +667,22 @@ class PatchEngine:
         # Safety valve: reject over-large rewrites.
         # FILE blocks are full rewrites; if the model drifts and rewrites most of the file,
         # we would rather fail than apply a huge, hard-to-review patch.
+        # NOTE (P22-1): compare LINE sequences with autojunk disabled. A
+        # character-level SequenceMatcher autojunk treats any element appearing
+        # in >1% of b (for b >= 200 chars) as junk — for text that means \n,
+        # space, '(', etc. — so ratio() collapses toward 0 and a single-line
+        # edit reads as a ~100% rewrite (file_rewrite_too_large for every file
+        # beyond ~40-50 KB). changed_lines_est below already assumes a line
+        # ratio, so the unit must be lines here too.
         try:
-            sm = difflib.SequenceMatcher(a=old_text, b=new_text)
+            old_lines = old_text.splitlines()
+            new_lines = new_text.splitlines()
+            sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
             change_ratio = 1.0 - float(sm.ratio())
         except Exception:
             change_ratio = 1.0
 
         try:
-            old_lines = old_text.splitlines()
-            new_lines = new_text.splitlines()
             max_lines = max(len(old_lines), len(new_lines), 1)
             # Approx: changed lines ~= (1 - similarity) * max(lines)
             changed_lines_est = round(change_ratio * max_lines)
@@ -720,8 +718,7 @@ class PatchEngine:
     def _strip_trailing_fences(s: str) -> str:
         t = str(s or "")
         # If the model accidentally included an ending fence inside unfenced capture, trim it.
-        t = re.sub(r"\n```[\s\S]*\Z", "\n", t)
-        return t
+        return re.sub(r"\n```[\s\S]*\Z", "\n", t)
 
     def _salvage_small_model_output(self, patch_text: str, target_file: str) -> Optional[str]:
         """
@@ -742,18 +739,51 @@ class PatchEngine:
         try:
             import difflib
             import re
-            from pathlib import Path
 
             rel = str(target_file).strip().lstrip("/")
             if not rel:
                 return None
 
-            abs_path = Path(self.repo_root) / rel
+            # P22-2: containment guard — prompt-derived paths must not escape the repo.
+            try:
+                abs_path = resolve_inside_repo(self.repo_root, rel)
+            except ValueError:
+                logger.debug("salvage_small_model_output: escape path rejected (%s)", rel)
+                return None
             if not abs_path.exists() or not abs_path.is_file():
+                return None
+
+            # P22-4: skip huge files on size alone — do not load a file we are
+            # about to skip anyway (the >2000-line check below is O(NxMxL);
+            # 256 KiB is a conservative bytes proxy for ~2000+ lines).
+            try:
+                st_size = abs_path.stat().st_size
+            except OSError:
+                logger.debug("salvage_small_model_output: stat failed for %s", rel)
+                return None
+            if st_size > int(self._SALVAGE_SKIP_MAX_BYTES):
+                logger.debug(
+                    "salvage_small_model_output: skipping large file by size "
+                    "(st_size=%d, target=%s)", st_size, rel,
+                )
                 return None
 
             old_text = abs_path.read_text(encoding="utf-8", errors="replace")
             old_lines = old_text.splitlines()
+
+            # Skip expensive fuzzy-salvage for very large files. Strategy 1/2
+            # below use an O(NxMxL) sliding-window SequenceMatcher.ratio() over
+            # the WHOLE file with no window limit, unlike _reanchor_patch()
+            # which caps at >2000 lines (see L2658). Salvage is best-effort
+            # recovery for malformed small-model output; large files are
+            # handled by the tolerant-apply + reanchor ladder, which already
+            # degrades gracefully past 2000 lines.
+            if len(old_lines) > 2000:
+                logger.debug(
+                    "salvage_small_model_output: skipping fuzzy salvage for "
+                    "large file (%d lines, target=%s)", len(old_lines), rel,
+                )
+                return None
 
             # --- Phase 1: Parse patch text for various patterns ---
 
@@ -827,7 +857,10 @@ class PatchEngine:
                     best_ratio = 0.0
                     for start_idx in range(len(old_lines) - n_removed + 1):
                         window = old_lines[start_idx:start_idx + n_removed]
-                        sm = difflib.SequenceMatcher(None, window, removed_lines)
+                        # P24-B: autojunk=False — repeated lines (blank,
+                        # common tokens) in >=200-line windows would be
+                        # purged, skewing the 0.6 threshold below.
+                        sm = difflib.SequenceMatcher(None, window, removed_lines, autojunk=False)
                         ratio = sm.ratio()
                         if ratio > best_ratio:
                             best_ratio = ratio
@@ -881,7 +914,8 @@ class PatchEngine:
                         best_ratio = 0.0
                         for start_idx in range(len(new_lines) - n_before + 1):
                             window = new_lines[start_idx:start_idx + n_before]
-                            sm = difflib.SequenceMatcher(None, window, before_lines)
+                            # P24-B: autojunk=False (see above).
+                            sm = difflib.SequenceMatcher(None, window, before_lines, autojunk=False)
                             ratio = sm.ratio()
                             if ratio > best_ratio:
                                 best_ratio = ratio
@@ -920,28 +954,36 @@ class PatchEngine:
 
                 # Try to find insertion point using symbol search if available
                 anchor_index = None
-                try:
-                    from .agent.symbol_search import SymbolSearcher
-                    searcher = SymbolSearcher(self.repo_root)
+                with contextlib.suppress(ImportError):
+                    from .agent.symbol_search import get_symbol_searcher
+                    searcher = get_symbol_searcher(self.repo_root)
 
                     # Look for function/class definitions in added lines
                     for line in insert_lines:
                         # Simple heuristic: look for "def " or "class " in Python
                         if "def " in line or "class " in line:
                             symbol = line.split("def ")[-1].split("class ")[-1].split("(")[0].strip()
-                            results = searcher.search(symbol, limit=5)
+                            if not symbol:
+                                continue
+                            # NOTE: the previous ``search(symbol, limit=5)``
+                            # call did not exist on SymbolSearcher — it raised
+                            # AttributeError every time, the function-level
+                            # except swallowed it, and symbol-aware anchoring
+                            # silently never ran (salvage aborted to None).
+                            # find_symbol is the real API (SymbolDef.file/.line,
+                            # repo-relative file).
+                            results = searcher.find_symbol(symbol)
                             if results:
                                 # Find the line after the last occurrence
                                 for result in results:
-                                    if result.get("file_path") == rel:
-                                        line_num = result.get("line_number", 0)
+                                    if result.file == rel:
+                                        line_num = result.line
                                         if line_num > 0:
                                             anchor_index = line_num - 1  # Convert to 0-index
                                             break
                                 if anchor_index is not None:
                                     break
-                except ImportError:
-                    pass  # Symbol search not available, fall back to heuristics
+                # Symbol search not available, fall back to heuristics
 
                 # Fallback heuristics (original logic)
                 if anchor_index is None:
@@ -996,7 +1038,7 @@ class PatchEngine:
                 for code_block in code_blocks:
                     # Check if code block contains function/class definition
                     lines = code_block.splitlines()
-                    for i, line in enumerate(lines):
+                    for _, line in enumerate(lines):
                         if is_python_definition(line):
                             # Try to find matching function/class in original file
                             _sym_name, _ = extract_symbol_name(line)
@@ -1052,9 +1094,11 @@ class PatchEngine:
                             diff_text += "\n"
                         return diff_text
 
-            return None
         except Exception:
             # Any unexpected error → salvage failed
+            logger.debug("_salvage_small_model_output: salvage failed", exc_info=True)
+            return None
+        else:
             return None
 
     def convert_patch_to_edit_blocks(self, patch: str, target_file: Optional[str] = None) -> Optional[dict]:
@@ -1140,257 +1184,259 @@ class PatchEngine:
         return {"file_path": file_path, "blocks": blocks}
 
     def repair_patch(self, patch_text: str, target_file: str,
-                                 failure_reason: str, llm_output: Optional[str] = None) -> PatchResult:
-                    """
-                    Attempt repair using fallback ladder.
+                     failure_reason: str, llm_output: Optional[str] = None) -> PatchResult:
+        """
+        Attempt repair using fallback ladder.
 
-                    Args:
-                        patch_text: Original patch that failed
-                        target_file: Target file path
-                        failure_reason: Why the patch failed
-                        llm_output: Optional original LLM output for context
+        Args:
+            patch_text: Original patch that failed
+            target_file: Target file path
+            failure_reason: Why the patch failed
+            llm_output: Optional original LLM output for context
 
-                    Returns:
-                        PatchResult with repair attempt outcome
-                    """
-                    metadata = {
-                        "reason": "",
-                        "mode": "",
-                        "fallback_used": [],
-                        "first_fail_reason": failure_reason,
-                        "second_fail_reason": "",
-                        "synth_reason": "",
-                        "execution_steps": [],
-                        "normalized_patch": patch_text,
-                    }
+        Returns:
+            PatchResult with repair attempt outcome
+        """
+        metadata = {
+            "reason": "",
+            "mode": "",
+            "fallback_used": [],
+            "first_fail_reason": failure_reason,
+            "second_fail_reason": "",
+            "synth_reason": "",
+            "execution_steps": [],
+            "normalized_patch": patch_text,
+        }
 
-                    self._add_step(metadata, "repair_start", f"Starting repair ladder for {target_file}")
+        self._add_step(metadata, "repair_start", f"Starting repair ladder for {target_file}")
 
-                    # If no LLM output (agent path), extract new_code from the patch text
-                    # and try _auto_repair_patch as fallback (P8 fix)
-                    if not llm_output:
-                        self._add_step(metadata, "no_llm_fallback",
-                                       "No LLM output — trying auto-repair from patch text")
-                        auto_fix = self._auto_repair_patch(patch_text, target_file)
-                        if auto_fix:
-                            metadata["reason"] = "repair_success:auto_repair"
-                            metadata["mode"] = "auto_repair"
-                            metadata["fallback_used"] = ["auto_repair"]
-                            return PatchResult(
-                                success=True,
-                                patch_applied=auto_fix,
-                                metadata=metadata
-                            )
-                        metadata["reason"] = "no_llm_fallback_all_failed"
-                        return PatchResult(
-                            success=False,
-                            error="Cannot repair patch without original LLM output "
-                                  "and auto-repair from patch text failed",
-                            metadata=metadata
+        # If no LLM output (agent path), extract new_code from the patch text
+        # and try _auto_repair_patch as fallback (P8 fix)
+        if not llm_output:
+            self._add_step(metadata, "no_llm_fallback",
+                           "No LLM output — trying auto-repair from patch text")
+            auto_fix = self._auto_repair_patch(patch_text, target_file)
+            if auto_fix:
+                metadata["reason"] = "repair_success:auto_repair"
+                metadata["mode"] = "auto_repair"
+                metadata["fallback_used"] = ["auto_repair"]
+                return PatchResult(
+                    success=True,
+                    patch_applied=auto_fix,
+                    metadata=metadata
+                )
+            metadata["reason"] = "no_llm_fallback_all_failed"
+            return PatchResult(
+                success=False,
+                error="Cannot repair patch without original LLM output "
+                      "and auto-repair from patch text failed",
+                metadata=metadata
+            )
+
+        # Parse file blocks from LLM output (llm_output guaranteed non-None here)
+        parsed_blocks = []
+        if parse_file_blocks:
+            try:
+                parsed_blocks = parse_file_blocks(llm_output or "")
+            except Exception as e:
+                logger.debug("parse_file_blocks failed: %s", e)
+                parsed_blocks = []
+        else:
+            logger.warning("parse_file_blocks not available")
+
+        if not parsed_blocks:
+            metadata["reason"] = "no_parsed_blocks"
+            return PatchResult(
+                success=False,
+                error="No parseable file blocks found in LLM output",
+                metadata=metadata
+            )
+
+        # Prefer the block that matches target_file; fall back to first block
+        block = parsed_blocks[0]
+        try:
+            normalized_target = normalize_rel_path_fast(str(target_file))
+            for candidate in parsed_blocks:
+                candidate_path = normalize_rel_path_fast(str(
+                    candidate.get("path")
+                    or candidate.get("file")
+                    or candidate.get("filename")
+                    or ""
+                ))
+                if candidate_path and normalized_target and candidate_path == normalized_target:
+                    block = candidate
+                    break
+        except Exception:
+            block = parsed_blocks[0]
+
+        new_code = block.get("text") or block.get("content") or ""
+        if not new_code.strip():
+            metadata["reason"] = "empty_new_code"
+            return PatchResult(
+                success=False,
+                error="Empty code block in LLM output",
+                metadata=metadata
+            )
+
+        # Track which fallbacks we attempt
+        fallback_attempted = []
+        fallback_succeeded = False
+        result_patch = None
+        result_mode = None
+
+        # 1. AST rewrite fallback
+        if self.ast_rewriter:
+            self._add_step(metadata, "ast_rewrite", "Attempting AST rewrite")
+            fallback_attempted.append("ast_rewrite")
+            try:
+                llm_header = (llm_output or "").strip().splitlines()[0].strip()
+                if llm_header.startswith("FUNCTION:"):
+                    func_name = llm_header.split("FUNCTION:")[1].strip()
+                    result = self.ast_rewriter.replace_function(
+                        target_file,
+                        func_name,
+                        new_code
+                    )
+                    result_patch = self.ast_rewriter.generate_patch(target_file, result)
+                    result_mode = "ast_function"
+                    fallback_succeeded = True
+                elif llm_header.startswith("CLASS:"):
+                    class_name = llm_header.split("CLASS:")[1].strip()
+                    result = self.ast_rewriter.replace_class(
+                        target_file,
+                        class_name,
+                        new_code
+                    )
+                    result_patch = self.ast_rewriter.generate_patch(target_file, result)
+                    result_mode = "ast_class"
+                    fallback_succeeded = True
+                elif llm_header.startswith("METHOD:"):
+                    path = llm_header.split("METHOD:")[1].strip()
+                    # rsplit on the LAST dot so class_name may be a nested-class
+                    # chain (e.g. "A.B.method" -> class_name="A.B", method_name="method"),
+                    # matching replace_method's documented nested-class support.
+                    # rsplit on the LAST dot so class_name may be a nested-class
+                    # chain (e.g. "A.B.method" -> class_name="A.B", method_name="method"),
+                    # matching replace_method's documented nested-class support.
+                    class_name, method_name = path.rsplit(".", 1)
+                    result = self.ast_rewriter.replace_method(
+                        target_file,
+                        class_name,
+                        method_name,
+                        new_code
+                    )
+                    result_patch = self.ast_rewriter.generate_patch(target_file, result)
+                    result_mode = "ast_method"
+                    fallback_succeeded = True
+                elif is_python_definition(new_code):
+                    func_name, _ = extract_symbol_name(new_code)
+                    result = self.ast_rewriter.replace_function(
+                        target_file,
+                        func_name,
+                        new_code
+                    )
+                    result_patch = self.ast_rewriter.generate_patch(target_file, result)
+                    result_mode = "ast_autodetect"
+                    fallback_succeeded = True
+            except Exception as e:
+                logger.debug("AST rewrite attempt failed: %s", e)
+                metadata["second_fail_reason"] = f"ast_rewrite_failed: {e}"
+
+        # 2. Symbol search fallback
+        if not fallback_succeeded and self.symbol_searcher and self.ast_rewriter:
+            self._add_step(metadata, "symbol_search", "Attempting symbol search fallback")
+            fallback_attempted.append("symbol_search")
+            try:
+                header = new_code.strip().splitlines()[0].strip()
+                symbol_name, symbol_kind = extract_symbol_name(header)
+
+                if symbol_name:
+                    results = self.symbol_searcher.find_symbol(symbol_name, kind=symbol_kind if symbol_kind != "function" else "any")
+                else:
+                    results = self.symbol_searcher.find_symbol(header)
+
+                if not results:
+                    sym = self.symbol_searcher.fuzzy_find_symbol(symbol_name or header)
+                    if sym:
+                        results = [sym]
+
+                if results:
+                    sym = results[0]
+                    if sym.kind in ("function", "async_function", "method"):
+                        result = self.ast_rewriter.replace_function(
+                            sym.file,  # was sym.file_path
+                            sym.name,
+                            new_code
                         )
-
-                    # Parse file blocks from LLM output (llm_output guaranteed non-None here)
-                    parsed_blocks = []
-                    if parse_file_blocks:
-                        try:
-                            parsed_blocks = parse_file_blocks(llm_output or "")
-                        except Exception as e:
-                            logger.debug("parse_file_blocks failed: %s", e)
-                            parsed_blocks = []
-                    else:
-                        logger.warning("parse_file_blocks not available")
-
-                    if not parsed_blocks:
-                        metadata["reason"] = "no_parsed_blocks"
-                        return PatchResult(
-                            success=False,
-                            error="No parseable file blocks found in LLM output",
-                            metadata=metadata
+                        result_patch = self.ast_rewriter.generate_patch(sym.file, result)
+                        result_mode = "ast_symbol_function"
+                        fallback_succeeded = True
+                    elif sym.kind == "class":
+                        result = self.ast_rewriter.replace_class(
+                            sym.file,
+                            sym.name,
+                            new_code
                         )
+                        result_patch = self.ast_rewriter.generate_patch(sym.file, result)
+                        result_mode = "ast_symbol_class"
+                        fallback_succeeded = True
+            except Exception as e:
+                logger.debug("Symbol search fallback failed: %s", e)
+                metadata["second_fail_reason"] = f"symbol_search_failed: {e}"
 
-                    # Prefer the block that matches target_file; fall back to first block
-                    block = parsed_blocks[0]
-                    try:
-                        normalized_target = normalize_rel_path_fast(str(target_file))
-                        for candidate in parsed_blocks:
-                            candidate_path = normalize_rel_path_fast(str(
-                                candidate.get("path")
-                                or candidate.get("file")
-                                or candidate.get("filename")
-                                or ""
-                            ))
-                            if candidate_path and normalized_target and candidate_path == normalized_target:
-                                block = candidate
-                                break
-                    except Exception:
-                        block = parsed_blocks[0]
+        # 3. Semantic patch fallback
+        if not fallback_succeeded and self.semantic_patcher:
+            self._add_step(metadata, "semantic_patch", "Attempting semantic patch fallback")
+            fallback_attempted.append("semantic_patch")
+            try:
+                sem_result = self.semantic_patcher.apply_semantic_patch(
+                    file_path=target_file,
+                    new_code=new_code,
+                )
+                if sem_result:
+                    result_patch = self.semantic_patcher.generate_patch(target_file, sem_result)
+                    result_mode = "semantic_class" if sem_result.kind == "class" else "semantic_function"
+                    fallback_succeeded = True
+            except Exception as e:
+                logger.debug("Semantic patch fallback failed: %s", e)
+                metadata["second_fail_reason"] = f"semantic_patch_failed: {e}"
 
-                    new_code = block.get("text") or block.get("content") or ""
-                    if not new_code.strip():
-                        metadata["reason"] = "empty_new_code"
-                        return PatchResult(
-                            success=False,
-                            error="Empty code block in LLM output",
-                            metadata=metadata
-                        )
+        # 4. File-block diff synthesis (using patch_synthesizer for FULL_FILE mode)
+        if not fallback_succeeded and self.patch_synthesizer and self.hybrid_parser and OutputMode is not None:
+            self._add_step(metadata, "file_block_synth", "Attempting file-block synthesis")
+            fallback_attempted.append("file_block_synth")
+            try:
+                # Try to parse as FULL_FILE mode
+                parse_result = self.hybrid_parser.parse(llm_output, OutputMode.FULL_FILE)
+                if parse_result.success and parse_result.mode == OutputMode.FULL_FILE:
+                    synthesized = self.patch_synthesizer.synthesize(parse_result, target_file)
+                    if synthesized.strip():
+                        result_patch = synthesized
+                        result_mode = "file_block_synth"
+                        fallback_succeeded = True
+            except Exception as e:
+                logger.debug("File-block synthesis failed: %s", e)
+                metadata["second_fail_reason"] = f"file_block_synth_failed: {e}"
 
-                    # Track which fallbacks we attempt
-                    fallback_attempted = []
-                    fallback_succeeded = False
-                    result_patch = None
-                    result_mode = None
-
-                    # 1. AST rewrite fallback
-                    if self.ast_rewriter:
-                        self._add_step(metadata, "ast_rewrite", "Attempting AST rewrite")
-                        fallback_attempted.append("ast_rewrite")
-                        try:
-                            llm_header = (llm_output or "").strip().splitlines()[0].strip()
-                            if llm_header.startswith("FUNCTION:"):
-                                func_name = llm_header.split("FUNCTION:")[1].strip()
-                                result = self.ast_rewriter.replace_function(
-                                    target_file,
-                                    func_name,
-                                    new_code
-                                )
-                                result_patch = self.ast_rewriter.generate_patch(target_file, result)
-                                result_mode = "ast_function"
-                                fallback_succeeded = True
-                            elif llm_header.startswith("CLASS:"):
-                                class_name = llm_header.split("CLASS:")[1].strip()
-                                result = self.ast_rewriter.replace_class(
-                                    target_file,
-                                    class_name,
-                                    new_code
-                                )
-                                result_patch = self.ast_rewriter.generate_patch(target_file, result)
-                                result_mode = "ast_class"
-                                fallback_succeeded = True
-                            elif llm_header.startswith("METHOD:"):
-                                path = llm_header.split("METHOD:")[1].strip()
-                                class_name, method_name = path.split(".")
-                                result = self.ast_rewriter.replace_method(
-                                    target_file,
-                                    class_name,
-                                    method_name,
-                                    new_code
-                                )
-                                result_patch = self.ast_rewriter.generate_patch(target_file, result)
-                                result_mode = "ast_method"
-                                fallback_succeeded = True
-                            elif is_python_definition(new_code):
-                                func_name, _ = extract_symbol_name(new_code)
-                                result = self.ast_rewriter.replace_function(
-                                    target_file,
-                                    func_name,
-                                    new_code
-                                )
-                                result_patch = self.ast_rewriter.generate_patch(target_file, result)
-                                result_mode = "ast_autodetect"
-                                fallback_succeeded = True
-                        except Exception as e:
-                            logger.debug("AST rewrite attempt failed: %s", e)
-                            metadata["second_fail_reason"] = f"ast_rewrite_failed: {e}"
-
-                    # 2. Symbol search fallback
-                    if not fallback_succeeded and self.symbol_searcher and self.ast_rewriter:
-                        self._add_step(metadata, "symbol_search", "Attempting symbol search fallback")
-                        fallback_attempted.append("symbol_search")
-                        try:
-                            header = new_code.strip().splitlines()[0].strip()
-                            symbol_name, symbol_kind = extract_symbol_name(header)
-
-                            if symbol_name:
-                                results = self.symbol_searcher.find_symbol(symbol_name, kind=symbol_kind if symbol_kind != "function" else "any")
-                            else:
-                                results = self.symbol_searcher.find_symbol(header)
-
-                            if not results:
-                                sym = self.symbol_searcher.fuzzy_find_symbol(symbol_name or header)
-                                if sym:
-                                    results = [sym]
-
-                            if results:
-                                sym = results[0]
-                                if sym.kind in ("function", "async_function", "method"):
-                                    result = self.ast_rewriter.replace_function(
-                                        sym.file,  # was sym.file_path
-                                        sym.name,
-                                        new_code
-                                    )
-                                    result_patch = self.ast_rewriter.generate_patch(sym.file, result)
-                                    result_mode = "ast_symbol_function"
-                                    fallback_succeeded = True
-                                elif sym.kind == "class":
-                                    result = self.ast_rewriter.replace_class(
-                                        sym.file,
-                                        sym.name,
-                                        new_code
-                                    )
-                                    result_patch = self.ast_rewriter.generate_patch(sym.file, result)
-                                    result_mode = "ast_symbol_class"
-                                    fallback_succeeded = True
-                        except Exception as e:
-                            logger.debug("Symbol search fallback failed: %s", e)
-                            metadata["second_fail_reason"] = f"symbol_search_failed: {e}"
-
-                    # 3. Semantic patch fallback
-                    if not fallback_succeeded and self.semantic_patcher:
-                        self._add_step(metadata, "semantic_patch", "Attempting semantic patch fallback")
-                        fallback_attempted.append("semantic_patch")
-                        try:
-                            sem_result = self.semantic_patcher.apply_semantic_patch(
-                                file_path=target_file,
-                                new_code=new_code,
-                            )
-                            if sem_result:
-                                result_patch = self.semantic_patcher.generate_patch(target_file, sem_result)
-                                if sem_result.kind == "class":
-                                    result_mode = "semantic_class"
-                                else:
-                                    result_mode = "semantic_function"
-                                fallback_succeeded = True
-                        except Exception as e:
-                            logger.debug("Semantic patch fallback failed: %s", e)
-                            metadata["second_fail_reason"] = f"semantic_patch_failed: {e}"
-
-                    # 4. File-block diff synthesis (using patch_synthesizer for FULL_FILE mode)
-                    if not fallback_succeeded and self.patch_synthesizer and self.hybrid_parser and OutputMode is not None:
-                        self._add_step(metadata, "file_block_synth", "Attempting file-block synthesis")
-                        fallback_attempted.append("file_block_synth")
-                        try:
-                            # Try to parse as FULL_FILE mode
-                            parse_result = self.hybrid_parser.parse(llm_output, OutputMode.FULL_FILE)
-                            if parse_result.success and parse_result.mode == OutputMode.FULL_FILE:
-                                synthesized = self.patch_synthesizer.synthesize(parse_result, target_file)
-                                if synthesized.strip():
-                                    result_patch = synthesized
-                                    result_mode = "file_block_synth"
-                                    fallback_succeeded = True
-                        except Exception as e:
-                            logger.debug("File-block synthesis failed: %s", e)
-                            metadata["second_fail_reason"] = f"file_block_synth_failed: {e}"
-
-                    # Return result
-                    if fallback_succeeded:
-                        metadata["reason"] = f"repair_success_{result_mode}"
-                        metadata["mode"] = result_mode
-                        metadata["fallback_used"] = fallback_attempted
-                        metadata["synth_reason"] = f"repaired via {result_mode}"
-                        return PatchResult(
-                            success=True,
-                            patch_applied=result_patch,
-                            metadata=metadata
-                        )
-                    else:
-                        metadata["reason"] = "all_repair_failed"
-                        metadata["fallback_used"] = fallback_attempted
-                        metadata["second_fail_reason"] = metadata.get("second_fail_reason", "all fallbacks failed")
-                        return PatchResult(
-                            success=False,
-                            error=f"All repair attempts failed: {failure_reason}",
-                            metadata=metadata
-                        )
+        # Return result
+        if fallback_succeeded:
+            metadata["reason"] = f"repair_success_{result_mode}"
+            metadata["mode"] = result_mode
+            metadata["fallback_used"] = fallback_attempted
+            metadata["synth_reason"] = f"repaired via {result_mode}"
+            return PatchResult(
+                success=True,
+                patch_applied=result_patch,
+                metadata=metadata
+            )
+        metadata["reason"] = "all_repair_failed"
+        metadata["fallback_used"] = fallback_attempted
+        metadata["second_fail_reason"] = metadata.get("second_fail_reason", "all fallbacks failed")
+        return PatchResult(
+            success=False,
+            error=f"All repair attempts failed: {failure_reason}",
+            metadata=metadata
+        )
 
     @staticmethod
     def _trim_patch_to_first_header(patch: str) -> str:
@@ -1410,7 +1456,7 @@ class PatchEngine:
         lines = str(patch).replace("\r\n", "\n").split("\n")
         start_idx: Optional[int] = None
         for i, line in enumerate(lines):
-            if line.startswith("diff --git ") or line.startswith("--- ") or line.startswith("+++ "):
+            if line.startswith(("diff --git ", "--- ", "+++ ")):
                 start_idx = i
                 break
 
@@ -1425,6 +1471,8 @@ class PatchEngine:
     @staticmethod
     def _sanitize_patch_lines(patch: str) -> str:
         """
+        Normalize LLM-generated patch text by cleaning up common formatting issues.
+
         External LLMs sometimes:
           - prepend BOM (\\ufeff)
           - indent diff markers with spaces/tabs
@@ -1433,8 +1481,17 @@ class PatchEngine:
 
         We normalize by:
           - removing BOM at line starts
-          - dropping markdown fence lines
-          - left-stripping lines that *look like* diff markers
+          - dropping markdown fence lines (header region only)
+          - left-stripping lines that *look like* diff markers (header region only)
+
+        Region tracking: once an ``@@`` hunk header is seen we enter the *body*
+        region. Body lines carry a significant leading char (' ' context, '+'
+        add, '-' remove, '\\\\' no-newline) and must be preserved verbatim — even
+        if their *content* looks like a diff marker. A context line such as
+        ``' +++ b/other.py'`` is legitimate file content (e.g. when the edited
+        file itself contains patch/markdown text), not a header; de-indenting it
+        would corrupt the patch. Only the header region (between sections) is
+        de-indented. A new ``diff --git`` line returns us to the header region.
         """
         if not patch:
             return ""
@@ -1443,33 +1500,54 @@ class PatchEngine:
         lines = txt.split("\n")
         out: list[str] = []
 
+        in_hunk = False  # True while inside a hunk body (after an '@@' header)
+
         for line in lines:
             if not line:
                 out.append(line)
                 continue
 
-            # Remove BOM at the start of a line
+            # Remove BOM at the start of a line (safe in both regions)
             if line and line[0] == "\ufeff":
                 line = line.lstrip("\ufeff")
 
             stripped = line.lstrip()
 
+            if in_hunk:
+                # Body region: a new section header returns to header mode.
+                if stripped.startswith("diff --git "):
+                    out.append(stripped)
+                    in_hunk = False
+                else:
+                    # Preserve body lines verbatim — leading ' '/'+'/'-'/'\\' is
+                    # significant. Do not lstrip or drop fences here.
+                    out.append(line)
+                continue
+
+            # Header region
             # Drop markdown fences that often leak into patch output
             if stripped.startswith("```"):
                 continue
 
             if (
-                stripped.startswith("diff --git ")
-                or stripped.startswith("--- ")
-                or stripped.startswith("+++ ")
-                or stripped.startswith("@@ ")
-                or stripped.startswith("index ")
-                or stripped.startswith("new file mode ")
-                or stripped.startswith("deleted file mode ")
-                or stripped.startswith("similarity index ")
-                or stripped.startswith("rename from ")
-                or stripped.startswith("rename to ")
+                stripped.startswith(
+                    (
+                        "diff --git ",
+                        "--- ",
+                        "+++ ",
+                        "@@ ",
+                        "index ",
+                        "new file mode ",
+                        "deleted file mode ",
+                        "similarity index ",
+                        "rename from ",
+                        "rename to ",
+                    )
+                )
             ):
+                # An '@@' hunk header transitions us into the body region.
+                if stripped.startswith("@@ "):
+                    in_hunk = True
                 out.append(stripped)
             else:
                 out.append(line)
@@ -1507,25 +1585,34 @@ class PatchEngine:
         # Locate diff --git boundaries
         diff_idxs = [i for i, _item_ in enumerate(lines) if _item_.startswith("diff --git ")]
         if diff_idxs:
-            diff_git_re = re.compile(r"^diff --git a/(.+?) b/(.+?)\s*$")
             sections: list[tuple[int, int, str, str]] = []
             for s_i, start in enumerate(diff_idxs):
                 end = diff_idxs[s_i + 1] if (s_i + 1) < len(diff_idxs) else len(lines)
-                m = diff_git_re.match(lines[start] or "")
+                m = _RE_DIFF_GIT.match(lines[start] or "")
                 a_path = m.group(1) if m else ""
                 b_path = m.group(2) if m else ""
                 sections.append((start, end, a_path, b_path))
 
             chosen = sections[0]
             if tf:
+                # Two-pass: prefer an EXACT path match across ALL sections
+                # before falling back to basename equality. A single-pass
+                # loop lets a basename collision win over a later exact match
+                # (e.g. choosing src/utils.py when the target is
+                # tests/utils.py), after which _force_target_file_paths would
+                # rewrite the wrong section's headers onto the target and
+                # apply an unrelated file's changes.
                 for sec in sections:
                     _s, _e, a_path, b_path = sec
-                    if a_path == tf or b_path == tf:
+                    if tf in (a_path, b_path):
                         chosen = sec
                         break
-                    if Path(a_path).name == Path(tf).name or Path(b_path).name == Path(tf).name:
-                        chosen = sec
-                        break
+                else:
+                    for sec in sections:
+                        _s, _e, a_path, b_path = sec
+                        if Path(a_path).name == Path(tf).name or Path(b_path).name == Path(tf).name:
+                            chosen = sec
+                            break
 
             s, e, _a, _b = chosen
             kept = "\n".join(lines[s:e]).strip()
@@ -1715,10 +1802,8 @@ class PatchEngine:
         cur_a: Optional[str] = None
         cur_b: Optional[str] = None
 
-        diff_git_re = re.compile(r"^diff --git a/(.+?) b/(.+?)\s*$")
-
         for line in lines:
-            m = diff_git_re.match(line or "")
+            m = _RE_DIFF_GIT.match(line or "")
             if m:
                 # New section
                 cur_a = f"--- a/{m.group(1)}"
@@ -1765,13 +1850,6 @@ class PatchEngine:
     # Auto-mode: file block parsing + diff synthesis
     # ---------------------------------------------------------------------
 
-    # Legacy regex fallback (kept for compatibility / debugging)
-    _RE_FILE_BLOCK = re.compile(
-        r"(?ims)"
-        r"(?:^|\n)\s*(?:FILE|Path|Target file)\s*:\s*(?P<path>[^\n\r]+?)\s*\r?\n"
-        r"(?:```[^\n\r]*\r?\n(?P<code1>[\s\S]*?)\r?\n```|"
-        r"(?P<code2>(?:(?!^\s*(?:FILE|Path|Target file)\s*:).*\r?\n)+))"
-    )
 
     def normalize_and_validate(self, patch_text: str, target_file: Optional[str]) -> tuple[str, Optional[str]]:
         """
@@ -1801,8 +1879,7 @@ class PatchEngine:
                     "(non-fatal, tolerant path may still succeed): %s", err,
                 )
             return p, None
-        else:
-            return p, "Patch does not look like a unified diff"
+        return p, "Patch does not look like a unified diff"
 
 
     def _looks_like_unified_diff(self, text: str) -> bool:
@@ -1829,19 +1906,20 @@ class PatchEngine:
                 input=patch_text.encode("utf-8"),
                 capture_output=True,
                 timeout=5,
+                check=False,
             )
             if result.returncode == 0:
                 return True, None
-            else:
-                error = result.stderr.decode("utf-8", errors="ignore").strip()
-                if not error:
-                    error = result.stdout.decode("utf-8", errors="ignore").strip()
-                if not error:
-                    error = f"git apply --check failed with exit code {result.returncode}"
-                return False, error
+            error = result.stderr.decode("utf-8", errors="ignore").strip()
+            if not error:
+                error = result.stdout.decode("utf-8", errors="ignore").strip()
+            if not error:
+                error = f"git apply --check failed with exit code {result.returncode}"
         except Exception as e:
             logger.debug("git apply --check failed with exception: %s", e)
             return False, f"git apply --check exception: {e}"
+        else:
+            return False, error
 
     def _classify_target_git_state(self, target_file: Optional[str]) -> str:
         """Classify the git tracking state of a target file (pre-apply gate).
@@ -1873,6 +1951,7 @@ class PatchEngine:
                 cwd=self.repo_root,
                 capture_output=True,
                 timeout=5,
+                check=False,
             )
             if chk.returncode == 0:
                 return "gitignored"
@@ -1888,6 +1967,7 @@ class PatchEngine:
                 cwd=self.repo_root,
                 capture_output=True,
                 timeout=5,
+                check=False,
             )
             if st.returncode != 0:
                 return "unknown"
@@ -1904,10 +1984,11 @@ class PatchEngine:
                 # staged-or-tracked but worktree-modified → pre-image blob (HEAD or index)
                 # may not match the patch's pre-image
                 return "freshly_edited"
-            return "tracked"
         except Exception as e:
             logger.debug("_classify_target_git_state failed: %s", e)
             return "unknown"
+        else:
+            return "tracked"
 
     def _patch_index_shas_are_fake(self, patch_text: str) -> bool:
         """Detect fabricated `index <sha>..<sha>` lines (Mode B).
@@ -1940,6 +2021,7 @@ class PatchEngine:
                     chk = subprocess.run(
                         ["git", "cat-file", "-e", sha],
                         cwd=self.repo_root, capture_output=True, timeout=5,
+                        check=False,
                     )
                     if chk.returncode != 0:
                         return True
@@ -1997,10 +2079,27 @@ class PatchEngine:
                         break
 
             if inferred_path:
+                # Strip any pre-hunk --- /+++ fragments from the body so we
+                # never emit TWO old/new headers. This branch is entered when
+                # at least one header is missing (has_hunk and not (old and
+                # new)); if exactly one was present it still lives in `stripped`,
+                # so a naive prepend of both would duplicate it and produce a
+                # "corrupt patch". Only column-0 header fragments before the
+                # first '@@' are dropped; indented context lines are untouched.
+                body_lines = stripped.split("\n")
+                cleaned: list[str] = []
+                seen_hunk = False
+                for ln in body_lines:
+                    if ln.startswith("@@"):
+                        seen_hunk = True
+                    if not seen_hunk and (ln.startswith(("--- ", "+++ "))):
+                        continue
+                    cleaned.append(ln)
+                rejoined = "\n".join(cleaned)
                 normalized = (
                     f"--- a/{inferred_path}\n"
                     f"+++ b/{inferred_path}\n"
-                    f"{stripped}"
+                    f"{rejoined}"
                 )
 
         try:
@@ -2010,10 +2109,10 @@ class PatchEngine:
             )
             if _ado_ok:
                 return True, None
-            else:
-                return False, _ado_msg or _ado_reason or "git apply failed"
         except Exception as e:
             return False, f"diff_apply exception: {e}"
+        else:
+            return False, _ado_msg or _ado_reason or "git apply failed"
 
     # ── Hunk header count fix ─────────────────────────────────────────────────
 
@@ -2026,16 +2125,12 @@ class PatchEngine:
 
         This method counts the actual context/remove/add lines and rewrites the header.
         """
-        hunk_header_re = re.compile(
-            r'^(@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@)(.*)',
-            re.DOTALL,
-        )
         lines = patch_text.splitlines(keepends=True)
         output = []
         i = 0
         while i < len(lines):
             line = lines[i]
-            m = hunk_header_re.match(line)
+            m = _RE_HUNK_HEADER_RECOUNT.match(line)
             if not m:
                 output.append(line)
                 i += 1
@@ -2182,13 +2277,25 @@ class PatchEngine:
                     input=encoded,
                     capture_output=True,
                     timeout=10,
+                    check=False,
                 )
                 if check.returncode == 0:
-                    # -C0 skips git's own context matching, so keep a pre-apply
-                    # snapshot to roll back a misplaced (unverifiable) hunk.
-                    _c0_snapshot: dict[str, Optional[str]] = {}
-                    if _is_c0:
-                        _c0_snapshot = self._snapshot_patch_targets(try_patch)
+                    # Snapshot before EVERY apply, not only -C0. There are two
+                    # distinct ways an apply mutates the tree and still reports
+                    # failure, and only the first used to be covered:
+                    #   • -C0 lands a hunk at the wrong line with rc=0 (caught
+                    #     by the placement check below);
+                    #   • --3way CONFLICTS: git writes merge markers into the
+                    #     file, STAGES the unmerged result, and exits non-zero.
+                    #     That is the documented behaviour of the last-resort
+                    #     mode ("creates merge markers if needed"), not a rare
+                    #     anomaly — and `--check --3way` returns 0 for it, so it
+                    #     lands squarely in the "check OK but apply failed"
+                    #     branch. The markers used to be left on disk, where the
+                    #     caller's re-anchor pass (_exact_reanchor_patch) then
+                    #     read them back as if they were source.
+                    _pre_snapshot = self._snapshot_patch_targets(try_patch)
+                    _pre_index = self._snapshot_index_entries(try_patch)
                     # Actually apply
                     apply_r = subprocess.run(
                         ["git", "apply", *flags, "-"],
@@ -2196,12 +2303,13 @@ class PatchEngine:
                         input=encoded,
                         capture_output=True,
                         timeout=30,
+                        check=False,
                     )
                     if apply_r.returncode == 0:
                         if _is_c0:
                             _place_ok, _place_detail = self._verify_c0_placement(try_patch)
                             if not _place_ok:
-                                self._restore_patch_targets(_c0_snapshot)
+                                self._restore_patch_targets(_pre_snapshot)
                                 _c0_verify_fail = _place_detail
                                 logger.warning(
                                     "tolerant_git_apply: mode=%s applied but placement "
@@ -2211,14 +2319,22 @@ class PatchEngine:
                                 continue
                         logger.info("tolerant_git_apply succeeded mode=%s flags=%s", mode_name, flags)
                         return True, None, mode_name
-                    else:
-                        err = apply_r.stderr.decode("utf-8", errors="ignore").strip()
-                        logger.warning(
-                            "tolerant_git_apply: --check passed but apply failed "
-                            "mode=%s flags=%s error=%s",
-                            mode_name, flags, err,
-                        )
-                        return False, f"check OK but apply failed ({mode_name}): {err}", mode_name
+                    err = apply_r.stderr.decode("utf-8", errors="ignore").strip()
+                    # Undo the partial/conflicted write before reporting
+                    # failure: "failed" must mean the tree is untouched,
+                    # otherwise every downstream repair step reads a file
+                    # this attempt corrupted. Content first, then the index
+                    # (restoring bytes does NOT clear --3way's unmerged
+                    # stages — measured).
+                    self._restore_patch_targets(_pre_snapshot)
+                    self._restore_index_entries(_pre_index)
+                    logger.warning(
+                        "tolerant_git_apply: --check passed but apply failed mode=%s flags=%s — rolled back: error=%s",
+                        mode_name,
+                        flags,
+                        err,
+                    )
+                    return False, f"check OK but apply failed ({mode_name}): {err}", mode_name
             except Exception as exc:
                 logger.debug("tolerant apply(%s) exception: %s", mode_name, exc)
 
@@ -2263,6 +2379,87 @@ class PatchEngine:
                 snap[abs_p] = None
         return snap
 
+    def _read_index_entries(self, rels: list[str]) -> dict[str, tuple[str, str]]:
+        """``{rel_path: (mode, sha)}`` for the STAGE-0 index entry of each path.
+
+        Paths with no entry (untracked) and paths already unmerged (stages 1-3,
+        e.g. a merge the user is in the middle of) are simply absent from the
+        result — the caller treats "absent" as "nothing of ours to restore".
+        """
+        out: dict[str, tuple[str, str]] = {}
+        if not rels:
+            return out
+        try:
+            r = subprocess.run(
+                ["git", "ls-files", "-s", "-z", "--", *rels],
+                cwd=self.repo_root,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("index snapshot failed: %s", exc)
+            return out
+        if r.returncode != 0:
+            return out
+        # -z, not the default line output: git C-quotes non-ASCII paths ("\355\225...")
+        # in line mode, so a Korean filename would never match the key we look
+        # it up by. NUL-terminated records are emitted raw.
+        for record in r.stdout.decode("utf-8", errors="replace").split("\0"):
+            if not record:
+                continue
+            meta, _, path = record.partition("\t")
+            parts = meta.split()
+            if len(parts) != 3 or not path:
+                continue
+            mode, sha, stage = parts
+            if stage == "0":
+                out[path] = (mode, sha)
+        return out
+
+    def _snapshot_index_entries(self, patch_text: str) -> dict[str, tuple[str, str]]:
+        """Snapshot the stage-0 index entry of every file *patch_text* touches.
+
+        ``git apply --3way`` stages what it produces, so a conflicted 3-way
+        leaves three unmerged stages behind. Restoring file CONTENT does not
+        clear them (measured: ``UU`` survives a byte-identical rewrite), which
+        is why the index needs its own snapshot.
+        """
+        from .agent._shared_utils import extract_files_from_patch
+
+        return self._read_index_entries(extract_files_from_patch(patch_text))
+
+    def _restore_index_entries(self, snapshot: dict[str, tuple[str, str]]) -> None:
+        """Re-point the index at its pre-apply blobs, for entries that moved.
+
+        Only paths captured at stage 0 are restored, and only when the current
+        entry differs — a healthy index is never rewritten, so this is a no-op
+        for every mode except a conflicted ``--3way``. ``--cacheinfo`` both
+        clears the unmerged stages and reinstates stage 0 in one step.
+        """
+        if not snapshot:
+            return
+        current = self._read_index_entries(list(snapshot))
+        for path, entry in snapshot.items():
+            if current.get(path) == entry:
+                continue
+            mode, sha = entry
+            try:
+                r = subprocess.run(
+                    ["git", "update-index", "--cacheinfo", f"{mode},{sha},{path}"],
+                    cwd=self.repo_root,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                if r.returncode != 0:
+                    logger.error(
+                        "tolerant_git_apply: index rollback of %s failed: %s",
+                        path, r.stderr.decode("utf-8", errors="ignore").strip(),
+                    )
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.exception("tolerant_git_apply: index rollback of %s failed: %s", path, exc)
+
     def _restore_patch_targets(self, snapshot: dict[str, Optional[str]]) -> None:
         """Undo an applied patch from a _snapshot_patch_targets snapshot."""
         for path, content in snapshot.items():
@@ -2274,7 +2471,7 @@ class PatchEngine:
                     with open(path, "w", encoding="utf-8") as fh:
                         fh.write(content)
             except OSError as exc:
-                logger.error("tolerant_git_apply: rollback of %s failed: %s", path, exc)
+                logger.exception("tolerant_git_apply: rollback of %s failed: %s", path, exc)
 
     @staticmethod
     def context_free_hunks(patch_text: str) -> list[str]:
@@ -2306,17 +2503,18 @@ class PatchEngine:
         body: Optional[list[str]] = None
 
         def _flush() -> None:
-            if body is not None and cur and not cur_is_new:
-                if not any(ln[:1] == " " for ln in body):
-                    out.append(f"{cur} {hdr}".strip())
+            if body is not None and cur and not cur_is_new and not any(ln[:1] == " " for ln in body):
+                out.append(f"{cur} {hdr}".strip())
 
         for line in patch_text.splitlines():
-            if line.startswith("diff --git ") or line.startswith("--- "):
-                _flush(); body = None
+            if line.startswith(("diff --git ", "--- ")):
+                _flush()
+                body = None
                 cur_is_new = line.startswith("--- /dev/null")
                 continue
             if line.startswith("+++ "):
-                _flush(); body = None
+                _flush()
+                body = None
                 p = line[4:].strip()
                 if p.startswith("b/"):
                     p = p[2:]
@@ -2336,7 +2534,8 @@ class PatchEngine:
             elif line.startswith("\\"):
                 continue
             else:
-                _flush(); body = None
+                _flush()
+                body = None
         _flush()
         return out
 
@@ -2360,7 +2559,7 @@ class PatchEngine:
         cur_hunk: Optional[list[str]] = None
 
         for line in patch_text.splitlines():
-            if line.startswith("diff --git ") or line.startswith("--- "):
+            if line.startswith(("diff --git ", "--- ")):
                 cur_hunk = None
                 cur_is_new = line.startswith("--- /dev/null")
                 continue
@@ -2402,6 +2601,7 @@ class PatchEngine:
                 with open(abs_p, encoding="utf-8", errors="replace") as fh:
                     file_norm = [self._ws_norm_line(ln) for ln in fh.read().splitlines()]
             except OSError:
+                logger.debug("_verify_c0_placement: cannot read %s (deleted by patch?)", abs_p)
                 continue  # deleted by the patch — nothing to place-check
             for hunk in hunk_list:
                 if not any(ln[:1] == " " for ln in hunk):
@@ -2420,12 +2620,16 @@ class PatchEngine:
 
     # ── Fuzzy context re-anchoring: fix wrong @@ line numbers ────────────────
 
-    def _exact_reanchor_patch(self, patch_text: str, target_file: Optional[str]) -> Optional[str]:
-        """Re-anchor a unified diff by finding exact removed-line content in the file.
+    def _reanchor_patch_core(self, patch_text, target_file, finder, log_prefix):
+        """Shared re-anchor skeleton for ``_exact_reanchor_patch``/``_reanchor_patch``.
 
-        Faster and more reliable than SequenceMatcher for small line offsets.
-        Searches for the first `-` line's exact content in the actual file,
-        then rewrites @@ headers if the offset is within ±50 lines.
+        Parses the unified diff into hunks and delegates anchor location to
+        *finder*, which receives ``(hunk_body, file_lines, old_start)`` and
+        returns ``(best_offset, context_before, log_fragment)`` — the 0-indexed
+        anchor position, the number of context lines preceding it (0 when the
+        search key already starts at the first hunk line), and the parenthesized
+        detail used in the info log — or ``None`` to keep the hunk untouched.
+        Returns the re-anchored patch text, or None when nothing changed.
         """
         if not target_file:
             return None
@@ -2433,8 +2637,9 @@ class PatchEngine:
         file_path = os.path.join(self.repo_root, target_file) if self.repo_root else target_file
         try:
             with open(file_path, encoding="utf-8", errors="replace") as fh:
-                file_lines = [_item_.rstrip("\n\r") for _item_ in fh.readlines()]
+                file_lines = fh.readlines()
         except OSError:
+            logger.debug("_reanchor_patch_core: cannot read %s", file_path)
             return None
         if not file_lines:
             return None
@@ -2444,18 +2649,14 @@ class PatchEngine:
         i = 0
         changed = False
 
-        hunk_header_re = re.compile(
-            r'^(@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@)(.*)', re.DOTALL
-        )
-
-        # Copy header lines
+        # Copy header lines verbatim
         while i < len(lines) and not lines[i].startswith("@@"):
             output.append(lines[i])
             i += 1
 
         while i < len(lines):
             line = lines[i]
-            m = hunk_header_re.match(line)
+            m = _RE_HUNK_HEADER_FIX.match(line)
             if not m:
                 output.append(line)
                 i += 1
@@ -2473,74 +2674,20 @@ class PatchEngine:
                 hunk_body.append(lines[i])
                 i += 1
 
-            # Extract removed lines (stripped of diff prefix)
-            removed_lines = []
-            for hl in hunk_body:
-                if hl.startswith("-"):
-                    removed_lines.append(hl[1:].rstrip("\n\r"))
-
-            if not removed_lines:
+            hit = finder(hunk_body, file_lines, old_start)
+            if hit is None:
                 output.append(line)
                 output.extend(hunk_body)
                 continue
 
-            # Search for the first removed line in the actual file
-            search_text = removed_lines[0].strip()
-            if not search_text or len(search_text) < 5:
-                output.append(line)
-                output.extend(hunk_body)
-                continue
-
-            # Find all matching positions
-            matches = []
-            for idx, fl in enumerate(file_lines):
-                if fl.strip() == search_text:
-                    matches.append(idx)
-
-            if not matches:
-                output.append(line)
-                output.extend(hunk_body)
-                continue
-
-            # Pick the match closest to the original position (within ±50 lines)
-            original_pos = old_start - 1  # 0-indexed
-            best_match = min(matches, key=lambda x: abs(x - original_pos))
-            offset_diff = abs(best_match - original_pos)
-
-            if offset_diff == 0 or offset_diff > 50:
-                output.append(line)
-                output.extend(hunk_body)
-                continue
-
-            # Verify: check if all removed lines match at this position
-            _all_match = True
-            for j, rl in enumerate(removed_lines):
-                _file_idx = best_match + j
-                if _file_idx >= len(file_lines) or file_lines[_file_idx].strip() != rl.strip():
-                    _all_match = False
-                    break
-            if not _all_match:
-                output.append(line)
-                output.extend(hunk_body)
-                continue
-
-            # Calculate the line offset for the hunk header
-            # The first context line should start at (best_match - context_before_count + 1)
-            context_before_count = 0
-            for hl in hunk_body:
-                if hl.startswith(" "):
-                    context_before_count += 1
-                elif hl.startswith("-") or hl.startswith("+"):
-                    break
-
-            new_start = best_match - context_before_count + 1  # 1-indexed
+            best_offset, context_before, log_fragment = hit
+            new_start = best_offset - context_before + 1  # 1-indexed
             delta = new_start - old_start
             new_new_start = int(m.group(4)) + delta
-
             new_header = f"@@ -{new_start},{old_count} +{new_new_start},{new_count} @@{suffix}"
             logger.info(
-                "exact_reanchor: hunk @@ -%d → -%d (offset=%+d, match='%s') file=%s",
-                old_start, new_start, delta, search_text[:40], target_file,
+                "%s: hunk @@ -%d → -%d %s file=%s",
+                log_prefix, old_start, new_start, log_fragment, target_file,
             )
             output.append(new_header)
             output.extend(hunk_body)
@@ -2549,6 +2696,63 @@ class PatchEngine:
         if not changed:
             return None
         return "".join(output)
+
+    def _exact_reanchor_patch(self, patch_text: str, target_file: Optional[str]) -> Optional[str]:
+        """Re-anchor a unified diff by finding exact removed-line content in the file.
+
+        Faster and more reliable than SequenceMatcher for small line offsets.
+        Searches for the first `-` line's exact content in the actual file,
+        then rewrites @@ headers if the offset is within ±50 lines.
+        """
+
+        def _find_exact(hunk_body, file_lines, old_start):
+            # Extract removed lines (stripped of diff prefix)
+            removed_lines = [hl[1:].rstrip("\n\r") for hl in hunk_body if hl.startswith("-")]
+
+            if not removed_lines:
+                return None
+
+            # Search for the first removed line in the actual file
+            search_text = removed_lines[0].strip()
+            if not search_text or len(search_text) < 5:
+                return None
+
+            # Find all matching positions
+            matches = []
+            for idx, fl in enumerate(file_lines):
+                if fl.strip() == search_text:
+                    matches.append(idx)
+
+            if not matches:
+                return None
+
+            # Pick the match closest to the original position (within ±50 lines)
+            original_pos = old_start - 1  # 0-indexed
+            best_match = min(matches, key=lambda x: abs(x - original_pos))
+            offset_diff = abs(best_match - original_pos)
+
+            if offset_diff == 0 or offset_diff > 50:
+                return None
+
+            # Verify: check if all removed lines match at this position
+            for j, rl in enumerate(removed_lines):
+                _file_idx = best_match + j
+                if _file_idx >= len(file_lines) or file_lines[_file_idx].strip() != rl.strip():
+                    return None
+
+            # The first context line starts at (best_match - context_before_count + 1)
+            context_before_count = 0
+            for hl in hunk_body:
+                if hl.startswith(" "):
+                    context_before_count += 1
+                elif hl.startswith(("-", "+")):
+                    break
+
+            new_start = best_match - context_before_count + 1  # 1-indexed
+            delta = new_start - old_start
+            return best_match, context_before_count, f"(offset={delta:+d}, match='{search_text[:40]}')"
+
+        return self._reanchor_patch_core(patch_text, target_file, _find_exact, "exact_reanchor")
 
     def _reanchor_patch(self, patch_text: str, target_file: Optional[str]) -> Optional[str]:
         """Re-anchor a unified diff patch to the correct line numbers.
@@ -2560,87 +2764,25 @@ class PatchEngine:
         3. Rewrites @@ headers with the correct line numbers
         4. Returns the repaired patch text, or None if re-anchoring fails.
         """
-        if not target_file:
-            return None
-        import difflib
-        import re
 
-        # Resolve file path
-        file_path = os.path.join(self.repo_root, target_file) if self.repo_root else target_file
-        try:
-            with open(file_path, encoding="utf-8", errors="replace") as fh:
-                file_lines = fh.readlines()
-        except OSError:
-            return None
-
-        if not file_lines:
-            return None
-
-        lines = patch_text.splitlines(keepends=True)
-        output = []
-        i = 0
-        changed = False
-
-        hunk_header_re = re.compile(
-            r'^(@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@)(.*)', re.DOTALL
-        )
-
-        # Collect header lines (diff --git, ---, +++) verbatim
-        while i < len(lines) and not lines[i].startswith("@@"):
-            output.append(lines[i])
-            i += 1
-
-        while i < len(lines):
-            line = lines[i]
-            m = hunk_header_re.match(line)
-            if not m:
-                output.append(line)
-                i += 1
-                continue
-
-            old_start = int(m.group(2))
-            old_count = int(m.group(3)) if m.group(3) is not None else 1
-            new_count = int(m.group(5)) if m.group(5) is not None else 1
-            suffix = m.group(6)
-
-            # Collect hunk body
-            i += 1
-            hunk_body = []
-            while i < len(lines) and not lines[i].startswith("@@"):
-                hunk_body.append(lines[i])
-                i += 1
-
+        def _find_fuzzy(hunk_body, file_lines, old_start):
             # Extract context (unchanged) + removed lines to use as search key
-            search_lines = []
-            for hl in hunk_body:
-                if hl.startswith(" ") or hl.startswith("-"):
-                    search_lines.append(hl[1:])  # strip prefix
+            search_lines = [hl[1:] for hl in hunk_body if hl.startswith((" ", "-"))]  # strip prefix
 
             if not search_lines:
-                # Cannot anchor empty search; keep as-is
-                output.append(line)
-                output.extend(hunk_body)
-                continue
+                return None
 
             # Build a normalized search string
             search_str = "".join(search_lines).strip()
             if not search_str:
-                output.append(line)
-                output.extend(hunk_body)
-                continue
-
-            # Try exact line match first (fast path)
-            best_score = 0.0
-            best_offset = old_start - 1  # default: use original
+                return None
 
             # Sliding window search with SequenceMatcher
             # Optimization (P5): reuse SequenceMatcher with set_seqs(),
             # limit search window to ±200 lines, skip files > 2000 lines
             window = len(search_lines)
             if window <= 0:
-                output.append(line)
-                output.extend(hunk_body)
-                continue
+                return None
 
             # Skip fuzzy matching for very large files — too expensive
             file_len = len(file_lines)
@@ -2649,9 +2791,10 @@ class PatchEngine:
                     "reanchor_patch: skipping fuzzy match for large file "
                     "(%d lines, target=%s)", file_len, target_file,
                 )
-                output.append(line)
-                output.extend(hunk_body)
-                continue
+                return None
+
+            best_score = 0.0
+            best_offset = old_start - 1  # default: use original
 
             # Restrict search to ±200 lines around original position
             search_start = max(0, old_start - 1 - 200)
@@ -2660,7 +2803,11 @@ class PatchEngine:
                 search_start = 0
                 search_end = file_len - window + 1
 
-            matcher = difflib.SequenceMatcher(None)
+            # P24-A: autojunk=False — search_str/chunk_str are joined
+            # CHARACTER sequences; autojunk would purge '\n', space and other
+            # chars appearing in >1% of a >=200-char chunk, collapsing
+            # ratio() and silently failing the re-anchor below.
+            matcher = difflib.SequenceMatcher(None, autojunk=False)
             for start_idx in range(search_start, search_end):
                 chunk = file_lines[start_idx:start_idx + window]
                 chunk_str = "".join(chunk).strip()
@@ -2675,25 +2822,10 @@ class PatchEngine:
             # Only re-anchor if we found a significantly better match than the original
             original_pos = old_start - 1  # 0-indexed
             if best_score >= 0.7 and best_offset != original_pos:
-                new_start = best_offset + 1  # 1-indexed
-                # Recalculate +N (new file start = old file start adjusted by delta so far)
-                delta = new_start - old_start
-                new_new_start = int(m.group(4)) + delta
-                new_header = f"@@ -{new_start},{old_count} +{new_new_start},{new_count} @@{suffix}"
-                logger.info(
-                    "reanchor_patch: hunk @@ -%d → -%d (score=%.2f) file=%s",
-                    old_start, new_start, best_score, target_file,
-                )
-                output.append(new_header)
-                changed = True
-            else:
-                output.append(line)  # Keep original header
+                return best_offset, 0, f"(score={best_score:.2f})"
+            return None
 
-            output.extend(hunk_body)
-
-        if not changed:
-            return None  # Nothing was improved
-        return "".join(output)
+        return self._reanchor_patch_core(patch_text, target_file, _find_fuzzy, "reanchor_patch")
 
     def _add_step(self, metadata: dict[str, Any], step: str, description: str):
         """Add execution step to metadata."""

@@ -4,9 +4,46 @@ Default-open model: ALL shell commands are allowed by default.
 Only specific dangerous operations require user approval.
 """
 
+import re as _re
+
 # Commands that are allowed but have certain forbidden flags.
+#
+# The entries are the stream editors' in-place flags. `sed -i` was here alone,
+# which made the restriction a property of the SPELLING rather than of the act:
+# `perl -i -pe 's/x/y/' f.py` edits f.py in place exactly as `sed -i` does, and
+# ran unprompted while sed's identical form was rejected with "Use apply_patch"
+# (measured by dispatching both). Same act, same answer.
 FORBIDDEN_FLAGS: dict = {
-    "sed": {"-i", "--in-place"},  # in-place edit bypasses apply_patch pipeline
+    "sed": {"-i", "--in-place"},   # in-place edit bypasses apply_patch pipeline
+    "perl": {"-i", "--in-place"},  # perl -i / -i.bak / -pi -e — same act as sed -i
+    "ruby": {"-i", "--in-place"},  # ruby -i -pe — the third spelling of the same
+}
+
+# Executables whose *argument* names a file they overwrite, with no `>` for the
+# redirect gate to see. `_truncating_redirect_targets` applies the same narrow
+# scoping it applies to redirects (in-repo, existing, non-empty), so a target
+# outside the repo or one that does not exist yet is still never mentioned.
+#
+# Value is the argument position: "all" = every non-flag argument (tee writes to
+# each of them), "last" = only the final one (cp/mv's destination; the leading
+# arguments are SOURCES and are read, not written).
+#
+# Deliberately excluded — `tee -a` and `cp -n`. Appending is not truncation, the
+# same call the redirect gate makes for `>>`; the point of this table is to make
+# the answer depend on the act, not the spelling, in both directions.
+OVERWRITING_EXECUTABLES: dict[str, str] = {
+    "tee": "all",
+    "cp": "last",
+    "mv": "last",
+    "install": "last",
+}
+
+# Flags that turn an OVERWRITING_EXECUTABLES entry non-destructive.
+NON_OVERWRITING_FLAGS: dict[str, frozenset[str]] = {
+    "tee": frozenset({"-a", "--append"}),
+    "cp": frozenset({"-n", "--no-clobber"}),
+    "mv": frozenset({"-n", "--no-clobber"}),
+    "install": frozenset(),
 }
 
 # Flag combinations that require user approval, even when the executable
@@ -490,7 +527,6 @@ SHELL_TIMEOUT_MAX: int = 300
 # the lesson of the shell-gate fix: `cd build\npytest` is two commands.
 # Consequence of anchoring: `pip install pytest` and `grep pytest .` do not
 # match, because there the runner name is an argument, not the executable.
-import re as _re
 
 _VERIFICATION_RUNNERS = (
     r"\S*python\S*\s+-m\s+(?:pytest|unittest|ruff|mypy|flake8|pylint)",

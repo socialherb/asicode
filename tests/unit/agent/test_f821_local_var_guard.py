@@ -36,10 +36,7 @@ def _collect_local_assigned_names(source: str) -> set:
                     at = getattr(child, 'target', None)
                     if isinstance(at, ast.Name):
                         local_assigned_names.add(at.id)
-                elif isinstance(child, ast.NamedExpr):
-                    if isinstance(child.target, ast.Name):
-                        local_assigned_names.add(child.target.id)
-                elif isinstance(child, ast.For):
+                elif isinstance(child, (ast.NamedExpr, ast.For)):
                     if isinstance(child.target, ast.Name):
                         local_assigned_names.add(child.target.id)
                 elif isinstance(child, ast.With):

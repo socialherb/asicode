@@ -31,8 +31,12 @@ import pytest
 
 
 def _read_asi() -> str:
-    with open("asi.py", "r", encoding="utf-8") as f:
-        return f.read()
+    """asi.py + external_llm/repl/repl_impl.py (P6-2: REPL block moved)."""
+    with open("asi.py", encoding="utf-8") as f:
+        asi_src = f.read()
+    with open("external_llm/repl/repl_impl.py", encoding="utf-8") as f:
+        repl_src = f.read()
+    return asi_src + "\n" + repl_src
 
 
 def _get_print_dep_status_source() -> str:
@@ -44,14 +48,17 @@ def _get_print_dep_status_source() -> str:
             start = i
             break
     if start is None:
-        pytest.skip("_print_dep_status not found in asi.py")
+        pytest.fail("_print_dep_status not found in asi.py — update this test or restore the symbol; silent skip would mask the regression")
     body = [lines[start]]
     for j in range(start + 1, len(lines)):
         ln = lines[j]
         # stop at the next module-level construct (col-0 def/class/assignment)
-        if ln[:1] and not ln.startswith((" ", "\t", "\n", "\r")):
-            if re.match(r"^(def |class |[A-Za-z_][A-Za-z0-9_]*\s*[=:])", ln):
-                break
+        if (
+            ln[:1]
+            and not ln.startswith((" ", "\t", "\n", "\r"))
+            and re.match(r"^(def |class |[A-Za-z_][A-Za-z0-9_]*\s*[=:])", ln)
+        ):
+            break
         body.append(ln)
     return "".join(body)
 

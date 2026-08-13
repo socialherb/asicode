@@ -1,6 +1,6 @@
 """Regression guard for the design_insights auto-compaction 401-spam bug.
 
-``_compact_insights_interactive`` (asi.py) makes a synchronous LLM call to
+``_compact_insights_interactive`` (repl_impl.py) makes a synchronous LLM call to
 the helper model. Without suppression, a persistent helper-model auth/quota
 failure surfaces the provider's raw ``logger.error("DeepSeek authentication
 failed (401)")`` on the terminal every time compaction runs (and it re-runs
@@ -21,16 +21,15 @@ from external_llm.agent import context_manager as cm
 
 
 def _get_compact_insights_source() -> str:
-    """Extract ``_compact_insights_interactive`` source from asi.py.
+    """Extract ``_compact_insights_interactive`` source from repl_impl.py.
 
-    asi.py is a large script with import-time side effects (it constructs
-    services, reads .env, etc.), so we parse the source text instead of
-    importing. The function is a closure defined inside ``run_repl``; we locate
-    it by its ``def`` line and balance-indent the body.
+    The function is a method inside the REPL class (moved from asi.py in P6-2);
+    we parse the source text instead of importing (which has heavy import-time
+    side effects) and locate it by its ``def`` line, balance-indenting the body.
     """
     import re
-    src_path = "asi.py"
-    with open(src_path, "r", encoding="utf-8") as f:
+    src_path = "external_llm/repl/repl_impl.py"
+    with open(src_path, encoding="utf-8") as f:
         lines = f.readlines()
     # Find the def line
     start = None
@@ -39,7 +38,7 @@ def _get_compact_insights_source() -> str:
             start = i
             break
     if start is None:
-        pytest.skip("_compact_insights_interactive not found in asi.py")
+        pytest.fail("_compact_insights_interactive not found in repl_impl.py — update this test or restore the symbol; silent skip would mask the regression")
     # Collect until the next top-level/statement at the same or lower indent
     # that isn't part of the body. The function is indented 4 spaces; its body
     # is indented 8+. We stop at the first line at indent <= 4 that follows a
@@ -48,10 +47,14 @@ def _get_compact_insights_source() -> str:
     for j in range(start + 1, len(lines)):
         ln = lines[j]
         # A line at indent <= 4 (and non-blank, non-comment-only) ends the func.
-        if ln.strip() and not ln.startswith("        ") and not ln.startswith("\t"):
+        if (
+            ln.strip()
+            and not ln.startswith("        ")
+            and not ln.startswith("\t")
+            and (re.match(r"^    def ", ln) or re.match(r"^def ", ln) or re.match(r"^    [a-zA-Z_]", ln))
+        ):
             # but allow decorators/continuation — a def at 4-space indent ends it
-            if re.match(r"^    def ", ln) or re.match(r"^def ", ln) or re.match(r"^    [a-zA-Z_]", ln):
-                break
+            break
         body.append(ln)
     return "".join(body)
 

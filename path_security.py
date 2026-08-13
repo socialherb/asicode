@@ -19,12 +19,13 @@ def normalize_rel_path(p: str) -> str:
     - Strips quotes, whitespace
     - Removes a/ or b/ prefixes (git diff convention)
     - Removes leading ./
-    - Rejects absolute paths, drive letters, and traversal (..)
+    - Strips leading slashes (absolute paths normalize to relative)
+    - Rejects drive letters and traversal (..)
     - Returns empty string if invalid
     """
     p = (p or "").strip().strip('"').strip("'")
     p = p.replace("\\", "/")
-    if p.startswith("a/") or p.startswith("b/"):
+    if p.startswith(("a/", "b/")):
         p = p[2:]
     while p.startswith("./"):
         p = p[2:]
@@ -32,7 +33,7 @@ def normalize_rel_path(p: str) -> str:
 
     if not p:
         return ""
-    if p.startswith("/") or (len(p) >= 2 and p[1] == ":" and p[0].isalpha()):
+    if len(p) >= 2 and p[1] == ":" and p[0].isalpha():
         return ""
     parts = [x for x in p.split("/") if x]
     if not parts or ".." in parts:
@@ -53,8 +54,8 @@ def resolve_inside_repo(repo_root: str, rel_path: str) -> Path:
     p = (repo / rel).resolve()
     try:
         p.relative_to(repo)
-    except ValueError:
-        raise ValueError(f"path_outside_repo: '{rel_path}' resolves outside '{repo}'")
+    except ValueError as e:
+        raise ValueError(f"path_outside_repo: '{rel_path}' resolves outside '{repo}'") from e
     return p
 
 
@@ -85,10 +86,10 @@ def resolve_under_repo_subdir(repo_root: str, subdir: str, candidate: str) -> Pa
     p = cand.resolve()
     try:
         p.relative_to(allowed_dir)
-    except ValueError:
+    except ValueError as e:
         raise ValueError(
             f"path_outside_allowed: {candidate!r} resolves to {p}, not under {allowed_dir}"
-        )
+        ) from e
     return p
 
 
@@ -112,9 +113,10 @@ def _repo_within_allowlist(repo: Path, root: str) -> bool:
         return True
     try:
         repo.relative_to(resolved_root)
-        return True
     except ValueError:
         return False
+    else:
+        return True
 
 
 def validate_repo_root(repo_root: str, allowed_roots: list[str] | None = None) -> Path:
@@ -135,9 +137,8 @@ def validate_repo_root(repo_root: str, allowed_roots: list[str] | None = None) -
     if allowed_roots is not None and len(allowed_roots) == 0:
         allowed_roots = None
 
-    if allowed_roots:
-        if not any(_repo_within_allowlist(repo, root) for root in allowed_roots):
-            logger.warning("Rejected repo_root outside allowlist: %s", repo)
-            raise ValueError(f"repo_root not in allowed list: {repo}")
+    if allowed_roots and not any(_repo_within_allowlist(repo, root) for root in allowed_roots):
+        logger.warning("Rejected repo_root outside allowlist: %s", repo)
+        raise ValueError(f"repo_root not in allowed list: {repo}")
 
     return repo

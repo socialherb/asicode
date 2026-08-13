@@ -12,11 +12,13 @@ Key features:
 import ast
 import json
 import logging
+import re
 import threading
 import time
 from collections import OrderedDict
 from typing import Any, Optional
 
+from ._response_utils import _TRUNCATION_REASONS
 from .enums import Complexity, Scope
 from .guard_ir import parse_guard as _parse_guard_ir
 from .intent_models import IntentResolutionConfig, IntentResult
@@ -60,8 +62,7 @@ class IntentResolver:
                         self._cache.move_to_end(cache_key)  # refresh LRU position
                         logger.debug("IntentResolver cache hit: %s", cache_key[:8])
                         return result
-                    else:
-                        del self._cache[cache_key]
+                    del self._cache[cache_key]
 
         # Resolve with LLM
         result = self._resolve_with_llm(request)
@@ -103,7 +104,7 @@ class IntentResolver:
                         temperature=0.1,
                         max_tokens=max_tokens,
                     )
-                elif hasattr(self._llm_client, "chat_with_tools"):
+                if hasattr(self._llm_client, "chat_with_tools"):
                     return self._llm_client.chat_with_tools(
                         messages=messages,
                         tools=[],
@@ -157,7 +158,7 @@ class IntentResolver:
                 _finish_reason, _json_looks_truncated, len(raw),
             )
 
-            if _finish_reason == "length" or _json_looks_truncated:
+            if _finish_reason in _TRUNCATION_REASONS or _json_looks_truncated:
                 logger.warning(
                     "IntentResolver: truncated response detected "
                     "(finish_reason=%r, json_truncated=%s) at max_tokens=%d — retrying with %d",
@@ -184,7 +185,7 @@ class IntentResolver:
             from ..client import LLMServerUnavailableError
             if isinstance(exc, LLMServerUnavailableError):
                 raise
-            logger.error("IntentResolver LLM resolution failed: %s", exc, exc_info=True)
+            logger.exception("IntentResolver LLM resolution failed: %s", exc)
             return self._fallback_extraction(request)
 
     def _build_system_prompt(self) -> str:
@@ -223,7 +224,6 @@ even if the response is truncated, the most critical routing information is pres
   "search_terms": ["list", "of", "technical", "search", "terms"],
   "edit_kind": "guard_add|body_only|signature_change|full_rewrite|extend|",
   "guard_statement": "if not x: return None",
-  "target_loop_iterable": "iterable_expr_or_empty_string",
   "new_files": ["path/to/new_file.py"],
   "confidence": 0.0-1.0,
   "metadata": {
@@ -317,7 +317,7 @@ LANE HINT GUIDE:
 
 CODE CONCEPTS (CRITICAL for finding the RIGHT symbol — not the named entry point):
 Extract the actual data structures / field names that need to change, and classify
-the behavioral role so SpecResolver can find the enforcement point, not just the
+the behavioral role so downstream resolution can find the enforcement point, not just the
 most prominent symbol that matches the request's surface words.
 
 - data_fields: Python field/attribute names that will be READ or WRITTEN by the fix.
@@ -375,12 +375,7 @@ guard_statement: Only populate when edit_kind == "guard_add".
      A placeholder is always better than a wrong name.
   Leave "" only if no guard condition can be inferred at all.
 
-target_loop_iterable: Only populate when edit_kind == "guard_add" AND the guard must go
-  inside a specific for-loop (not at function entry).
-  Extract the iterable expression of the target loop AS IT LIKELY APPEARS IN SOURCE CODE.
-  This is the expression after "for VAR in <HERE>:" — extract from the request description
-  of which collection/list is being iterated. Use the variable name as described in the request;
-  the verifier maps it to the real source variable.
+
   Leave "" when the guard is at function entry (not inside a loop), or the loop cannot be
   identified from the request.
 
@@ -441,6 +436,7 @@ Be concise and accurate. Return JSON only."""
                 if isinstance(recovered, dict) and recovered:
                     return recovered
             except json.JSONDecodeError:
+                logger.debug("recovered JSON still invalid, continue", exc_info=True)
                 continue
 
         return None
@@ -585,13 +581,12 @@ Be concise and accurate. Return JSON only."""
             modify_symbols, reference_symbols, [ns.get("name") for ns in new_symbols],
         )
 
-        # Edit kind + guard statement + target_loop_iterable (Intent → Policy layer)
+        # Edit kind + guard statement (Intent → Policy layer)
         _edit_kind_raw = (result_dict.get("edit_kind") or "").strip().lower()
         _VALID_EDIT_KINDS = {"guard_add", "body_only", "signature_change", "full_rewrite", "extend"}
         _edit_kind = _edit_kind_raw if _edit_kind_raw in _VALID_EDIT_KINDS else ""
         _guard_statement = ""
         _guard_spec = None  # typed GuardIR — authoritative downstream
-        _target_loop_iterable = ""
         if _edit_kind == "guard_add":
             _guard_statement = (result_dict.get("guard_statement") or "").strip()
             if _guard_statement:
@@ -618,31 +613,15 @@ Be concise and accurate. Return JSON only."""
                         _guard_statement[:80],
                     )
                     _guard_spec = None
-            # target_loop_iterable: the iterable expression the user described.
-            # Keep only if it looks like a valid Python identifier or simple expression
-            # (guards against hallucinated multi-word phrases).
-            _tli_raw = (result_dict.get("target_loop_iterable") or "").strip()
-            if _tli_raw and _tli_raw not in ("iterable_expr_or_empty_string", ""):
-                # Accept simple identifiers, attribute accesses, and subscripts.
-                # Reject multi-word phrases (contain spaces) or placeholder strings.
-                try:
-                    ast.parse(_tli_raw, mode="eval")
-                    _target_loop_iterable = _tli_raw
-                except SyntaxError:
-                    logger.debug(
-                        "IntentResolver: target_loop_iterable %r is not valid Python, discarding",
-                        _tli_raw[:80],
-                    )
 
         # code_concepts: validate and normalize
         _raw_cc = result_dict.get("code_concepts", {}) or {}
         _code_concepts: dict[str, Any] = {}
         if isinstance(_raw_cc, dict):
-            import re as _re_cc
             _df_raw = _raw_cc.get("data_fields", [])
             _data_fields = [
                 f for f in (_df_raw if isinstance(_df_raw, list) else [])
-                if isinstance(f, str) and _re_cc.match(r'^[\w.]+$', f) and len(f) >= 2
+                if isinstance(f, str) and re.match(r'^[\w.]+$', f) and len(f) >= 2
             ][:8]
             _bk = _raw_cc.get("behavioral_kind", "")
             _behavioral_kind = _bk if _bk in ("enforcement", "creation", "fix", "query") else ""
@@ -656,13 +635,13 @@ Be concise and accurate. Return JSON only."""
                 }
 
         # Generic vocabulary (e.g. "plan", "execution", "order") is filtered
-        # downstream in SpecResolver._filter_terms_by_graph via cardinality gate:
+        # downstream via a cardinality gate:
 
         # scope_hint / complexity_hint / is_test_write / is_style_fix
         _scope_hint = Scope(result_dict.get("scope_hint", "single_file"))
 
         # project_wide scope_hint contradicts a specific scope_phase — clear scope_phase
-        # so SpecResolver doesn't constrain grounding to a narrow system domain.
+        # so downstream resolution doesn't constrain grounding to a narrow system domain.
         if _scope_hint == Scope.PROJECT_WIDE and _scope_phase:
             logger.info(
                 "IntentResolver: scope_hint=project_wide overrides scope_phase='%s' — "
@@ -693,7 +672,6 @@ Be concise and accurate. Return JSON only."""
             edit_kind=_edit_kind,
             guard_statement=_guard_statement,
             guard_spec=_guard_spec,
-            target_loop_iterable=_target_loop_iterable,
             target_files=target_files,
             target_symbols=target_symbols,
             new_symbols=new_symbols,
@@ -729,10 +707,9 @@ Be concise and accurate. Return JSON only."""
             for _ch in text:
                 if _ch.isalnum() or _ch in ('_', '-'):
                     _cur.append(_ch)
-                else:
-                    if _cur:
-                        words.append(''.join(_cur))
-                        _cur = []
+                elif _cur:
+                    words.append(''.join(_cur))
+                    _cur = []
             if _cur:
                 words.append(''.join(_cur))
             return [w for w in words if len(w) >= 2]  # Keep words with at least 2 chars
@@ -830,23 +807,10 @@ Be concise and accurate. Return JSON only."""
             "metadata": {"source": "llm_parse_failed"},
         }
 
-    def clear_cache(self) -> None:
-        """Clear the intent resolution cache."""
-        self._cache.clear()
-        logger.debug("IntentResolver cache cleared")
-
-    def get_cache_stats(self) -> dict[str, Any]:
-        """Get cache statistics."""
-        return {
-            "cache_size": len(self._cache),
-            "cache_keys": list(self._cache.keys())[:10],  # First 10 keys
-        }
-
 
 def create_intent_resolver(
     llm_client: Any,
     model: str,
-    repo_root: Optional[str] = None,
     enable_cache: bool = True,
 ) -> IntentResolver:
     """Factory function to create IntentResolver with default config."""

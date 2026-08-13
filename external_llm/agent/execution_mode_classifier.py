@@ -113,6 +113,14 @@ _MODE_INTENT_EXAMPLES = {
 _mode_matcher = None
 _mode_matcher_lock = threading.Lock()
 
+# Position words that cue a line-number reference (the strict_json structural
+# anchor). This is the *fast* path: every position word the semantic backstop
+# knows (_MODE_INTENT_EXAMPLES["line_edit"]) must appear here, otherwise a
+# digit prompt phrased with that word pays an ~8s sentence_transformers import
+# + embedding-model load on the first semantic backstop hit. Keep in sync with
+# the Hangul examples ("라인", "줄", "행") in _MODE_INTENT_EXAMPLES above.
+_LINE_REFERENCE_KEYWORDS: tuple[str, ...] = ("line", "라인", "줄", "행")
+
 
 def _get_mode_matcher():
     """Lazily build the line-edit semantic matcher (singleton)."""
@@ -169,10 +177,10 @@ def analyze_request_for_optimal_mode(prompt: str, target_file: Optional[str]) ->
         return llm_decision.value
 
     # Fallback to structural analysis
-    return _analyze_intent_with_keywords(prompt, target_file)
+    return _analyze_intent_with_keywords(prompt)
 
 
-def _analyze_intent_with_keywords(prompt: str, target_file: Optional[str]) -> str:
+def _analyze_intent_with_keywords(prompt: str) -> str:
     """Keyword-based intent classification as fallback when LLM is unavailable.
 
     - Line-number references -> strict_json
@@ -186,7 +194,7 @@ def _analyze_intent_with_keywords(prompt: str, target_file: Optional[str]) -> st
         return "legacy"
 
     # Check for keyword followed by digits (the number is the actual cue, not the keyword).
-    if _has_number_after_keyword(prompt_lower, ("line",)):
+    if _has_number_after_keyword(prompt_lower, _LINE_REFERENCE_KEYWORDS):
         return "strict_json"
 
     # Semantic backstop: a line-level edit phrased with a position word not in the
@@ -298,7 +306,7 @@ Output only the mode name — no explanation."""
                 return mode
 
     except Exception as e:
-        logger.debug(f"LLM intent analysis failed (falling back to keywords): {e}")
+        logger.debug("LLM intent analysis failed (falling back to keywords): %s", e)
 
     return None
 

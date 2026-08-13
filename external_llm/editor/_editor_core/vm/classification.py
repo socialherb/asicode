@@ -1,8 +1,8 @@
-"""classification.py — Typed failure classification (shared by vm and ts_vm).
+"""classification.py — Typed failure classification for the VM subsystem.
 
 This module defines the unified FailureType enum and Classification dataclass
 for structured failure analysis. Replaces the duplicate enums in
-vm/failure_classifier.py and ts_vm/repair/failure_classifier.py.
+vm/failure_classifier.py.
 
 Design: docs/design/typed_failure_classifier.md
 """
@@ -16,7 +16,7 @@ from typing import Optional
 class FailureType(str, Enum):
     """Actionable failure categories (language-agnostic).
 
-    Unified enum covering both vm (Python/Java/Kotlin/Go) and ts_vm (TS/JS).
+    Unified enum covering vm languages (Python/Java/Kotlin/Go).
     """
 
     MISSING_IMPORT = "missing_import"
@@ -26,7 +26,6 @@ class FailureType(str, Enum):
     MISSING_RETURN = "missing_return"
     SYNTAX_ERROR = "syntax_error"
     DUPLICATE_IDENTIFIER = "duplicate_identifier"
-    PROPERTY_NOT_EXIST = "property_not_exist"      # TS: property does not exist on type
     MISSING_VARIABLE = "missing_variable"           # Python: NameError
     UNUSED_IMPORT = "unused_import"                 # Go: imported and not used
     UNKNOWN = "unknown"

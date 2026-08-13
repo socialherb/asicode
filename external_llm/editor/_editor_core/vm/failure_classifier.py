@@ -6,24 +6,25 @@ so the repair planner can dispatch to the right strategy.
 from __future__ import annotations
 
 import re
-from typing import Optional
+from contextlib import suppress
+from typing import ClassVar, Optional
 
+from external_llm.editor._editor_core.vm.classification import Classification, EvidenceSource, FailureType, FixHint
 from external_llm.editor._editor_core.vm.models import VerifyError
-from external_llm.editor._editor_core.vm.classification import (
-    Classification, EvidenceSource, FailureType, FixHint
-)
 
-__all__ = ["FailureType", "BaseFailureClassifier", "create_failure_classifier"]
+__all__ = ["BaseFailureClassifier", "FailureType", "create_failure_classifier"]
 
 
 class BaseFailureClassifier:
     """Base classifier that subclasses override with language-specific patterns."""
 
-    # Subclasses define: error_code_map, keyword_map, regex_patterns, extract_symbol_re
-
-    error_code_map: dict = {}
-    keyword_map: list = []
-    regex_patterns: list = []
+    # Subclasses define: error_code_map, keyword_map, regex_patterns,
+    # extract_patterns — (compiled_regex, group) pairs tried in order by
+    # extract_symbol().
+    error_code_map: ClassVar[dict] = {}
+    keyword_map: ClassVar[list] = []
+    regex_patterns: ClassVar[list] = []
+    extract_patterns: ClassVar[list] = []
 
     def classify(self, errors: list[VerifyError]) -> FailureType:
         if not errors:
@@ -48,7 +49,8 @@ class BaseFailureClassifier:
 
         # Layer A: tree-sitter structural check (highest confidence for syntax errors)
         if code is not None and language is not None:
-            try:
+            with suppress(RecursionError, TypeError, ValueError, IndexError):
+                # tree-sitter unavailable or failed — fall back to Layer B/C
                 from external_llm.languages.tree_sitter_utils import find_error_nodes
                 error_nodes = find_error_nodes(code, language)
                 if error_nodes:
@@ -69,14 +71,8 @@ class BaseFailureClassifier:
                         fix_hint=fix_hint,
                         error_index=0,
                     )
-            except Exception:
-                # tree-sitter unavailable or failed — fall back to Layer B/C
-                pass
 
         return self._classify_single_typed(errors[0], error_index=0, code=code, language=language)
-
-    def classify_all(self, errors: list[VerifyError]) -> list[FailureType]:
-        return [self._classify_single(e) for e in errors]
 
     def _classify_single(self, error: VerifyError) -> FailureType:
         if error.code and error.code in self.error_code_map:
@@ -148,18 +144,21 @@ class BaseFailureClassifier:
         """
         # Try position-based extraction first
         if code and language and error.line and error.column:
-            try:
+            with suppress(RecursionError, TypeError, ValueError, IndexError):
                 from external_llm.languages.tree_sitter_utils import extract_symbol_at_position
                 symbol = extract_symbol_at_position(code, language, error.line, error.column)
                 if symbol:
                     return symbol
-            except Exception:
-                pass
 
         # Fallback to regex-based extraction
         return self.extract_symbol(error)
 
     def extract_symbol(self, error: VerifyError) -> Optional[str]:
+        """First capture-group match across ``self.extract_patterns`` (in order)."""
+        for pattern, group in self.extract_patterns:
+            m = pattern.search(error.message)
+            if m:
+                return m.group(group)
         return None
 
 
@@ -210,25 +209,19 @@ _PY_REGEX_PATTERNS = [
 ]
 
 _PY_EXTRACT_SYMBOL = re.compile(r"name\s+['\"]?(\w+)['\"]?\s+is not defined", re.IGNORECASE)
+_PY_EXTRACT_IMPORT_SYMBOL = re.compile(r"cannot import\s+['\"]?(\w+)", re.IGNORECASE)
+_PY_EXTRACT_MODULE_SYMBOL = re.compile(r"module\s+['\"]?(\w+)['\"]?", re.IGNORECASE)
 
 
 class PythonFailureClassifier(BaseFailureClassifier):
     error_code_map = _PY_ERROR_CODE_MAP
     keyword_map = _PY_KEYWORD_MAP
     regex_patterns = _PY_REGEX_PATTERNS
-
-    def extract_symbol(self, error: VerifyError) -> Optional[str]:
-        m = _PY_EXTRACT_SYMBOL.search(error.message)
-        if m:
-            return m.group(1)
-        # Try import error patterns
-        m = re.search(r"cannot import\s+['\"]?(\w+)", error.message, re.IGNORECASE)
-        if m:
-            return m.group(1)
-        m = re.search(r"module\s+['\"]?(\w+)['\"]?", error.message, re.IGNORECASE)
-        if m:
-            return m.group(1)
-        return None
+    extract_patterns: ClassVar[list] = [
+        (_PY_EXTRACT_SYMBOL, 1),
+        (_PY_EXTRACT_IMPORT_SYMBOL, 1),
+        (_PY_EXTRACT_MODULE_SYMBOL, 1),
+    ]
 
 
 # ── Java ──────────────────────────────────────────────────────────────
@@ -270,21 +263,19 @@ _JAVA_REGEX_PATTERNS = [
 ]
 
 _JAVA_EXTRACT_SYMBOL = re.compile(r"symbol:\s+(variable|method|class)\s+(\w+)", re.MULTILINE)
+_JAVA_EXTRACT_SYMBOL_FALLBACK = re.compile(
+    r"cannot find symbol[\s\S]*?symbol:[\s\S]*?(\w+)\s*$", re.MULTILINE
+)
 
 
 class JavaFailureClassifier(BaseFailureClassifier):
     error_code_map = _JAVA_ERROR_CODE_MAP
     keyword_map = _JAVA_KEYWORD_MAP
     regex_patterns = _JAVA_REGEX_PATTERNS
-
-    def extract_symbol(self, error: VerifyError) -> Optional[str]:
-        m = _JAVA_EXTRACT_SYMBOL.search(error.message)
-        if m:
-            return m.group(2)
-        m = re.search(r"cannot find symbol[\s\S]*?symbol:[\s\S]*?(\w+)\s*$", error.message, re.MULTILINE)
-        if m:
-            return m.group(1)
-        return None
+    extract_patterns: ClassVar[list] = [
+        (_JAVA_EXTRACT_SYMBOL, 2),
+        (_JAVA_EXTRACT_SYMBOL_FALLBACK, 1),
+    ]
 
 
 # ── Kotlin ────────────────────────────────────────────────────────────
@@ -320,15 +311,10 @@ _KOTLIN_EXTRACT_SYMBOL = re.compile(r"unresolved reference:\s+(\w+)", re.IGNOREC
 
 
 class KotlinFailureClassifier(BaseFailureClassifier):
-    error_code_map = {}
+    error_code_map: ClassVar[dict] = {}
     keyword_map = _KOTLIN_KEYWORD_MAP
     regex_patterns = _KOTLIN_REGEX_PATTERNS
-
-    def extract_symbol(self, error: VerifyError) -> Optional[str]:
-        m = _KOTLIN_EXTRACT_SYMBOL.search(error.message)
-        if m:
-            return m.group(1)
-        return None
+    extract_patterns: ClassVar[list] = [(_KOTLIN_EXTRACT_SYMBOL, 1)]
 
 
 # ── Go ────────────────────────────────────────────────────────────────
@@ -359,21 +345,17 @@ _GO_REGEX_PATTERNS = [
 ]
 
 _GO_EXTRACT_SYMBOL = re.compile(r"(?:undefined|undeclared name):\s+(\w+)")
+_GO_EXTRACT_SYMBOL_FALLBACK = re.compile(r"imported and not used:\s+['\"]?(\S+)")
 
 
 class GoFailureClassifier(BaseFailureClassifier):
-    error_code_map = {}
+    error_code_map: ClassVar[dict] = {}
     keyword_map = _GO_KEYWORD_MAP
     regex_patterns = _GO_REGEX_PATTERNS
-
-    def extract_symbol(self, error: VerifyError) -> Optional[str]:
-        m = _GO_EXTRACT_SYMBOL.search(error.message)
-        if m:
-            return m.group(1)
-        m = re.search(r"imported and not used:\s+['\"]?(\S+)", error.message)
-        if m:
-            return m.group(1)
-        return None
+    extract_patterns: ClassVar[list] = [
+        (_GO_EXTRACT_SYMBOL, 1),
+        (_GO_EXTRACT_SYMBOL_FALLBACK, 1),
+    ]
 
 
 # ── Factory ───────────────────────────────────────────────────────────

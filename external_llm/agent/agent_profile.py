@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -28,8 +29,7 @@ class AgentProfile:
         "model": null,
         "provider": null,
         "system_prompt_prefix": "You are a code reviewer. Avoid modifying files.",
-        "max_turns": 10,
-        "planning_enabled": false
+        "max_turns": 10
     }
 
     Rules:
@@ -37,7 +37,7 @@ class AgentProfile:
     - blocked_tools: tools always denied regardless of allowed_tools.
     - model / provider: override AgentConfig if set.
     - system_prompt_prefix: prepended to the system prompt.
-    - max_turns / planning_enabled: override corresponding AgentConfig fields if set.
+    - max_turns: override the corresponding AgentConfig field if set.
     """
 
     name: str
@@ -48,7 +48,6 @@ class AgentProfile:
     provider: Optional[str] = None
     system_prompt_prefix: Optional[str] = None
     max_turns: Optional[int] = None
-    planning_enabled: Optional[bool] = None
 
     # ------------------------------------------------------------------ #
     # Construction helpers                                                 #
@@ -91,7 +90,6 @@ class AgentProfile:
             provider=data.get("provider"),
             system_prompt_prefix=data.get("system_prompt_prefix"),
             max_turns=data.get("max_turns"),
-            planning_enabled=data.get("planning_enabled"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -104,7 +102,6 @@ class AgentProfile:
             "provider": self.provider,
             "system_prompt_prefix": self.system_prompt_prefix,
             "max_turns": self.max_turns,
-            "planning_enabled": self.planning_enabled,
         }
 
     # ------------------------------------------------------------------ #
@@ -122,13 +119,6 @@ class AgentProfile:
         if self.max_turns is not None:
             agent_config.max_turns = self.max_turns
             logger.debug("AgentProfile '%s': max_turns → %d", self.name, self.max_turns)
-        if self.planning_enabled is not None:
-            agent_config.planning_enabled = self.planning_enabled
-            logger.debug(
-                "AgentProfile '%s': planning_enabled → %s",
-                self.name,
-                self.planning_enabled,
-            )
 
 
 # ------------------------------------------------------------------ #
@@ -144,7 +134,6 @@ BUILTIN_PROFILES: dict[str, dict] = {
             "get_project_info", "find_relevant_files",
         ],
         "blocked_tools": [],
-        "planning_enabled": False,
     },
     "patcher": {
         "name": "patcher",
@@ -163,7 +152,6 @@ BUILTIN_PROFILES: dict[str, dict] = {
             # run_tests removed from LLM tool set (internal dispatch only; use bash("pytest ..."))
         ],
         "blocked_tools": ["apply_patch", "bash"],
-        "planning_enabled": False,
     },
 }
 
@@ -187,10 +175,8 @@ def load_profile(name: str, repo_root: str) -> AgentProfile:
     Raises:
         ValueError: If not found in files or built-ins.
     """
-    try:
+    with suppress(FileNotFoundError):
         return AgentProfile.load(name, repo_root)
-    except FileNotFoundError:
-        pass
     builtin = get_builtin_profile(name)
     if builtin is not None:
         return builtin

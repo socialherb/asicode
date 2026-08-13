@@ -1,34 +1,49 @@
 """Web search tool handler for ToolRegistry.
 
-Provides web search via multiple backends, tried in fallback order:
-    1. SearXNG self-hosted (set SEARXNG_BASE_URL) — private; first ONLY when the
-       user explicitly configured it.
-    2. Startpage — keyless, unmetered, proxies Google's index. Default primary.
-    3. Brave Search API (set BRAVE_API_KEY) — clean JSON API, stable but metered.
-    4. Naver (headless browser) — Korean-query last resort.
-    5. SearXNG auto-install offer (Docker/Colima present, SEARXNG_BASE_URL unset).
-       Last because it raises a user Checkpoint.
+Tier 1 — keyless and unmetered, queried in PARALLEL and merged by cross-backend
+agreement (no per-use cost, so there is no reason to stop at the first answer):
+    * SearXNG self-hosted (set SEARXNG_BASE_URL) — private; participates only when
+      the user explicitly configured it.
+    * Startpage — proxies Google's index. Its httpx route has been refused from
+      this network since 2026-08-03 (see _WALL_BACKOFF_BASE_SEC). The refusal is
+      CLIENT-shaped, not IP-scoped: a browser on the same IP is served normally,
+      so a walled httpx route promotes "Startpage (browser)" into this tier
+      instead of losing the backend (see _search_startpage_browser).
+    * Exa (https://mcp.exa.ai/mcp) — keyless MCP search returning page EXCERPTS
+      rather than SERP snippets. Opt out with ASICODE_EXA_SEARCH=off.
+
+Tier 2 — first-wins, because each of these costs something per use:
+    * Brave Search API (set BRAVE_API_KEY) — clean JSON API, metered free tier.
+    * Naver (headless browser) — Korean-query last resort.
+    * SearXNG auto-install offer (Docker/Colima present, SEARXNG_BASE_URL unset).
+      Last because it raises a user Checkpoint.
     (-) DuckDuckGo — OPT-IN only via ASICODE_DDG_FALLBACK=on; see _should_try_ddg
-       for why it left the default chain.
+      for why it left the default chain.
 
 Every HTML-scraping backend routes its empty result set through
 ``_guard_block_wall``: an engine that answers HTTP 200 with a CAPTCHA/consent page
 parses to zero results and would otherwise be reported as a genuine "nothing
 matched", hiding an infrastructure failure behind a plausible answer. A wall
-raises ``_BlockWallError``, which also trips the session circuit breaker so a
-refusing engine is not asked again for the cooldown.
+raises ``_BlockWallError``, which sidelines the engine on a PERSISTED escalating
+backoff (15min → 24h, cleared by a real success) — a wall is an IP-reputation
+decision measured in days, so unlike a connect failure it must survive process
+exit, and re-probing it is not merely wasted latency but another flagged request.
 
 Usage: search_web(query="...", max_results=5, site_filter="...")
 """
 
 from __future__ import annotations
 
+import contextlib
 import html as html_mod
+import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -38,6 +53,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
+
+from ...client import interruptible_sleep
+from ..agent_loop_types import AgentCancelled
 
 if TYPE_CHECKING:
     import httpx
@@ -113,6 +131,188 @@ _FETCH_BINARY_CONTENT_PREFIXES = (
     "video/",
 )
 
+# Request headers for web_fetch. A real Chrome top-level navigation sends the
+# whole Sec-Fetch/client-hint block, and sending only part of it is itself a bot
+# signature — measured against old.reddit.com 2026-08-05, 4 requests per variant,
+# fully deterministic:
+#
+#   UA only                              → 200 (4/4)
+#   UA + Accept                          → 200 (4/4)
+#   UA + Accept-Language                 → 200 (4/4)
+#   UA + Accept + Accept-Language        → 403 (4/4)   ← what web_fetch used to send
+#   the full set below                   → 200 (4/4)
+#
+# So the block was not the UA and not either header alone; it was the pair
+# arriving WITHOUT the Sec-Fetch headers that always accompany them in a browser.
+# curl was unaffected throughout, which is why this stayed invisible to probing by
+# hand. Keep this set complete: dropping a member re-creates the partial-browser
+# fingerprint. Search backends keep their own headers — their behaviour is
+# separately measured and is not covered by these numbers.
+_BROWSER_FETCH_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# Request headers for the html-form search backends (DDG html, Startpage). They
+# share the same UA/Accept/Accept-Language trio, sent as plain form GET/POST
+# requests — NOT browser navigations — so the Sec-Fetch block above is
+# deliberately absent: the backends accept this trio (measured per-backend in
+# each backend's docstring), and sending browser-navigation headers here would
+# recreate the partial-browser fingerprint the web_fetch comment warns about.
+_HTML_SEARCH_HEADERS = {
+    "User-Agent": _BROWSER_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# ── web_fetch SSRF guard ──────────────────────────────────────────────────
+# _tool_web_fetch fetches arbitrary user-supplied URLs. Without host validation
+# a prompt-injected page could redirect the agent into fetching local services
+# (http://127.0.0.1:11434 Ollama API, :8000 webapp, :8080 SearXNG, cloud
+# metadata 169.254.169.254, …) and leak their responses into the conversation.
+# The guard rejects loopback/private/link-local/reserved targets before any
+# request, and re-validates every hop via an httpx request hook so a redirect
+# chain cannot smuggle the connection back to a local address.
+# ``ASI_ALLOW_PRIVATE_URLS=1`` disables the guard for users who genuinely fetch
+# local dev servers. SearXNG's own backend (_search_searxng) is a separate path
+# and is not affected by this guard.
+_SSRF_ALLOW_ENV = "ASI_ALLOW_PRIVATE_URLS"
+
+
+class _SSRFBlockedError(Exception):
+    """Raised when a web_fetch target is not a public internet address."""
+
+
+def _ssrf_guard_disabled() -> bool:
+    """True when the user opted out via ``ASI_ALLOW_PRIVATE_URLS`` (on/1/…)."""
+    return os.environ.get(_SSRF_ALLOW_ENV, "").strip().lower() in ("on", "always", "1", "true")
+
+
+def _ip_is_non_public(addr: str) -> bool:
+    """True when *addr* (an IP literal) is not a routable public address.
+
+    Covers loopback, RFC1918/ULA private, link-local, reserved, unspecified and
+    multicast ranges. IPv4-mapped IPv6 (``::ffff:127.0.0.1``) is unwrapped so
+    the embedded IPv4 is judged, not the 6-to-4 wrapper.
+    """
+    ip = ipaddress.ip_address(addr)
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_unspecified
+        or ip.is_multicast
+    )
+
+
+def _assert_public_fetch_host(hostname: str) -> None:
+    """Raise ``_SSRFBlockedError`` unless *hostname* is a public internet target.
+
+    IP literals are judged directly; hostnames are resolved via ``getaddrinfo``
+    and must resolve to *only* public addresses (any private hit blocks — a DNS
+    rebinding attack could otherwise flip the connection target after the
+    check). Resolution failure (NXDOMAIN, …) passes through: the subsequent
+    request will surface the usual connect error, preserving pre-guard behavior.
+    """
+    if _ssrf_guard_disabled():
+        return
+    host = (hostname or "").strip().lower()
+    if not host:
+        raise _SSRFBlockedError(
+            f"web_fetch SSRF guard: empty host. Set {_SSRF_ALLOW_ENV}=1 to allow local URLs."
+        )
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None  # not an IP literal — resolve as a hostname below
+    if ip is not None:
+        if _ip_is_non_public(host):
+            raise _SSRFBlockedError(
+                f"web_fetch SSRF guard: host {host!r} is a loopback/private/"
+                f"link-local/reserved address. Set {_SSRF_ALLOW_ENV}=1 to allow "
+                f"local URLs (not recommended)."
+            )
+        return
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except OSError as e:
+        logger.debug("web_fetch SSRF: DNS resolution failed for %s: %s", host, e)
+        return  # resolution failure → let the request surface the connect error
+    for info in infos:
+        sockaddr = info[4][0]
+        try:
+            is_non_public = _ip_is_non_public(sockaddr)
+        except ValueError:
+            is_non_public = False  # unparseable sockaddr — request will fail anyway
+        if is_non_public:
+            raise _SSRFBlockedError(
+                f"web_fetch SSRF guard: host {host!r} resolves to non-public "
+                f"address {sockaddr}. Set {_SSRF_ALLOW_ENV}=1 to allow local "
+                f"URLs (not recommended)."
+            )
+
+
+def _fetch_url_hostname(url: str) -> str:
+    """Hostname of a web_fetch URL (lowercased, IPv6 brackets stripped)."""
+    return urllib.parse.urlsplit(url).hostname or ""
+
+
+# Reddit hosts that answer an unauthenticated fetch with a bot challenge instead
+# of content, and therefore get routed to old.reddit.com. The bare apex is in the
+# set because it 302s to www — measured 2026-08-05: `reddit.com/r/X` lands on the
+# same "Please wait for verification" interstitial that www serves directly, so
+# matching only "www.reddit.com" left the commonest hand-typed form broken.
+#
+# old.reddit.com is the one route that still works unauthenticated: 8/8 back-to-back
+# 200s with real markup (a 745KB comment thread, search included) on the same IP and
+# in the same minute that www, `.json` (all six User-Agents tried, incl. a real
+# Chrome one), api.reddit.com, and every probed redlib instance returned 403 or a
+# challenge. `.rss` also serves real content but is rate-limited to ~1 request per
+# 60s per IP (x-ratelimit-remaining: 0.0, reset ~58), so it is not a general route.
+_REDDIT_CHALLENGE_HOSTS = frozenset({
+    "reddit.com",
+    "www.reddit.com",
+    "np.reddit.com",
+    "new.reddit.com",
+    "m.reddit.com",
+    "amp.reddit.com",
+})
+
+
+def _rewrite_reddit_url(url: str) -> str:
+    """Route a challenge-serving Reddit host to old.reddit.com, else return as-is.
+
+    Host-based rather than the substring test it replaces: ``"www.reddit.com" in
+    url`` missed the bare apex and the mobile hosts, and would also have fired on
+    an unrelated URL that merely *mentions* the string (a query parameter, a path
+    segment on another site).
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    if (parts.hostname or "").lower() not in _REDDIT_CHALLENGE_HOSTS:
+        return url
+    netloc = "old.reddit.com" + (f":{parts.port}" if parts.port else "")
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def _ssrf_request_hook(request: Any) -> None:
+    """httpx ``request`` event hook: re-validate every hop, incl. redirects."""
+    _assert_public_fetch_host(request.url.host)
+
+
 # Transient (retryable) HTTP errors shared by all search backends. A single tuple
 # keeps SearXNG / DuckDuckGo / Brave on one retry policy instead of each backend
 # ad-hoc-listing a subset (SearXNG used to be the only one with any retry).
@@ -180,6 +380,82 @@ def _search_http_timeout():
 # block's connect timeout; short enough that a transient blip only briefly
 # sidelines the backend before it is retried.
 _BACKEND_COOLDOWN_SEC = 90.0
+
+# ── Persistent, escalating backoff for BLOCKED backends ──────────────────
+# _BACKEND_COOLDOWN_SEC is the right shape for a connect failure (a host that is
+# down usually comes back in minutes) but the wrong one for a bot-detection wall,
+# which is a reputation decision that lasts DAYS.
+#
+# Measured 2026-08-03: Startpage answered 0/6 queries, redirecting every one to
+# /sp/captcha-block ("Startpage Blocked", bc=KR&bi=SK Broadband) — the same
+# suspension recorded on 2026-07-20, still in force TWO WEEKS later.
+#
+# CORRECTION (2026-08-05): that block was read as IP/network reputation because
+# the block page names the connection (bc=KR&bi=SK Broadband). It is not. From
+# the SAME IP, minutes apart: httpx refused 9/9 (current headers, a full Chrome
+# header set, and UA-only alike) while Chromium was served normally — headed 3/3,
+# and headless 6/6 once "HeadlessChrome/" was rewritten out of its UA (headless
+# with the stock UA: blocked 3/3). So the discriminator is the CLIENT, and the
+# durable part of the finding is that the backoff below cannot recover a block of
+# this shape: re-probing the same refused transport can only escalate the ladder.
+# Recovering it takes a different transport — hence the browser route.
+#
+# The ladder is still right for what it does. Against that,
+# a 90s in-memory cooldown means every `asi` process re-probes on its first search
+# and then again every 90 seconds: ~1.7s of pure latency per probe, and each probe
+# is another bot-flagged request reinforcing the very block it is testing.
+#
+# So a wall gets a backoff that (a) survives process exit, and (b) doubles per
+# consecutive strike. 15min → 30 → 1h → 2h → 4h → 8h → 16h → 24h(cap). The cap
+# keeps a recovered backend discoverable at ~1 probe/day, which costs nothing and
+# is well under any plausible detection threshold. A success clears the strikes.
+_WALL_BACKOFF_BASE_SEC = 900.0
+_WALL_BACKOFF_MAX_SEC = 86400.0
+
+# A backend blocked this long is not a blip — the user's search quality is
+# degraded and they cannot see it from the results alone, so say so in the tool
+# output (the same reasoning as the SearXNG staleness notice: a warning that only
+# reaches a log file is a warning nobody acts on).
+_WALL_NOTICE_AFTER_SEC = 6 * 3600.0
+
+# ── Exa (keyless MCP search) ─────────────────────────────────────────────
+# https://mcp.exa.ai/mcp speaks MCP over HTTP but — verified 2026-08-03 — serves
+# tools/call WITHOUT the initialize handshake, so this backend is a single stateless
+# POST (no session id, no notifications/initialized, no extra round trip).
+#
+# Why it is in tier 1. Measured 2026-08-03, 6 varied queries (EN technical + KO),
+# same IP, against the incumbents: Exa 6/6 at 1.27s median (fastest of all
+# backends), SearXNG 6/6 at 1.47s, Startpage 0/6 (suspended, above). It is keyless
+# and unmetered like the other tier-1 members, and — the reason it earns the token
+# cost — it returns query-relevant page EXCERPTS rather than a SERP snippet. On
+# "MCP streamable HTTP transport session id header", SearXNG's top hit was the
+# 2025-03-26 spec while Exa returned the current 2026-07-28 revision AND the
+# sentence stating the session mechanism had been removed in it — a fact no
+# 400-char snippet can carry.
+#
+# It is a COMPLEMENT, not a replacement: across the 6 queries Exa and asicode's
+# merged output shared only 1-2 domains of 5, so dropping either loses real
+# coverage.
+_EXA_MCP_URL = "https://mcp.exa.ai/mcp"
+
+# Opt-OUT switch. Exa is the only tier-1 backend that sends the query to a
+# third-party aggregator (SearXNG is self-hosted; Startpage is a proxy we query
+# directly), and it is the one that costs meaningful tokens — both are legitimate
+# reasons to want it off without editing code.
+_EXA_ENV = "ASICODE_EXA_SEARCH"
+
+# Excerpt budget. Exa's raw payload averaged 14.3k chars (~3.6k tokens) per search
+# against asicode's 1.7k (~430 tokens) — 8x, on EVERY search, which is too much to
+# accept unbounded for a backend that participates in every tier-1 merge. These
+# caps are applied at RENDER time against the final merged ranking, so the budget
+# is spent on the results that actually ranked rather than on Exa's own ordering.
+_EXCERPT_MAX_CHARS = 1500
+_EXCERPT_TOTAL_BUDGET = 6000
+
+# Per-result cap on a SERP snippet. Named rather than inlined so it is not mistaken
+# for the excerpt budget's sibling — the two solve different problems, and the
+# reasoning for this one lives at its use site in _format_search_results.
+_SNIPPET_MAX_CHARS = 400
 
 # Wall-clock budget for the tier-1 parallel phase. A merge is only as fast as its
 # slowest participant, so without a deadline one slow engine sets the latency of
@@ -256,11 +532,9 @@ def _retry_after_seconds(resp: httpx.Response, default: float) -> float:
     if not raw:
         return default
     raw = raw.strip()
-    try:  # delta-seconds form (RFC 7231 §7.1.3)
+    with contextlib.suppress(ValueError):  # delta-seconds form (RFC 7231 §7.1.3)
         return min(max(float(raw), 0.0), 30.0)
-    except ValueError:
-        pass
-    try:  # HTTP-date form
+    with contextlib.suppress(TypeError, ValueError, OverflowError):  # HTTP-date form
         import email.utils as _eut
         from datetime import datetime, timezone
 
@@ -269,8 +543,6 @@ def _retry_after_seconds(resp: httpx.Response, default: float) -> float:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return min(max((dt - datetime.now(timezone.utc)).total_seconds(), 0.0), 30.0)
-    except Exception:
-        pass
     return default
 
 
@@ -312,13 +584,34 @@ def _sniff_html_encoding(body_bytes: bytes) -> Optional[str]:
 
 
 class _ResultParserBase(HTMLParser):
-    """Attribute helpers shared by every engine's result parser.
+    """Shared machinery for every engine's result parser.
 
-    SSOT for the two operations each parser needs from a tag's attribute list.
-    Kept in one place so a fix (e.g. class matching that must not treat
-    ``result-title-extra`` as ``result-title``) lands for every engine at once,
-    rather than being fixed in one twin and left broken in the other.
+    SSOT for (1) the attribute-list operations each parser needs
+    (``_get_attr``/``_has_class``) and (2) the result-collection lifecycle:
+    ``__init__`` state and the three-site ``_flush`` emission. Kept in one
+    place so a fix (e.g. class matching that must not treat
+    ``result-title-extra`` as ``result-title``) lands for every engine at
+    once, rather than being fixed in one twin and left broken in the other.
     """
+
+    #: Fields that must be truthy for a pending result to be emitted by
+    #: ``_flush``. Engines with a stricter completeness rule extend this.
+    _REQUIRED_FIELDS: tuple[str, ...] = ("title",)
+
+    def __init__(self, max_results: int = 10):
+        super().__init__()
+        self.max_results = max_results
+        self.results: list[dict[str, str]] = []
+
+        # Shared parser state. Subclasses add their engine-specific flags
+        # (which anchor is open, raw-text regions, ...) after super().__init__().
+        self._current: dict[str, str] | None = None
+        self._text_parts: list[str] = []
+        self._capturing = False
+        self._in_snippet = False
+        # True once _current has been appended to self.results, so flushing it
+        # again (next result start / EOF) is a no-op rather than a duplicate.
+        self._emitted = False
 
     @staticmethod
     def _get_attr(attrs: list[tuple[str, str | None]], name: str, default: str = "") -> str:
@@ -338,6 +631,23 @@ class _ResultParserBase(HTMLParser):
         class_val = _ResultParserBase._get_attr(attrs, "class")
         return cls in class_val.split() if class_val else False
 
+    def _flush(self) -> None:
+        """Emit the pending result if it is usable and room remains.
+
+        Called from three sites: the snippet closing tag, the start of the next
+        result (catches results whose snippet was missing), and ``close()``
+        (catches the trailing result). The ``_emitted`` flag plus the
+        ``max_results`` guard make repeated flushes safe and bounded. A result
+        is usable when every field in ``_REQUIRED_FIELDS`` is truthy.
+        """
+        if self._current is None or self._emitted:
+            return
+        if len(self.results) >= self.max_results:
+            return
+        if all(self._current.get(field) for field in self._REQUIRED_FIELDS):
+            self.results.append(self._current)
+        self._emitted = True
+
 
 class _DDGResultParser(_ResultParserBase):
     """Structured HTML parser that extracts search results from DuckDuckGo search page.
@@ -355,19 +665,8 @@ class _DDGResultParser(_ResultParserBase):
     """
 
     def __init__(self, max_results: int = 10):
-        super().__init__()
-        self.max_results = max_results
-        self.results: list[dict[str, str]] = []
-
-        # Parser state
-        self._current: dict[str, str] | None = None
-        self._text_parts: list[str] = []
-        self._capturing = False
+        super().__init__(max_results)
         self._in_result_a = False
-        self._in_snippet = False
-        # True once _current has been appended to self.results, so flushing it
-        # again (next result start / EOF) is a no-op rather than a duplicate.
-        self._emitted = False
 
     # ── helpers ──
 
@@ -379,22 +678,6 @@ class _DDGResultParser(_ResultParserBase):
             decoded = urllib.parse.parse_qs(qs).get("uddg", [None])[0]
             return urllib.parse.unquote(decoded) if decoded else href
         return href
-
-    def _flush(self) -> None:
-        """Emit the pending result if it has a title and room remains.
-
-        Called from three sites: the snippet closing tag, the start of the next
-        result (catches results whose snippet was missing), and ``close()``
-        (catches the trailing result). The ``_emitted`` flag plus the
-        ``max_results`` guard make repeated flushes safe and bounded.
-        """
-        if self._current is None or self._emitted:
-            return
-        if len(self.results) >= self.max_results:
-            return
-        if self._current.get("title"):
-            self.results.append(self._current)
-        self._emitted = True
 
     # ── parser callbacks ──
 
@@ -462,34 +745,55 @@ class _DDGResultParser(_ResultParserBase):
 # chain reports "No results found" and the caller reads infrastructure failure as
 # an honest empty answer. Same trap as the rg_fallback counter in CLAUDE.md —
 # absence of evidence silently read as evidence of health.
-_BLOCK_WALL_MARKERS = (
+# Phrases specific enough to name an interstitial ON THEIR OWN, with no
+# corroborating signal. A page whose visible text says "verifying your browser"
+# IS a challenge page — the wording has no innocent reading — which is what lets
+# web_fetch consult these without the "zero results parsed" gate that the looser
+# markers below require (see _fetch_is_challenge_page).
+#
+# Phrases are taken VERBATIM from the live pages — a paraphrase does not match.
+# DDG's CAPTCHA, for instance, contains neither the word "captcha" nor "complete
+# the challenge"; it says "complete the FOLLOWING challenge" and "confirm this
+# search was made by a human". The last three were captured 2026-08-05 while
+# probing Reddit, and none of them matched the pre-existing list: "checking your
+# browser" does NOT match "verifying your browser".
+_CHALLENGE_PAGE_MARKERS = (
+    "verification required",
+    "complete the challenge",
+    "complete the following challenge",
+    "made by a human",
+    "verify you are human",
+    "are you a robot",
+    "please wait for verification",   # www.reddit.com (2026-08-05)
+    "verifying your browser",         # safereddit.com / libreddit (2026-08-05)
+    "not a bot",                      # Anubis PoW, e.g. redlib.privacyredirect.com
+    # throttle / JS interstitials
+    "wait a moment",
+    "just a moment",
+    "checking your browser",
+    "enable javascript and cookies",
+)
+
+# Markers that are NOT self-sufficient: ordinary words which legitimately appear
+# in real search results ABOUT those topics ("rate limit", "captcha") or in prose
+# that merely mentions them. Safe only behind the zero-results gate, so these stay
+# out of _CHALLENGE_PAGE_MARKERS and are search-path only.
+_LOOSE_WALL_MARKERS = (
     # rate-limit / anomaly
     "an anomaly in",
     "unusual traffic",
     "rate limit",
     "too many requests",
     "duckduckgo.com/anomaly",
-    # explicit bot challenge. Phrases are taken VERBATIM from the live pages —
-    # a paraphrase does not match. DDG's current CAPTCHA, for instance, contains
-    # neither the word "captcha" nor "complete the challenge"; it says "complete
-    # the FOLLOWING challenge" and "confirm this search was made by a human".
-    "verification required",
-    "complete the challenge",
-    "complete the following challenge",
-    "made by a human",
     "bots use duckduckgo",
-    "verify you are human",
-    "are you a robot",
     "captcha",
-    # throttle interstitials
-    "wait a moment",
     "bot activity",
-    "just a moment",
-    "checking your browser",
-    # consent / JS walls
+    # consent walls — "before you continue" is a common enough English opener
+    # that it needs the gate.
     "before you continue",
-    "enable javascript and cookies",
 )
+
+_BLOCK_WALL_MARKERS = _CHALLENGE_PAGE_MARKERS + _LOOSE_WALL_MARKERS
 
 # Upper bound on the body prefix scanned for wall markers. Wall pages are small
 # (Mojeek 5KB, Marginalia 37KB) and put the message near the top, so a bounded
@@ -524,9 +828,100 @@ def _normalize_result_url(url: str) -> str:
     return f"{host}{path}?{p.query}" if p.query else f"{host}{path}"
 
 
+# BM25 constants, matching rag_searcher's (_K1/_B). Standard defaults.
+_BM25_K1 = 1.5
+_BM25_B = 0.75
+
+_IDENT_FN: Any = None
+
+
+def _url_text(url: str) -> str:
+    """Host and path of ``url`` as scoreable words.
+
+    The URL carries real relevance signal that the title often omits —
+    ``reddit.com/r/LocalLLaMA`` names the subreddit the query asked for — but the
+    separators have to go first, or the whole path is one unmatchable token.
+    """
+    try:
+        p = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    return re.sub(r"[/\-_.+]+", " ", f"{p.hostname or ''} {p.path}")
+
+
+def _relevance_tokens(text: str) -> list[str]:
+    """Lowercased identifier/Hangul tokens for relevance scoring.
+
+    Reuses ``rag_configs._extract_identifiers`` — the regex there already handles
+    Hangul runs alongside Latin identifiers, which a naive ``\\w+`` split does not,
+    and getting that wrong would silently score every Korean query at zero.
+
+    Imported on first use, not at module load: this module is imported on every
+    ToolRegistry construction (and every subagent spawn), which is why even httpx
+    is deferred here. rag_configs is only ~5ms/+6 modules, but a search tool
+    should not pay it just to exist.
+
+    Deliberately does NOT sub-split CamelCase the way the code tokenizer does.
+    Web results are prose, and splitting ``CancelledError`` into ``cancelled`` +
+    ``error`` makes generic pages match a specific API name.
+    """
+    global _IDENT_FN
+    if _IDENT_FN is None:
+        from ..rag_configs import _extract_identifiers
+
+        _IDENT_FN = _extract_identifiers
+    return [t.lower() for t in _IDENT_FN(text)]
+
+
+def _relevance_scores(query: str, docs: list[str]) -> list[float]:
+    """BM25 of each doc against ``query``, scored over ``docs`` as the corpus.
+
+    A ten-document corpus makes IDF noisy in absolute terms, but this score is
+    only ever used to ORDER these same ten documents, where the relative values
+    are what matter: a term every result contains (the topic word) is damped and
+    a term only one result contains does the discriminating — exactly the
+    behaviour needed to separate a page that matched one incidental token from
+    one that matched the query.
+    """
+    if not query or not docs:
+        return [0.0] * len(docs)
+    q_tokens = _relevance_tokens(query)
+    if not q_tokens:
+        return [0.0] * len(docs)
+
+    tokenised = [_relevance_tokens(d) for d in docs]
+    counts: list[dict[str, int]] = []
+    df: dict[str, int] = {}
+    for toks in tokenised:
+        c: dict[str, int] = {}
+        for t in toks:
+            c[t] = c.get(t, 0) + 1
+        counts.append(c)
+        for t in c:
+            df[t] = df.get(t, 0) + 1
+
+    n_docs = len(docs)
+    lengths = [len(t) for t in tokenised]
+    avgdl = (sum(lengths) / n_docs) or 1.0
+
+    scores = []
+    for c, dl in zip(counts, lengths, strict=True):
+        score = 0.0
+        for qt in q_tokens:
+            tf = c.get(qt, 0)
+            if tf == 0:
+                continue
+            n_q = df.get(qt, 0)
+            idf = math.log((n_docs - n_q + 0.5) / (n_q + 0.5) + 1.0)
+            score += idf * tf * (_BM25_K1 + 1) / (tf + _BM25_K1 * (1 - _BM25_B + _BM25_B * dl / avgdl))
+        scores.append(score)
+    return scores
+
+
 def _merge_search_results(
     per_backend: list[tuple[str, list[dict[str, str]]]],
     max_results: int,
+    query: str = "",
 ) -> list[dict[str, str]]:
     """Merge several backends' result lists into one deduplicated ranking.
 
@@ -558,6 +953,8 @@ def _merge_search_results(
                     "url": url,
                     "title": (r.get("title") or "").strip(),
                     "snippet": (r.get("snippet") or "").strip(),
+                    "excerpt": (r.get("excerpt") or "").strip(),
+                    "published": (r.get("published") or "").strip(),
                     "sources": [name],
                     "best_position": position,
                     "first_backend": backend_index,
@@ -574,23 +971,162 @@ def _merge_search_results(
             snippet = (r.get("snippet") or "").strip()
             if len(snippet) > len(entry["snippet"]):
                 entry["snippet"] = snippet
+            # Same "keep the more informative variant" rule, but excerpt and
+            # snippet are NOT interchangeable: an excerpt-bearing backend
+            # (Exa) leaves snippet empty and vice versa, so merging them into
+            # one field would let a 400-char snippet beat a real page excerpt
+            # on length alone and discard the better content.
+            excerpt = (r.get("excerpt") or "").strip()
+            if len(excerpt) > len(entry["excerpt"]):
+                entry["excerpt"] = excerpt
+            if not entry["published"]:
+                entry["published"] = (r.get("published") or "").strip()
 
     # Drop unusable entries BEFORE truncating — slicing first would let a
     # titleless result consume one of the caller's max_results slots and return
     # fewer usable results than were available.
+    candidates = [e for e in merged.values() if e["title"]]
+
+    # Relevance breaks ties that declaration order used to decide. Measured
+    # 2026-08-03 over 8 queries: every backend's own #0 lands at
+    # (agreement=1, best_position=0), so whichever backend was appended FIRST won
+    # every such tie — and SearXNG, which leads tier 1, keyword-matches badly on
+    # its top hit (r/LocalLLaMA… → r-project.org; "ruff F821 undefined name" →
+    # Maine Coon on Wikipedia; "파이썬 asyncio CancelledError" → python.org's front
+    # page). Those beat Exa's correct #0 purely because SearXNG is listed first.
+    #
+    # Placed AFTER best_position on purpose. Ordering by relevance first would
+    # override each engine's own ranking with a ten-document BM25, and engines
+    # have far more signal than we do (link graph, click data, freshness). The
+    # measured defect is confined to the tie, so the fix is confined to the tie.
+    #
+    # first_backend stays as the LAST key: relevance ties at 0.0 whenever a query
+    # shares no token with any candidate, and ordering must stay deterministic.
+    scores = _relevance_scores(
+        query,
+        [f"{e['title']} {e['snippet']} {e['excerpt']} {_url_text(e['url'])}" for e in candidates],
+    )
+    for e, s in zip(candidates, scores, strict=True):
+        e["relevance"] = s
     ranked = sorted(
-        (e for e in merged.values() if e["title"]),
-        key=lambda e: (-len(e["sources"]), e["best_position"], e["first_backend"]),
+        candidates,
+        key=lambda e: (-len(e["sources"]), e["best_position"], -e["relevance"], e["first_backend"]),
     )
     return [
         {
             "url": e["url"],
             "title": e["title"],
             "snippet": e["snippet"],
+            "excerpt": e["excerpt"],
+            "published": e["published"],
             "sources": ",".join(e["sources"]),
         }
         for e in ranked[:max_results]
     ]
+
+
+def _mcp_result_text(payload: Any) -> str:
+    """Flatten an MCP ``tools/call`` result into its text blocks.
+
+    Raises on a JSON-RPC error or an ``isError`` result so a refusal (quota,
+    upstream failure) drives the fallback chain instead of being reported as an
+    empty result set — the same reasoning as ``_guard_block_wall``.
+    """
+    if not isinstance(payload, dict):
+        raise TypeError(f"malformed MCP response ({type(payload).__name__})")
+    if "error" in payload:
+        err = payload["error"]
+        msg = err.get("message") if isinstance(err, dict) else err
+        raise RuntimeError(f"MCP error: {msg}")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise TypeError("MCP response has no result")
+    blocks = result.get("content") or []
+    text = "\n".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+    if result.get("isError"):
+        raise RuntimeError(f"MCP tool error: {text[:200] or 'unspecified'}")
+    return text
+
+
+def _parse_exa_results(text: str, max_results: int) -> list[dict[str, str]]:
+    """Parse Exa's ``web_search_exa`` text payload into result dicts.
+
+    Exa returns no ``structuredContent`` (verified 2026-08-03 — the result carries
+    only a ``content`` text block), so the wire format has to be read directly. It
+    is machine-generated and fixed::
+
+        Title: <title>
+        URL: <url>
+        Published: <iso8601 | N/A>
+        Author: <name | N/A>
+        Highlights:
+        <excerpt lines…>
+
+        ---
+
+        Title: <next…>
+
+    Splitting on the ``---`` separator alone would be wrong: the highlights are
+    page text and can legitimately contain a markdown horizontal rule, which would
+    split one result into two malformed halves. A chunk is therefore only accepted
+    as a NEW record when it opens with a ``Title:`` line; anything else is rejoined
+    to the previous record's excerpt, where it came from.
+    """
+    records: list[list[str]] = []
+    for chunk in (text or "").split("\n\n---\n\n"):
+        if chunk.startswith("Title:") or not records:
+            records.append([chunk])
+        else:
+            # A markdown rule from inside the page body — put it back.
+            records[-1].append(chunk)
+
+    results: list[dict[str, str]] = []
+    for parts in records:
+        chunk = "\n\n---\n\n".join(parts)
+        if not chunk.strip():
+            continue
+        fields: dict[str, str] = {}
+        excerpt_lines: list[str] = []
+        in_excerpt = False
+        for line in chunk.splitlines():
+            if in_excerpt:
+                excerpt_lines.append(line)
+                continue
+            if line.startswith("Highlights:"):
+                in_excerpt = True
+                tail = line[len("Highlights:"):].strip()
+                if tail:
+                    excerpt_lines.append(tail)
+                continue
+            key, sep, value = line.partition(":")
+            if sep and key in ("Title", "URL", "Published", "Author"):
+                fields[key] = value.strip()
+            elif not fields:
+                # Preamble before the first header line — not a result.
+                break
+        url = fields.get("URL", "")
+        title = fields.get("Title", "")
+        if not url or title in ("", "N/A"):
+            # Exa emits `Title: N/A` for pages it could not title; without a title
+            # _merge_search_results drops the entry anyway, so skip it here rather
+            # than let it consume a max_results slot.
+            continue
+        # Exa's own elision marker between highlight spans; it carries no
+        # information and costs tokens in every excerpt.
+        excerpt = "\n".join(ln for ln in excerpt_lines if ln.strip() != "...").strip()
+        results.append({
+            "title": title,
+            "url": url,
+            # Excerpts are page text, not a SERP snippet — keep them in their own
+            # field so the renderer can budget them separately and _merge_search_results
+            # does not treat them as interchangeable with a one-line snippet.
+            "snippet": "",
+            "excerpt": excerpt,
+            "published": fields.get("Published", "") if fields.get("Published") != "N/A" else "",
+        })
+        if len(results) >= max_results:
+            break
+    return results
 
 
 class _BlockWallError(RuntimeError):
@@ -617,6 +1153,37 @@ def _body_is_block_wall(body: str) -> bool:
         return False
     low = body[:_BLOCK_WALL_SCAN_CHARS].lower()
     return any(m in low for m in _BLOCK_WALL_MARKERS)
+
+
+# Upper bound, in chars of EXTRACTED text, under which a page can still be a bot
+# challenge. Measured 2026-08-05: challenge pages extract to 37 chars
+# (www.reddit.com), 484 (Anubis proof-of-work), and 1408 (safereddit.com) because
+# their payload is JS that the extractor drops, while the real old.reddit.com
+# thread reached through the same fetch extracts to 57,192. The nearest miss is
+# ~40x away from the threshold, so this is not tuned to a boundary case.
+_FETCH_CHALLENGE_MAX_TEXT = 3000
+
+
+def _fetch_is_challenge_page(text: str) -> bool:
+    """Does this EXTRACTED page text look like a bot challenge served as HTTP 200?
+
+    web_fetch's analogue of ``_guard_block_wall``, and it exists for the same
+    reason: the challenge answers 200, so without this the caller is handed a
+    stub of interstitial boilerplate formatted exactly like a successful read and
+    takes an infrastructure block for the site's actual content.
+
+    It deliberately does NOT reuse ``_body_is_block_wall``: that helper's contract
+    requires a "zero results parsed" gate which a single-page fetch has no
+    equivalent of. The length bound plays that role here — only
+    ``_CHALLENGE_PAGE_MARKERS`` (phrases with no innocent reading) are consulted,
+    and only on a page that extracted to almost no text. An article *about*
+    CAPTCHAs fails both halves; a challenge page fails neither.
+    """
+    stripped = text.strip()
+    if not stripped or len(stripped) > _FETCH_CHALLENGE_MAX_TEXT:
+        return False
+    low = stripped[:_BLOCK_WALL_SCAN_CHARS].lower()
+    return any(m in low for m in _CHALLENGE_PAGE_MARKERS)
 
 
 # Control characters that must never reach a result field. Startpage interleaves
@@ -654,18 +1221,14 @@ class _StartpageResultParser(_ResultParserBase):
     ``_DDGResultParser`` so a result whose snippet is missing is not dropped.
     """
 
-    def __init__(self, max_results: int = 10):
-        super().__init__()
-        self.max_results = max_results
-        self.results: list[dict[str, str]] = []
+    # A result needs both a destination and a label to be usable, so Startpage
+    # demands an explicit URL on top of the base title requirement.
+    _REQUIRED_FIELDS: tuple[str, ...] = ("title", "url")
 
-        self._current: dict[str, str] | None = None
-        self._text_parts: list[str] = []
-        self._capturing = False
+    def __init__(self, max_results: int = 10):
+        super().__init__(max_results)
         self._in_title = False
-        self._in_snippet = False
         self._in_raw_text = False   # inside <style>/<script>: never capture
-        self._emitted = False
 
     # ── helpers ──
 
@@ -675,16 +1238,6 @@ class _StartpageResultParser(_ResultParserBase):
         out = html_mod.unescape(text)
         out = _CONTROL_CHARS_RE.sub("", out)
         return " ".join(out.split())
-
-    def _flush(self) -> None:
-        if self._current is None or self._emitted:
-            return
-        if len(self.results) >= self.max_results:
-            return
-        # A result needs both a destination and a label to be usable.
-        if self._current.get("title") and self._current.get("url"):
-            self.results.append(self._current)
-        self._emitted = True
 
     # ── parser callbacks ──
 
@@ -835,7 +1388,7 @@ class _HTMLTextExtractor(HTMLParser):
             return None
         resolved = urllib.parse.urljoin(self._base, href)
         resolved = urllib.parse.urldefrag(resolved).url
-        if not (resolved.startswith("http://") or resolved.startswith("https://")):
+        if not (resolved.startswith(("http://", "https://"))):
             return None
         return resolved
 
@@ -880,7 +1433,7 @@ class _HTMLTextExtractor(HTMLParser):
         if tag in self._BLOCK_TAGS:
             self._parts.append("\n")
 
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:  # noqa: V105 — HTMLParser callback override
         # XHTML self-closing forms (<br/>, <hr/>) — emit a single boundary newline.
         if tag in self._SKIP_TAGS:
             return
@@ -1051,13 +1604,90 @@ class WebSearchToolsMixin:
     _backend_cooldown: ClassVar[dict[str, float]] = {}
     _backend_cooldown_lock: ClassVar = threading.Lock()
 
+    # ── Cross-process wall backoff ──
+    # backend-name → {"until": epoch, "strikes": int, "since": epoch}. Separate
+    # from _backend_cooldown because the two model different failures: a connect
+    # error is transient and in-memory is enough, whereas a bot-detection wall is
+    # an IP-reputation decision that outlives the process (Startpage: 14 days and
+    # counting). Wall-clock epochs, not time.monotonic(), precisely BECAUSE this
+    # crosses process boundaries — a monotonic origin is meaningless in the next
+    # process (see the "container is not a clean clock" lesson).
+    _wall_state: ClassVar[dict[str, dict[str, float]]] = {}
+    _wall_state_loaded: ClassVar[bool] = False
+
+    # Strike / first-blocked bookkeeping for a backend whose backoff has lapsed
+    # but which has not yet proven it recovered. Held aside so the ladder survives
+    # the probe (see _backend_in_cooldown) without keeping the backend sidelined.
+    _wall_pending_strikes: ClassVar[dict[str, float]] = {}
+    _wall_since: ClassVar[dict[str, float]] = {}
+
+    def _wall_state_path(self) -> str:
+        return os.path.join(str(getattr(self, "repo_root", ".")), ".asicode", "search_backend_walls.json")
+
+    def _load_wall_state_locked(self) -> None:
+        """Read persisted wall backoffs once per process (best-effort).
+
+        Caller MUST hold ``_backend_cooldown_lock``. Searches run concurrently on
+        the shared tool-executor pool, and this replaces the whole ``_wall_state``
+        dict — done outside the lock, a second thread could observe
+        ``_wall_state_loaded`` already True while the dict was still the empty
+        pre-load one and conclude a walled backend was fine.
+        """
+        if WebSearchToolsMixin._wall_state_loaded:
+            return
+        WebSearchToolsMixin._wall_state_loaded = True
+        try:
+            with open(self._wall_state_path(), encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if isinstance(raw, dict):
+                WebSearchToolsMixin._wall_state = {
+                    str(k): {
+                        "until": float(v.get("until", 0.0)),
+                        "strikes": float(v.get("strikes", 1)),
+                        "since": float(v.get("since", 0.0)),
+                    }
+                    for k, v in raw.items()
+                    if isinstance(v, dict)
+                }
+        except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError) as e:
+            logger.debug("web_search: no usable wall state (%s); starting clean", e)
+
+    def _persist_wall_state(self, snapshot: dict[str, dict[str, float]]) -> None:
+        """Write ``snapshot`` (taken under the lock) to disk, best-effort.
+
+        Takes the snapshot as an argument rather than re-reading the class dict:
+        serialising it here would read shared state outside the lock while another
+        thread mutates it.
+        """
+        try:
+            from ...common.atomic_io import atomic_write_json
+
+            atomic_write_json(self._wall_state_path(), snapshot)
+        except Exception as e:  # never let bookkeeping break a working search
+            logger.debug("web_search: could not persist wall state (%s)", e)
+
     def _backend_in_cooldown(self, name: str) -> bool:
         """True if ``name`` is currently sidelined by the circuit breaker.
 
-        Lazily evicts an expired entry so a recovered backend is retried once the
-        cooldown lapses.
+        Consults both breakers: the in-memory connect-failure cooldown and the
+        persisted wall backoff. Each lazily evicts its own expired entry so a
+        recovered backend is retried once its deadline lapses.
         """
         with WebSearchToolsMixin._backend_cooldown_lock:
+            self._load_wall_state_locked()
+            wall = WebSearchToolsMixin._wall_state.get(name)
+            if wall is not None:
+                if time.time() < wall["until"]:
+                    return True
+                # Deadline lapsed: let this search probe the backend again, but
+                # KEEP the strike count. Clearing it here would reset the ladder
+                # on every probe, so a permanently blocked backend would never
+                # escalate past the base interval — it is _clear_backend_wall (a
+                # real success) that resets the ladder.
+                del WebSearchToolsMixin._wall_state[name]
+                WebSearchToolsMixin._wall_pending_strikes[name] = wall["strikes"]
+                WebSearchToolsMixin._wall_since[name] = wall["since"]
+
             deadline = WebSearchToolsMixin._backend_cooldown.get(name)
             if deadline is None:
                 return False
@@ -1066,10 +1696,103 @@ class WebSearchToolsMixin:
                 return False
             return True
 
-    def _trip_backend_cooldown(self, name: str) -> None:
-        """Sideline ``name`` for ``_BACKEND_COOLDOWN_SEC`` (connect failure or wall)."""
+    def _trip_backend_cooldown(self, name: str, wall: bool = False) -> None:
+        """Sideline ``name`` after a failure.
+
+        ``wall=False`` (connect failure): the in-memory ``_BACKEND_COOLDOWN_SEC``
+        cooldown — the host is unreachable now and will likely be reachable soon.
+
+        ``wall=True`` (bot-detection/quota refusal): an escalating backoff that is
+        persisted to disk, because re-probing is not merely wasted latency — each
+        probe is another flagged request that deepens the block.
+        """
+        # Load BEFORE reading the strike count. Both callers happen to consult
+        # _backend_in_cooldown first (which loads), but relying on that ordering
+        # would mean a trip reached from anywhere else reads prev=None, restarts
+        # the ladder at strike 1, and then persists that reset over a real
+        # history — and a later load would clobber this trip in the other
+        # direction. The flag makes this a no-op in the normal path.
         with WebSearchToolsMixin._backend_cooldown_lock:
+            self._load_wall_state_locked()
             WebSearchToolsMixin._backend_cooldown[name] = time.monotonic() + _BACKEND_COOLDOWN_SEC
+            if not wall:
+                return
+            now = time.time()
+            prev = WebSearchToolsMixin._wall_state.get(name)
+            strikes = (prev["strikes"] if prev else WebSearchToolsMixin._wall_pending_strikes.pop(name, 0.0)) + 1
+            since = (prev or {}).get("since") or WebSearchToolsMixin._wall_since.pop(name, 0.0) or now
+            backoff = min(_WALL_BACKOFF_BASE_SEC * (2 ** (strikes - 1)), _WALL_BACKOFF_MAX_SEC)
+            WebSearchToolsMixin._wall_state[name] = {
+                "until": now + backoff,
+                "strikes": strikes,
+                "since": since,
+            }
+            snapshot = {k: dict(v) for k, v in WebSearchToolsMixin._wall_state.items()}
+        logger.warning(
+            "web_search: %s walled (strike %d); backing off %.0f min, blocked since %s",
+            name,
+            int(strikes),
+            backoff / 60.0,
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(since)),
+        )
+        self._persist_wall_state(snapshot)
+
+    def _clear_backend_wall(self, name: str) -> None:
+        """Record that ``name`` served real results — reset its backoff ladder."""
+        with WebSearchToolsMixin._backend_cooldown_lock:
+            self._load_wall_state_locked()
+            had = WebSearchToolsMixin._wall_state.pop(name, None)
+            had_pending = WebSearchToolsMixin._wall_pending_strikes.pop(name, None)
+            WebSearchToolsMixin._wall_since.pop(name, None)
+            snapshot = {k: dict(v) for k, v in WebSearchToolsMixin._wall_state.items()}
+        if had is None and had_pending is None:
+            return
+        logger.info("web_search: %s recovered; wall backoff cleared", name)
+        self._persist_wall_state(snapshot)
+
+    def _walled_backend_notice(self) -> Optional[str]:
+        """One-liner naming backends blocked long enough to be degrading results.
+
+        Surfaced in the tool CONTENT rather than only the log. A search that
+        silently lost its Google-index backend still returns plausible-looking
+        results, so nothing in the output tells the user their coverage dropped —
+        which is exactly how Startpage stayed dead for two weeks unnoticed.
+        """
+        now = time.time()
+        stale: list[tuple[str, float]] = []
+        substituted: list[str] = []
+        with WebSearchToolsMixin._backend_cooldown_lock:
+            self._load_wall_state_locked()
+            entries = [(k, dict(v)) for k, v in WebSearchToolsMixin._wall_state.items()]
+        for name, st in entries:
+            since = st.get("since") or 0.0
+            if not (since and now - since >= _WALL_NOTICE_AFTER_SEC):
+                continue
+            # A backend whose OTHER transport is carrying the load is not degrading
+            # coverage, and saying it is would be the same misreport this notice
+            # exists to prevent — just pointed the other way.
+            if name == "Startpage" and self._startpage_browser_available():
+                substituted.append(name)
+                continue
+            stale.append((name, (now - since) / 86400.0))
+
+        if not stale:
+            if substituted:
+                return (
+                    f"[web_search] {', '.join(substituted)}: the direct HTTP route is refused from "
+                    f"this network, so queries are served through the browser route instead — same "
+                    f"results, about 3s slower per search. General-web coverage is NOT reduced."
+                )
+            return None
+
+        stale.sort(key=lambda kv: -kv[1])
+        parts = ", ".join(f"{n} ({d:.1f}d)" for n, d in stale)
+        return (
+            f"[web_search] Blocked backend(s) skipped: {parts}. The refusal is against this "
+            f"client, not necessarily this IP — a real browser on the same network may still be "
+            f"served — so results below come from the remaining backends only and general-web "
+            f"coverage is reduced. Retried automatically on an escalating schedule (max 1/day)."
+        )
 
     @staticmethod
     def _guard_block_wall(
@@ -1137,8 +1860,10 @@ class WebSearchToolsMixin:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                check=False,
             )
         except (subprocess.TimeoutExpired, OSError):
+            logger.debug("docker image inspect for searxng failed", exc_info=True)
             return None
         if proc.returncode != 0:
             return None  # image not present locally
@@ -1266,14 +1991,18 @@ class WebSearchToolsMixin:
                         results = fut.result()
                     except _BlockWallError as e:
                         # Refusing to serve us; retrying feeds the detection that
-                        # escalates to a hard IP block. Sideline for the cooldown.
-                        self._trip_backend_cooldown(name)
+                        # escalates to a hard IP block. Sideline on the ESCALATING
+                        # persisted ladder, not the 90s cooldown — a wall is an
+                        # IP-reputation decision measured in days.
+                        self._trip_backend_cooldown(name, wall=True)
                         errors.append(f"{name}: {e}")
                         logger.warning("web_search: %s walled (%s); sidelining it", name, e)
                     except _connect_errors() as e:
                         connect_failed.add(name)
                         errors.append(f"{name}: {e}")
                         logger.warning("web_search: %s connect-failed (%s)", name, e)
+                    except AgentCancelled:
+                        raise
                     except Exception as e:
                         errors.append(f"{name}: {e}")
                         logger.warning("web_search: %s failed (%s)", name, e)
@@ -1281,6 +2010,9 @@ class WebSearchToolsMixin:
                         if results:
                             logger.info("web_search: %s returned %d results", name, len(results))
                             collected.append((name, results))
+                            # Real results are the only proof a wall lifted, so
+                            # this is where the backoff ladder resets.
+                            self._clear_backend_wall(name)
             except FuturesTimeoutError:
                 pending = [futures[f] for f in futures if not f.done()]
                 logger.warning(
@@ -1362,15 +2094,28 @@ class WebSearchToolsMixin:
             # must not run inside the parallel phase. Deferred to tier 2.
             searxng_autosetup = ("SearXNG", lambda: self._setup_and_search_searxng(query, max_results))
         tier1.append(("Startpage", lambda: self._search_startpage(query, max_results)))
+        # Startpage's refusal is client-shaped, not IP-shaped (see
+        # _search_startpage_browser), so when the httpx route is walled the same
+        # query still succeeds in a real browser. Added ONLY in that state: while
+        # httpx works there is nothing to recover and a Chromium render is ~3s.
+        if self._startpage_browser_available():
+            tier1.append(
+                ("Startpage (browser)", lambda: self._search_startpage_browser(query, max_results))
+            )
+        # Exa: keyless, unmetered, and the only tier-1 member returning page
+        # excerpts instead of SERP snippets. It also covers the gap Startpage's
+        # suspension opened — see _EXA_MCP_URL for the 2026-08-03 measurements.
+        if self._should_try_exa():
+            tier1.append(("Exa", lambda: self._search_exa(query, max_results)))
 
         per_backend, tier1_errors, connect_failed = self._run_tier_parallel(tier1, _TIER1_DEADLINE_SEC)
-        merged = _merge_search_results(per_backend, max_results)
+        merged = _merge_search_results(per_backend, max_results, query)
         if merged:
             return self._format_search_results(
                 query,
                 merged,
                 [n for n, _ in per_backend],
-                notice=self._stale_searxng_image_notice() if searxng_url else None,
+                notice=self._search_notice(searxng_url),
             )
 
         # ── Tier 2: sequential fallback — each of these has a per-use cost ──
@@ -1416,6 +2161,7 @@ class WebSearchToolsMixin:
                 results = search_fn()
                 if results:
                     logger.info("web_search: %s returned %d results for '%s'", name, len(results), query)
+                    self._clear_backend_wall(name)
                     break
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
                 if name == "SearXNG":
@@ -1424,7 +2170,7 @@ class WebSearchToolsMixin:
                     # not running — so it must trigger the install/start prompt too.
                     # ConnectTimeout is NOT a subclass of ConnectError in httpx, so
                     # it has to be listed explicitly.
-                    last_error = self._handle_searxng_connect_error(e, query, max_results, searxng_url)
+                    last_error = self._handle_searxng_connect_error(e, searxng_url)
                     # _handle_searxng_connect_error may have retried after installing;
                     # if results is now populated, we have a successful install+search
                     if last_error is None:
@@ -1438,6 +2184,8 @@ class WebSearchToolsMixin:
                             if results:
                                 logger.info("web_search: SearXNG succeeded after install")
                                 break
+                        except AgentCancelled:
+                            raise
                         except Exception as retry_err:
                             logger.warning(
                                 "web_search: SearXNG retry after install failed (%s), falling back", retry_err
@@ -1454,13 +2202,16 @@ class WebSearchToolsMixin:
             except _BlockWallError as e:
                 # The engine is refusing to serve this client, and every further
                 # attempt reinforces its bot-detection (which escalates to a hard
-                # IP block). Sideline it for the cooldown rather than re-asking on
-                # each search — the same reasoning as the connect-failure breaker,
-                # a different trigger.
-                self._trip_backend_cooldown(name)
+                # IP block). Sideline it on the escalating persisted ladder rather
+                # than re-asking on each search — the same reasoning as the
+                # connect-failure breaker, a different trigger and a different
+                # timescale (days, not seconds).
+                self._trip_backend_cooldown(name, wall=True)
                 last_error = f"{name}: {e}"
                 logger.warning("web_search: %s walled (%s); sidelining it, trying next backend", name, e)
                 continue
+            except AgentCancelled:
+                raise
             except Exception as e:
                 last_error = f"{name}: {e}"
                 logger.warning("web_search: %s failed (%s), trying next backend", name, e)
@@ -1468,9 +2219,28 @@ class WebSearchToolsMixin:
 
         if not results:
             error_msg = last_error or "No results found from any backend."
-            return self._make_result(ok=True, content=f"No results found. ({error_msg})", metadata={"result_count": 0})
+            notice = self._walled_backend_notice()
+            return self._make_result(
+                ok=True,
+                content=f"No results found. ({error_msg})" + (f"\n\n{notice}" if notice else ""),
+                metadata={"result_count": 0},
+            )
 
-        return self._format_search_results(query, results, [name])
+        return self._format_search_results(query, results, [name], notice=self._search_notice(searxng_url))
+
+    def _search_notice(self, searxng_url: str) -> Optional[str]:
+        """Operational notices for the tool output, newest concern first.
+
+        Two independent conditions can degrade a search without changing how its
+        results LOOK: a stale SearXNG image (engines silently returning 0) and a
+        walled backend (whole indexes missing). Both are joined here so callers
+        have one notice slot rather than each render site picking a subset.
+        """
+        parts = [self._walled_backend_notice()]
+        if searxng_url:
+            parts.append(self._stale_searxng_image_notice())
+        live = [p for p in parts if p]
+        return "\n".join(live) if live else None
 
     def _format_search_results(
         self,
@@ -1494,14 +2264,49 @@ class WebSearchToolsMixin:
         lines = [f"Web search results for: {query}", ""]
         if notice:
             lines += [notice, ""]
+        excerpt_spent = 0
         for i, r in enumerate(results, 1):
             lines.append(f"{i}. {r['title']}")
             lines.append(f"   URL: {r['url']}")
+            if r.get("published"):
+                # Recency is the one field a snippet cannot imply, and it is often
+                # the deciding factor between two versions of the same doc.
+                lines.append(f"   Published: {r['published'][:10]}")
             sources = (r.get("sources") or "").split(",")
             if len(sources) > 1:
                 lines.append(f"   [confirmed by {len(sources)} sources: {', '.join(sources)}]")
-            if r.get("snippet"):
-                lines.append(f"   {r['snippet'][:400]}")
+            # An excerpt is real page text answering the query, so it supersedes
+            # the SERP snippet for the same result rather than printing alongside
+            # it. Budgeted: excerpts are ~8x a snippet's size, and spending that on
+            # every result of every search is what makes an excerpt-bearing backend
+            # expensive. Spent in ranked order, so the budget lands on the results
+            # that actually won the merge.
+            excerpt = (r.get("excerpt") or "").strip()
+            if excerpt and excerpt_spent < _EXCERPT_TOTAL_BUDGET:
+                allowance = min(_EXCERPT_MAX_CHARS, _EXCERPT_TOTAL_BUDGET - excerpt_spent)
+                clipped = excerpt[:allowance]
+                if len(excerpt) > allowance:
+                    clipped = clipped.rstrip() + " […]"
+                excerpt_spent += len(clipped)
+                for ln in clipped.splitlines():
+                    lines.append(f"   {ln}")
+            elif r.get("snippet"):
+                # A TAIL GUARD, not a budget — do not read it as the snippet
+                # counterpart of _EXCERPT_TOTAL_BUDGET above. Measured 2026-08-03
+                # over 90 live SearXNG snippets: median 182 chars, p90 367, max
+                # 1116, and only 8.9% exceed 400 — so this clips outliers (a parser
+                # that drops page body into the snippet field) and leaves 91% of
+                # results untouched. Raising it to 800 would grow total snippet
+                # text by 6%; that is how little it binds.
+                #
+                # No total budget is needed here precisely because snippets are
+                # structurally short: 5 results x ~180 median is ~900 chars, which
+                # bounds itself. Excerpts are structurally long (Exa averaged 14.3k
+                # chars per search), which is why only they carry one.
+                #
+                # The value arrived unexplained in this file's first commit
+                # (770ecfc3); the measurements above are what justify keeping it.
+                lines.append(f"   {r['snippet'][:_SNIPPET_MAX_CHARS]}")
             lines.append("")
 
         content = "\n".join(lines).strip()
@@ -1517,6 +2322,14 @@ class WebSearchToolsMixin:
 
     # ── Shared HTTP retry helper ─────────────────────────────────────
 
+    def _live_cancel_event(self) -> Optional[threading.Event]:
+        """The registry's current ``cancel_event`` (None when absent).
+
+        Defensive ``getattr``: the mixin is also mounted on duck-typed test
+        hosts that carry no ``config`` attribute.
+        """
+        return getattr(getattr(self, "config", None), "cancel_event", None)
+
     @staticmethod
     def _http_request_with_retry(
         client: httpx.Client,
@@ -1525,10 +2338,12 @@ class WebSearchToolsMixin:
         *,
         params: Optional[dict] = None,
         data: Optional[dict] = None,
+        json_body: Optional[dict] = None,
         headers: Optional[dict] = None,
         retries: int = 2,
         backoff: float = 1.5,
         retry_statuses: frozenset[int] = _RETRYABLE_HTTP_STATUSES,
+        cancel_event: Optional[threading.Event] = None,
     ) -> httpx.Response:
         """Execute an HTTP GET/POST with transient-error AND transient-status retry.
 
@@ -1545,13 +2360,24 @@ class WebSearchToolsMixin:
         caller's ``raise_for_status()`` raises the precise HTTPStatusError, and the
         fallback chain keeps its existing contract. The final attempt's response is
         likewise returned for the caller to raise.
+
+        ``cancel_event`` (optional) makes the backoff sleeps ESC-interruptible:
+        when it is set mid-wait the retry aborts with ``AgentCancelled`` instead of
+        stalling the turn for up to the 30s Retry-After cap.
         """
+        if cancel_event is not None and cancel_event.is_set():
+            raise AgentCancelled("cancelled by user before web_search request")
         last_err: Optional[Exception] = None
         resp: Optional[httpx.Response] = None
         for attempt in range(retries):
             try:
                 if method.upper() == "GET":
                     resp = client.get(url, params=params, headers=headers)
+                elif json_body is not None:
+                    # JSON-RPC backends (Exa's MCP endpoint) need a JSON body, not
+                    # a form encoding. Kept mutually exclusive with `data` rather
+                    # than passing both, which httpx rejects.
+                    resp = client.post(url, json=json_body, headers=headers)
                 else:
                     resp = client.post(url, data=data, headers=headers)
             except _transient_http_errors() as e:
@@ -1569,7 +2395,10 @@ class WebSearchToolsMixin:
                         e,
                         backoff,
                     )
-                    time.sleep(backoff)
+                    if interruptible_sleep(backoff, cancel_event):
+                        raise AgentCancelled(
+                            "cancelled by user during web_search retry backoff"
+                        ) from None
                     continue
                 raise  # final attempt failed — propagate
 
@@ -1584,7 +2413,10 @@ class WebSearchToolsMixin:
                     retries,
                     wait,
                 )
-                time.sleep(wait)
+                if interruptible_sleep(wait, cancel_event):
+                    raise AgentCancelled(
+                        "cancelled by user during web_search Retry-After wait"
+                    )
                 continue
             return resp
 
@@ -1636,16 +2468,11 @@ class WebSearchToolsMixin:
         instead of regex, making it resilient to HTML structure changes.
         """
         url = "https://html.duckduckgo.com/html/"
-        headers = {
-            "User-Agent": _BROWSER_UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
+        headers = {**_HTML_SEARCH_HEADERS, "Content-Type": "application/x-www-form-urlencoded"}
         data = {"q": query}
 
         with httpx.Client(timeout=_search_http_timeout(), follow_redirects=True, headers=headers) as client:
-            resp = self._http_request_with_retry(client, "POST", url, data=data)
+            resp = self._http_request_with_retry(client, "POST", url, data=data, cancel_event=self._live_cancel_event())
             resp.raise_for_status()
 
         parser = _DDGResultParser(max_results=max_results)
@@ -1673,15 +2500,11 @@ class WebSearchToolsMixin:
         exactly like a genuine empty result set.
         """
         url = "https://www.startpage.com/sp/search"
-        headers = {
-            "User-Agent": _BROWSER_UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
+        headers = dict(_HTML_SEARCH_HEADERS)
         params = {"query": query}
 
         with httpx.Client(timeout=_search_http_timeout(), follow_redirects=True, headers=headers) as client:
-            resp = self._http_request_with_retry(client, "GET", url, params=params)
+            resp = self._http_request_with_retry(client, "GET", url, params=params, cancel_event=self._live_cancel_event())
             resp.raise_for_status()
 
         parser = _StartpageResultParser(max_results=max_results)
@@ -1690,6 +2513,136 @@ class WebSearchToolsMixin:
         results = parser.results
         self._guard_block_wall("Startpage", resp.text, results, status=resp.status_code)
         return results
+
+    def _startpage_browser_available(self) -> bool:
+        """Is the browser route worth registering for this search?
+
+        Only when the httpx route is ALREADY walled: the browser costs ~3s and a
+        Chromium process, which is not worth paying while the 1s httpx path works.
+        Registering it as a separate backend (rather than as an in-function retry)
+        is what makes it reachable at all — a walled backend is skipped whole, so a
+        fallback nested inside ``_search_startpage`` would never run.
+        """
+        if not self._backend_in_cooldown("Startpage"):
+            return False
+        from .browser_tools import HAS_PLAYWRIGHT, PLAYWRIGHT_BROWSER_AVAILABLE
+        # Both, and no install prompt: a search must not raise a Checkpoint.
+        return bool(HAS_PLAYWRIGHT and PLAYWRIGHT_BROWSER_AVAILABLE)
+
+    def _search_startpage_browser(self, query: str, max_results: int) -> list[dict[str, str]]:
+        """Startpage via a real browser, for when the httpx route is walled.
+
+        Startpage's block is NOT the IP — measured 2026-08-05, all from one IP
+        within minutes: httpx was refused 9/9 (current headers, a full Chrome
+        header set, and UA-only alike), while a browser on that same IP was served
+        normally. What the anti-abuse system rejects is the non-browser client, so
+        rendering the identical query in Chromium recovers the backend outright.
+        The page is parsed by the SAME ``_StartpageResultParser`` as the httpx
+        route — verified 10/10 results on three queries incl. Korean — so this
+        adds a transport, not a second parser to keep in sync.
+
+        Registered as its own backend name so its wall ladder stays separate: a
+        block of the httpx route must not sideline this one, and vice versa.
+        """
+        url = "https://www.startpage.com/sp/search?query=" + urllib.parse.quote_plus(query)
+        html = self._render_and_eval(
+            url,
+            "document.documentElement.outerHTML",
+            timeout_ms=20000,
+            # The results are client-hydrated: domcontentloaded/load alone parse to
+            # ZERO results (5/5 queries), so waiting for a real result anchor is a
+            # correctness requirement, not a latency tweak. It is also the fast
+            # path — ~3.1s vs ~6.5s for networkidle, inside the 8s tier-1 deadline.
+            wait_until="domcontentloaded",
+            wait_for_selector="a.result-link",
+        )
+        if not isinstance(html, str):
+            return []
+        parser = _StartpageResultParser(max_results=max_results)
+        parser.feed(html)
+        parser.close()
+        self._guard_block_wall("Startpage (browser)", html, parser.results)
+        return parser.results
+
+    @staticmethod
+    def _should_try_exa() -> bool:
+        """Exa is on by default; ``ASICODE_EXA_SEARCH=off|0|false|no`` disables it."""
+        return os.environ.get(_EXA_ENV, "").strip().lower() not in ("off", "0", "false", "no")
+
+    def _search_exa(self, query: str, max_results: int) -> list[dict[str, str]]:
+        """Search via Exa's keyless MCP endpoint — returns page EXCERPTS, not snippets.
+
+        A single stateless POST: the endpoint serves ``tools/call`` without the MCP
+        initialize handshake (verified 2026-08-03), so there is no session id to
+        carry and no extra round trip to pay on every search.
+
+        The response body is either plain JSON or an SSE frame depending on what
+        the server picks, so both are accepted — keying on the declared
+        Content-Type rather than sniffing the body.
+        """
+        headers = {
+            "Content-Type": "application/json",
+            # Advertise both: the server chooses, and it does choose SSE in practice.
+            "Accept": "application/json, text/event-stream",
+        }
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "web_search_exa",
+                "arguments": {"query": query, "numResults": max_results},
+            },
+        }
+
+        with httpx.Client(timeout=_search_http_timeout(), follow_redirects=True) as client:
+            resp = self._http_request_with_retry(
+                client,
+                "POST",
+                _EXA_MCP_URL,
+                json_body=body,
+                headers=headers,
+                # 429 is dropped from the retry set on purpose. The shared policy
+                # retries it after ~1.5s, which is right for a per-second rate
+                # limit but pointless for a keyless daily quota — it just adds a
+                # sleep before the same refusal. Let it fall through to the wall
+                # ladder below, which backs off on the right timescale.
+                retry_statuses=_RETRYABLE_HTTP_STATUSES - {429},
+                cancel_event=self._live_cancel_event(),
+            )
+            if resp.status_code == 429:
+                # A keyless endpoint's quota refusal. Same handling as a bot wall:
+                # retrying spends nothing but latency and the ladder's 15min→24h
+                # schedule is the right shape for a quota that resets on a timer.
+                raise _BlockWallError("Exa returned HTTP 429 (keyless quota exhausted)")
+            resp.raise_for_status()
+            payload = self._parse_mcp_body(resp)
+
+        results = _parse_exa_results(_mcp_result_text(payload), max_results)
+        logger.debug("web_search: Exa parsed %d results for '%s'", len(results), query)
+        return results
+
+    @staticmethod
+    def _parse_mcp_body(resp: "httpx.Response") -> Any:
+        """Decode an MCP HTTP response body — plain JSON or an SSE ``data:`` frame."""
+        if "text/event-stream" in resp.headers.get("content-type", ""):
+            last = None
+            for line in resp.text.splitlines():
+                if line.startswith("data:"):
+                    try:
+                        last = json.loads(line[5:].strip())
+                    except json.JSONDecodeError as e:
+                        # Skipping is right — an SSE stream carries keepalive and
+                        # progress frames we do not model. But log it: if the wire
+                        # format changes, every frame fails here and the caller
+                        # sees only "no decodable data frame", which names the
+                        # symptom and not one byte of the cause.
+                        logger.debug("web_search: skipping undecodable SSE frame (%s)", e)
+                        continue
+            if last is None:
+                raise RuntimeError("MCP SSE response carried no decodable data frame")
+            return last
+        return resp.json()
 
     def _search_brave(self, query: str, max_results: int, api_key: str) -> list[dict[str, str]]:
         """Search using Brave Search API (requires BRAVE_API_KEY)."""
@@ -1702,19 +2655,15 @@ class WebSearchToolsMixin:
         params = {"q": query, "count": max_results}
 
         with httpx.Client(timeout=_search_http_timeout()) as client:
-            resp = self._http_request_with_retry(client, "GET", url, params=params, headers=headers)
+            resp = self._http_request_with_retry(client, "GET", url, params=params, headers=headers, cancel_event=self._live_cancel_event())
             resp.raise_for_status()
             data = resp.json()
 
-        results: list[dict[str, str]] = []
-        for item in data.get("web", {}).get("results", []):
-            results.append(
-                {
+        results: list[dict[str, str]] = [{
                     "title": item.get("title", ""),
                     "url": item.get("url", ""),
                     "snippet": item.get("description", ""),
-                }
-            )
+                } for item in data.get("web", {}).get("results", [])]
         return results
 
     # ── Naver (browser-rendered, JS-hydrated results) ────────────────
@@ -1810,7 +2759,7 @@ class WebSearchToolsMixin:
         # Retry policy is shared with the other backends via _http_request_with_retry
         # (previously SearXNG was the only backend with any retry; DDG/Brave had none).
         with httpx.Client(timeout=_search_http_timeout(), follow_redirects=True) as client:
-            resp = self._http_request_with_retry(client, "GET", url, params=params)
+            resp = self._http_request_with_retry(client, "GET", url, params=params, cancel_event=self._live_cancel_event())
             resp.raise_for_status()
             data = resp.json()
 
@@ -1857,17 +2806,16 @@ class WebSearchToolsMixin:
         """
         # ── pip package check (fast, no Docker needed) ──
         for pkg in ("searxng", "searx"):
-            try:
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                 r = subprocess.run(
                     [sys.executable, "-m", "pip", "show", pkg],
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    check=False,
                 )
                 if r.returncode == 0:
                     return True
-            except (subprocess.TimeoutExpired, OSError):
-                continue
 
         # ── Docker / Colima binary check ──
         docker_path = shutil.which("docker")
@@ -1881,6 +2829,7 @@ class WebSearchToolsMixin:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                check=False,
             )
             daemon_alive = info.returncode == 0
         except (subprocess.TimeoutExpired, OSError):
@@ -1888,74 +2837,89 @@ class WebSearchToolsMixin:
 
         if daemon_alive:
             # Check for image or stopped container
-            try:
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                 r = subprocess.run(
                     [docker_path, "image", "inspect", "searxng/searxng"],
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    check=False,
                 )
                 if r.returncode == 0:
                     return True
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-            try:
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                 r = subprocess.run(
                     [docker_path, "ps", "-a", "--filter", "name=searxng", "--format", "{{.Names}}"],
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    check=False,
                 )
                 if r.stdout.strip():
                     return True
-            except (subprocess.TimeoutExpired, OSError):
-                pass
             return False  # daemon alive but no searxng found
-        else:
-            # Daemon is down — optimistic: docker binary exists, so installed
-            return True
+        # Daemon is down — optimistic: docker binary exists, so installed
+        return True
 
-    def _ask_start_searxng(self) -> bool:
-        """Ask the user if they want to start SearXNG (installed but not running).
+    def _ask_searxng_decision(self, decision_attr: str, question: str, reason: str, skip_label: str) -> bool:
+        """Ask the user a SearXNG setup question and cache the decision per session.
 
         Uses the agent's ask_user mechanism. Falls back to 'no' if
         checkpoint/prompting is unavailable.
 
-        Caches the decision in self._searxng_start_decision so the prompt
-        is issued at most once per session — covering both the LLM retrying
-        search_web sequentially AND two searches running concurrently on the
-        tool-executor pool (see _searxng_setup_lock).
+        Caches the decision in ``self.<decision_attr>`` so the prompt is issued
+        at most once per session — covering both the LLM retrying search_web
+        sequentially AND two searches running concurrently on the tool-executor
+        pool. Double-checks under ``_searxng_setup_lock``: the thread we queued
+        behind may have asked this very question and cached the answer while we
+        waited; without the second read we would prompt again with the answer
+        already in hand — the whole bug the lock exists to prevent.
+
+        ``skip_label`` names the skipped action in the fallback warning
+        ("skipping SearXNG <skip_label>").
         """
-        if self._searxng_start_decision is not None:
-            return self._searxng_start_decision
+        if getattr(self, decision_attr) is not None:
+            return getattr(self, decision_attr)
         with WebSearchToolsMixin._searxng_setup_lock:
             # Re-check under the lock: the thread we just queued behind may have
             # asked this very question and cached the answer while we waited.
             # Without this second read we would prompt again with the answer
             # already in hand — the whole bug this lock exists to prevent.
-            if self._searxng_start_decision is not None:
-                return self._searxng_start_decision
+            if getattr(self, decision_attr) is not None:
+                return getattr(self, decision_attr)
             try:
                 result = self._tool_ask_user(
                     {
-                        "question": (
-                            "SearXNG is installed but not currently running.\nWould you like to start it now?"
-                        ),
+                        "question": question,
                         "type": "confirm",
                         "options": ["yes", "no"],
                         "default": "no",
-                        "reason": "SearXNG is installed but not running",
+                        "reason": reason,
                     }
                 )
                 answer = result.metadata.get("answer", "no").lower().strip()
-                self._searxng_start_decision = answer == "yes"
-                return self._searxng_start_decision
+                decided = answer == "yes"
+                setattr(self, decision_attr, decided)
             except Exception as e:
-                logger.warning("web_search: ask_user failed (%s), skipping SearXNG start", e)
-                self._searxng_start_decision = False
+                logger.warning("web_search: ask_user failed (%s), skipping SearXNG %s", e, skip_label)
+                setattr(self, decision_attr, False)
                 return False
+            else:
+                return decided
 
-    def _wait_for_searxng(self, base_url: str, timeout: float = 15.0, interval: float = 0.5) -> bool:
+    def _ask_start_searxng(self) -> bool:
+        """Ask the user if they want to start SearXNG (installed but not running).
+
+        See :meth:`_ask_searxng_decision` for the caching/locking contract.
+        """
+        return self._ask_searxng_decision(
+            "_searxng_start_decision",
+            "SearXNG is installed but not currently running.\nWould you like to start it now?",
+            "SearXNG is installed but not running",
+            "start",
+        )
+
+    def _wait_for_searxng(self, base_url: str, timeout: float = 15.0, interval: float = 0.5, cancel_event: Optional[threading.Event] = None) -> bool:
         """Poll SearXNG /healthz until it responds or ``timeout`` elapses.
 
         Replaces a fixed ``time.sleep(5)``: returns as soon as the service is
@@ -1976,7 +2940,10 @@ class WebSearchToolsMixin:
                     return True
             except Exception as e:  # ConnectionError, Timeout, etc.
                 last_err = e
-            time.sleep(interval)
+            if interruptible_sleep(interval, cancel_event):
+                raise AgentCancelled(
+                    "cancelled by user while waiting for SearXNG readiness"
+                )
         logger.warning("web_search: SearXNG not ready after %.1fs (%s)", timeout, last_err)
         return False
 
@@ -2011,6 +2978,7 @@ class WebSearchToolsMixin:
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    check=False,
                 )
                 if status.returncode != 0:
                     logger.info("web_search: Starting Colima...")
@@ -2034,6 +3002,7 @@ class WebSearchToolsMixin:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                check=False,
             )
             container_names = ps_result.stdout.strip().split()
             if container_names:
@@ -2056,7 +3025,7 @@ class WebSearchToolsMixin:
                 # setup (each warm container still passes the same readiness check).
                 if all_ok:
                     base_url = os.environ.get("SEARXNG_BASE_URL", "http://localhost:8080")
-                    self._wait_for_searxng(base_url)
+                    self._wait_for_searxng(base_url, cancel_event=self._live_cancel_event())
                 return all_ok
 
             # No existing container — pull and run
@@ -2086,50 +3055,27 @@ class WebSearchToolsMixin:
                 timeout=30,
                 check=True,
             )
-            self._wait_for_searxng(base_url)
+            self._wait_for_searxng(base_url, cancel_event=self._live_cancel_event())
             logger.info("web_search: SearXNG container started (pulled+run)")
-            return True
 
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as e:
             logger.warning("web_search: Failed to start SearXNG: %s", e)
             return False
+        else:
+            return True
 
     def _ask_install_searxng(self) -> bool:
         """Ask the user if they want to install SearXNG.
 
-        Uses the agent's ask_user mechanism. Falls back to 'no' if
-        checkpoint/prompting is unavailable.
-
-        Caches the decision in self._searxng_install_decision so the prompt is
-        issued at most once per session — covering both sequential retries and
-        concurrent searches (see _searxng_setup_lock).
+        See :meth:`_ask_searxng_decision` for the caching/locking contract.
         """
-        if self._searxng_install_decision is not None:
-            return self._searxng_install_decision
-        with WebSearchToolsMixin._searxng_setup_lock:
-            # Re-check under the lock — see _ask_start_searxng.
-            if self._searxng_install_decision is not None:
-                return self._searxng_install_decision
-            try:
-                result = self._tool_ask_user(
-                    {
-                        "question": (
-                            "SearXNG is needed for web search but is not installed.\n"
-                            "Would you like to install and start a local SearXNG instance?"
-                        ),
-                        "type": "confirm",
-                        "options": ["yes", "no"],
-                        "default": "no",
-                        "reason": "SearXNG required for web search, but not installed",
-                    }
-                )
-                answer = result.metadata.get("answer", "no").lower().strip()
-                self._searxng_install_decision = answer == "yes"
-                return self._searxng_install_decision
-            except Exception as e:
-                logger.warning("web_search: ask_user failed (%s), skipping SearXNG install", e)
-                self._searxng_install_decision = False
-                return False
+        return self._ask_searxng_decision(
+            "_searxng_install_decision",
+            "SearXNG is needed for web search but is not installed.\n"
+            "Would you like to install and start a local SearXNG instance?",
+            "SearXNG required for web search, but not installed",
+            "install",
+        )
 
     def _install_searxng(self) -> bool:
         """Install and start a local SearXNG instance.
@@ -2163,7 +3109,7 @@ class WebSearchToolsMixin:
         return self._search_searxng(query, max_results, base_url)
 
     def _handle_searxng_connect_error(
-        self, error: Exception, query: str, max_results: int, searxng_url: str
+        self, error: Exception, searxng_url: str
     ) -> Optional[str]:
         """Handle SearXNG ConnectError.
 
@@ -2230,6 +3176,10 @@ class WebSearchToolsMixin:
         checking Content-Length — the guard was dead code for the download, only
         saving the decode copy). Transient network errors and HTTP 429/5xx status
         codes are retried with backoff, matching the search backends' policy.
+
+        A SSRF guard rejects loopback/private/link-local/reserved hosts before
+        connecting and re-validates every redirect hop; set
+        ``ASI_ALLOW_PRIVATE_URLS=1`` to allow local URLs.
         """
         url = str(args.get("url", "")).strip()
         max_chars = int(args.get("max_chars", 15000))
@@ -2243,20 +3193,22 @@ class WebSearchToolsMixin:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
 
-        # ── Reddit: www.reddit.com → old.reddit.com (www blocking bypass) ──
-        if "www.reddit.com" in url:
-            old_url = url
-            url = url.replace("www.reddit.com", "old.reddit.com")
-            logger.info("URL rewrite: %s → %s (bypassing Reddit www block)", old_url, url)
+        # ── Reddit: challenge-serving host → old.reddit.com ──
+        rewritten = _rewrite_reddit_url(url)
+        if rewritten != url:
+            logger.info("URL rewrite: %s → %s (bypassing Reddit www block)", url, rewritten)
+            url = rewritten
 
-        headers = {
-            "User-Agent": _BROWSER_UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
+        headers = {"User-Agent": _BROWSER_UA, **_BROWSER_FETCH_HEADERS}
 
         try:
-            with httpx.Client(timeout=30.0, follow_redirects=True, headers=headers) as client:
+            # ── SSRF guard: reject non-public targets before connecting ──
+            _assert_public_fetch_host(_fetch_url_hostname(url))
+            with httpx.Client(
+                timeout=30.0, follow_redirects=True, headers=headers,
+                event_hooks={"request": [_ssrf_request_hook]},
+            ) as client:
+                _ce = self._live_cancel_event()
                 # ── Streaming GET with retry + OOM guard ──────────────────────
                 # Retry loop mirrors _http_request_with_retry: transient network
                 # errors AND transient HTTP status codes (429/5xx) are retried
@@ -2295,7 +3247,7 @@ class WebSearchToolsMixin:
                             # streaming byte-cap catches chunked / no-CL responses.
                             _cl = stream_resp.headers.get("content-length")
                             if _cl:
-                                try:
+                                with contextlib.suppress(ValueError):  # malformed Content-Length — ignore
                                     if int(_cl) > _WEB_FETCH_MAX_BYTES:
                                         _mb = int(_cl) // (1024 * 1024)
                                         _lim = _WEB_FETCH_MAX_BYTES // (1024 * 1024)
@@ -2308,8 +3260,6 @@ class WebSearchToolsMixin:
                                                 f"dedicated download tool for large files."
                                             ),
                                         )
-                                except ValueError:
-                                    pass  # malformed Content-Length — ignore
 
                             # Stream body with byte cap (catches chunked responses
                             # that have no Content-Length at all).
@@ -2336,6 +3286,8 @@ class WebSearchToolsMixin:
                             header_charset = stream_resp.charset_encoding
                             break  # success — exit retry loop
 
+                    except _SSRFBlockedError:
+                        raise  # security block — never retried
                     except _transient_http_errors() as e:
                         last_err = e
                         if attempt < 2:
@@ -2344,7 +3296,10 @@ class WebSearchToolsMixin:
                                 "retrying in %.1fs…",
                                 attempt + 1, e, 1.5,
                             )
-                            time.sleep(1.5)
+                            if interruptible_sleep(1.5, _ce):
+                                raise AgentCancelled(
+                                    "cancelled by user during web_fetch retry backoff"
+                                ) from None
                             continue
                         raise  # final attempt — propagate
 
@@ -2356,7 +3311,10 @@ class WebSearchToolsMixin:
                                 "web_fetch: HTTP %d (attempt %d/3); retrying in %.1fs…",
                                 code, attempt + 1, wait,
                             )
-                            time.sleep(wait)
+                            if interruptible_sleep(wait, _ce):
+                                raise AgentCancelled(
+                                    "cancelled by user during web_fetch Retry-After wait"
+                                ) from None
                             continue
                         raise  # non-retryable status or final attempt — propagate
 
@@ -2388,6 +3346,18 @@ class WebSearchToolsMixin:
                     extractor.feed(text)
                     extractor.close()
                     formatted = extractor.get_text()
+                    # HTTP 200 + bot challenge: report the block instead of
+                    # handing back interstitial boilerplate as if it were content.
+                    if _fetch_is_challenge_page(formatted):
+                        return self._make_result(
+                            ok=False,
+                            content="",
+                            error=(
+                                f"{url} answered HTTP 200 with a bot-challenge page rather than "
+                                f"content (only {len(formatted.strip())} chars of text extracted) "
+                                f"— try browser_action navigate, which renders via a real browser"
+                            ),
+                        )
                 else:
                     # text/plain, binary-as-text, or unknown — best-effort text view.
                     formatted = text
@@ -2438,6 +3408,8 @@ class WebSearchToolsMixin:
                     },
                 )
 
+        except _SSRFBlockedError as e:
+            return self._make_result(ok=False, content="", error=str(e))
         except httpx.TimeoutException:
             return self._make_result(ok=False, content="", error=f"Timeout fetching {url} (30s)")
         except httpx.HTTPStatusError as e:
@@ -2448,6 +3420,17 @@ class WebSearchToolsMixin:
                     " — the site likely blocks automated requests or needs a "
                     "session; try browser_action navigate (renders via a real browser)"
                 )
+                # Reddit's JSON API is 403 for unauthenticated clients regardless of
+                # User-Agent (six tried, incl. a real Chrome one, 2026-08-05), so the
+                # generic "use a browser" advice would send the caller down a dead end.
+                # The HTML view of the same path does work.
+                if _fetch_url_hostname(url).endswith("reddit.com") and ".json" in url:
+                    hint = (
+                        " — Reddit's JSON API refuses unauthenticated clients whatever the "
+                        f"User-Agent; fetch the HTML view instead ({url.replace('.json', '')})"
+                    )
             return self._make_result(ok=False, content="", error=f"HTTP {code} fetching {url}{hint}")
+        except AgentCancelled:
+            raise
         except Exception as e:
             return self._make_result(ok=False, content="", error=f"Failed to fetch {url}: {type(e).__name__}: {e}")

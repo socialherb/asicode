@@ -36,7 +36,6 @@ class TestAgentProfileFromDict:
             "provider": "anthropic",
             "system_prompt_prefix": "Be careful.",
             "max_turns": 15,
-            "planning_enabled": False,
         }
         profile = AgentProfile.from_dict(data)
         assert profile.name == "custom"
@@ -47,7 +46,6 @@ class TestAgentProfileFromDict:
         assert profile.provider == "anthropic"
         assert profile.system_prompt_prefix == "Be careful."
         assert profile.max_turns == 15
-        assert profile.planning_enabled is False
 
     def test_none_allowed_tools_becomes_empty(self):
         """None or missing allowed_tools becomes empty list (no restriction)."""
@@ -77,7 +75,6 @@ class TestAgentProfileToDict:
             "provider": None,
             "system_prompt_prefix": None,
             "max_turns": None,
-            "planning_enabled": None,
         }
         profile = AgentProfile.from_dict(data)
         assert profile.to_dict() == data
@@ -136,7 +133,6 @@ class TestAgentProfileApply:
         config.model = "default-model"
         config.provider = "default-provider"
         config.max_turns = 100
-        config.planning_enabled = True
         return config
 
     def test_none_fields_do_not_override(self, mock_config):
@@ -145,7 +141,6 @@ class TestAgentProfileApply:
         assert mock_config.model == "default-model"
         assert mock_config.provider == "default-provider"
         assert mock_config.max_turns == 100
-        assert mock_config.planning_enabled is True
 
     def test_set_model(self, mock_config):
         profile = AgentProfile(name="test", model="claude-opus-4")
@@ -163,24 +158,17 @@ class TestAgentProfileApply:
         profile.apply(mock_config)
         assert mock_config.max_turns == 5
 
-    def test_set_planning_enabled(self, mock_config):
-        profile = AgentProfile(name="test", planning_enabled=False)
-        profile.apply(mock_config)
-        assert mock_config.planning_enabled is False
-
     def test_set_all_fields(self, mock_config):
         profile = AgentProfile(
             name="full",
             model="m1",
             provider="p1",
             max_turns=10,
-            planning_enabled=False,
         )
         profile.apply(mock_config)
         assert mock_config.model == "m1"
         assert mock_config.provider == "p1"
         assert mock_config.max_turns == 10
-        assert mock_config.planning_enabled is False
 
 
 class TestGetBuiltinProfile:
@@ -202,7 +190,8 @@ class TestGetBuiltinProfile:
         profile = get_builtin_profile("tester")
         assert profile is not None
         assert profile.name == "tester"
-        assert profile.planning_enabled is False
+        assert "apply_patch" in profile.blocked_tools
+        assert "bash" in profile.blocked_tools
 
     def test_unknown_returns_none(self):
         assert get_builtin_profile("nonexistent") is None

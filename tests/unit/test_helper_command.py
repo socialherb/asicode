@@ -14,6 +14,7 @@ import sys
 import pytest
 
 import asi
+from external_llm.repl import repl_impl
 
 
 class TestResolveModelArg:
@@ -102,7 +103,9 @@ class TestPerTerminalModelRestore:
 
     def _repl_src(self) -> str:
         import inspect
-        return inspect.getsource(asi.run_repl)
+        # P1-1 split: svc creation moved to _init_repl_engine; source-contract
+        # guards inspect that implementation.
+        return inspect.getsource(asi._init_repl_engine)
 
     def test_restore_reads_per_terminal_config_before_svc_creation(self):
         # The restore block must exist in main() and run before run_repl,
@@ -168,7 +171,7 @@ class TestHelperCommandRegistration:
         # The dispatch guard that routes /model etc. must include /helper,
         # otherwise a bare ``/helper`` falls through to design chat.
         import inspect
-        src = inspect.getsource(asi.run_repl)
+        src = inspect.getsource(asi._run_repl_impl)
         assert '"/helper"' in src
 
 
@@ -187,7 +190,8 @@ class TestInsightsCompactUsesHelperModel:
 
     def _src(self) -> str:
         import inspect
-        return inspect.getsource(asi.run_repl)
+        # P1-1 split: the closure lives in _run_repl_impl.
+        return inspect.getsource(asi._run_repl_impl)
 
     def test_compact_subcommand_delegates_to_interactive_helper(self):
         # /insights compact must route through _compact_insights_interactive
@@ -233,7 +237,8 @@ class TestInsightsCompactBudgetBackstopUsesPostWriteSize:
 
     def _src(self) -> str:
         import inspect
-        return inspect.getsource(asi.run_repl)
+        # P1-1 split: the closure lives in _run_repl_impl.
+        return inspect.getsource(asi._run_repl_impl)
 
     def test_backstop_gated_on_post_write_size(self):
         src = self._src()
@@ -263,7 +268,7 @@ class TestRunOnceJsonErrorPaths:
 
     def test_runtime_error_emits_json(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(
-            asi, "_build_engine",
+            repl_impl, "_build_engine",
             lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("no provider configured")),
         )
 
@@ -276,7 +281,7 @@ class TestRunOnceJsonErrorPaths:
 
     def test_unexpected_exception_emits_json(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(
-            asi, "_build_engine",
+            repl_impl, "_build_engine",
             lambda *a, **kw: (_ for _ in ()).throw(ValueError("weird internal state")),
         )
 
@@ -288,9 +293,9 @@ class TestRunOnceJsonErrorPaths:
         assert "weird internal state" in payload["error"]
 
     def test_cancelled_emits_json(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setattr(asi, "_build_engine", lambda *a, **kw: object())
-        monkeypatch.setattr(asi, "_git_baseline", lambda repo_root: None)
-        monkeypatch.setattr(asi, "_run_with_cancel", lambda *a, **kw: None)
+        monkeypatch.setattr(repl_impl, "_build_engine", lambda *a, **kw: object())
+        monkeypatch.setattr(repl_impl, "_git_baseline", lambda repo_root: None)
+        monkeypatch.setattr(repl_impl, "_run_with_cancel", lambda *a, **kw: None)
 
         rc = asi.run_once(self._args(tmp_path), "do something")
 

@@ -60,6 +60,7 @@ def _is_referenced_outside_defining(field: str) -> bool:
         result = subprocess.run(
             ["git", "grep", "-l", "-e", field, "--", "*.py"],
             capture_output=True, text=True, cwd=REPO, timeout=60,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         print(f"❌ git grep for {field!r} timed out after 60s — failing closed rather than guess reachability.", file=sys.stderr)

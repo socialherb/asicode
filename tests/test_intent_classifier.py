@@ -46,11 +46,11 @@ class TestExecuteMode:
         assert ExecuteMode("  normal  ") == ExecuteMode.NORMAL
 
     def test_unknown_value_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="not a valid ExecuteMode"):
             ExecuteMode("unknown_mode")
 
     def test_non_string_value_raises(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="not a valid ExecuteMode"):
             ExecuteMode(42)
 
     @pytest.mark.parametrize("value,expected", [
@@ -130,28 +130,45 @@ class TestAnalyzeIntentWithKeywords:
     """Tests for keyword-based intent analysis fallback."""
 
     def test_legacy_explicit(self):
-        assert _analyze_intent_with_keywords("use legacy mode", None) == "legacy"
+        assert _analyze_intent_with_keywords("use legacy mode") == "legacy"
 
     def test_legacy_case_insensitive(self):
-        assert _analyze_intent_with_keywords("LEGACY please", None) == "legacy"
+        assert _analyze_intent_with_keywords("LEGACY please") == "legacy"
 
     def test_line_number_strict_json(self):
-        assert _analyze_intent_with_keywords("change line 42", None) == "strict_json"
+        assert _analyze_intent_with_keywords("change line 42") == "strict_json"
 
-    @pytest.mark.slow
     def test_line_number_with_hangul(self):
-        assert _analyze_intent_with_keywords("라인 42 수정", None) == "strict_json"
-        assert _analyze_intent_with_keywords("줄 5 변경", None) == "strict_json"
+        # B1 regression: Hangul position words must classify via the fast keyword
+        # path — previously they fell through to the semantic backstop, which
+        # builds the embedding matcher (~8s sentence_transformers import).
+        assert _analyze_intent_with_keywords("라인 42 수정") == "strict_json"
+        assert _analyze_intent_with_keywords("줄 5 변경") == "strict_json"
+        assert _analyze_intent_with_keywords("행 10 삭제") == "strict_json"
+        assert _analyze_intent_with_keywords("line 42 수정") == "strict_json"
+
+    def test_hangul_line_reference_never_builds_semantic_matcher(self):
+        """B1 regression: any keyword-covered position word must short-circuit
+        BEFORE the semantic backstop, which lazily imports sentence_transformers
+        and loads the embedding model (~8s). Fail loudly if that path is hit."""
+        with patch(
+            "external_llm.agent.execution_mode_classifier._get_mode_matcher",
+            side_effect=AssertionError("semantic matcher must not be built"),
+        ):
+            assert _analyze_intent_with_keywords("라인 42 수정") == "strict_json"
+            assert _analyze_intent_with_keywords("줄 5 변경") == "strict_json"
+            assert _analyze_intent_with_keywords("행 10 삭제") == "strict_json"
+            assert _analyze_intent_with_keywords("line 42") == "strict_json"
 
     def test_legacy_beats_line_number(self):
         """'legacy' keyword takes priority over line number."""
-        assert _analyze_intent_with_keywords("legacy mode on line 42", None) == "legacy"
+        assert _analyze_intent_with_keywords("legacy mode on line 42") == "legacy"
 
     def test_default_normal(self):
-        assert _analyze_intent_with_keywords("fix the bug in foo()", None) == "normal"
+        assert _analyze_intent_with_keywords("fix the bug in foo()") == "normal"
 
     def test_empty_prompt(self):
-        assert _analyze_intent_with_keywords("", None) == "normal"
+        assert _analyze_intent_with_keywords("") == "normal"
 
 
 # ── validate_instruction_target_file ──────────────────────────────────────
@@ -294,4 +311,4 @@ class TestAnalyzeRequestForOptimalMode:
     def test_falls_back_to_keywords(self, mock_kw, mock_llm):
         result = analyze_request_for_optimal_mode("fix bug", None)
         assert result == "normal"
-        mock_kw.assert_called_once_with("fix bug", None)
+        mock_kw.assert_called_once_with("fix bug")

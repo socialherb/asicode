@@ -1,4 +1,4 @@
-from external_llm.agent.context_manager import _compress_failure_notice, _compress_fail_latch, _compress_fail_latch_lock
+from external_llm.agent.context_manager import _compress_fail_latch, _compress_fail_latch_lock, _compress_failure_notice
 from external_llm.client import (
     LLMAuthenticationError,
     LLMConnectionError,

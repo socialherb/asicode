@@ -9,6 +9,7 @@ Deterministic, rule-based. Falls back to filename heuristic if graph unavailable
 """
 import logging
 import os
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -50,6 +51,7 @@ class SymbolAwareTestTarget:
             "reason_codes": self.reason_codes[:3],
             "matched_symbols": self.matched_symbols[:3],
             "match_type": self.match_type,
+            "scope_level_hint": self.scope_level_hint,
         }
 
 
@@ -67,10 +69,8 @@ class SymbolAwareTestFinder:
     Falls back to filename heuristic if graph unavailable.
     """
 
-    def __init__(self, repo_root: str, graph_facade=None, dependency_graph=None):
+    def __init__(self, repo_root: str):
         self._repo_root = repo_root
-        self._facade = graph_facade
-        self._dependency_graph = dependency_graph  # P9-2: pre-computed test dependency graph
         self._test_files_cache: Optional[list[str]] = None
         self._content_cache: dict[str, str] = {}
 
@@ -134,20 +134,6 @@ class SymbolAwareTestFinder:
                             t.reason_codes.append("DIRECT_SYMBOL_MATCH")
                         if sym not in t.matched_symbols:
                             t.matched_symbols.append(sym)
-
-            # P9-2: Use dependency graph for module import matches (faster than file scanning)
-            if self._dependency_graph and files:
-                for f in files:
-                    dep_tests = self._dependency_graph.get_tests_for_file(f)
-                    for tf in dep_tests:
-                        if tf in targets:
-                            continue  # already found by symbol match
-                        t = targets.setdefault(tf, SymbolAwareTestTarget(test_path=tf))
-                        if t.priority_score < MATCH_SCORES["module_import"]:
-                            t.priority_score = MATCH_SCORES["module_import"]
-                            t.match_type = "module_import"
-                        if "DEP_GRAPH_MODULE_IMPORT" not in t.reason_codes:
-                            t.reason_codes.append("DEP_GRAPH_MODULE_IMPORT")
 
             # 2. Module import match — test imports the target module
             target_modules = self._extract_module_names(files)
@@ -249,7 +235,6 @@ class SymbolAwareTestFinder:
         """Build concise summary for metadata."""
         return {
             "symbol_aware_targeting_used": True,
-            "dependency_graph_used": self._dependency_graph is not None,  # P9-2
             "target_count": len(targets),
             "match_type_distribution": self._count_match_types(targets),
             "top_targets": [t.to_dict() for t in targets[:3]],
@@ -263,15 +248,13 @@ class SymbolAwareTestFinder:
             return self._test_files_cache
 
         test_files = []
-        try:
+        with suppress(OSError):  # walk on permission-restricted dirs
             for dirpath, dirnames, filenames in os.walk(self._repo_root):
-                dirnames[:] = [d for d in dirnames if not d.startswith('.') and d != '__pycache__' and d != 'node_modules']
+                dirnames[:] = [d for d in dirnames if not d.startswith('.') and d not in {'__pycache__', 'node_modules'}]
                 for fname in filenames:
                     if self._is_test_filename(fname):
                         rel = os.path.relpath(os.path.join(dirpath, fname), self._repo_root)
                         test_files.append(rel)
-        except Exception:
-            pass
 
         self._test_files_cache = test_files
         return test_files
@@ -284,13 +267,11 @@ class SymbolAwareTestFinder:
         # TS/JS: foo.test.ts / foo.spec.tsx / test_foo.ts
         if filename.endswith(('.ts', '.tsx', '.js', '.jsx')):
             base, _ = os.path.splitext(filename)
-            if base.endswith('.test') or base.endswith('.spec'):
+            if base.endswith(('.test', '.spec')):
                 return True
             return filename.startswith('test_')
         # Go: foo_test.go
-        if filename.endswith('_test.go'):
-            return True
-        return False
+        return bool(filename.endswith("_test.go"))
 
     def _is_test_file(self, path: str) -> bool:
         return self._is_test_filename(os.path.basename(path))
@@ -316,7 +297,7 @@ class SymbolAwareTestFinder:
             if not os.path.isfile(abs_path):
                 content = ""
             else:
-                with open(abs_path, errors='ignore', encoding="utf-8") as f:
+                with open(abs_path, errors='replace', encoding="utf-8") as f:
                     content = f.read()
         except OSError:
             content = ""
@@ -337,8 +318,9 @@ class SymbolAwareTestFinder:
                 if before and after:
                     return True
                 idx = content.find(symbol, idx + 1)
+        except (OSError, UnicodeDecodeError):  # unreadable test file
             return False
-        except Exception:
+        else:
             return False
 
     def _file_imports_module(self, test_file: str, module_name: str) -> bool:
@@ -353,7 +335,7 @@ class SymbolAwareTestFinder:
                 or f"from {module_name}" in content
                 or f"from {module_name.replace('/', '.')}" in content
             )
-        except Exception:
+        except (OSError, UnicodeDecodeError):  # unreadable test file
             return False
 
     def _extract_module_names(self, file_paths: list[str]) -> list[str]:

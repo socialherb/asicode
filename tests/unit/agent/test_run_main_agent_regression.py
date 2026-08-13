@@ -19,7 +19,7 @@ from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 
 
 def _run(cmd, cwd, **kw):
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, **kw)
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, **kw, check=False)
 
 
 def _make_loop(tmp_path) -> AgentLoop:
@@ -33,7 +33,7 @@ def _make_loop(tmp_path) -> AgentLoop:
     client = Mock()
     client.get_provider_name.return_value = "openai"
     client.provider = "openai"
-    cfg = AgentConfig(max_turns=1, planning_enabled=False, rag_enabled=False)
+    cfg = AgentConfig(max_turns=1, rag_enabled=False)
     reg = ToolRegistry(str(repo), cfg)
     return AgentLoop(llm_client=client, registry=reg, config=cfg, model="test")
 
@@ -70,3 +70,4 @@ def test_run_route_none_returns_fallback_result(tmp_path):
     result = loop.run("test request")
     assert isinstance(result, AgentResult)
     assert result.metadata.get("unhandled_lane") is True
+

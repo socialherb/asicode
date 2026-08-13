@@ -11,6 +11,13 @@ from enum import Enum
 from functools import lru_cache
 
 _EXT_MAP = {
+    # Canonical extension → language-name map (values are LanguageId member
+    # names).  The structural-scan walk selects a subset of these
+    # (SCAN_EXTS, external_llm/analysis/scan_walk.py) and deliberately
+    # excludes the stub/module/script variants below; the boundary is pinned
+    # by test_scan_ext_map_boundary_is_exhaustive.  The tree-sitter
+    # extension → grammar-key map (tree_sitter_utils._EXT_TO_GRAMMAR_KEY) is
+    # DERIVED from this map for languages with full AST query support.
     ".py": "PYTHON",
     ".pyi": "PYTHON",
     ".ts": "TYPESCRIPT",
@@ -65,33 +72,72 @@ _EXT_MAP = {
 # called from .js/.jsx/.tsx, so they form one family — hence a group, not a
 # single LanguageId.
 #
-# Covers every extension that maps to a full-AST-support language
-# (_SYMBOL_QUERIES + _CALL_QUERIES + _IMPORT_QUERIES + _REFERENCE_QUERIES all
-# populated).  An extension absent here causes two live bugs:
+# The hand-maintained fact is the LANGUAGE-LEVEL partition below
+# (_LANGUAGE_FAMILIES): which LanguageId member names form one callability
+# family.  The extension sets are DERIVED from _EXT_MAP (the canonical
+# extension → language map) by _derive_language_extension_groups — the old
+# 33-entry literal table is gone, so extension drift is structurally
+# impossible.  The partition must name exactly the full-AST-support languages
+# (the _EXT_TO_GRAMMAR_KEY domain, tree_sitter_utils — pinned by
+# test_family_groups_match_grammar_map); an extension absent from its family
+# causes two live bugs:
 #   (a) caller_search_extensions returns the broad fallback union instead of a
 #       tight family glob — every other language's files are scanned;
 #   (b) _get_language_group returns -1, silently bypassing the cross-language
 #       resolution guard.
 #
+# The tuple ORDER is part of the contract: _get_language_group returns group
+# indices that the cross-language resolution guard compares (pinned by
+# test_group_indices_are_stable) — keep family order stable.
+#
 # Single source of truth, consumed by:
 #   * cross-file caller search (ripgrep glob set — see caller_search_extensions)
-#   * cross-language resolution guard (SpecGraphEnricher — see _get_language_group)
-_LANGUAGE_EXTENSION_GROUPS: list[frozenset[str]] = [
-    frozenset({".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"}),  # JS/TS family
-    frozenset({".py", ".pyi"}),                                  # Python (+type stubs)
-    frozenset({".go"}),                                          # Go
-    frozenset({".java"}),                                        # Java
-    frozenset({".kt", ".kts"}),                                  # Kotlin
-    frozenset({".rs"}),                                          # Rust
-    frozenset({".rb"}),                                          # Ruby
-    frozenset({".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh"}),  # C/C++ family
-    frozenset({".php"}),                                         # PHP
-    frozenset({".cs"}),                                          # C#
-    frozenset({".swift"}),                                       # Swift
-    frozenset({".scala", ".sc"}),                                # Scala
-    frozenset({".lua"}),                                         # Lua
-    frozenset({".sh", ".bash", ".zsh", ".ksh"}),                 # Bash
-]
+#   * cross-language resolution guard (see _get_language_group)
+_LANGUAGE_FAMILIES: tuple[frozenset[str], ...] = (
+    frozenset({"TYPESCRIPT", "JAVASCRIPT"}),  # JS/TS family
+    frozenset({"PYTHON"}),                    # Python (+type stubs)
+    frozenset({"GO"}),                        # Go
+    frozenset({"JAVA"}),                      # Java
+    frozenset({"KOTLIN"}),                    # Kotlin
+    frozenset({"RUST"}),                      # Rust
+    frozenset({"RUBY"}),                      # Ruby
+    frozenset({"C", "CPP"}),                  # C/C++ family
+    frozenset({"PHP"}),                       # PHP
+    frozenset({"CSHARP"}),                    # C#
+    frozenset({"SWIFT"}),                     # Swift
+    frozenset({"SCALA"}),                     # Scala
+    frozenset({"LUA"}),                       # Lua
+    frozenset({"BASH"}),                      # Bash
+)
+
+
+def _derive_language_extension_groups() -> list[frozenset[str]]:
+    """Resolve the language-level families to extension sets via _EXT_MAP.
+
+    Fails at import time (fail-fast) when a family names a language that has
+    no extensions in _EXT_MAP — a typo'd member name, or a language whose
+    entries were removed, would otherwise silently shrink/empty the family,
+    widening caller search to the broad fallback union and bypassing the
+    cross-language resolution guard.
+    """
+    known = set(_EXT_MAP.values())
+    groups: list[frozenset[str]] = []
+    for family in _LANGUAGE_FAMILIES:
+        unknown = family - known
+        if unknown:
+            raise ValueError(
+                f"_LANGUAGE_FAMILIES names {sorted(unknown)} which has no "
+                "extensions in _EXT_MAP (external_llm/languages/models.py) — "
+                "fix the family name or add the language's extensions"
+            )
+        exts = frozenset(ext for ext, lang in _EXT_MAP.items() if lang in family)
+        if not exts:
+            raise ValueError(f"family {sorted(family)} resolved to no extensions")
+        groups.append(exts)
+    return groups
+
+
+_LANGUAGE_EXTENSION_GROUPS: list[frozenset[str]] = _derive_language_extension_groups()
 
 
 def _get_language_group(ext: str) -> int:
@@ -160,7 +206,7 @@ class LanguageId(Enum):
 
 
 @dataclass(frozen=True)
-class SyntaxError_:
+class SyntaxError_:  # noqa: N801 — trailing underscore avoids builtin shadow
     """A single syntax/semantic diagnostic in a file.
 
     ``severity`` and ``code`` were added to carry semantic diagnostics

@@ -62,3 +62,89 @@ def test_walk_files_index_truncated_false_when_complete(tmp_path: Path):
     searcher = RAGSearcher(str(tmp_path))
     searcher._walk_files()
     assert searcher.index_truncated is False
+
+
+def test_dotfile_survives_incremental_edit(tmp_path: Path):
+    """F-RAG-1 regression: the build walk indexes basename dotfiles
+    (.eslintrc.js) but ``_prepare_files``' all-parts check dropped them on the
+    first incremental edit — a one-edit-then-gone-from-search bug.  Only
+    DIRECTORY parts may be pruned; the basename is never a directory."""
+    (tmp_path / "src" / "app.py").parent.mkdir(parents=True)
+    (tmp_path / "src" / "app.py").write_text("print(1)\n")
+    (tmp_path / ".eslintrc.js").write_text("module.exports = {}\n")
+
+    searcher = RAGSearcher(str(tmp_path), vector_cache_enabled=False)
+    searcher._ensure_index()
+    assert ".eslintrc.js" in searcher._rel_paths, "build must index basename dotfiles"
+
+    (tmp_path / ".eslintrc.js").write_text("module.exports = {a: 1}\n")
+    searcher.invalidate_files([".eslintrc.js"])
+    assert ".eslintrc.js" in searcher._rel_paths, "incremental edit must not drop the dotfile"
+    assert "src/app.py" in searcher._rel_paths
+
+
+def test_walk_files_applies_shared_skip_policy(tmp_path: Path):
+    """4th-walker parity (B2' contract, F-RAG-2): the RAG walker must prune
+    exactly the dirs the shared policy prunes (vendor/, .egg-info/, venv*/
+    site-packages) and skip minified-bundle suffixes — or the corpus drifts
+    from the CGI/RG graph universes (vendored bundles / venv site-packages
+    can even starve real source under the file cap)."""
+    files = {
+        "src/app.py": "print(1)\n",
+        "vendor/dep.py": "x = 1\n",
+        "pkg.egg-info/meta.py": "y = 2\n",
+        "venv310/lib/python3.14/site-packages/mod.py": "z = 3\n",
+        "assets/lib.min.js": "function f() {}\n",
+        "app.min.css": "a { color: red }\n",
+    }
+    for rel, text in files.items():
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+
+    searcher = RAGSearcher(str(tmp_path), vector_cache_enabled=False)
+    rels = {str(f.relative_to(tmp_path)) for f in searcher._walk_files()}
+    assert rels == {"src/app.py"}, rels
+
+
+def test_prepare_files_matches_walk_admission(tmp_path: Path):
+    """Incremental admission must equal walk admission (F-RAG-2): files under
+    pruned dirs / with minified suffixes are refused in ``_prepare_files``
+    too, so an invalidate_files call can never index what a rebuild drops."""
+    for rel in ("vendor/dep.py", "lib.min.js", "app.min.css"):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x = 1\n", encoding="utf-8")
+
+    searcher = RAGSearcher(str(tmp_path), vector_cache_enabled=False)
+    prepared, fp_map = searcher._prepare_files(
+        ["vendor/dep.py", "lib.min.js", "app.min.css"]
+    )
+    assert prepared == {}
+    assert fp_map == {}
+
+
+def test_invalidate_files_batches_vector_cache_adds(tmp_path: Path):
+    """F3: the deferred vector-cache updates of an incremental update are
+    flushed in ONE ``add_documents`` batch (single encode pass) instead of N
+    per-file ``add_document`` calls — the per-file path must never be used."""
+    from unittest.mock import MagicMock
+
+    (tmp_path / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("def b():\n    return 2\n", encoding="utf-8")
+
+    searcher = RAGSearcher(str(tmp_path), vector_cache_enabled=False)
+    searcher._ensure_index()
+
+    mock_mgr = MagicMock()
+    searcher.vector_cache_manager = mock_mgr
+    searcher.vector_cache_enabled = True
+
+    (tmp_path / "a.py").write_text("def a():\n    return 10\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("def b():\n    return 20\n", encoding="utf-8")
+    searcher.invalidate_files(["a.py", "b.py"])
+
+    mock_mgr.add_documents.assert_called_once()
+    added = mock_mgr.add_documents.call_args.args[0]
+    assert {p for p, _t in added} == {"a.py", "b.py"}
+    mock_mgr.add_document.assert_not_called()

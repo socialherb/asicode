@@ -1,13 +1,16 @@
 """
 Context packs for different agent roles.
 
-HelperContextBuilder – minimal function/snippet-level context.
+HelperContextBuilder - minimal function/snippet-level context.
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+
+
 @dataclass
 class ContextPack:
     """Container for a rendered context string and metadata."""

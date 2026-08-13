@@ -58,7 +58,6 @@ class TestApplyPatchRepoRootStrip:
     @staticmethod
     def _strip(repo_root: str, path: str) -> str:
         """Mirror of the normalisation in _tool_apply_patch_impl."""
-        from external_llm.agent.tool_handlers import write_tools  # noqa: F401
         repo_root_str = repo_root.rstrip("/")
         if path == repo_root_str:
             path = ""

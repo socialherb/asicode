@@ -96,10 +96,67 @@ class TestRunBoundedSubprocess:
         assert cp.returncode == -9
         assert marker.exists(), "child never recorded its PID (spawn failed?)"
         pid = int(marker.read_text().strip())
-        # Allow the SIGKILL to propagate.
-        time.sleep(0.4)
-        with pytest.raises((ProcessLookupError, OSError)):
-            os.kill(pid, 0)  # signal 0 = liveness check; raises if reaped
+        # Allow the SIGKILL to propagate, then poll (bounded) until the child is
+        # fully reaped — a zombie still answers os.kill(pid, 0), so only a
+        # successful raise proves the kill. A fixed sleep flakes when the
+        # reaper is slow under load.
+        deadline = time.monotonic() + 2.0
+        reaped = False
+        while time.monotonic() < deadline and not reaped:
+            try:
+                os.kill(pid, 0)  # signal 0 = liveness check; raises if reaped
+            except (ProcessLookupError, OSError):
+                reaped = True
+            else:
+                time.sleep(0.05)
+        assert reaped, f"pid {pid} still alive 2s after SIGKILL (killpg failed?)"
+
+    def test_timeout_kills_grandchildren_when_leader_exits_first(self, run, tmp_path):
+        """The direct child can exit well BEFORE the timeout — e.g.
+        ``bash -c "sleep 30 & echo started"`` returns as soon as the
+        backgrounding is done, leaving only the grandchild. The group kill must
+        then target the GROUP (which survives its leader while any member is
+        alive), not a re-resolved ``getpgid(proc.pid)``: ``communicate()``
+        reaps the exited leader, so getpgid raises ProcessLookupError and the
+        silently-skipped kill orphans the grandchild — the leak the helper
+        exists to prevent.
+        """
+        marker = tmp_path / "grandchild_pid.txt"
+        cp = run(
+            ["bash", "-c", f"sleep 30 & echo $! > {marker}; echo started"],
+            timeout=1,
+        )
+        assert cp.returncode == -9
+        if not marker.exists():
+            pytest.skip("grandchild did not record PID before timeout (race); retry")
+        gpid = int(marker.read_text().strip())
+        deadline = time.monotonic() + 2.0
+        reaped = False
+        while time.monotonic() < deadline and not reaped:
+            try:
+                os.kill(gpid, 0)
+            except (ProcessLookupError, OSError):
+                reaped = True
+            else:
+                time.sleep(0.05)
+        assert reaped, f"pid {gpid} still alive 2s after SIGKILL (leader-reaped killpg failed?)"
+
+    def test_timeout_with_early_leader_exit_keeps_output_and_stays_fast(self, run):
+        """Regression for the leader-exits-first shape: the pre-fix path let
+        the grandchild hold the pipes, the post-kill drain burned its full 5 s
+        grace, and the ``except Exception`` then BLANKED the output the command
+        had already printed — the caller saw an empty, failed-looking result
+        for a command that had answered. Post-fix the stored-pid killpg works,
+        the drain returns immediately, and the partial output survives.
+        """
+        start = time.monotonic()
+        cp = run(["bash", "-c", "sleep 30 & echo started"], timeout=1)
+        elapsed = time.monotonic() - start
+        assert cp.returncode == -9
+        assert "started" in cp.stdout, f"partial stdout lost on timeout: {cp.stdout!r}"
+        # Pre-fix this returned in ~6 s (1 s budget + 5 s failed second drain);
+        # the teardown must stay near the budget.
+        assert elapsed < 4, f"teardown dragged on for {elapsed:.1f}s (kill was skipped?)"
 
     def test_timeout_kills_grandchildren(self, run, tmp_path):
         """A backgrounded child of the shell is in the same process group and
@@ -116,9 +173,16 @@ class TestRunBoundedSubprocess:
         if not marker.exists():
             pytest.skip("grandchild did not record PID before timeout (race); retry")
         gpid = int(marker.read_text().strip())
-        time.sleep(0.4)
-        with pytest.raises((ProcessLookupError, OSError)):
-            os.kill(gpid, 0)
+        deadline = time.monotonic() + 2.0
+        reaped = False
+        while time.monotonic() < deadline and not reaped:
+            try:
+                os.kill(gpid, 0)
+            except (ProcessLookupError, OSError):
+                reaped = True
+            else:
+                time.sleep(0.05)
+        assert reaped, f"pid {gpid} still alive 2s after SIGKILL (killpg failed?)"
 
 
 # ── source-level guard: the bare-subprocess.run regression must not return ──
@@ -150,7 +214,8 @@ def test_no_timeoutless_subprocess_run_in_target_files():
         # the targets present in this tree.
         if not os.path.exists(path):
             continue
-        src = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
         tree = ast.parse(src, path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):

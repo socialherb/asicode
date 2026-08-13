@@ -25,13 +25,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from diff_apply import _clean_diff  # noqa: E402
-from patch_synth import synthesize_replace_line_unified_diff  # noqa: E402
+from diff_apply import _clean_diff
+from patch_synth import synthesize_replace_line_unified_diff
 
 
 def _git_apply_ok(patch_text: str, cwd: str) -> bool:
     p = subprocess.run(
-        ["git", "apply", "--check"], input=patch_text, cwd=cwd, text=True, capture_output=True
+        ["git", "apply", "--check"], input=patch_text, cwd=cwd, text=True, capture_output=True,
+        check=False,
     )
     return p.returncode == 0
 
@@ -105,7 +106,8 @@ def test_safe_single_line_path_routes_through_clean_diff():
     )
     if not os.path.exists(src_path):
         pytest.skip("webapp/ not present (public CLI-only snapshot)")
-    src = open(src_path).read()
+    with open(src_path) as fh:
+        src = fh.read()
     assert "def _try_deterministic_replace_block(" in src
     start = src.index("def _try_deterministic_replace_block(")
     nxt = src.find("\ndef ", start + 1)

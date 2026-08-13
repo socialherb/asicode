@@ -34,7 +34,7 @@ def repo(tmp_path: Path) -> Path:
 
 
 def _registry(repo: Path) -> ToolRegistry:
-    return ToolRegistry(str(repo), AgentConfig(planning_enabled=False, rag_enabled=False))
+    return ToolRegistry(str(repo), AgentConfig(rag_enabled=False))
 
 
 class TestSymbolReadScope:
@@ -142,3 +142,4 @@ class TestSymbolCacheSurvivesNonOverlappingWrite:
         removed = cache.invalidate_paths(frozenset({os.path.normpath(str(repo / "a.py"))}))
         assert removed == 1
         assert cache.get("find_symbol", args) is None
+

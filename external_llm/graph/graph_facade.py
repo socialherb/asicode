@@ -12,17 +12,16 @@ import os
 import threading
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
-
 from .graph_builder import GraphBuilder
 from .models import CallEdge, ImportEdge, SymbolNode
 from .repository_graph import RepositoryGraph
 
+logger = logging.getLogger(__name__)
+
 
 class RepositoryGraphFacade:
-    def __init__(self, call_graph_indexer=None, test_finder=None, repo_root: Optional[str] = None):
+    def __init__(self, call_graph_indexer=None, repo_root: Optional[str] = None):
         self.call_graph_indexer = call_graph_indexer
-        self.test_finder = test_finder
         self.repo_root = repo_root or os.getcwd()
         self._graph: Optional[RepositoryGraph] = None
         self._graph_builder = GraphBuilder(self.repo_root)
@@ -47,14 +46,6 @@ class RepositoryGraphFacade:
             depth=depth,
             limit=limit,
         )
-
-    def get_test_targets(self, symbol: str) -> list[str]:
-        if self.test_finder is None:
-            return []
-        try:
-            return self.test_finder.find_tests_for_symbol(symbol)
-        except Exception:
-            return []
 
     # ── P1: Global Symbol Graph extensions ──────────────────────────────────
 
@@ -86,14 +77,24 @@ class RepositoryGraphFacade:
             if not lang_paths:
                 return
 
+            # Split into existing (reparse) and deleted (remove) files, then
+            # hand each set to the graph's BATCHED incremental path: one
+            # _remove_files pass + one _process_file_* per reparse target,
+            # vs the old per-path reparse_file/remove_file that rebuilt the
+            # edge lists for every path (O(N paths x M edges)) — P3, 2026-08-11.
+            reparse: list[str] = []
+            deleted: set[str] = set()
             for rel_path in lang_paths:
                 norm = rel_path.strip().lstrip("/")
                 abs_path = os.path.join(self.repo_root, norm)
-
                 if os.path.isfile(abs_path):
-                    graph.reparse_file(abs_path)
+                    reparse.append(abs_path)
                 else:
-                    graph.remove_file(norm)
+                    deleted.add(norm)
+            if reparse:
+                graph.reparse_files(reparse)
+            if deleted:
+                graph._remove_files(deleted)
 
         logger.debug("GSG incremental update: %d files reparsed", len(lang_paths))
 
@@ -143,6 +144,10 @@ class RepositoryGraphFacade:
         Direction-agnostic: both get_callers() and get_callees() return RepositoryGraph
         edges whose ``file_path`` is always the *caller's* file, so the callee_file is
         resolved from the symbol table identically for either direction.
+
+        NOTE (P2, 2026-08-12): production always injects a CallGraphIndexer
+        (tool_registry.py), so this RG fallback path is exercised only by direct
+        /test callers — kept as a functional fallback, not dead code.
         """
         result = []
         for e in edges:
@@ -153,11 +158,15 @@ class RepositoryGraphFacade:
                 caller_symbol=e.caller,
                 caller_file=e.file_path,
                 caller_line=e.line,
-                callee_symbol=e.callee,
-                callee_display=e.callee,
+                # P3 Stage 1: pass through the canonical attribution when the
+                # RG edge carries it (new snapshots); fall back to the legacy
+                # bare callee for pre-P3 payloads.
+                callee_symbol=getattr(e, "callee_symbol", None) or e.callee,
+                callee_display=getattr(e, "callee_display", "") or e.callee,
                 callee_file=_callee_file,
                 call_args=getattr(e, "call_args", []),
                 is_mutating=getattr(e, "is_mutating", False),
+                confidence=getattr(e, "confidence", 0.5),
             ))
         return result
 
@@ -175,13 +184,27 @@ class RepositoryGraphFacade:
         try:
             graph = self._ensure_graph()
             return graph.get_importers(file_path)
-        except Exception:
+        except (OSError, ValueError, RuntimeError):  # graph unavailable → empty (documented contract)
             return []
 
     def get_symbols_in_file(self, file_path: str) -> list[SymbolNode]:
         """Return all symbols defined in the given file."""
         graph = self._ensure_graph()
         return graph.get_symbols_in_file(file_path)
+
+    @property
+    def py_files(self) -> list[str]:
+        """Repo-relative paths of every walked .py file — UNCAPPED.
+
+        Triggers the lazy build on first access (same cost as any first
+        graph query).  Populated by every ``RepositoryGraph.build()`` mode
+        (2026-08-11); the structural-scan tool unions it into its
+        cross-file-ref input (analysis_tools.py) so references living only
+        in files beyond ``SCAN_FILE_CAP`` still suppress dead-code
+        candidates — the same soundness contract as the structural gate
+        (scripts/check_structural_scanners.py).
+        """
+        return self._ensure_graph().py_files
 
     def get_symbol_file(self, symbol_name: str) -> Optional[str]:
         """

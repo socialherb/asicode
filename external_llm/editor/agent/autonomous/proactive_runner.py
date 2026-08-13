@@ -168,10 +168,11 @@ def make_stream_callback_interceptor(
     def _interceptor(event_name: str, data: dict[str, Any]) -> None:
         # Always forward first — never break existing behavior
         if original_cb:
+            # non-critical — never block execution
             try:
                 original_cb(event_name, data)
-            except Exception:
-                pass  # non-critical — never block execution
+            except Exception as _exc:
+                logger.debug("interceptor callback failed: %s", _exc)
 
         # Route relevant events to TriggerEngine
         if event_name in ("fail_loop_detected", "complete", "error"):
@@ -253,6 +254,9 @@ class ProactiveRunner:
                 return
             self._running = False
             self._engine.stop()
+            # Wake the drain thread so it exits on the next loop check instead
+            # of sleeping out the poll interval.
+            self._queue.wake.set()
             logger.info("ProactiveRunner stopped (repo=%s)", self.repo_root)
 
     # ── Schedule helpers ──────────────────────────────────────────────────────
@@ -292,6 +296,10 @@ class ProactiveRunner:
     def _drain_loop(self) -> None:
         """Background daemon thread: drains task queue and spawns executor threads."""
         while self._running:
+            # Clear the wake flag BEFORE draining: any enqueue/slot-free that
+            # lands after this point is either found by get_nowait() or visible
+            # to the wait() below — no wake can be lost.
+            self._queue.wake.clear()
             task = self._queue.get_nowait()
             if task:
                 t = threading.Thread(
@@ -302,7 +310,10 @@ class ProactiveRunner:
                 )
                 t.start()
             else:
-                time.sleep(self.DRAIN_INTERVAL)
+                # Block until a task is enqueued or a concurrency slot frees,
+                # instead of sleeping the full poll interval while work is
+                # already pending (stop() also sets wake for prompt exit).
+                self._queue.wake.wait(self.DRAIN_INTERVAL)
 
     # ── Task execution ────────────────────────────────────────────────────────
 

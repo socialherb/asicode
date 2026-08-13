@@ -388,6 +388,7 @@ def test_is_editable_install_parses_direct_url(monkeypatch):
     # _is_editable_install enumerates distributions() and returns True if ANY
     # distribution carries a direct_url.json with dir_info.editable set.
     import importlib.metadata as _meta
+
     import utils.version_check as vc
 
     class _FakeDist:
@@ -418,6 +419,7 @@ def test_editable_ignores_unrelated_distributions(monkeypatch):
     # A non-asicode editable install must NOT trip the asicode guard; the name
     # filter inside _has_editable_distribution scopes the enumeration.
     import importlib.metadata as _meta
+
     import utils.version_check as vc
 
     class _FakeDist:
@@ -443,6 +445,7 @@ def test_is_editable_install_resilient(monkeypatch):
     # Any metadata error must fail-open to False (benign: worst case a redundant
     # notice), never raise.
     import importlib.metadata as _meta
+
     import utils.version_check as vc
 
     def _boom():
@@ -461,6 +464,7 @@ def test_editable_not_fooled_by_egginfo_shadowing(tmp_path, monkeypatch):
     import importlib
     import importlib.metadata as _meta
     import json as _json
+
     import utils.version_check as vc
 
     pkg = "asicodeshadowfixturerepro"
@@ -471,7 +475,7 @@ def test_editable_not_fooled_by_egginfo_shadowing(tmp_path, monkeypatch):
     egg_info = repo_root / f"{pkg}.egg-info"
     egg_info.mkdir()
     (egg_info / "PKG-INFO").write_text(
-        "Metadata-Version: 2.1\nName: %s\nVersion: 0.0.0\n" % pkg
+        f"Metadata-Version: 2.1\nName: {pkg}\nVersion: 0.0.0\n"
     )
 
     # real editable *.dist-info in site-packages — carries direct_url.json
@@ -480,7 +484,7 @@ def test_editable_not_fooled_by_egginfo_shadowing(tmp_path, monkeypatch):
     dist_info = site_dir / f"{pkg}-0.2.10.dist-info"
     dist_info.mkdir()
     (dist_info / "PKG-INFO").write_text(
-        "Metadata-Version: 2.1\nName: %s\nVersion: 0.2.10\n" % pkg
+        f"Metadata-Version: 2.1\nName: {pkg}\nVersion: 0.2.10\n"
     )
     (dist_info / "direct_url.json").write_text(
         _json.dumps({"url": repo_root.as_uri(), "dir_info": {"editable": True}})

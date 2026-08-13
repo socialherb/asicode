@@ -32,6 +32,7 @@ normalises back inside) must keep working.
 """
 from __future__ import annotations
 
+import contextlib
 import tempfile
 from pathlib import Path
 
@@ -84,15 +85,14 @@ def _escape_args(target: str):
 
 @pytest.mark.parametrize("traversal", [True, False], ids=["relative-..", "absolute"])
 def test_no_write_tool_escapes_repo_root(sandbox, traversal):
-    reg, repo, victim = sandbox
+    reg, _repo, victim = sandbox
     target = "../outside/victim.txt" if traversal else str(victim)
     escaped = []
     for tool, args in _escape_args(target):
         victim.write_text(OUTSIDE_MARK, encoding="utf-8")
-        try:
+        # a raise is an acceptable refusal; only the file state matters
+        with contextlib.suppress(Exception):
             reg.dispatch(tool, dict(args))
-        except Exception:
-            pass  # a raise is an acceptable refusal; only the file state matters
         if PWNED in victim.read_text(encoding="utf-8"):
             escaped.append(tool)
     assert not escaped, f"wrote outside repo_root via: {sorted(set(escaped))}"

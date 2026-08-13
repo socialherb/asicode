@@ -22,11 +22,28 @@ from .client import (
     LLMServerUnavailableError,
     ToolCallRequest,
     ToolCallResponse,
+    iter_sse_data_events,
     parse_retry_after,
 )
 from .output_parser import parse_tool_args
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_callback(cb, *args):
+    """Invoke a user-supplied streaming callback, isolating its failures.
+
+    Progress/streaming callbacks are arbitrary caller code: one buggy callback
+    must not abort the whole LLM stream. The isolation is NOT silent — the
+    failure is logged at debug level so a broken UI hook stays diagnosable.
+    """
+    try:
+        cb(*args)
+    except Exception as _exc:
+        logger.debug(
+            "streaming callback %r failed: %s", getattr(cb, "__name__", cb), _exc,
+        )
+
 _num_ctx_overshoot_warned: set[tuple[str, int]] = set()
 """Tracks (model, cap) pairs that have already logged the overshoot warning
 so it fires only once per (model, cap) combination per process."""
@@ -58,10 +75,35 @@ def _normalize_gemini_finish_reason(raw: Optional[str]) -> Optional[str]:
 
 # ── Ollama vision helpers ─────────────────────────────────────────────────────
 
-def _is_ollama_vision_model(model: str) -> bool:
-    """Return True if the model name suggests multimodal (vision) support."""
+def _is_ollama_vision_model(model: str, base_url_hint: Optional[str] = None) -> bool:
+    """Return True if the model name suggests multimodal (vision) support.
+
+    ``base_url_hint`` is forwarded to the runtime capability slow path
+    (Ollama /api/show) so a non-default Ollama server is queried, matching
+    what ``_num_ctx_for_model`` already does for num_ctx.
+    """
     from external_llm.model_registry import ollama_vision
-    return ollama_vision(model)
+    return ollama_vision(model, base_url_hint=base_url_hint)
+
+
+def _ollama_apply_images(m_dict: dict[str, Any], msg: Any, is_vision: bool) -> None:
+    """Attach images to an Ollama message dict, or fold them into text content.
+
+    Single source of truth for image conversion — ``chat`` and
+    ``chat_with_tools`` must produce byte-identical messages for the same
+    input. (The tool-calling path historically dropped images entirely:
+    system/user turns went out with ``content`` only.)
+    """
+    images = getattr(msg, "images", None)
+    if not images:
+        return
+    if is_vision:
+        # Native Ollama vision: pass base64 data list directly
+        m_dict["images"] = [img["data"] for img in images]
+    else:
+        # Non-vision model: prepend OCR text (or placeholder) to content
+        image_text = _images_to_text(images)
+        m_dict["content"] = image_text + ("\n" + m_dict["content"] if m_dict["content"] else "")
 
 
 def _is_gpt_oss(model: str) -> bool:
@@ -131,10 +173,10 @@ def _normalize_ollama_system_messages(messages: list[dict[str, Any]]) -> list[di
     merged: dict[str, Any] = {"role": "system", "content": "\n".join(system_parts)}
     # Preserve non-payload keys (e.g. 'images') from the first system message.
     if first_sys:
-        for k, v in first_sys.items():
-            if k not in ("role", "content"):
-                merged[k] = v
-    return [merged] + rest
+        merged.update(
+            {k: v for k, v in first_sys.items() if k not in ("role", "content")}
+        )
+    return [merged, *rest]
 
 
 def _is_gemini_3(model: str) -> bool:
@@ -147,12 +189,66 @@ def _is_gemini_3(model: str) -> bool:
     return _m.startswith("gemini-3")
 
 
+_OCR_RESOLVED_LANG: str | None = None
+
+
+_OCR_AVAILABLE_LANGS: frozenset | None = None
+# Cache of the ``tesseract --list-langs`` probe (one cheap subprocess per
+# process). ``None`` = not probed yet; a probe *failure* is cached separately
+# so a broken ``--list-langs`` is not re-run for every image — callers fall
+# back to the legacy per-pack try/skip probing in that case.
+_OCR_LANG_PROBE_FAILED = False
+
+
+def _probe_ocr_available_langs(_tess) -> frozenset | None:
+    """Installed tesseract language packs (probed once per process).
+
+    Returns ``None`` when the probe cannot run or fails — the caller then keeps
+    the legacy per-candidate try/skip probing (a pack's absence is discovered
+    by the first failing ``image_to_data``, exactly as before).  An empty set
+    means the probe ran and reported *no* packs at all.
+    """
+    global _OCR_AVAILABLE_LANGS, _OCR_LANG_PROBE_FAILED
+    if _OCR_AVAILABLE_LANGS is not None or _OCR_LANG_PROBE_FAILED:
+        return _OCR_AVAILABLE_LANGS
+    try:
+        langs = frozenset(_tess.get_languages(config=""))
+    except Exception:
+        logger.debug(
+            "tesseract --list-langs probe failed; falling back to legacy per-pack OCR probing",
+            exc_info=True,
+        )
+        _OCR_LANG_PROBE_FAILED = True
+        return None
+    _OCR_AVAILABLE_LANGS = langs
+    return langs
+
+
+def _ocr_candidate_available(candidate: str, available: frozenset) -> bool:
+    """True when every pack of a (possibly ``+``-combined) candidate is installed.
+
+    ``tesseract --list-langs`` lists individual packs (``eng``, ``kor``, …);
+    a combined candidate like ``kor+eng`` needs every component present.
+    """
+    return all(part in available for part in candidate.split("+"))
+
+
 def _detect_image_ocr_lang(b64_data: str) -> tuple:
     """Detect OCR language from image data by trying language packs.
 
-    Tries 'kor+eng' first (most common for this project), then 'eng' alone
-    as fallback. Returns empty string if no text found with any language.
+    Probes language packs in priority order, **skipping any that are
+    unavailable** — a missing ``traineddata`` raises
+    ``pytesseract.TesseractError``, which previously hit the *outer*
+    ``except Exception`` and aborted OCR for the whole image (so on an
+    English-only ``tesseract`` install, ``kor+eng`` errored and ``eng``
+    alone was never tried → OCR silently dead). The first pack that
+    yields recognized text wins and is cached as ``_OCR_RESOLVED_LANG``
+    so subsequent images probe it first and skip re-probing failing packs.
+
+    Returns ``(lang, img_w, img_h, data)``. On failure (no deps, no
+    extractable text, or image-decode error) returns ``("eng", w, h, None)``.
     """
+    global _OCR_RESOLVED_LANG
     img_w = img_h = 0
     try:
         import base64 as _b64
@@ -165,9 +261,37 @@ def _detect_image_ocr_lang(b64_data: str) -> tuple:
         img = _PILImage.open(_io.BytesIO(_b64.b64decode(b64_data)))
         img_w, img_h = img.size
 
-        # Priority order: most likely first
-        for lang in ("kor+eng", "eng", "chi_sim+eng", "jpn+eng"):
-            data = _tess.image_to_data(img, lang=lang, output_type=_Out.DICT)
+        # Priority order, with a previously-resolved winning lang first so a
+        # multi-image session probes the known-good pack before re-probing.
+        priority = ("kor+eng", "eng", "chi_sim+eng", "jpn+eng")
+        if _OCR_RESOLVED_LANG in priority:
+            order = (
+                _OCR_RESOLVED_LANG,
+                *(candidate for candidate in priority if candidate != _OCR_RESOLVED_LANG),
+            )
+        else:
+            order = priority
+
+        # Probe installed packs once per process so a missing pack is filtered
+        # out BEFORE the expensive full OCR pass — on an English-only install
+        # the legacy code burned a whole kor+eng image_to_data (~1-5s) merely
+        # discovering that kor was absent.  When the probe itself fails,
+        # ``available`` is None and the legacy per-candidate try/skip below
+        # keeps working unchanged.  An empty filtered order simply falls
+        # through to the default ``("eng", w, h, None)`` return.
+        available = _probe_ocr_available_langs(_tess)
+        if available is not None:
+            order = tuple(c for c in order if _ocr_candidate_available(c, available))
+
+        for lang in order:
+            try:
+                data = _tess.image_to_data(img, lang=lang, output_type=_Out.DICT)
+            except Exception:
+                # Missing/unavailable lang pack — skip to the next candidate
+                # instead of aborting OCR for the whole image. A missing
+                # traineddata is an expected, recoverable condition.
+                logger.debug("OCR lang pack %r unavailable, skipping", lang, exc_info=True)
+                continue
             texts = [
                 (data["text"][i] or "").strip()
                 for i in range(len(data["text"]))
@@ -175,11 +299,13 @@ def _detect_image_ocr_lang(b64_data: str) -> tuple:
             ]
             joined = " ".join(texts).strip()
             if joined:
+                _OCR_RESOLVED_LANG = lang  # cache winner for the next image
                 return lang, img_w, img_h, data
-        return "eng", img_w, img_h, None
     except ImportError:
         return "eng", img_w, img_h, None
     except Exception:
+        return "eng", img_w, img_h, None
+    else:
         return "eng", img_w, img_h, None
 
 
@@ -191,7 +317,7 @@ def _try_ocr_base64(b64_data: str) -> str:
         (top-left / top-center / top-right / middle-* / bottom-*).
 
     Example output:
-        [Image OCR — Position Includes (1456×800px):
+        [Image OCR — Position Includes (1456x800px):
             [top-center] asicode Idle
             [top-right] Providers Settings
             [middle-left] DESIGN Chat — discuss design with AI
@@ -300,6 +426,55 @@ def _images_to_text(images: list[dict[str, str]]) -> str:
     return "\n".join(parts)
 
 
+def _count_delimiters(s: str) -> dict[str, int]:
+    """Count curly/square delimiters in ``s``, ignoring those inside string literals.
+
+    Streaming responses can be silently truncated mid-stream even when the
+    server reports ``finish_reason='stop'`` (the final content delta is dropped
+    but the terminating chunk arrives intact). Detecting unbalanced braces or
+    brackets is a reliable proxy for such truncation. Delimiters that appear
+    inside single- or double-quoted string literals — with backslash escapes
+    handled — are excluded so JSON string contents do not produce false
+    positives.
+
+    Returns a dict with keys ``open_curly``, ``close_curly``, ``open_square``
+    and ``close_square``. Callers test balance via, e.g.,
+    ``c['open_curly'] > c['close_curly']``.
+    """
+    counts = {
+        "open_curly": 0,
+        "close_curly": 0,
+        "open_square": 0,
+        "close_square": 0,
+    }
+    in_str = False
+    str_char: Optional[str] = None
+    escaped = False
+    for ch in s:
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == str_char:
+                in_str = False
+                str_char = None
+            continue
+        if ch in ('"', "'"):
+            in_str = True
+            str_char = ch
+            continue
+        if ch == "{":
+            counts["open_curly"] += 1
+        elif ch == "}":
+            counts["close_curly"] += 1
+        elif ch == "[":
+            counts["open_square"] += 1
+        elif ch == "]":
+            counts["close_square"] += 1
+    return counts
+
+
 class GoogleClient(LLMClient):
     """
     Google Gemini API client
@@ -340,11 +515,10 @@ class GoogleClient(LLMClient):
                 else:
                     _level = "high"
                 return {"thinkingLevel": _level}
-        else:
-            if thinking_mode is True:
-                return {"thinkingBudget": -1}
-            elif thinking_mode is False and "pro" not in model.lower():
-                return {"thinkingBudget": 0}
+        elif thinking_mode is True:
+            return {"thinkingBudget": -1}
+        elif thinking_mode is False and "pro" not in model.lower():
+            return {"thinkingBudget": 0}
         return {}
 
     def chat(
@@ -381,13 +555,12 @@ class GoogleClient(LLMClient):
                 images = getattr(msg, "images", None)
                 if images:
                     parts: list[dict[str, Any]] = [{"text": msg.content or ""}]
-                    for img in images:
-                        parts.append({
+                    parts.extend({
                             "inlineData": {
                                 "mimeType": img.get("media_type", "image/png"),
                                 "data": img.get("data", ""),
                             }
-                        })
+                        } for img in images)
                     contents.append({"role": role, "parts": parts})
                 else:
                     contents.append({"role": role, "parts": [{"text": msg.content}]})
@@ -431,7 +604,7 @@ class GoogleClient(LLMClient):
 
             elapsed_ms = (time.monotonic() - t0) * 1000
 
-            if response.status_code == 401 or response.status_code == 403:
+            if response.status_code in {401, 403}:
                 logger.error("Google API authentication failed (%d)", response.status_code)
                 raise LLMAuthenticationError(
                     "Invalid Google API key. "
@@ -516,20 +689,20 @@ class GoogleClient(LLMClient):
             )
 
         except requests.ConnectionError as e:
-            logger.error("Cannot connect to Google API: %s", e)
+            logger.exception("Cannot connect to Google API: %s", e)
             raise LLMConnectionError(
                 "Cannot connect to Google API. "
                 "Please check your internet connection."
             ) from e
 
         except requests.Timeout as e:
-            logger.error("Google request timed out after %ds", self.timeout)
+            logger.exception("Google request timed out after %ds", self.timeout)
             raise LLMConnectionError(
                 f"Google request timed out after {self.timeout}s"
             ) from e
 
         except requests.RequestException as e:
-            logger.error("Google request failed: %s", e)
+            logger.exception("Google request failed: %s", e)
             raise LLMAPIError(f"Google request failed: {e}") from e
 
     def chat_with_tools(
@@ -573,9 +746,11 @@ class GoogleClient(LLMClient):
                     contents.append({"role": role, "parts": raw_content})
                 elif images:
                     # Multimodal: inlineData parts + text
-                    parts = []
-                    for img in images:
-                        parts.append({"inlineData": {"mimeType": img["media_type"], "data": img["data"]}})
+                    # Defensive .get() with defaults — mirrors GoogleClient.chat
+                    # (L437) and the streaming path. image_utils normally fills
+                    # both keys, but a malformed/foreign image dict must not
+                    # KeyError here; it degrades to image/png + "" instead.
+                    parts = [{"inlineData": {"mimeType": img.get("media_type", "image/png"), "data": img.get("data", "")}} for img in images]
                     parts.append({"text": msg.content})
                     contents.append({"role": role, "parts": parts})
                 else:
@@ -724,7 +899,6 @@ class GoogleClient(LLMClient):
         Text parts are forwarded via token_callback.
         Function call parts are buffered (they arrive as complete objects, not deltas).
         """
-        import json as _json
 
         t0 = time.monotonic()
         try:
@@ -765,19 +939,7 @@ class GoogleClient(LLMClient):
             tokens_used = None
 
             try:
-                for raw_line in response.iter_lines():
-                    if not raw_line:
-                        continue
-                    line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if not data_str:
-                        continue
-                    try:
-                        ev = _json.loads(data_str)
-                    except Exception:
-                        continue
+                for ev in iter_sse_data_events(response):
 
                     candidates = ev.get("candidates", [])
                     if candidates:
@@ -789,10 +951,7 @@ class GoogleClient(LLMClient):
                                 chunk = part["text"]
                                 text_content += chunk
                                 if chunk:
-                                    try:
-                                        token_callback(chunk)
-                                    except Exception:
-                                        pass
+                                    _safe_callback(token_callback, chunk)
                             elif "functionCall" in part:
                                 fc = part["functionCall"]
                                 tool_calls.append(ToolCallRequest(
@@ -1038,20 +1197,20 @@ class DeepSeekClient(LLMClient):
             )
 
         except requests.ConnectionError as e:
-            logger.error("Cannot connect to DeepSeek API: %s", e)
+            logger.exception("Cannot connect to DeepSeek API: %s", e)
             raise LLMServerUnavailableError(
                 "Cannot connect to DeepSeek API. "
                 "Please check your internet connection."
             ) from e
 
         except requests.Timeout as e:
-            logger.error("DeepSeek request timed out after %ds", self.timeout)
+            logger.exception("DeepSeek request timed out after %ds", self.timeout)
             raise LLMServerUnavailableError(
                 f"DeepSeek request timed out after {self.timeout}s"
             ) from e
 
         except requests.RequestException as e:
-            logger.error("DeepSeek request failed: %s", e)
+            logger.exception("DeepSeek request failed: %s", e)
             raise LLMAPIError(f"DeepSeek request failed: {e}") from e
 
     def _chat_streaming(
@@ -1074,6 +1233,7 @@ class DeepSeekClient(LLMClient):
         payload["stream_options"] = {"include_usage": True}
 
         t0 = time.monotonic()
+        response = None
         try:
             response = self._session.post(
                 url, headers=headers, json=payload, timeout=self.timeout, stream=True
@@ -1115,16 +1275,7 @@ class DeepSeekClient(LLMClient):
             finish_reason = None
             usage: dict[str, Any] = {}
 
-            for line in response.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
-                    continue
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = _json.loads(data_str)
-                except Exception:
-                    continue
+            for chunk in iter_sse_data_events(response):
 
                 choices = chunk.get("choices", [])
                 if not choices:
@@ -1136,17 +1287,11 @@ class DeepSeekClient(LLMClient):
                 if delta.get("content"):
                     full_content += delta["content"]
                     if token_callback:
-                        try:
-                            token_callback(delta["content"])
-                        except Exception:
-                            pass
+                        _safe_callback(token_callback, delta["content"])
                 if delta.get("reasoning_content"):
                     reasoning_parts.append(delta["reasoning_content"])
                     if reasoning_callback:
-                        try:
-                            reasoning_callback(delta["reasoning_content"])
-                        except Exception:
-                            pass
+                        _safe_callback(reasoning_callback, delta["reasoning_content"])
 
                 fr = choices[0].get("finish_reason")
                 if fr:
@@ -1196,28 +1341,26 @@ class DeepSeekClient(LLMClient):
             )
 
         except requests.ConnectionError as e:
-            logger.error("Cannot connect to DeepSeek API: %s", e)
+            logger.exception("Cannot connect to DeepSeek API: %s", e)
             raise LLMServerUnavailableError(
                 "Cannot connect to DeepSeek API. Please check your internet connection."
             ) from e
         except requests.Timeout as e:
-            logger.error("DeepSeek stream timed out after %ds", self.timeout)
+            logger.exception("DeepSeek stream timed out after %ds", self.timeout)
             raise LLMServerUnavailableError(
                 f"DeepSeek request timed out after {self.timeout}s"
             ) from e
         except requests.exceptions.ChunkedEncodingError as e:
-            logger.error("DeepSeek stream interrupted: %s", e)
+            logger.exception("DeepSeek stream interrupted: %s", e)
             raise LLMServerUnavailableError(
                 f"DeepSeek stream interrupted: {e}"
             ) from e
         except requests.RequestException as e:
-            logger.error("DeepSeek stream request failed: %s", e)
+            logger.exception("DeepSeek stream request failed: %s", e)
             raise LLMAPIError(f"DeepSeek request failed: {e}") from e
         finally:
-            try:
+            if response is not None:
                 response.close()
-            except NameError:
-                pass
 
     def chat_with_tools(
         self,
@@ -1303,6 +1446,7 @@ class DeepSeekClient(LLMClient):
                 payload["reasoning_effort"] = _reasoning_effort
 
         t0 = time.monotonic()
+        response = None
         try:
             response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout, stream=True)
 
@@ -1342,16 +1486,7 @@ class DeepSeekClient(LLMClient):
             # Extract reasoning_callback if provided
             reasoning_callback = kwargs.get("reasoning_callback")
 
-            for line in response.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
-                    continue
-                data_str = line[6:]  # Remove "data: " prefix
-                if data_str.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = _json.loads(data_str)
-                except Exception:
-                    continue
+            for chunk in iter_sse_data_events(response):
 
                 choices = chunk.get("choices", [])
                 if not choices:
@@ -1367,19 +1502,13 @@ class DeepSeekClient(LLMClient):
                     full_content += delta["content"]
                     _token_cb = kwargs.get("token_callback")
                     if _token_cb:
-                        try:
-                            _token_cb(delta["content"])
-                        except Exception:
-                            pass
+                        _safe_callback(_token_cb, delta["content"])
 
                 # Accumulate reasoning_content (DeepSeek Reasoner)
                 if delta.get("reasoning_content"):
                     reasoning_content_parts.append(delta["reasoning_content"])
                     if reasoning_callback:
-                        try:
-                            reasoning_callback(delta["reasoning_content"])
-                        except Exception:
-                            pass
+                        _safe_callback(reasoning_callback, delta["reasoning_content"])
 
                 # Accumulate tool calls
                 tc_deltas = delta.get("tool_calls") or []
@@ -1411,49 +1540,21 @@ class DeepSeekClient(LLMClient):
             if finish_reason == "stop" and full_content:
                 _trimmed = full_content.strip()
                 if _trimmed.startswith(("{", "[")):
-                    # String-aware brace/bracket counting: ignore braces/brackets
-                    # inside string literals to avoid false positives.
-                    _open_cb = 0
-                    _close_cb = 0
-                    _open_sb = 0
-                    _close_sb = 0
-                    _in_str = False
-                    _str_char = None
-                    _esc = False
-                    for _ch in _trimmed:
-                        if _in_str:
-                            if _esc:
-                                _esc = False
-                            elif _ch == "\\":
-                                _esc = True
-                            elif _ch == _str_char:
-                                _in_str = False
-                                _str_char = None
-                            continue
-                        if _ch in ('"', "'"):
-                            _in_str = True
-                            _str_char = _ch
-                            continue
-                        if _ch == "{":
-                            _open_cb += 1
-                        elif _ch == "}":
-                            _close_cb += 1
-                        elif _ch == "[":
-                            _open_sb += 1
-                        elif _ch == "]":
-                            _close_sb += 1
-                    if _trimmed.startswith("{") and _open_cb > _close_cb:
+                    # String-aware brace/bracket counting via shared helper
+                    # (ignores delimiters inside string literals).
+                    _dc = _count_delimiters(_trimmed)
+                    if _trimmed.startswith("{") and _dc["open_curly"] > _dc["close_curly"]:
                         logger.warning(
                             "Response content appears truncated: %d unclosed braces "
                             "in %d chars (finish_reason='stop' is misleading)",
-                            _open_cb - _close_cb, len(_trimmed),
+                            _dc["open_curly"] - _dc["close_curly"], len(_trimmed),
                         )
                         finish_reason = "truncated"
-                    elif _trimmed.startswith("[") and _open_sb > _close_sb:
+                    elif _trimmed.startswith("[") and _dc["open_square"] > _dc["close_square"]:
                         logger.warning(
                             "Response content appears truncated: %d unclosed brackets "
                             "in %d chars (finish_reason='stop' is misleading)",
-                            _open_sb - _close_sb, len(_trimmed),
+                            _dc["open_square"] - _dc["close_square"], len(_trimmed),
                         )
                         finish_reason = "truncated"
 
@@ -1468,37 +1569,15 @@ class DeepSeekClient(LLMClient):
                     if not _args or not _args.strip():
                         continue
                     _trimmed = _args.strip()
-                    # String-aware brace counting
-                    _open_cb = 0
-                    _close_cb = 0
-                    _in_str = False
-                    _str_char = None
-                    _esc = False
-                    for _ch in _trimmed:
-                        if _in_str:
-                            if _esc:
-                                _esc = False
-                            elif _ch == "\\":
-                                _esc = True
-                            elif _ch == _str_char:
-                                _in_str = False
-                                _str_char = None
-                            continue
-                        if _ch in ('"', "'"):
-                            _in_str = True
-                            _str_char = _ch
-                            continue
-                        if _ch == "{":
-                            _open_cb += 1
-                        elif _ch == "}":
-                            _close_cb += 1
-                    if _open_cb > _close_cb:
+                    # String-aware brace counting via shared helper.
+                    _dc = _count_delimiters(_trimmed)
+                    if _dc["open_curly"] > _dc["close_curly"]:
                         _tc_truncated = True
                         _tc_name = _tc.get("function", {}).get("name", f"tool_call[{_tc_idx}]")
                         logger.warning(
                             "Tool call '%s' arguments appear truncated: %d unclosed braces "
                             "in %d chars (finish_reason='tool_calls' may be misleading)",
-                            _tc_name, _open_cb - _close_cb, len(_trimmed),
+                            _tc_name, _dc["open_curly"] - _dc["close_curly"], len(_trimmed),
                         )
                 if _tc_truncated:
                     finish_reason = "truncated"
@@ -1573,10 +1652,8 @@ class DeepSeekClient(LLMClient):
         except requests.RequestException as e:
             raise LLMAPIError(f"DeepSeek request failed: {e}") from e
         finally:
-            try:
+            if response is not None:
                 response.close()
-            except NameError:
-                pass
 
 
 class OllamaClient(LLMClient):
@@ -1628,19 +1705,11 @@ class OllamaClient(LLMClient):
         url = f"{base_url.rstrip('/')}/api/chat"
 
         # Convert to Ollama format
-        is_vision = _is_ollama_vision_model(model)
+        is_vision = _is_ollama_vision_model(model, self.base_url)
         ollama_messages = []
         for msg in messages:
             m_dict: dict[str, Any] = {"role": msg.role, "content": msg.content}
-            images = getattr(msg, "images", None)
-            if images:
-                if is_vision:
-                    # Native Ollama vision: pass base64 data list directly
-                    m_dict["images"] = [img["data"] for img in images]
-                else:
-                    # Non-vision model: prepend OCR text (or placeholder) to content
-                    image_text = _images_to_text(images)
-                    m_dict["content"] = image_text + ("\n" + msg.content if msg.content else "")
+            _ollama_apply_images(m_dict, msg, is_vision)
             ollama_messages.append(m_dict)
 
         # Collapse all system messages into one at index 0 — strict templates
@@ -1683,9 +1752,9 @@ class OllamaClient(LLMClient):
                 logger.debug("Auto-set num_ctx=%d for model %s", _num_ctx, model)
 
         # UI Thinking Mode override — GPT-OSS needs string levels, others use boolean
-        thinking_mode = kwargs.get("thinking_mode", None)
-        reasoning_effort = kwargs.get("reasoning_effort", None)
-        reasoning_callback = kwargs.get("reasoning_callback", None)
+        thinking_mode = kwargs.get("thinking_mode")
+        reasoning_effort = kwargs.get("reasoning_effort")
+        reasoning_callback = kwargs.get("reasoning_callback")
 
         # Thinking mode: explicit UI setting only (think=False is Ollama default)
         if thinking_mode is not None:
@@ -1740,7 +1809,8 @@ class OllamaClient(LLMClient):
             if response.status_code == 429:
                 retry_after = parse_retry_after(response.headers)
                 raise LLMRateLimitError(
-                    f"Ollama rate limited (429), retry after {retry_after}s"
+                    f"Ollama rate limited (429), retry after {retry_after}s",
+                    retry_after=retry_after,
                 )
             if response.status_code >= 500:
                 error_body = response.text[:500]
@@ -1776,6 +1846,7 @@ class OllamaClient(LLMClient):
                     try:
                         chunk = _json.loads(line)
                     except Exception:
+                        logger.debug("ollama stream line not JSON", exc_info=True)
                         continue
 
                     if chunk.get("error"):
@@ -1787,18 +1858,12 @@ class OllamaClient(LLMClient):
 
                     if thinking_chunk:
                         thinking_parts.append(thinking_chunk)
-                        try:
-                            reasoning_callback(thinking_chunk)
-                        except Exception:
-                            pass
+                        _safe_callback(reasoning_callback, thinking_chunk)
 
                     if content_chunk:
                         content_parts.append(content_chunk)
                         if token_callback:
-                            try:
-                                token_callback(content_chunk)
-                            except Exception:
-                                pass
+                            _safe_callback(token_callback, content_chunk)
 
                     if chunk.get("done"):
                         finish_reason = chunk.get("done_reason")
@@ -1859,20 +1924,20 @@ class OllamaClient(LLMClient):
             )
 
         except requests.ConnectionError as e:
-            logger.error("Cannot connect to Ollama at %s: %s", base_url, e)
+            logger.exception("Cannot connect to Ollama at %s: %s", base_url, e)
             raise LLMConnectionError(
                 f"Cannot connect to Ollama at {base_url}. "
                 f"Is Ollama running? Try 'ollama serve'"
             ) from e
 
         except requests.Timeout as e:
-            logger.error("Ollama request timed out after %ds", self.timeout)
+            logger.exception("Ollama request timed out after %ds", self.timeout)
             raise LLMConnectionError(
                 f"Ollama request timed out after {self.timeout}s"
             ) from e
 
         except requests.RequestException as e:
-            logger.error("Ollama request failed: %s", e)
+            logger.exception("Ollama request failed: %s", e)
             raise LLMAPIError(f"Ollama request failed: {e}") from e
 
     def _num_ctx_for_model(
@@ -2003,6 +2068,7 @@ class OllamaClient(LLMClient):
         url = f"{base_url.rstrip('/')}/api/chat"
 
         # Build Ollama message list, handling tool_calls and tool results
+        is_vision = _is_ollama_vision_model(model, self.base_url)
         ollama_messages: list[dict[str, Any]] = []
         for msg in messages:
             if msg.role == "tool":
@@ -2047,7 +2113,9 @@ class OllamaClient(LLMClient):
                 ollama_messages.append(m_dict)
             else:
                 # system / user
-                ollama_messages.append({"role": msg.role, "content": msg.content or ""})
+                m_dict: dict[str, Any] = {"role": msg.role, "content": msg.content or ""}
+                _ollama_apply_images(m_dict, msg, is_vision)
+                ollama_messages.append(m_dict)
 
         # Collapse all system messages into one at index 0 — strict templates
         # (e.g. Qwen3 / bonsai27b) reject any system message that is not first.
@@ -2096,6 +2164,7 @@ class OllamaClient(LLMClient):
             payload["stream"] = True
 
         t0 = time.monotonic()
+        response = None
 
         try:
             response = self._session.post(
@@ -2116,7 +2185,8 @@ class OllamaClient(LLMClient):
             if response.status_code == 429:
                 retry_after = parse_retry_after(response.headers)
                 raise LLMRateLimitError(
-                    f"Ollama rate limited (429), retry after {retry_after}s"
+                    f"Ollama rate limited (429), retry after {retry_after}s",
+                    retry_after=retry_after,
                 )
             if response.status_code >= 500:
                 error_body = response.text[:500]
@@ -2142,6 +2212,7 @@ class OllamaClient(LLMClient):
                     try:
                         chunk = _json.loads(line)
                     except Exception:
+                        logger.debug("ollama stream line not JSON", exc_info=True)
                         continue
 
                     if chunk.get("error"):
@@ -2151,10 +2222,7 @@ class OllamaClient(LLMClient):
                     content_chunk = msg_chunk.get("content", "") or ""
                     if content_chunk:
                         content_parts.append(content_chunk)
-                        try:
-                            token_callback(content_chunk)
-                        except Exception:
-                            pass
+                        _safe_callback(token_callback, content_chunk)
 
                     # Tool calls may appear in the final chunk
                     if msg_chunk.get("tool_calls"):
@@ -2236,8 +2304,6 @@ class OllamaClient(LLMClient):
         except requests.RequestException as e:
             raise LLMAPIError(f"Ollama request failed: {e}") from e
         finally:
-            try:
+            if response is not None:
                 response.close()
-            except NameError:
-                pass
 

@@ -215,7 +215,8 @@ class TestIntentIsUndetermined:
         """Contract test against the real IntentResolver, not a fake: whatever
         it emits when its LLM call raises must be recognised as undetermined."""
         from external_llm.agent.intent_resolver import (
-            IntentResolver, IntentResolutionConfig,
+            IntentResolutionConfig,
+            IntentResolver,
         )
 
         class _Boom:

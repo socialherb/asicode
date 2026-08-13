@@ -14,6 +14,7 @@ assertion fails (plain dict has no move_to_end → LRU silently disabled).
 """
 from __future__ import annotations
 
+import contextlib
 from collections import OrderedDict
 
 import external_llm.editor.agent.autonomous.proactive_runner as pr_mod
@@ -56,10 +57,8 @@ class TestProactiveRunnerRegistryLRU:
             runners = list(_runners.values())
             _runners.clear()
         for r in runners:
-            try:
+            with contextlib.suppress(Exception):
                 r.stop()
-            except Exception:
-                pass
         # Restore the pre-test registry (without re-starting saved runners —
         # they are external test-env state we must not mutate further).
         with _runners_lock:
@@ -132,7 +131,7 @@ class TestProactiveRunnerRegistryLRU:
         cap = 2
         monkeypatch.setattr(pr_mod, "_cfg", _StubCfg(cap))
         r0 = get_or_create_runner("/repo-0")
-        r1 = get_or_create_runner("/repo-1")
+        get_or_create_runner("/repo-1")  # occupies slot 2; result not needed
         # Re-access /repo-0 → it should become most-recently-used.
         r0_again = get_or_create_runner("/repo-0")
         assert r0_again is r0, "existing runner must be returned (no new instance)"

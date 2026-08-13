@@ -1,6 +1,9 @@
 """Tests for PythonSyntaxProvider (external_llm/languages/python_provider.py)."""
+import importlib
+
 import pytest
 
+from external_llm.languages import python_provider
 from external_llm.languages.models import LanguageId
 from external_llm.languages.python_provider import PythonSyntaxProvider
 
@@ -154,3 +157,53 @@ def test_definition_keywords(provider):
     keywords = provider.get_definition_keywords()
     assert "def " in keywords
     assert "class " in keywords
+
+
+# ── _tree_sitter_available ────────────────────────────────────────────────────
+# Availability is answered by tree_sitter_utils.is_language_available("python"),
+# which is memoised in its _LANG_CACHE (positive AND negative) and cleared by
+# invalidate_caches() — repeated checks are cache hits, and a grammar installed
+# mid-process takes effect after invalidate_caches() without a restart.
+
+def test_tree_sitter_available_matches_language_availability():
+    tsu = importlib.import_module("external_llm.languages.tree_sitter_utils")
+    expected = tsu.is_available() and tsu.is_language_available("python")
+    assert python_provider._tree_sitter_available() is expected
+
+
+def test_tree_sitter_available_resolves_language_once(monkeypatch):
+    """Second call must hit the _LANG_CACHE — the language is resolved once."""
+    tsu = importlib.import_module("external_llm.languages.tree_sitter_utils")
+    if not tsu._HAS_TREE_SITTER:
+        pytest.skip("tree-sitter core not installed")
+    tsu.invalidate_caches()
+    calls = {"n": 0}
+    real_resolve = tsu._resolve_language_uncached
+
+    def counting(language):
+        calls["n"] += 1
+        return real_resolve(language)
+
+    monkeypatch.setattr(tsu, "_resolve_language_uncached", counting)
+    first = python_provider._tree_sitter_available()
+    assert calls["n"] == 1
+    assert python_provider._tree_sitter_available() is first
+    assert calls["n"] == 1
+
+
+def test_tree_sitter_available_does_not_build_parser(monkeypatch):
+    """The check must stay side-effect-free — no per-thread Parser construction."""
+    tsu = importlib.import_module("external_llm.languages.tree_sitter_utils")
+    if not tsu._HAS_TREE_SITTER:
+        pytest.skip("tree-sitter core not installed")
+
+    def fail(*args, **kwargs):
+        raise AssertionError("availability check must not build a parser")
+
+    monkeypatch.setattr(tsu, "get_parser", fail)
+    expected = tsu.is_available() and tsu.is_language_available("python")
+    assert python_provider._tree_sitter_available() is expected
+
+
+def test_capabilities_has_tree_sitter_matches_availability(provider):
+    assert provider.capabilities().has_tree_sitter is python_provider._tree_sitter_available()

@@ -91,10 +91,7 @@ class TriggerEngine:
             timers = list(self._schedule_timers)
             self._schedule_timers.clear()
         for t in timers:
-            try:
-                t.cancel()
-            except Exception:
-                pass
+            t.cancel()  # Timer.cancel() cannot raise (finished.set())
         logger.info("TriggerEngine stopped")
 
     # ── Agent event hooks ─────────────────────────────────────────────────────

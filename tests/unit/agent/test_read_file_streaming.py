@@ -102,6 +102,67 @@ class TestSplitterParity:
         assert window == ["a", "b", "c"]
         assert total == 3
 
+    def test_a_break_free_file_is_not_quadratic(self):
+        """The carry must not be re-split once per chunk.
+
+        Prepending the accumulated carry to each chunk and re-splitting the
+        result is O(n^2) in the length of ONE line, and a file with almost no
+        newlines is a real input (minified bundle, .map, one-line JSON). The
+        `\\r`-boundary probe re-scanned the same carry a second time, so the
+        cost came twice per chunk: measured 9.81 s inside 1,042 splitlines()
+        calls on a 34 MB one-liner, ~1.1 GB of transient strings.
+
+        Time against a calibration workload — not allocation, not an absolute
+        threshold, and not a self-ratio. All three were tried and two of them
+        cannot see this bug at all:
+
+        * Allocation is blind to it. Each iteration's temporary dies before the
+          next is built, so peak live memory is ~3x the file either way:
+          tracemalloc peak measured 8.5 MB quadratic against 8.4 MB linear. An
+          assertion on it is green on both and tests nothing.
+        * A self-ratio (time at 4x the input / time at 1x) is too noisy. The
+          small run is ~10 ms, inside the scheduler noise floor, and the linear
+          build measured 12.1x growth against the quadratic build's 18.0x.
+
+        So the budget is expressed in units of the machine's own speed: one
+        decode plus one splitlines over the same bytes is the theoretical
+        minimum this function can do. Measured at 16 MB: 3.4x that minimum with
+        the fix, 402x with the carry re-split per chunk (0.13 s against 16.54 s)
+        — a 118x separation, so 25x sits far from both edges.
+        """
+        import io
+        import time
+
+        raw = b"var a=1;" * (8 * 131_072)  # 8 MB, ZERO line breaks
+        expected = raw.decode()
+
+        def _best(fn) -> float:
+            best = float("inf")
+            for _ in range(3):
+                started = time.perf_counter()
+                fn()
+                best = min(best, time.perf_counter() - started)
+            return best
+
+        # The clock must not include building the reader — a BytesIO(raw) is a
+        # full copy of the input and swamped the measurement when it was inside.
+        readers = [io.BytesIO(raw) for _ in range(3)]
+        results: list = []
+
+        def _run() -> None:
+            results.append(rt._stream_split_window(readers.pop(), b"", 1, 1 << 40, 1 << 40))
+
+        calibration = _best(lambda: raw.decode("utf-8", errors="replace").splitlines())
+        measured = _best(_run)
+
+        assert results[0] == (1, [expected]), "the split itself must still be right"
+        ratio = measured / calibration if calibration else float("inf")
+        assert ratio < 25.0, (
+            f"the splitter cost {ratio:.0f}x one decode+split of the same bytes "
+            f"({measured:.3f}s against {calibration:.3f}s) — the carry is being "
+            "re-split on every chunk"
+        )
+
     def test_the_count_survives_the_retention_cap(self):
         import io
 
@@ -182,6 +243,26 @@ class TestToolParity:
         assert bulk.content == streamed.content
         assert bulk.metadata == streamed.metadata
 
+    def test_a_line_wider_than_the_retention_window_agrees(
+        self, tool_registry, temp_repo_root, monkeypatch,
+    ):
+        """One line wider than the streaming window — a minified bundle.
+
+        The sibling below uses 200-char lines, so both paths stayed inside the
+        window and the disagreement never showed: the bulk path cut the line to
+        the budget and reported `partial_line` (_apply_char_budget's documented
+        "emit a prefix and advance PAST it" branch), while the streaming path
+        dropped it before the budget ever saw it and returned an EMPTY code
+        block — 60,355 chars and full metadata against 91 chars and {}.
+        """
+        wide = "var a=1;" * 40_000  # 320k chars, well past _retain
+        name = _write(temp_repo_root, "bundle.min.js", wide + "\n")
+        bulk, streamed = self._both(tool_registry, monkeypatch, {"path": name})
+        assert (bulk.metadata or {}).get("partial_line") == 1, "fixture no longer over-wide"
+        assert bulk.content == streamed.content
+        assert bulk.metadata == streamed.metadata
+        assert "var a=1;" in streamed.content, "the streamed body must not be empty"
+
     def test_the_char_budget_cut_agrees(self, tool_registry, temp_repo_root, monkeypatch):
         """A range far past the output budget must truncate at the same line."""
         name = _write(
@@ -207,22 +288,32 @@ class TestToolParity:
 @pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="needs rusage")
 class TestMemory:
     @staticmethod
-    def _big(root):
-        with open(f"{root}/big.log", "w", encoding="utf-8") as fh:
+    def _big(root, ext="log"):
+        name = f"big.{ext}"
+        with open(f"{root}/{name}", "w", encoding="utf-8") as fh:
             fh.write("2026-07-30 INFO a log line with some text in it\n" * 700_000)
-        return "big.log"
+        return name
 
+    # The extension is the whole point of the parametrisation, not incidental
+    # coverage. This assertion was green for a year against `big.log` alone
+    # while the branch it guards allocated 1.65 GB, because `.log` matches no
+    # LanguageId: the over-cap refusal decorates itself with a file outline,
+    # and for `.py`/`.js` that outline read and parsed the entire file
+    # (tree_sitter.Parser.parse alone took 8.67 s on 32 MB). The fixture, not
+    # the code, was what kept the number small.
+    @pytest.mark.parametrize("ext", ["log", "py", "js"])
     def test_the_over_cap_refusal_does_not_materialise_the_file(
-        self, tool_registry, temp_repo_root,
+        self, tool_registry, temp_repo_root, ext,
     ):
-        name = self._big(temp_repo_root)
+        name = self._big(temp_repo_root, ext)
         peak: list = []
         with _peak_alloc_mb(peak):
             result = tool_registry.dispatch("read_file", {"path": name})
         assert (result.metadata or {}).get("over_line_cap") is True
         assert peak[0] < 20, (
-            f"read_file allocated {peak[0]:.0f} MB to refuse a file — the whole "
-            "file is being decoded and split just to count its lines"
+            f"read_file allocated {peak[0]:.0f} MB to refuse a .{ext} file — the "
+            "whole file is being decoded and split just to count its lines, or "
+            "the outline that decorates the refusal is parsing all of it"
         )
 
     def test_a_ranged_read_does_not_materialise_the_file(

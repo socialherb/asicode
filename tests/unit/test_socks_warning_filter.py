@@ -61,6 +61,7 @@ def _run(script: str) -> subprocess.CompletedProcess:
         text=True,
         timeout=120,
         env=os.environ.copy(),
+        check=False,
     )
 
 

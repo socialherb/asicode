@@ -1,6 +1,6 @@
 """ts_semantic_tracer.py — TS/JS Semantic Trace Extraction.
 
-Three-layer architecture:
+Two-layer architecture:
 
 1. **Structural IR** (P1+P2, `analyze_core`) — language-agnostic:
    - imports / exports, functions, classes, interfaces, enums, variables
@@ -12,9 +12,6 @@ Three-layer architecture:
    - Usage graph (IRUsage: every reference)
    - Data flow (IRAssignment: target ← source with type)
 
-3. **Profile-aware** (`analyze`) — React/Browser-specific extensions:
-   - components, hooks, state variables, event handlers, JSX tree
-
 Both layers share the same tree-sitter parsing infrastructure.
 Reuses `tree_sitter_utils.is_available()` — no new parser introduced.
 """
@@ -22,7 +19,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Optional
+import threading as _threading
+from typing import Any, Optional  # f821-protected
 
 from external_llm.editor.semantic.ts_ir_models import (
     ExportKind,
@@ -44,20 +42,6 @@ from external_llm.editor.semantic.ts_ir_models import (
     TSModule,
     TSParam,
 )
-from external_llm.editor.semantic.ts_semantic_models import (
-    TSComponent,
-    TSEventHandler,
-    TSHook,
-    TSModuleSemantic,
-    TSProp,
-    TSStateVar,
-)
-from external_llm.editor.semantic.ts_semantic_models import (
-    TSFunction as ProfileTSFunction,
-)
-from external_llm.editor.semantic.ts_semantic_models import (
-    TSImport as ProfileTSImport,
-)
 from external_llm.languages.tree_sitter_utils import is_available
 
 logger = logging.getLogger(__name__)
@@ -66,11 +50,10 @@ logger = logging.getLogger(__name__)
 #
 # Per-thread. tree-sitter's TSParser is stateful and NOT thread-safe
 # ("not safe to call ts_parser_parse from multiple threads at once" — api.h).
-# Tools run on a shared thread pool (_thread_pool.shared_pool,
-# async_tool_executor), so a module-global cached Parser would be hit
+# Tools run on a shared thread pool (_thread_pool.shared_pool), so a
+# module-global cached Parser would be hit
 # concurrently from multiple worker threads. Each worker reuses its thread, so
 # the per-thread Parser is constructed once and then reused with no locking.
-import threading as _threading
 
 _PARSER_TLS = _threading.local()
 _PARSER_MISS = object()
@@ -116,42 +99,30 @@ def _build_jsx_parser():
         return None
 
 
-def _get_tsx_parser():
-    """Get a tree-sitter parser for TSX (per-thread cached, or None)."""
+def _get_parser(key: str, builder) -> Any:
+    """Get a tree-sitter parser via the per-thread cache (or None)."""
     cache = getattr(_PARSER_TLS, "cache", None)
     if cache is None:
         cache = {}
         _PARSER_TLS.cache = cache
-    cached = cache.get("tsx", _PARSER_MISS)
+    cached = cache.get(key, _PARSER_MISS)
     if cached is _PARSER_MISS:
-        cached = _build_tsx_parser()
-        cache["tsx"] = cached
+        cached = builder()
+        cache[key] = cached
     return cached
+
+
+def _get_tsx_parser():
+    """Get a tree-sitter parser for TSX (per-thread cached, or None)."""
+    return _get_parser("tsx", _build_tsx_parser)
 
 
 def _get_jsx_parser():
     """Get a tree-sitter parser for JavaScript (per-thread cached, or None)."""
-    cache = getattr(_PARSER_TLS, "cache", None)
-    if cache is None:
-        cache = {}
-        _PARSER_TLS.cache = cache
-    cached = cache.get("jsx", _PARSER_MISS)
-    if cached is _PARSER_MISS:
-        cached = _build_jsx_parser()
-        cache["jsx"] = cached
-    return cached
+    return _get_parser("jsx", _build_jsx_parser)
 
 
 # ── constants ────────────────────────────────────────────────────────────────
-
-_REACT_HOOKS = {
-    "useState", "useEffect", "useContext", "useReducer", "useCallback",
-    "useMemo", "useRef", "useImperativeHandle", "useLayoutEffect",
-    "useDebugValue", "useDeferredValue", "useTransition", "useId",
-    "useSyncExternalStore", "useInsertionEffect",
-}
-
-# _event_attr: match attr_name.startswith("on") and attr_name[2:3].isupper()
 
 # Node types that represent function-like declarations
 _FUNC_LIKE = {"arrow_function", "function_expression", "function"}
@@ -160,9 +131,8 @@ _FUNC_LIKE = {"arrow_function", "function_expression", "function"}
 class TSSemanticTracer:
     """Extracts semantic structure from TS/JS source using tree-sitter.
 
-    Provides two public APIs:
+    Public API:
     - ``analyze_core(code, file_path)`` → ``TSModule`` (Core IR)
-    - ``analyze(code, file_path)`` → ``TSModuleSemantic`` (Profile-aware, React)
     """
 
     def __init__(self, language: str = "typescript"):
@@ -192,7 +162,6 @@ class TSSemanticTracer:
             logger.exception("Failed to parse %s", file_path)
             return None
 
-        self._code = code
         self._code_bytes = code.encode("utf-8")
         self._file_path = file_path
         return tree.root_node
@@ -375,13 +344,10 @@ class TSSemanticTracer:
                         alias_node = spec.child_by_field_name("alias")
                         if name_node:
                             name = self._text(name_node)
-                            original = None
                             if alias_node:
-                                original = name
                                 name = self._text(alias_node)
                             module.exports.append(IRExport(
-                                name=name, kind=ExportKind.NAMED,
-                                original_name=original))
+                                name=name, kind=ExportKind.NAMED))
             elif child.type == "identifier":
                 text = self._text(child)
                 if text != "default":
@@ -398,13 +364,11 @@ class TSSemanticTracer:
         name = self._node_field_text(node, "name") or "anonymous"
         params = self._core_extract_params(node)
         is_async = any(c.type == "async" for c in node.children)
-        is_gen = any(self._text(c) == "*" for c in node.children)
         meta = self._make_meta(node)
 
         func = IRFunction(
             name=name, params=params, is_async=is_async,
-            is_generator=is_gen, is_exported=is_exported,
-            export_kind=export_kind,
+            is_exported=is_exported, export_kind=export_kind,
             start_line=node.start_point.row + 1,
             end_line=node.end_point.row + 1,
             meta=meta,
@@ -580,9 +544,7 @@ class TSSemanticTracer:
                             if ec.type in ("identifier", "member_expression"):
                                 extends = self._text(ec)
                     elif hc.type == "implements_clause":
-                        for ic in hc.children:
-                            if ic.type in ("identifier", "generic_type"):
-                                implements.append(self._text(ic))
+                        implements.extend(self._text(ic) for ic in hc.children if ic.type in ("identifier", "generic_type"))
 
         # P2.5: class symbol
         module.symbols.append(IRSymbol(
@@ -666,9 +628,7 @@ class TSSemanticTracer:
 
         for child in node.children:
             if child.type == "extends_type_clause":
-                for ec in child.children:
-                    if ec.type in ("identifier", "generic_type"):
-                        extends.append(self._text(ec))
+                extends.extend(self._text(ec) for ec in child.children if ec.type in ("identifier", "generic_type"))
 
         body = node.child_by_field_name("body")
         if body:
@@ -723,9 +683,7 @@ class TSSemanticTracer:
         members: list[str] = []
         body = node.child_by_field_name("body")
         if body:
-            for child in body.children:
-                if child.type in ("enum_assignment", "property_identifier"):
-                    members.append(self._text(child).split("=")[0].strip())
+            members.extend(self._text(child).split("=")[0].strip() for child in body.children if child.type in ("enum_assignment", "property_identifier"))
         module.symbols.append(IRSymbol(
             name=name, kind=SymbolKind.ENUM, scope="<module>", meta=meta))
         return IREnum(
@@ -896,392 +854,13 @@ class TSSemanticTracer:
                 params.append(TSParam(
                     name=name, has_default=has_default, is_rest=is_rest))
             elif child.type == "rest_pattern":
-                for rc in child.children:
-                    if rc.type == "identifier":
-                        params.append(TSParam(
-                            name=self._text(rc), is_rest=True))
+                params.extend(TSParam(
+                            name=self._text(rc), is_rest=True) for rc in child.children if rc.type == "identifier")
             elif child.type == "object_pattern":
                 params.append(TSParam(name="{...}"))
             elif child.type == "array_pattern":
                 params.append(TSParam(name="[...]"))
         return params
-
-    # ══════════════════════════════════════════════════════════════════════
-    #  LAYER 2 — Profile-aware (React / Browser)
-    # ══════════════════════════════════════════════════════════════════════
-
-    def analyze(self, code: str, file_path: str = "") -> TSModuleSemantic:
-        """Parse *code* and return a TSModuleSemantic model (React-aware).
-
-        Uses TSX parser for TypeScript, JSX-aware parser for JavaScript.
-        """
-        module = TSModuleSemantic(file_path=file_path)
-        root = self._parse(code, file_path)
-        if root is None:
-            return module
-
-        for node in root.children:
-            self._process_top_level(node, module)
-
-        return module
-
-    # ── top-level dispatch ───────────────────────────────────────────────
-
-    def _process_top_level(self, node, module: TSModuleSemantic) -> None:
-        ntype = node.type
-
-        if ntype == "import_statement":
-            imp = self._parse_import(node)
-            if imp:
-                module.imports.append(imp)
-            return
-
-        is_exported = False
-        inner = node
-        if ntype == "export_statement":
-            is_exported = True
-            for child in node.children:
-                if child.type in (
-                    "function_declaration", "class_declaration",
-                    "lexical_declaration",
-                ):
-                    inner = child
-                    break
-            else:
-                name = self._extract_export_name(node)
-                if name:
-                    module.exports.append(name)
-                return
-
-        ntype = inner.type
-
-        if ntype == "function_declaration":
-            self._process_function_or_component(inner, module, is_exported)
-        elif ntype == "lexical_declaration":
-            self._process_lexical_declaration(inner, module, is_exported)
-        elif ntype == "class_declaration":
-            name = self._node_field_text(inner, "name")
-            if name:
-                func = ProfileTSFunction(
-                    name=name, is_exported=is_exported,
-                    start_line=inner.start_point.row + 1,
-                    end_line=inner.end_point.row + 1,
-                )
-                module.functions.append(func)
-
-    # ── function / component detection ───────────────────────────────────
-
-    def _process_function_or_component(
-        self, node, module: TSModuleSemantic, is_exported: bool,
-    ) -> None:
-        name = self._node_field_text(node, "name") or ""
-        body = node.child_by_field_name("body")
-
-        if self._is_component(name, body):
-            comp = self._extract_component(node, name, is_exported)
-            module.components.append(comp)
-            if is_exported:
-                module.exports.append(name)
-        else:
-            params = self._extract_params(node)
-            is_async = any(
-                c.type == "async" for c in node.children if hasattr(c, "type"))
-            func = ProfileTSFunction(
-                name=name, params=params, is_exported=is_exported,
-                is_async=is_async,
-                start_line=node.start_point.row + 1,
-                end_line=node.end_point.row + 1,
-            )
-            module.functions.append(func)
-            if is_exported:
-                module.exports.append(name)
-
-    def _process_lexical_declaration(
-        self, node, module: TSModuleSemantic, is_exported: bool,
-    ) -> None:
-        for child in node.children:
-            if child.type != "variable_declarator":
-                continue
-
-            name_node = child.child_by_field_name("name")
-            value_node = child.child_by_field_name("value")
-            if not name_node:
-                continue
-
-            name = self._text(name_node)
-
-            if value_node and value_node.type in _FUNC_LIKE:
-                body = value_node.child_by_field_name("body")
-                if self._is_component(name, body):
-                    comp = self._extract_component(
-                        value_node, name, is_exported)
-                    module.components.append(comp)
-                else:
-                    params = self._extract_params(value_node)
-                    is_async = any(
-                        c.type == "async" for c in value_node.children
-                        if hasattr(c, "type"))
-                    func = ProfileTSFunction(
-                        name=name, params=params, is_exported=is_exported,
-                        is_async=is_async,
-                        start_line=node.start_point.row + 1,
-                        end_line=node.end_point.row + 1,
-                    )
-                    module.functions.append(func)
-                if is_exported:
-                    module.exports.append(name)
-
-    def _is_component(self, name: str, body_node) -> bool:
-        if name and name[0].isupper():
-            return True
-        if body_node and self._contains_jsx(body_node):
-            return True
-        return False
-
-    # ── component extraction ─────────────────────────────────────────────
-
-    def _extract_component(
-        self, node, name: str, is_exported: bool,
-    ) -> TSComponent:
-        comp = TSComponent(
-            name=name, is_exported=is_exported,
-            start_line=node.start_point.row + 1,
-            end_line=node.end_point.row + 1,
-        )
-        comp.props = self._extract_props(node)
-        body = node.child_by_field_name("body")
-        if body:
-            self._walk_component_body(body, comp)
-        return comp
-
-    def _walk_component_body(self, node, comp: TSComponent) -> None:
-        self._collect_hooks(node, comp)
-        self._collect_events(node, comp)
-        self._collect_jsx_root(node, comp)
-
-    # ── hook extraction ──────────────────────────────────────────────────
-
-    def _collect_hooks(self, node, comp: TSComponent) -> None:
-        for child in self._walk(node):
-            if child.type == "call_expression":
-                func_node = child.child_by_field_name("function")
-                if not func_node:
-                    continue
-                func_name = self._text(func_node)
-
-                if func_name == "useState":
-                    self._extract_use_state(child, comp)
-                    comp.hooks.append(TSHook(name="useState"))
-                elif func_name == "useEffect":
-                    deps = self._extract_hook_deps(child)
-                    comp.hooks.append(TSHook(name="useEffect", deps=deps))
-                elif func_name == "useCallback":
-                    deps = self._extract_hook_deps(child)
-                    comp.hooks.append(TSHook(name="useCallback", deps=deps))
-                elif func_name == "useMemo":
-                    deps = self._extract_hook_deps(child)
-                    comp.hooks.append(TSHook(name="useMemo", deps=deps))
-                elif func_name == "useRef":
-                    comp.hooks.append(TSHook(name="useRef"))
-                elif func_name in _REACT_HOOKS:
-                    comp.hooks.append(TSHook(name=func_name))
-                elif func_name.startswith("use") and func_name[3:4].isupper():
-                    comp.hooks.append(TSHook(name=func_name))
-
-    def _extract_use_state(self, call_node, comp: TSComponent) -> None:
-        parent = call_node.parent
-        if not parent:
-            return
-        if parent.type == "variable_declarator":
-            name_node = parent.child_by_field_name("name")
-            if name_node and name_node.type == "array_pattern":
-                children = [
-                    c for c in name_node.children if c.type == "identifier"]
-                var_name = (
-                    self._text(children[0]) if len(children) >= 1 else "")
-                setter_name = (
-                    self._text(children[1]) if len(children) >= 2 else "")
-                args = call_node.child_by_field_name("arguments")
-                init_val = None
-                if args:
-                    arg_children = [
-                        c for c in args.children
-                        if c.type not in ("(", ")", ",")]
-                    if arg_children:
-                        init_val = self._text(arg_children[0])
-                if var_name:
-                    comp.state_vars.append(TSStateVar(
-                        name=var_name, setter=setter_name,
-                        initial_value=init_val))
-
-    def _extract_hook_deps(self, call_node) -> Optional[list[str]]:
-        args = call_node.child_by_field_name("arguments")
-        if not args:
-            return None
-        arg_children = [
-            c for c in args.children if c.type not in ("(", ")", ",")]
-        if len(arg_children) >= 2 and arg_children[1].type == "array":
-            deps = []
-            for elem in arg_children[1].children:
-                if elem.type not in ("[", "]", ","):
-                    deps.append(self._text(elem))
-            return deps
-        return None
-
-    # ── event handler extraction ─────────────────────────────────────────
-
-    def _collect_events(self, node, comp: TSComponent) -> None:
-        for child in self._walk(node):
-            if child.type == "jsx_attribute":
-                attr_children = list(child.children)
-                if not attr_children:
-                    continue
-                attr_name = self._text(attr_children[0])
-                if attr_name.startswith("on") and len(attr_name) > 2 and attr_name[2].isupper():
-                    handler_expr = ""
-                    for ac in attr_children:
-                        if ac.type in ("jsx_expression", "string"):
-                            handler_expr = self._text(ac)
-                            break
-                    comp.events.append(TSEventHandler(
-                        event_name=attr_name, handler_expr=handler_expr))
-
-    # ── JSX extraction ───────────────────────────────────────────────────
-
-    def _collect_jsx_root(self, node, comp: TSComponent) -> None:
-        if comp.jsx_root is not None:
-            return
-        for child in self._walk(node):
-            if child.type in ("jsx_element", "jsx_self_closing_element"):
-                tag = self._get_jsx_tag_name(child)
-                if tag:
-                    comp.jsx_root = tag
-                    return
-            elif child.type == "jsx_fragment":
-                comp.jsx_root = "Fragment"
-                return
-
-    def _get_jsx_tag_name(self, jsx_node) -> Optional[str]:
-        if jsx_node.type == "jsx_self_closing_element":
-            for child in jsx_node.children:
-                if child.type in ("identifier", "member_expression"):
-                    return self._text(child)
-        elif jsx_node.type == "jsx_element":
-            for child in jsx_node.children:
-                if child.type == "jsx_opening_element":
-                    has_ident = False
-                    for gc in child.children:
-                        if gc.type in ("identifier", "member_expression"):
-                            has_ident = True
-                            return self._text(gc)
-                    if not has_ident:
-                        return "Fragment"
-        return None
-
-    def _contains_jsx(self, node) -> bool:
-        for child in self._walk(node):
-            if child.type in (
-                "jsx_element", "jsx_self_closing_element",
-                "jsx_fragment", "jsx_expression",
-            ):
-                return True
-        return False
-
-    # ── import extraction (profile) ──────────────────────────────────────
-
-    def _parse_import(self, node) -> Optional[ProfileTSImport]:
-        source_node = node.child_by_field_name("source")
-        if not source_node:
-            return None
-
-        source = self._text(source_node).strip("'\"")
-        specifiers: list[str] = []
-        default_import: Optional[str] = None
-        is_type_only = False
-
-        for child in node.children:
-            text = self._text(child)
-            if child.type == "type" or text == "type":
-                is_type_only = True
-            if child.type == "import_clause":
-                for cc in child.children:
-                    if cc.type == "identifier":
-                        default_import = self._text(cc)
-                    elif cc.type == "named_imports":
-                        for spec in cc.children:
-                            if spec.type == "import_specifier":
-                                nn = spec.child_by_field_name("name")
-                                if nn:
-                                    specifiers.append(self._text(nn))
-
-        return ProfileTSImport(
-            source=source, specifiers=specifiers,
-            default_import=default_import, is_type_only=is_type_only,
-        )
-
-    # ── props extraction ─────────────────────────────────────────────────
-
-    def _extract_props(self, func_node) -> list[TSProp]:
-        params_node = func_node.child_by_field_name("parameters")
-        if not params_node:
-            return []
-
-        props: list[TSProp] = []
-
-        def _extract_from_object_pattern(obj_node) -> None:
-            for prop_child in obj_node.children:
-                if prop_child.type in (
-                    "shorthand_property_identifier_pattern", "pair_pattern",
-                ):
-                    name = self._text(prop_child).split(":")[0].strip()
-                    has_default = "=" in self._text(prop_child)
-                    props.append(TSProp(name=name, has_default=has_default))
-                elif prop_child.type == "assignment_pattern":
-                    left = prop_child.child_by_field_name("left")
-                    if left:
-                        props.append(TSProp(
-                            name=self._text(left), has_default=True))
-
-        for child in params_node.children:
-            if child.type == "object_pattern":
-                _extract_from_object_pattern(child)
-            elif child.type == "required_parameter":
-                for sub in child.children:
-                    if sub.type == "object_pattern":
-                        _extract_from_object_pattern(sub)
-        return props
-
-    # ── param extraction (profile) ───────────────────────────────────────
-
-    def _extract_params(self, func_node) -> list[str]:
-        params_node = func_node.child_by_field_name("parameters")
-        if not params_node:
-            return []
-
-        params: list[str] = []
-        for child in params_node.children:
-            if child.type in (
-                "identifier", "required_parameter", "optional_parameter",
-            ):
-                name_node = child.child_by_field_name("pattern") or child
-                params.append(self._text(name_node))
-            elif child.type == "object_pattern":
-                params.append("{...}")
-        return params
-
-    # ── export name extraction ───────────────────────────────────────────
-
-    def _extract_export_name(self, export_node) -> Optional[str]:
-        for child in export_node.children:
-            if child.type == "identifier":
-                return self._text(child)
-            if child.type == "export_clause":
-                for spec in child.children:
-                    if spec.type == "export_specifier":
-                        nn = spec.child_by_field_name("name")
-                        if nn:
-                            return self._text(nn)
-        return None
 
     # ══════════════════════════════════════════════════════════════════════
     #  SHARED UTILITIES

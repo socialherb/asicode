@@ -2,13 +2,17 @@
 
 Covers the "callability family" abstraction shared by cross-file caller search
 (ripgrep glob derivation) and the cross-language resolution guard.  These are
-pure functions over the single source of truth (_LANGUAGE_EXTENSION_GROUPS),
-so the tests pin the contract both consumers rely on.
+pure functions over the single source of truth (_LANGUAGE_EXTENSION_GROUPS,
+DERIVED from _EXT_MAP via the language-level _LANGUAGE_FAMILIES partition), so
+the tests pin the contract both consumers rely on.
 """
 from __future__ import annotations
 
+import pytest
+
 from external_llm.languages.models import (
     _LANGUAGE_EXTENSION_GROUPS,
+    _LANGUAGE_FAMILIES,
     _get_language_group,
     caller_search_extensions,
 )
@@ -95,11 +99,11 @@ def test_result_is_sorted_for_determinism():
     assert caller_search_extensions(None) == sorted(caller_search_extensions(None))
 
 
-# ── _get_language_group (SpecGraphEnricher contract) ───────────────────────
+# ── _get_language_group (cross-language resolution guard) ──────────────────
 
 def test_group_indices_are_stable():
-    # spec_graph_enricher compares group INDICES to detect cross-language
-    # resolution; the indices must stay stable after the move to models.py.
+    # The cross-language resolution guard compares group INDICES; the indices
+    # must stay stable (see _LANGUAGE_EXTENSION_GROUPS in models.py).
     assert _get_language_group(".ts") == _get_language_group(".js") == 0   # JS/TS
     assert _get_language_group(".py") == 1
     assert _get_language_group(".go") == 2
@@ -119,3 +123,29 @@ def test_group_indices_are_stable():
 def test_unknown_extension_returns_minus_one():
     for ext in (".md", ".txt", ".json", ".css", ".html", ""):
         assert _get_language_group(ext) == -1, ext
+
+
+# ── derivation (single source) ───────────────────────────────────────────────
+
+def test_family_groups_are_derived_from_ext_map():
+    """Recomputing the derivation must reproduce the live groups — a manual
+    edit of the derived _LANGUAGE_EXTENSION_GROUPS is a drift (structural:
+    recompute == live), not a refactor."""
+    from external_llm.languages.models import _derive_language_extension_groups
+
+    assert _derive_language_extension_groups() == _LANGUAGE_EXTENSION_GROUPS
+
+
+def test_family_derivation_fails_fast_on_unknown_language_name(monkeypatch):
+    """A family naming a language with no _EXT_MAP entries is an import-time
+    error (typo'd member name, or entries removed), not a silent family
+    shrink — a shrunk family would widen caller search to the broad fallback
+    union and bypass the cross-language resolution guard."""
+    from external_llm.languages.models import _derive_language_extension_groups
+
+    monkeypatch.setattr(
+        "external_llm.languages.models._LANGUAGE_FAMILIES",
+        (*_LANGUAGE_FAMILIES, frozenset({"PYTHONN"})),
+    )
+    with pytest.raises(ValueError, match="no extensions in _EXT_MAP"):
+        _derive_language_extension_groups()

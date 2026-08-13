@@ -23,10 +23,13 @@ Usage::
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from . import tree_sitter_utils as ts_utils
 from .models import LanguageId, SyntaxValidationResult
+
+logger = logging.getLogger(__name__)
 
 
 def _get_provider(lang: LanguageId):
@@ -132,6 +135,7 @@ class SyntaxValidator:
                 with open(file_path, encoding="utf-8", errors="replace") as f:
                     content = f.read()
             except OSError:
+                logger.debug("symbol file read failed: %s", file_path, exc_info=True)
                 return None
 
         provider = _get_provider(lang)

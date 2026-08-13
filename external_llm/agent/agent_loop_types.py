@@ -9,10 +9,22 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+# ── Write-tool name SSOT ────────────────────────────────────────────────────
+# Single source of truth for the set of tool names that modify files. Both
+# ``ToolRegistry._WRITE_TOOLS`` (file-locking, failure-logging, cache
+# invalidation) and ``TurnContext.write_tools`` (reads_since_last_edit reset,
+# write_tool_used detection, test-impact invalidation) derive from this.
+# Adding a write tool here keeps all six mechanisms in lockstep; forgetting
+# one lets edits via it silently bypass them. This module is a leaf
+# (stdlib-only imports), so ``tool_registry`` can import it without a cycle.
+WRITE_TOOL_NAMES: frozenset[str] = frozenset({
+    "apply_patch", "write_plan", "edit_ast", "edit_file",
+    "edit_text", "modify_symbol", "anchor_edit",
+})
 
-class AgentCancelled(Exception):
+
+class AgentCancelled(Exception):  # noqa: N818 — Cancelled-suffix convention (asyncio.CancelledError parity)
     """Exception raised when agent execution is cancelled."""
-    pass
 
 
 @dataclass
@@ -32,49 +44,6 @@ class AgentResult:
     applied_patches: list[str] = field(default_factory=list)
     error: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class _PlannerLaneOutcome:
-    """Result of _run_planner_lane().
-
-    result=non-None  → caller returns it directly.
-    result=None      → PLANNER fell through; use fallback_context if set.
-    """
-    result: Optional[AgentResult] = None
-    fallback_context: Optional[str] = None
-
-
-@dataclass
-class _EscalationOutcome:
-    """Result of _handle_analyze_first_escalation()."""
-    exec_result: dict
-    op_plan: Any
-    spec: Any
-    completed: int
-    failed: int
-    exec_status: str
-    exec_detail: str
-    early_outcome: Optional[_PlannerLaneOutcome] = None
-
-
-@dataclass
-class _SpecResolutionResult:
-    """Spec resolution result consumed by _build_and_execute_plan().
-
-    Built in PlannerPipelineMixin._run_planner_lane from the prebuilt spec
-    (Design Chat analysis). fit_verdict.action == CLARIFY → caller handles
-    early return. Escalation state fields are forwarded to
-    _build_and_execute_plan().
-    """
-    spec: Optional[Any] = None
-    fit_verdict: Optional[Any] = None
-    grounding_summary: Optional[Any] = None
-    is_read_only_intent: bool = False
-    llm_hints: dict[str, Any] = field(default_factory=dict)
-    pending_guidance: Optional[dict[str, Any]] = None
-    prev_spec_fingerprint: Optional[frozenset] = None
-    escalation_attempt: int = 0
 
 
 @dataclass
@@ -188,6 +157,11 @@ class TurnContext:
     any_tool_called: bool = False
     budget_warned: bool = False
     fail_streak: dict = field(default_factory=dict)
+    # Per-run session identity for failure-recall dedup (failure_pattern_store).
+    # Generated once per run via new_session_key() — NOT str(id(fail_streak)),
+    # which reuses freed object addresses and collapses distinct runs onto one
+    # key, silencing [RECALL] for the process lifetime.
+    recall_session_key: str = ""
     noop_confirmed: bool = False
     # True when IntentResolver never produced a classification (LLM failure,
     # unparseable response, no IntentResult attached). ``read_only_request``
@@ -202,12 +176,9 @@ class TurnContext:
     rollback_performed: bool = False
     rollback_result: Any = None
     plan_current_index: int = 0
-    # NOTE: keep in sync with ToolRegistry._WRITE_TOOLS (tool_registry.py:854).
-    #       This default drives reads_since_last_edit reset (GOAL REMINDER guard),
-    #       write_tool_used detection (read-only early-finish guard), and
-    #       write-time test-impact index invalidation.  Missing a tool here means
-    #       edits via that tool silently bypass all three mechanisms.
-    write_tools: set = field(default_factory=lambda: {
-        "apply_patch", "write_plan", "edit_ast",
-        "edit_file", "edit_text", "modify_symbol", "anchor_edit",
-    })
+    # Drives reads_since_last_edit reset (GOAL REMINDER guard), write_tool_used
+    # detection (read-only early-finish guard), and write-time test-impact index
+    # invalidation. Derived from the ``WRITE_TOOL_NAMES`` SSOT in this module so
+    # it never drifts from ``ToolRegistry._WRITE_TOOLS``; a fresh copy per
+    # instance keeps turn contexts independently mutable.
+    write_tools: set = field(default_factory=lambda: set(WRITE_TOOL_NAMES))

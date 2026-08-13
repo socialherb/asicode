@@ -12,10 +12,8 @@ Categories:
     counts   — iteration/sample/file count caps
     scores   — confidence/similarity/score gates
 
-Some domain policy modules keep their own constants (`termination_policy.py`,
-`execution_policy.py`, `learned_policy.py`, `task_quality.py`,
-`alignment_scorer.py`, `self_planning_policy.py`, `weight_learning.py`) because
-the values are tightly coupled to that module's algorithm. They remain
+Some domain policy modules keep their own constants (`weight_learning.py`)
+because the values are tightly coupled to that module's algorithm. They remain
 defined in-place by design — they are policy, not magic numbers.
 """
 
@@ -33,13 +31,21 @@ def _env_flag(name: str, default: bool) -> bool:
     return default
 
 
-def _env_int(name: str, default: int) -> int:
-    """Parse a positive-int env var; fallback to default on empty/invalid/non-positive."""
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Parse an int env var; fallback to default on empty/invalid/out-of-range.
+
+    ``minimum`` is the smallest accepted value. Anything below it is treated as
+    misconfiguration and yields *default* rather than being clamped — a typo
+    should not silently become a boundary value. ``minimum=1`` keeps the
+    original positive-only contract for existing callers; pass ``minimum=0``
+    where zero is a meaningful setting (e.g. a "never" cap).
+    """
     try:
         v = int((os.getenv(name, "") or "").strip() or str(default))
-        return v if v > 0 else default
     except Exception:
         return default
+    else:
+        return v if v >= minimum else default
 
 
 @dataclass(frozen=True)
@@ -55,28 +61,19 @@ class TokenLimits:
     PLAN_JSON: int = 8192
     PLAN_REPAIR: int = 16384
     INTENT_CLASSIFY: int = 4096
-    INTENT_RESOLVER_DEFAULT: int = 4096
+    # 8192: reasoner models bill reasoning tokens against max_tokens, so a 4096
+    # budget is exhausted by reasoning alone and every resolve call truncates
+    # (observed 5/5 self_eval runs: "truncated ... retrying with 8192").
+    INTENT_RESOLVER_DEFAULT: int = 8192
     SERVICE_DEFAULT: int = 4096
     SERVICE_REPAIR: int = 8192
-    PAIR_EVALUATOR_MAX_TOKENS: int = 4096
-    PLANNER_AGENT_DEFAULT: int = 16384
-    PLANNER_SUMMARY: int = 4096
-    PLANNER_SUMMARY_REPAIR: int = 8192
     SUBAGENT_SHORT: int = 2000
-    LOCAL_ASSISTANT_DEFAULT: int = 4096
     LOCAL_ASSISTANT_SHORT: int = 512
     LOCAL_MODEL_CONTEXT_CHARS: int = 4000
     INTELLIGENT_SERVICE_DEFAULT: int = 4096
-    META_STRATEGY: int = 4096
     EXPLORATION: int = 4096
     AGENT_STREAM: int = 4096
     ANTHROPIC_DEFAULT: int = 65536
-
-    PLANNER_AGENT_INPUT_SCALE_THRESHOLD: int = 10000  # planner_agent.py: input token estimate → scaled output switch
-    PLANNER_AGENT_SCALED_OUTPUT: int = 65536           # planner_agent.py: output max_tokens when input is large
-                                                      # Increased from 32768 because the old cap made retry
-                                                      # doubling useless (capped at same value), and modern
-                                                      # LLMs support 64K+ output tokens.
 
     AGENT_TOOL_CALL: int = 32768  # agent_loop.py _llm_call_with_tools default max_tokens
 
@@ -99,19 +96,8 @@ class TokenLimits:
 class LineLimits:
     """File read caps — soft limits to avoid OOM on huge files."""
 
-    PRIOR_REF_LINES_PER_FILE: int = 200   # per-file cap for prior-read reference context
-    PRIOR_REF_TOTAL_LINES: int = 500      # total cap across all prior-read files
-    PAIR_EVALUATOR_SYM_MIN_LINES: int = 80
-    PAIR_EVALUATOR_SYM_FACTOR: float = 3.0
-    PAIR_EVALUATOR_SYM_ABSOLUTE_MAX: int = 5000
     DESIGN_TURN_MAX_CHARS: int = 100000
-    SYM_BUDGET_CHARS: int = 6_000
-    TOTAL_BUDGET_CHARS: int = 50_000
     RAG_FILE_CHARS: int = 200_000
-    STRATEGY_LIGHT_LINES: int = 150
-    STRATEGY_LIGHT_BYTES: int = 8_000
-    STRATEGY_LIGHT_TOKENS: int = 2_000
-    STRATEGY_CHARS_PER_TOKEN: float = 3.5
     UI_FULL_MAX_LINES: int = 1000
 
     # ── read_file output budget ──────────────────────────────────────────
@@ -130,46 +116,51 @@ class LineLimits:
     # Sized like BASH_OUTPUT_MAX_CHARS for worst-case token density (~2
     # chars/token for dense ASCII => ~30K tokens), not for prose.
     READ_FILE_MAX_CHARS: int = 60_000
+    # Per-LINE clamp for search output (grep). The char budget below bounds how
+    # many lines are emitted but said nothing about how WIDE one is, so a
+    # single match inside a minified bundle, a .map, or one-line JSON returned
+    # the whole line: measured 34,000,257 chars from one match against a
+    # 60,000-char cap — 566x, straight into the conversation history. 2,000 is
+    # generous for real source (the longest line in this repo is under 400) and
+    # is what rg's own --max-columns is given, so the clamp happens in the
+    # child for the rg path and only on retention for the grep fallback.
+    SEARCH_MAX_LINE_CHARS: int = 2_000
     # Symbols listed in the over-cap outline before truncating. Enough to
     # cover a large module's public surface without the outline itself
     # becoming the thing that costs a round-trip.
     READ_FILE_OUTLINE_MAX_SYMBOLS: int = 60
 
-    # Budget for RTP-lite lightweight file preview.
-    # 8K → 24K: enough for small-to-medium projects (2-4 files ~20K chars)
-    # without losing the "lite" character versus full RTP (30K default).
-    # Prevents mid-size files (e.g. 8599-char client.js) from being dropped.
-    PLANNER_RTP_LITE_CHARS: int = 24_000
-
-    # Budget for replan anchor-miss file content injection.
-    # Same rationale as RTP-lite: anchor hallucination recovery needs
-    # enough file content for the LLM to pick a real anchor.
-    PLANNER_REPLAN_ANCHOR_CHARS: int = 24_000
-    SUMMARIZE_ANALYSIS_CHARS: int = 500_000
-    SUMMARIZE_STRUCTURAL_CHARS: int = 80_000
+    # ── call-graph indexing caps ─────────────────────────────────────────
+    # Largest source file CallGraphIndexer will parse in process. build() had
+    # NO size gate of any kind while every sibling path grew one (P26-4 for
+    # the batch tree-sitter walker, _too_big_to_parse_inproc for the per-file
+    # symbol-search entry points), and it is reachable from the shipping
+    # analyze_impact / trace_call_path tools.
+    #
+    # Measured: one 3.7 MB generated .py in an otherwise empty repo cost
+    # build() 10.12 s and 762 MB peak RSS. ast.parse alone is ~155x the source
+    # size in transient memory, consistently across sizes:
+    #     0.34 MB -> 0.07 s /  56 MB      1.48 MB -> 0.28 s / 232 MB
+    #     0.98 MB -> 0.19 s / 160 MB      3.72 MB -> 0.85 s / 570 MB
+    # so the CAP is what bounds the peak, not the average file.
+    #
+    # 1 MiB is ~3x the largest first-party file in this repo (repl_impl.py at
+    # 358 KB) and far above any hand-written module (CPython's _pydecimal.py is
+    # 230 KB, SQLAlchemy's largest ~400 KB). What it excludes is the generated
+    # class — *_pb2.py, generated API clients, bundled migrations — where the
+    # call-graph value is lowest and the size is unbounded. The vendored-code
+    # case does not arise: the walker already skips .venv / site-packages.
+    CALLGRAPH_PY_MAX_BYTES: int = 1 << 20
+    # Same gate for the TS/JS tree-sitter path. Deliberately the SAME number as
+    # symbol_search's _NONPY_INPROC_MAX_BYTES rather than a third threshold —
+    # that is the trade P26-4 already made for tree-sitter, and a minified
+    # bundle is the shape both are defending against.
+    CALLGRAPH_TS_MAX_BYTES: int = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
 class ScoreThresholds:
     """Confidence/similarity/score gates."""
-
-    AUTO_CORRECT: float = 0.65
-    HINT_ONLY: float = 0.40
-    SIM_WEIGHT_JACCARD: float = 0.45
-    SIM_WEIGHT_PREFIX: float = 0.20
-    SIM_WEIGHT_EDIT: float = 0.35
-    STRICT_TOP1: float = 0.30
-    STRICT_MARGIN: float = 0.20
-    STRICT_TARGETED_TOP1: float = 0.35
-    STRICT_TARGETED_MARGIN: float = 0.25
-    GUIDED_TOP1: float = 0.15
-    MIN_EDGE_CONFIDENCE: float = 0.50
-    MIN_REPAIR_CONFIDENCE: float = 0.65
-    PHASE_SKIP_COVERAGE_HIGH: float = 0.95
-    PHASE_SKIP_COVERAGE_MED: float = 0.85
-    UNKNOWN_SYMBOL_ABORT_RATIO: float = 0.50
-    PLANNER_MIN_GROUNDING_CONF: float = 0.30
-    EXPLORE_FIRST_THRESHOLD: float = 0.85
 
     # ── Semantic intent fallback (embedding cosine) ──────────────────────────
     # semantic_intent.py matchers score a query by *mean* cosine to each label's
@@ -185,14 +176,6 @@ class ScoreThresholds:
     SEMANTIC_INTENT_MIN: float = 0.10
     SEMANTIC_INTENT_MARGIN: float = 0.08
 
-    # ── Phase / Execution ────────────────────────────────────────────────
-    PHASE_RECONSTRUCTION_SKIP_COVERAGE: float = 0.95  # phase_orchestrator.py reconstruction skip gate
-    REPAIR_IMPROVEMENT_RATIO_LOW: float = 0.30   # repair_engine.py low-improvement hint
-    REPAIR_IMPROVEMENT_RATIO_HIGH: float = 0.70  # repair_engine.py high-improvement hint
-
-    # ── Rename / Overlap Detection ───────────────────────────────────────
-    RENAME_SIMILARITY_RATIO: float = 0.50   # executor_signal_utils.py rename char-ratio gate
-    RENAME_BEST_SCORE_THRESHOLD: float = 1.0  # executor_signal_utils.py rename score gate
 
     # ── Tool health (failure_rate consumer) ─────────────────────────────────
     # A tool whose failure_rate ≥ this trips a ``warn_failing_tools`` health
@@ -252,85 +235,17 @@ class ScoreThresholds:
     # TOOL_FAILURE_WARN_MIN_CALLS (the failure gate's equivalent floor).
     LATENCY_P95_MIN_SAMPLES: int = 5
 
-    # ── Distillation / Learning ────────────────────────────────────────────
-    DISTILL_THRESHOLD_SPARSE: float = 0.90   # context_utils.py: sample_count < 10
-    DISTILL_THRESHOLD_MODERATE: float = 0.82 # context_utils.py: sample_count < 30
-    DISTILL_THRESHOLD_CONFIDENT: float = 0.75# context_utils.py: sample_count >= 30
-    DISTILL_SPARSE_LIMIT: int = 10           # context_utils.py: sparse data bound
-    DISTILL_MODERATE_LIMIT: int = 30         # context_utils.py: moderate data bound
-
-
-@dataclass(frozen=True)
-class WeightConfig:
-    """Hand-tuned scoring weights across planner modules.
-
-    These weights are heuristics — not empirically calibrated. Each weight is
-    annotated with its usage site and design rationale. When adjusting, prefer
-    small deltas (<=0.05) and log the change rationale in the commit message.
-    """
-
-    # ── planner_policy_adapter.py: _synthesize_weights() ─────────────────
-    # final = learned_policy*LEARNED_POLICY + strategy_policy*STRATEGY_POLICY
-    #         + reward_ema*REWARD_EMA + execution_bias*EXECUTION_BIAS
-    LEARNED_POLICY: float = 0.30       # learned Q-policy (strongest signal)
-    STRATEGY_POLICY: float = 0.20      # strategy policy score
-    REWARD_EMA: float = 0.20           # exponential-moving-average reward
-    EXECUTION_BIAS: float = 0.15       # execution history bias
-
-    # ── multi_strategy_planner.py: plan_score formula ────────────────────
-    # plan_score = strategy*MULTI_STRATEGY + contract_rate*MULTI_CONTRACT
-    #              - complexity*MULTI_COMPLEXITY - graph_impact*MULTI_IMPACT
-    MULTI_STRATEGY: float = 0.65       # strategy simulator (primary signal)
-    MULTI_CONTRACT: float = 0.25       # contract-preserving intent quality
-    MULTI_COMPLEXITY: float = 0.10     # complexity penalty per excess op
-    MULTI_IMPACT: float = 0.10         # graph blast-radius penalty
-    MULTI_COMPLEXITY_BASELINE: int = 6   # ops beyond this count as excess
-    MULTI_COMPLEXITY_PENALTY_PER_OP: float = 0.01
-
-    # ── planner_agent.py: memory-aware strategy ordering ─────────────────
-    # preference = success_rate
-    #              - PREF_ROLLBACK_PENALTY*rollback_rate
-    #              - PREF_REPAIR_PENALTY*repair_rate
-    PREF_ROLLBACK_PENALTY: float = 0.30
-    PREF_REPAIR_PENALTY: float = 0.20
-    PREF_EXPLORATION_UPLIFT: float = 0.10  # added when selected_count < threshold
-    PREF_EXPLORE_THRESHOLD: int = 3
-    PREF_WEAK_DEPRIORITIZE: float = 0.20
-    PREF_WEAK_MIN_RUNS: int = 5
-    PREF_WEAK_SUCCESS_THRESHOLD: float = 0.25
-    PREF_WEAK_ROLLBACK_THRESHOLD: float = 0.50
-    PREF_GRAPH_SYMBOL_BOOST: float = 0.15
-    PREF_GRAPH_SYMBOL_PENALTY: float = 0.10
-    PREF_EARLY_SHUFFLE_THRESHOLD: int = 5
-    PREF_NEUTRAL_SCORE: float = 0.0
-
-
 
 @dataclass(frozen=True)
 class CountLimits:
     """Hardcoded upper bounds on iteration / sample / fan-out counts."""
 
-    REF_FILES_PRELOAD: int = 10
-    DPB_SAMPLE_SYMBOLS: int = 6
-    MAX_BRIDGE_LINES: int = 20
-    LOCALIZED_EDIT_LINES: int = 50
-    PLANNER_MAX_BODIES: int = 5
-    PLANNER_MAX_STEPS: int = 1
-    PLANNER_LARGE_SYMBOL_LINES: int = 80
-    SEMANTIC_REFINER_EXPAND: int = 2
-    SEMANTIC_VERIFIER_MAX_CALLERS: int = 10
-    SEMANTIC_VERIFIER_MAX_ISSUES: int = 8
     AGENT_NO_TOOL_NUDGE_MAX: int = 3
     AGENT_NO_PROGRESS_THRESHOLD: int = 5
     AGENT_FAIL_LOOP_LARGE: int = 3
     SYMBOL_MAX_PY_FILES: int = 3000
     SYMBOL_MAX_TS_FILES: int = 1500
     RAG_MAX_FILES: int = 3000
-    AST_CACHE_MAX: int = 16
-    ROUTING_POLICY_CACHE_TTL_S: float = 300.0
-    RUN_STORE_TOP_K: int = 3
-    RUN_STORE_MAX_DYNAMIC: int = 10
-    PHASE_MAX_STORE_LOAD_BYTES: int = 20 * 1024 * 1024
     PUSH_CLIENT_QUEUE_SIZE: int = 200
     PROACTIVE_DRAIN_INTERVAL_S: float = 1.0
     # Defense-in-depth cap on the autonomous task queue. Normal operation never
@@ -344,28 +259,8 @@ class CountLimits:
     # Evicted runners are stop()'d (drain thread + engine timers torn down) on
     # overflow. See proactive_runner.get_or_create_runner.
     AUTONOMOUS_RUNNER_MAX: int = 8
-    AGENT_CTX_BUDGET_TIME_S: float = 3.0
-    PAIR_EVALUATOR_MAX_PAIRS: int = 8
     VULTURE_HUB_IMPORTER_THRESHOLD: int = 5  # arbitrary — no empirical basis yet; revisit after shadow log data accumulates
 
-    # Callee / caller source injection budgets in operation_executor.py.
-    # Lines injected into developer LLM context per modify/insert call.
-    # Keep generous — truncating callee bodies mid-way gives the LLM worse
-    # information than omitting them entirely and costs extra repair rounds.
-    CALLEE_SOURCE_LINE_BUDGET: int = 2000   # total across all injected callees
-    CALLEE_SOURCE_MAX_COUNT: int = 8        # top-N callees to consider
-    CALLER_SOURCE_LINE_BUDGET: int = 300    # total across all injected callers
-    CALLER_SOURCE_MAX_COUNT: int = 4        # top-N callers to consider
-
-    # Repair engine hint budget — adaptive: max(min_lines, len(lines) * factor)
-    REPAIR_SUMMARY_MIN_LINES: int = 12
-    REPAIR_SUMMARY_ADAPTIVE_FACTOR: float = 0.5
-
-    # Planner context limits — adaptive: max(PLANNER_MAX_SYMBOLS_MIN,
-    #   min(PLANNER_MAX_SYMBOLS_TOTAL, len(file_paths) * PLANNER_SYMBOLS_PER_FILE))
-    PLANNER_MAX_SYMBOLS_MIN: int = 20
-    PLANNER_SYMBOLS_PER_FILE: int = 15
-    PLANNER_MAX_SYMBOLS_TOTAL: int = 200
 
     # Scanner max_per_file defaults — prevents silent truncation from hiding issues.
     # Values are conservative (5-10) to avoid overwhelming callers with noise, but
@@ -374,7 +269,7 @@ class CountLimits:
     SCANNER_DEAD_BLOCK_MAX: int = 5
     SCANNER_PUBLIC_DEAD_BLOCK_MAX: int = 5
     SCANNER_VULTURE_MAX: int = 10
-    SCANNER_VULTURE_MIN_CONFIDENCE: int = 60  # 0–100 raw Vulture confidence floor
+    SCANNER_VULTURE_MIN_CONFIDENCE: int = 60  # 0-100 raw Vulture confidence floor
     SCANNER_DUP_DEF_MAX: int = 10
     SCANNER_UNUSED_IMPORT_MAX: int = 10
     SCANNER_CONTAINER_REACH_MAX: int = 5
@@ -387,27 +282,6 @@ class CountLimits:
     AGENT_MAX_TURNS_DEFAULT: int = 500         # tool_registry + agent_stream + asi
     DESIGN_CHAT_MAX_TOOL_ITERATIONS: int = 500  # design_chat_loop.py + design_chat.py
     DESIGN_CHAT_LLM_MAX_RETRIES: int = 2        # design_chat_loop.py outer retries on transient LLM errors (on top of the client's own)
-
-    # ── Plan / Contract ──────────────────────────────────────────────────
-    PLAN_CREATE_OPS_MIN_FOR_WIRING: int = 2  # contract_driven_planning.py missing-route wiring check
-    PLAN_OPS_MIN_FOR_REORDER: int = 2        # contract_driven_planning.py topo sort gate (len > 1)
-    MAX_CONTRACT_LINES_SKIP: int = 3         # contract_driven_planning.py short contract skip
-
-    # ── Runtime Gate ─────────────────────────────────────────────────────
-    RUNTIME_MIN_TOTAL_FOR_CHECK: int = 1     # runtime_gate.py check skip threshold (total <= 1)
-    CONTEXT_BUCKET_MULTI_FILE_COUNT: int = 3 # repair_engine.py multi-file vs single-file bucket
-    PHASE_INCOMPLETE_GAP_COUNT: int = 2      # phase_orchestrator.py min missing primitives to run F.3/G/G.1
-
-    # ── Repair / PDG / Design ────────────────────────────────────────────
-    PDG_INCLUDE_MUTATION_LINES: int = 300    # pdg_lite.py mutation inclusion gate
-    PDG_VERY_LARGE_FUNC_LINES: int = 800     # pdg_lite.py depth cap gate
-
-    # ── Execution / Replan ────────────────────────────────────────────────
-    EXECUTION_MAX_REPLAN_COUNT: int = 2
-    EXECUTION_MAX_REPLAN_OP_RATIO: float = 2.0
-    EXECUTION_MEDIUM_FUNC_SURGICAL_EDIT: int = 40
-    EXECUTION_MAX_DELEGATION_COUNT: int = 1
-    EXECUTION_MAX_ALIGNMENT_RETRIES: int = 2
 
 
 @dataclass(frozen=True)
@@ -452,11 +326,6 @@ class DisplayConfig:
     INLINE_OP_DIFF_MAX_LINES: int = field(
         default_factory=lambda: _env_int("ASICODE_INLINE_OP_DIFF_MAX_LINES", 40)
     )
-    # Maximum char length of diff string delivered via operation_complete event patch_preview.
-    #adjust: ASICODE_INLINE_OP_DIFF_MAX_CHARS=8000
-    INLINE_OP_DIFF_MAX_CHARS: int = field(
-        default_factory=lambda: _env_int("ASICODE_INLINE_OP_DIFF_MAX_CHARS", 4000)
-    )
     # Whether to auto-display the full file diff ("changes" block) after successful
     # execution. Default off — use /diff when needed.
     #enable: ASICODE_RUN_DIFF=1 (or on/true/yes)
@@ -477,7 +346,6 @@ class ThresholdConfig:
     lines: LineLimits = field(default_factory=LineLimits)
     scores: ScoreThresholds = field(default_factory=ScoreThresholds)
     counts: CountLimits = field(default_factory=CountLimits)
-    weights: WeightConfig = field(default_factory=WeightConfig)
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
 

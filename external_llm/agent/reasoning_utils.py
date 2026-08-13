@@ -48,7 +48,7 @@ def reasoning_ab_kwargs(env_var: str = "ASICODE_PLANNER_REASONING") -> dict:
     try:
         _frag = _json.loads(_raw)
         if not isinstance(_frag, dict):
-            raise ValueError(f"{env_var} JSON must be a JSON object")
+            raise TypeError(f"{env_var} JSON must be a JSON object")
     except Exception as exc:
         logger.warning(
             "[%s] bad ASICODE_DEEPSEEK_NOTHINK_JSON (%r): %s — "

@@ -65,6 +65,23 @@ class SymbolNode:
     docstring: Optional[str] = None
     signature: Optional[str] = None  # full function signature text with type annotations
     bases: Optional[list[str]] = None  # parent class names (for class symbols only)
+    # P3 Stage 2: CGI-convention reconstruction fields — RG's snapshot is the
+    # SSOT for CallGraphIndexer, which needs (a) the async-ness CGI encodes in
+    # its def kind ("async_function" vs "function") and (b) the CGI defs symbol
+    # (direct-class-qualified "Class.method", bare name otherwise) that differs
+    # from RG's full-scope qualname (e.g. "Outer.inner" vs "inner").  Additive
+    # defaults keep pre-P3 snapshots loadable: SymbolNode(**d) without these
+    # keys still works, and the CGI conversion falls back to name/function.
+    is_async: bool = False  # def is async def (CGI kind discriminator)
+    cgi_symbol: Optional[str] = None  # CGI-convention defs symbol
+    # P3 Stage 2: AST nesting depth of the symbol's definition (module=0,
+    # class/function body=1, ...).  CGI collects defs via ``ast.walk`` (BFS:
+    # ALL depth-k symbols before any depth-(k+1) symbol), while RG traverses
+    # DFS — qualname's dotted depth alone cannot reproduce BFS order because
+    # if/for blocks (invisible in qualnames) add nesting levels.  Storing the
+    # real AST depth lets the SSOT conversion sort defs (depth, start_line),
+    # which IS ast.walk order.
+    ast_depth: int = 0
 
     @property
     def symbol_id(self) -> SymbolId:

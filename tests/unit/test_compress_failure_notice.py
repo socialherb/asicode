@@ -12,10 +12,10 @@ import pytest
 
 from external_llm.agent import context_manager as cm
 from external_llm.client import (
+    LLMAPIError,
     LLMAuthenticationError,
     LLMQuotaExceededError,
     LLMRateLimitError,
-    LLMAPIError,
 )
 
 

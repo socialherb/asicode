@@ -4,10 +4,10 @@ import os
 import tempfile
 import textwrap
 from pathlib import Path
+from typing import ClassVar
+from unittest.mock import patch
 
 import pytest
-
-from unittest.mock import patch
 
 from external_llm.agent import symbol_modify_tool as smt
 from external_llm.agent.symbol_modify_tool import (
@@ -60,9 +60,8 @@ SAMPLE_SOURCE = textwrap.dedent("""\
 
 def _write_temp_file(content: str, suffix: str = ".py") -> str:
     """Write content to a temp file and return the path."""
-    f = tempfile.NamedTemporaryFile(mode='w', suffix=suffix, delete=False)
-    f.write(content)
-    f.close()
+    with tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False) as f:
+        f.write(content)
     return f.name
 
 
@@ -383,7 +382,7 @@ class TestModifySymbol:
         Regression: a body-only block whose multi-line call aligns arguments to
         the open paren (e.g. column 27) made ``model_unit`` collapse to 1 via the
         leading-run GCD. The body was then re-indented by ``file_unit /
-        model_unit`` ≈ ×4, exploding every line (116-space indents, 24/40 where
+        model_unit`` ≈ x4, exploding every line (116-space indents, 24/40 where
         12/16 were expected). Logical lines must remap cleanly while the aligned
         continuations shift with their owner, preserving the alignment.
         """
@@ -630,7 +629,7 @@ class TestFindSymbolProviderModifiers:
     """Symbol location must find declarations with leading modifiers."""
 
     # (source, symbol, file, expected_start_line_index, desc)
-    CASES = [
+    CASES: ClassVar[list] = [
         # Kotlin — every common modifier form
         ("    private fun allocateUniqueNames(): List<String> {\n        x()\n    }\n",
          "allocateUniqueNames", "Engine.kt", 0, "private fun"),
@@ -1592,7 +1591,7 @@ class TestSurgicalEditMultilineSignatureBodyStart:
             y = a * 2
             return y
         ''')
-        diff = _apply_surgical_edit(source, "m.py", "foo", new_body, 0, 6)
+        diff = _apply_surgical_edit(source, "m.py", new_body, 0, 6)
         assert diff is not None
         added = _added_lines(diff)
         removed = _removed_lines(diff)
@@ -1620,7 +1619,7 @@ class TestSurgicalEditMultilineSignatureBodyStart:
             y = a * 2
             return y
         ''')
-        diff = _apply_surgical_edit(source, "m.py", "foo", new_body, 0, 3)
+        diff = _apply_surgical_edit(source, "m.py", new_body, 0, 3)
         assert diff is not None
         added = _added_lines(diff)
         removed = _removed_lines(diff)
@@ -1641,7 +1640,7 @@ class TestSurgicalEditMultilineSignatureBodyStart:
             y = a * 2
             return y
         ''')
-        diff = _apply_surgical_edit(source, "m.py", "foo", new_body, 0, 4)
+        diff = _apply_surgical_edit(source, "m.py", new_body, 0, 4)
         assert diff is not None
         added = _added_lines(diff)
         removed = _removed_lines(diff)
@@ -1764,7 +1763,7 @@ class TestAtomicWriteText:
             raise OSError("simulated rename failure")
         monkeypatch.setattr(aio.os, "replace", boom)
 
-        with pytest.raises(OSError):
+        with pytest.raises(OSError, match="simulated rename failure"):
             atomic_write_text(str(p), "new")
 
         leftovers = [n for n in os.listdir(tmp_path) if n.startswith(".atomic_")]

@@ -23,9 +23,12 @@ the script lands on ``$PATH``).
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import sysconfig
+
+logger = logging.getLogger(__name__)
 
 
 def pip_install_flags() -> list[str]:
@@ -61,6 +64,7 @@ def ensure_user_site_importable() -> None:
         import site
         user_site = site.getusersitepackages()
     except Exception:
+        logger.debug("site.getusersitepackages failed", exc_info=True)
         return
     if user_site and os.path.isdir(user_site) and user_site not in sys.path:
         sys.path.append(user_site)

@@ -7,3 +7,11 @@ tests/conftest.py::AgentConfig
 tests/conftest.py::AgentLoop
 tests/conftest.py::FileLockManager
 tests/conftest.py::ToolRegistry
+tests/test_target_resolver.py::IntentSemanticScorer
+tests/test_target_resolver.py::SectionPatcher
+tests/test_target_resolver.py::SemanticRepairPlanner
+tests/test_target_resolver.py::TargetResolution
+tests/test_target_resolver.py::TargetResolver
+tests/test_target_resolver.py::TargetSession
+tests/test_target_resolver.py::classify_all_semantic_failures
+tests/test_target_resolver.py::detect_role

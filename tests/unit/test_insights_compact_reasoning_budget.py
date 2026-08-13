@@ -1,6 +1,6 @@
 """Regression guard for the ``/insights compact`` reasoning-budget bug.
 
-``_compact_insights_interactive`` (asi.py) compacts the design-insights
+``_compact_insights_interactive`` (repl_impl.py) compacts the design-insights
 file via a single LLM call. On reasoning-capable models (DeepSeek v4 on the
 OpenCode Go / OpenRouter endpoints) the ``max_tokens`` budget is SHARED
 between reasoning tokens and content tokens — so a budget sized only for the
@@ -26,9 +26,9 @@ import pytest
 
 
 def _get_compact_insights_source() -> str:
-    """Extract ``_compact_insights_interactive`` source from asi.py."""
-    src_path = "asi.py"
-    with open(src_path, "r", encoding="utf-8") as f:
+    """Extract ``_compact_insights_interactive`` source from repl_impl.py."""
+    src_path = "external_llm/repl/repl_impl.py"
+    with open(src_path, encoding="utf-8") as f:
         lines = f.readlines()
     start = None
     for i, ln in enumerate(lines):
@@ -36,13 +36,17 @@ def _get_compact_insights_source() -> str:
             start = i
             break
     if start is None:
-        pytest.skip("_compact_insights_interactive not found in asi.py")
+        pytest.fail("_compact_insights_interactive not found in repl_impl.py — update this test or restore the symbol; silent skip would mask the regression")
     body = [lines[start]]
     for j in range(start + 1, len(lines)):
         ln = lines[j]
-        if ln.strip() and not ln.startswith("        ") and not ln.startswith("\t"):
-            if re.match(r"^    def ", ln) or re.match(r"^def ", ln) or re.match(r"^    [a-zA-Z_]", ln):
-                break
+        if (
+            ln.strip()
+            and not ln.startswith("        ")
+            and not ln.startswith("\t")
+            and (re.match(r"^    def ", ln) or re.match(r"^def ", ln) or re.match(r"^    [a-zA-Z_]", ln))
+        ):
+            break
         body.append(ln)
     return "".join(body)
 

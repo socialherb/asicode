@@ -16,15 +16,37 @@ AFTER: 95% understanding, rich structured context
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import subprocess
 from pathlib import Path
 from typing import Optional
 
+from utils.string_helper import utf8_trailing_incomplete_len
+
+from .agent.agent_context_manager import get_git_snapshot
 from .code_analyzer import CodeAnalyzer
+from .context_builder import _FILE_CONTEXT_MAX_BYTES, _cached_git_log
 from .dependency_graph import DependencyGraphBuilder
 
 # TestFinder import removed — class never existed in test_finder.py.
+
+
+# P25-2: prompt-path reads here were unbounded — the whole README was loaded
+# to extract one paragraph, the whole requirements file for the first 10 deps,
+# and the whole target file before deciding how much to show. Heads only.
+_PROMPT_HEAD_MAX_BYTES = 64 * 1024
+
+
+def _bounded_head_text(p: Path, max_bytes: int = _PROMPT_HEAD_MAX_BYTES) -> str:
+    """Read up to ``max_bytes`` of ``p`` (UTF-8, errors=replace), cut on a
+    UTF-8 boundary — never loads more than ``max_bytes`` into memory."""
+    with p.open("rb") as f:
+        raw = f.read(max_bytes)
+    trim = utf8_trailing_incomplete_len(raw)
+    if trim:
+        raw = raw[:-trim]
+    return raw.decode("utf-8", errors="replace")
 # SymbolAwareTestFinder has different interface (no find_tests_for_file).
 # This module is currently unused; kept for future context building.
 # Note: pattern_matcher.py was removed (it was a duplicate of context_builder.py
@@ -149,28 +171,24 @@ class SuperContextBuilder:
         lines = []
 
         # README
-        readme = self._find_readme()
+        readme = self._find_first_existing("README.md", "README.rst", "README.txt", "README")
         if readme:
             lines.append(f"**README**: `{readme.name}` (exists)")
             # Extract first paragraph
-            try:
-                content = readme.read_text(encoding="utf-8", errors="replace")
+            with contextlib.suppress(OSError, UnicodeDecodeError):  # read race / binary file
+                content = _bounded_head_text(readme)
                 first_para = content.split('\n\n')[0]
                 if len(first_para) < 500:
                     lines.append(f"> {first_para}")
-            except Exception:
-                pass
 
         # Requirements
-        req_file = self._find_requirements()
+        req_file = self._find_first_existing("requirements.txt", "requirements-dev.txt", "requirements.in")
         if req_file:
-            try:
-                reqs = req_file.read_text(encoding="utf-8", errors="replace").split('\n')
+            with contextlib.suppress(OSError, UnicodeDecodeError):  # read race / binary file
+                reqs = _bounded_head_text(req_file).split('\n')
                 main_reqs = [r.split('==')[0] for r in reqs if r and not r.startswith('#')][:10]
                 if main_reqs:
                     lines.append(f"\n**Dependencies**: {', '.join(main_reqs)}")
-            except Exception:
-                pass
 
         # pyproject.toml
         pyproject = self.repo_root / "pyproject.toml"
@@ -200,20 +218,16 @@ class SuperContextBuilder:
         authors, subjects = self._fetch_commit_subjects_authors(commits=20)
 
         # 1. Git recent contributors (most recent 10 commits' authors)
-        try:
+        with contextlib.suppress(subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError):  # git best-effort
             contributors = self._get_recent_contributors(commits=10, authors=authors)
             if contributors:
                 lines.append(f"- **Recent contributors**: {', '.join(contributors)}")
-        except Exception:
-            pass
 
         # 2. Code review patterns (from commit subjects)
-        try:
+        with contextlib.suppress(ValueError, TypeError):  # subject-shape tolerance
             review_patterns = self._detect_review_patterns(commits=20, subjects=subjects)
             if review_patterns:
                 lines.append(f"- **Code review focus**: {review_patterns}")
-        except Exception:
-            pass
 
         # 3. Team conventions (from common files)
         conventions = self._detect_team_conventions()
@@ -221,12 +235,10 @@ class SuperContextBuilder:
             lines.append(f"- **Team conventions**: {conventions}")
 
         # 4. Related issues/PRs (from commit subjects)
-        try:
+        with contextlib.suppress(ValueError, TypeError):  # subject-shape tolerance
             related_refs = self._extract_issue_references(commits=15, subjects=subjects)
             if related_refs:
                 lines.append(f"- **Related issues/PRs**: {', '.join(related_refs[:3])}")
-        except Exception:
-            pass
 
         return '\n'.join(lines) if lines else ""
 
@@ -246,6 +258,7 @@ class SuperContextBuilder:
                     capture_output=True,
                     text=True,
                     timeout=5,
+                    check=False,
                 )
                 if result.returncode != 0:
                     return [], []
@@ -258,9 +271,10 @@ class SuperContextBuilder:
                         author, subject = line, ""
                     authors.append(author)
                     subjects.append(subject)
-                return authors, subjects
             except Exception:
                 return [], []
+            else:
+                return authors, subjects
     def _get_recent_contributors(self, commits: int = 10, authors=None) -> list[str]:
         """Get recent git contributors.
 
@@ -294,7 +308,6 @@ class SuperContextBuilder:
 
     def _detect_team_conventions(self) -> str:
         """Detect team coding conventions"""
-        conventions = []
 
         # Check for common convention files
         convention_files = [
@@ -302,9 +315,7 @@ class SuperContextBuilder:
             ".flake8", ".pylintrc", "pyproject.toml"
         ]
 
-        for cf in convention_files:
-            if (self.repo_root / cf).exists():
-                conventions.append(cf)
+        conventions = [cf for cf in convention_files if (self.repo_root / cf).exists()]
 
         # Check for linting in CI
         ci_files = [".github/workflows", ".gitlab-ci.yml", ".circleci/config.yml"]
@@ -355,7 +366,7 @@ class SuperContextBuilder:
             lines.append(f"**Classes**: {len(analysis.classes)} defined")
 
             if analysis.imports:
-                imp_modules = list(set(imp.module for imp in analysis.imports))[:5]
+                imp_modules = list({imp.module for imp in analysis.imports})[:5]
                 lines.append(f"**Imports**: {', '.join(imp_modules)}")
 
             lines.append("")
@@ -397,6 +408,18 @@ class SuperContextBuilder:
         lines.append("")
 
         try:
+            if file_path.stat().st_size > _FILE_CONTEXT_MAX_BYTES:
+                # P25-2: the previous code read the whole file before deciding
+                # how much to show — a multi-hundred-MB target was materialised
+                # to display at most max_lines (500). Same budget as
+                # context_builder's head reads; the file stays reachable via
+                # read_file (which streams).
+                lines.append(
+                    f"*File too large to embed ({file_path.stat().st_size:,} bytes "
+                    f"> {_FILE_CONTEXT_MAX_BYTES:,}) — use read_file with "
+                    f"start_line/end_line ranges instead.*"
+                )
+                return "\n".join(lines)
             content = file_path.read_text(encoding="utf-8", errors="replace")
             content_lines = content.split('\n')
 
@@ -439,8 +462,7 @@ class SuperContextBuilder:
             if rel_path in graph.file_imports:
                 imports = graph.file_imports[rel_path]
                 lines.append("**This file imports**:")
-                for imp in imports[:5]:
-                    lines.append(f"- `{imp}`")
+                lines.extend(f"- `{imp}`" for imp in imports[:5])
                 lines.append("")
 
             # Call relationships
@@ -459,7 +481,7 @@ class SuperContextBuilder:
                         lines.append("")
 
         except Exception as e:
-            logger.debug(f"Failed to build dependency context: {e}")
+            logger.debug("Failed to build dependency context: %s", e)
 
         return '\n'.join(lines) if lines else ""
 
@@ -500,11 +522,9 @@ class SuperContextBuilder:
         4. Function definitions (with docstrings)
         5. Key comments
         """
-        selected = []
 
         # Always include first 10 lines (module docstring, imports)
-        for i in range(min(10, len(all_lines))):
-            selected.append((i + 1, all_lines[i]))
+        selected = [(i + 1, all_lines[i]) for i in range(min(10, len(all_lines)))]
 
         # If we have analysis, include function/class definitions
         if analysis:
@@ -512,16 +532,12 @@ class SuperContextBuilder:
                 # Include function def line + docstring
                 start = func.line_number - 1
                 end = min(start + 10, len(all_lines))
-                for i in range(start, end):
-                    if i >= 0 and i < len(all_lines):
-                        selected.append((i + 1, all_lines[i]))
+                selected.extend((i + 1, all_lines[i]) for i in range(start, end) if i >= 0 and i < len(all_lines))
 
             for cls in analysis.classes[:2]:
                 start = cls.line_number - 1
                 end = min(start + 15, len(all_lines))
-                for i in range(start, end):
-                    if i >= 0 and i < len(all_lines):
-                        selected.append((i + 1, all_lines[i]))
+                selected.extend((i + 1, all_lines[i]) for i in range(start, end) if i >= 0 and i < len(all_lines))
 
         # Remove duplicates and sort
         selected = sorted(set(selected), key=lambda x: x[0])
@@ -541,53 +557,34 @@ class SuperContextBuilder:
         return '\n'.join(lines) if lines else ""
 
     def _get_git_status(self) -> str:
-        """Get git status"""
-        try:
-            result = subprocess.run(
-                # core.quotePath=false: this block goes into the model's
-                # context, and git C-quotes non-ASCII paths by default.
-                ["git", "-c", "core.quotePath=false", "status", "--short"],
-                cwd=str(self.repo_root),
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except Exception:
-            pass
-        return ""
+        """Get git status (delegated to the shared get_git_snapshot SSOT)."""
+        return get_git_snapshot(str(self.repo_root)).get("status", "")
 
     def _get_recent_commits(self, count: int = 3) -> str:
+        """Get recent commits (TTL-cached; see context_builder._cached_git_log)."""
+        return _cached_git_log(self.repo_root, count, self._fetch_recent_commits)
+
+    def _fetch_recent_commits(self, count: int) -> str:
         """Get recent commits"""
-        try:
+        with contextlib.suppress(subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):  # git best-effort
             result = subprocess.run(
                 ["git", "log", f"-{count}", "--oneline", "--decorate"],
                 cwd=str(self.repo_root),
                 capture_output=True,
                 text=True,
-                timeout=5
+                timeout=5,
+                check=False,
             )
             if result.returncode == 0:
                 return result.stdout.strip()
-        except Exception:
-            pass
         return ""
 
-    def _find_readme(self) -> Optional[Path]:
-        """Find README file"""
-        for name in ["README.md", "README.rst", "README.txt", "README"]:
-            readme = self.repo_root / name
-            if readme.exists():
-                return readme
-        return None
-
-    def _find_requirements(self) -> Optional[Path]:
-        """Find requirements file"""
-        for name in ["requirements.txt", "requirements-dev.txt", "requirements.in"]:
-            req = self.repo_root / name
-            if req.exists():
-                return req
+    def _find_first_existing(self, *names: str) -> Optional[Path]:
+        """Return the first file in ``repo_root`` that exists, or None."""
+        for name in names:
+            candidate = self.repo_root / name
+            if candidate.exists():
+                return candidate
         return None
 
     def _get_enhanced_instructions(self, target_file: Optional[str]) -> str:
@@ -632,15 +629,3 @@ diff --git a/file.py b/file.py
 ```
 
 Generate the patch now."""
-
-
-# Backward compatibility alias
-EnhancedContextBuilder = SuperContextBuilder
-ContextBuilder = SuperContextBuilder
-
-
-
-
-def enhance_user_request(user_request: str, **kwargs) -> str:
-    """Enhance user request (compatibility function)"""
-    return user_request

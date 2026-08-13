@@ -44,19 +44,27 @@ import threading
 import time
 import traceback
 import uuid
+import weakref
 from collections import defaultdict, deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
+from external_llm.common.walk_policy import _walk_dir_sort_key, _walk_should_skip_dir
 from utils.llm_utils import simple_llm_call
-from utils.string_helper import parse_json
+from utils.string_helper import parse_json, utf8_trailing_incomplete_len
 
 # Imported at call sites (originally inline to avoid any chance of a circular
 # import). agent_loop.py does NOT import orchestrator, so this is safe at module
 # level — deduplicates 5 identical inline imports.
 from .agent_loop import AgentResult
+from .write_targets import (
+    normalize_plan,
+    parse_patch_targets,
+    plan_target_paths,
+    write_target_paths,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +72,6 @@ logger = logging.getLogger(__name__)
 # WeakValueDictionary so that a Lock for a path is GC'd once no live
 # FileLockManager references it (via acquire()/_held). A plain dict would grow
 # unboundedly in long-running server processes as unique file paths accumulate.
-import weakref
 
 _file_locks: "weakref.WeakValueDictionary[str, threading.Lock]" = weakref.WeakValueDictionary()
 _file_locks_meta = threading.Lock()
@@ -152,8 +159,7 @@ class FileLockManager:
         # Convert to absolute path and resolve symlinks
         abs_path = os.path.join(self.repo_root, rel_path)
         try:
-            real_path = os.path.realpath(abs_path)
-            return real_path
+            return os.path.realpath(abs_path)
         except Exception:
             # If realpath fails, fall back to absolute path
             return os.path.abspath(abs_path)
@@ -206,7 +212,7 @@ class FileLockManager:
             try:
                 lock.release()
             except RuntimeError:
-                pass  # already released
+                logger.debug("lock already released: %s", norm_path)
 
     @staticmethod
     def _patch_target_paths(patch: str) -> list[str]:
@@ -216,50 +222,39 @@ class FileLockManager:
         / ``+++ b/`` headers), not in a scalar ``path`` arg — so without parsing
         the patch, ``acquire_relevant`` would lock ZERO files for the primary
         write tool, letting two parallel sub-agents patch the same file with no
-        mutual exclusion. Mirrors ``WriteSafetyManager.snapshot_target_files``.
+        mutual exclusion.
+
+        Delegates to ``write_targets.parse_patch_targets``. It used to be a
+        private copy that merely *mirrored* the snapshot's parser, and the two
+        had drifted: this one ignored ``--- b/`` and, like every copy but the
+        snapshot's, mistook a ``diff -u`` timestamp for part of the path.
         """
-        targets: list[str] = []
-        for _line in patch.splitlines():
-            if _line.startswith("diff --git "):
-                _parts = _line.split()
-                if len(_parts) >= 4 and _parts[3].startswith("b/"):
-                    targets.append(_parts[3][2:])
-            elif _line.startswith("--- a/") or _line.startswith("+++ b/"):
-                _p = _line[6:].strip()
-                if _p and _p != "/dev/null":
-                    targets.append(_p)
-        return targets
+        return parse_patch_targets(patch)
 
     @staticmethod
     def _plan_target_paths(plan: Any) -> list[str]:
         """Extract target file paths from a ``write_plan`` ``plan`` arg.
 
-        ``plan`` may be a unified-diff string (delegated to :meth:`_patch_target_paths`)
-        or a structured dict ``{"ops": [{"path": ...}, ...]}`` (the common form for
-        write_plan, which is the primary multi-file write tool). Without this,
-        ``acquire_relevant`` checked only the ``patch`` key and locked ZERO files for
-        write_plan, so two concurrent sessions editing the same file via write_plan got
-        no mutual exclusion — the exact snapshot-rollback-overwrite race the FileLockManager
-        exists to prevent. Mirrors the dict-plan branch of
-        ``WriteSafetyManager.snapshot_target_files`` and ``_extract_write_target_paths``.
+        ``plan`` may be a unified-diff string, a structured dict
+        ``{"ops": [{"path": ...}, ...]}``, or any of the other shapes
+        ``_tool_write_plan`` accepts — normalisation and extraction are both the
+        shared ones (see ``write_targets``). Without this, ``acquire_relevant``
+        checked only the ``patch`` key and locked ZERO files for write_plan, so
+        two concurrent sessions editing the same file via write_plan got no
+        mutual exclusion — the exact snapshot-rollback-overwrite race the
+        FileLockManager exists to prevent.
         """
-        if isinstance(plan, str):
-            return FileLockManager._patch_target_paths(plan)
-        targets: list[str] = []
-        if isinstance(plan, dict):
-            plan_ops = plan.get("ops") or plan.get("operations") or []
-            # A bare {"path": ...} plan (no ops list) targets that single file.
-            if not plan_ops and "path" in plan:
-                plan_ops = [plan]
-            for _op in plan_ops:
-                if isinstance(_op, dict):
-                    _p = _op.get("path")
-                    if _p:
-                        targets.append(str(_p))
-        return targets
+        return plan_target_paths(normalize_plan({"plan": plan}))
 
-    def acquire_relevant(self, tool_args: dict[str, Any]) -> list[str]:
-        """Acquire locks for all file paths referenced in tool_args. Returns locked paths."""
+    def acquire_relevant(
+        self, tool_args: dict[str, Any], tool_name: Optional[str] = None
+    ) -> list[str]:
+        """Acquire locks for all file paths referenced in tool_args. Returns locked paths.
+
+        *tool_name* is optional because the webapp calls this with a bare
+        ``{"patch": …}``; ``write_target_paths`` infers the payload tool from
+        the argument keys when it is absent.
+        """
         # Collect and normalize all paths
         norm_paths_set = set()
         for key in ("path", "file_path", "src", "dst"):
@@ -268,25 +263,16 @@ class FileLockManager:
                 norm_path = self._normalize_path(val)
                 if norm_path is not None:
                     norm_paths_set.add(norm_path)
-        # apply_patch: pull targets out of the unified-diff body (see helper).
-        _patch = tool_args.get("patch")
-        if _patch and isinstance(_patch, str):
-            for _rel in self._patch_target_paths(_patch):
-                _np = self._normalize_path(_rel)
-                if _np is not None:
-                    norm_paths_set.add(_np)
-        # write_plan: pull targets out of the ``plan`` arg (string diff OR dict with
-        # ops). write_plan is the primary multi-file write tool (create_file / patch
-        # ops), and its targets live inside ``plan`` — NOT in ``path``/``file_path``
-        # — so the scalar-key scan above finds nothing for it. Without this branch
-        # write_plan locks ZERO files (see _plan_target_paths). Mirrors
-        # snapshot_target_files / _extract_write_target_paths target resolution.
-        _plan = tool_args.get("plan")
-        if _plan is not None:
-            for _rel in self._plan_target_paths(_plan):
-                _np = self._normalize_path(_rel)
-                if _np is not None:
-                    norm_paths_set.add(_np)
+        # apply_patch / write_plan carry their targets INSIDE the ``patch`` /
+        # ``plan`` payload, not in a scalar path arg — so without this the two
+        # primary write tools would lock ZERO files and two parallel sub-agents
+        # could patch the same file with no mutual exclusion. Resolution is the
+        # shared one (see write_targets): it also covers the payload shapes the
+        # handler repairs, which this manager's own copy could not see.
+        for _rel in write_target_paths(tool_name, tool_args):
+            _np = self._normalize_path(_rel)
+            if _np is not None:
+                norm_paths_set.add(_np)
 
         # Sort to ensure consistent lock acquisition order (deadlock prevention)
         norm_paths = sorted(norm_paths_set)
@@ -333,6 +319,62 @@ class FileLockManager:
         for p in paths:
             self._release_by_normalized_path(p)
 
+    def _repo_lock_key(self) -> str:
+        """Canonical shared-registry key for the per-repo worktree mutex.
+
+        The key is a pseudo-path inside the repo's meta directory
+        (``.asr-edit/__worktree_lock__``) — it is ONLY a registry key, never
+        touched on disk. Namespacing it under the realpath'd repo root makes
+        two FileLockManager instances (e.g. a fresh one in the webapp's
+        edit_apply and the agent lane's) resolve the SAME Lock for the same
+        repo, while distinct repos stay independent.
+        """
+        return os.path.join(os.path.realpath(self.repo_root), ".asr-edit", "__worktree_lock__")
+
+    def acquire_repo(self) -> Optional[str]:
+        """Acquire the per-repo worktree mutex, NON-blocking (fail-fast).
+
+        Coarse-grained complement to the per-file locks: it serializes whole
+        interactive apply sections (edit_apply's apply_patch + git bookkeeping)
+        against any other repo-level mutator, and lets HTTP callers surface
+        contention as an immediate 409 instead of blocking an open request.
+
+        Returns:
+          * the repo lock key (pass to ``release_repo``) when acquired,
+          * None when another lane currently holds the repo mutex, or
+          * "" when ``repo_root`` is unset — there is nothing to serialize on
+            (caller may skip ``release_repo``).
+
+        Lock ordering: acquire the repo lock BEFORE any ``acquire_relevant``
+        per-file locks and release it AFTER ``release_all`` — repo → files
+        ordering everywhere prevents deadlock. ``reset()`` releases it like any
+        other held lock.
+        """
+        if not self.repo_root:
+            return ""
+        key = self._repo_lock_key()
+        with _file_locks_meta:
+            lock = _file_locks.setdefault(key, threading.Lock())
+        if not lock.acquire(blocking=False):
+            return None
+        try:
+            with _file_locks_meta:
+                # Strong-ref while held (same WeakValueDictionary discipline as
+                # acquire()): the entry must survive until release, and once the
+                # last holder drops its ref the entry dies with the Lock, so
+                # abandoned repos do not accumulate registry keys.
+                self._held[key] = lock
+        except BaseException:
+            lock.release()
+            raise
+        return key
+
+    def release_repo(self, key: str) -> None:
+        """Release a repo mutex acquired via ``acquire_repo``. No-op for ""."""
+        if not key:
+            return
+        self._release_by_normalized_path(key)
+
     def reset(self) -> None:
         """Release locks held by THIS manager instance only.
 
@@ -353,7 +395,7 @@ class FileLockManager:
                 try:
                     lock.release()
                 except RuntimeError:
-                    pass  # already released (e.g. caller called lock.release() directly)
+                    logger.debug("lock already released during reset: %s", _path)
 
 
 class OrderedEventDispatcher:
@@ -419,9 +461,6 @@ class SubTaskSpec:
     assigned_files: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)  # task_id of dependencies
     priority: int = 0     # 0=highest (run first), 1=normal, 2=lowest
-    # "planner" → AST-only files; enables internal planning phase in AgentLoop.
-    # "main_agent" → non-AST files or mixed; keeps planning disabled (more flexible).
-    preferred_lane: str = "main_agent"
 
 
 @dataclass
@@ -574,12 +613,14 @@ def _build_git_context(repo_root: Optional[str]) -> str:
         log = _sp.run(
             ["git", "log", "--oneline", "-10"],
             cwd=repo_root, capture_output=True, text=True, timeout=5,
+            check=False,
         ).stdout.strip()
         changed = _sp.run(
             # core.quotePath=false: this list is shown to the planner LLM, and
             # git C-quotes non-ASCII paths by default (한글.py -> "\355\225\234...").
             ["git", "-c", "core.quotePath=false", "diff", "--name-only", "HEAD~3..HEAD"],
             cwd=repo_root, capture_output=True, text=True, timeout=5,
+            check=False,
         ).stdout.strip()
     except (OSError, _sp.SubprocessError):
         return ""
@@ -667,7 +708,11 @@ def _expand_directory_assignments(repo_root: Optional[str], files: list[str]) ->
 
     A path that does not exist yet (a file the sub-agent is expected to
     CREATE) passes through unchanged — only EXISTING directories are
-    expanded. ``.git`` is skipped during the walk. A directory that would
+    expanded.  Subdirectory pruning delegates to the shared
+    ``walk_policy._walk_should_skip_dir`` (so a directory assigned at/under
+    the repo root, ``.venv`` or ``node_modules`` doesn't inflate the expansion
+    and trip the cap), and descent order uses ``_walk_dir_sort_key`` so source
+    files fill the cap before tests/fixtures/generated. A directory that would
     expand past ``_MAX_DIR_EXPANSION_FILES`` is left UNEXPANDED (see the
     constant's docstring) instead of risking a memory blowup.
     """
@@ -685,8 +730,11 @@ def _expand_directory_assignments(repo_root: Optional[str], files: list[str]) ->
             _dir_files: list[str] = []
             _over_cap = False
             for _dirpath, _dirnames, _filenames in os.walk(_abs):
-                _dirnames[:] = [d for d in _dirnames if d != ".git"]
-                for _fn in _filenames:
+                _dirnames[:] = sorted(
+                    (d for d in _dirnames if not _walk_should_skip_dir(d)),
+                    key=_walk_dir_sort_key,
+                )
+                for _fn in sorted(_filenames):
                     _full = os.path.join(_dirpath, _fn)
                     _dir_files.append(os.path.relpath(_full, repo_root))
                     if len(_dir_files) > _MAX_DIR_EXPANSION_FILES:
@@ -830,6 +878,23 @@ _SNAPSHOT_AGGREGATE_MAX_BYTES = 64 * 1024 * 1024  # 64 MiB
 _SYNTH_DIFF_FILE_BYTES = 64 * 1024
 
 
+def _read_synth_diff_head(abs_path: str, max_bytes: int = _SYNTH_DIFF_FILE_BYTES) -> tuple[str, bool, int]:
+    """Read up to ``max_bytes`` of ``abs_path`` for the synthetic-diff review.
+
+    Returns ``(text, truncated, size)``. The cut is UTF-8-boundary safe: a
+    multi-byte char straddling the window would otherwise end the review
+    diff in U+FFFD (P21-2, mirror of P20-5). Raises OSError when the file
+    cannot be stat'd or read (the caller's try/except handles it).
+    """
+    size = os.path.getsize(abs_path)
+    with open(abs_path, "rb") as fh:
+        content = fh.read(max_bytes)
+    trim = utf8_trailing_incomplete_len(content)
+    if trim:
+        content = content[:-trim]
+    return content.decode("utf-8", errors="replace"), size > max_bytes, size
+
+
 def _capture_assigned_snapshots(repo_root: str, file_paths: list[str]) -> dict:
     """Capture pre-run bytes of assigned files so a rejected attempt can be
     reverted without clobbering the user's uncommitted edits or cross-batch
@@ -876,7 +941,8 @@ def _capture_assigned_snapshots(repo_root: str, file_paths: list[str]) -> dict:
             snaps[_fp] = _MISSING_SNAP
             continue
         except OSError:
-            continue  # unreadable: leave out (no revert for this file)
+            logger.debug("snapshot: file unreadable (skipped): %s", _abs)
+            continue
         # Check size BEFORE reading to avoid loading huge files into RAM
         if _size > _SNAPSHOT_MAX_BYTES:
             logger.warning(
@@ -905,7 +971,7 @@ def _capture_assigned_snapshots(repo_root: str, file_paths: list[str]) -> dict:
         except FileNotFoundError:
             snaps[_fp] = _MISSING_SNAP
         except Exception:
-            pass  # unreadable: leave out (no revert for this file)
+            logger.debug("snapshot: read failed (skipped): %s", _abs, exc_info=True)
     return snaps
 
 
@@ -932,7 +998,7 @@ def _restore_assigned_snapshots(repo_root: str, snaps: dict) -> list[str]:
                         if os.path.isfile(_tp) and os.path.getmtime(_tp) < _stale_deadline:
                             os.unlink(_tp)
             except OSError:
-                pass  # directory gone, permission denied, etc. — non-critical
+                logger.debug("stale revert-temp cleanup failed: %s", _dir)
         try:
             if _data is _MISSING_SNAP:
                 if os.path.exists(_abs):
@@ -943,7 +1009,7 @@ def _restore_assigned_snapshots(repo_root: str, snaps: dict) -> list[str]:
                     try:
                         os.removedirs(os.path.dirname(_abs))
                     except OSError:
-                        pass  # directory not empty (or already gone) — expected
+                        logger.debug("removedirs failed: %s", os.path.dirname(_abs))
             else:
                 # Atomic write (mkstemp + os.replace) so a crash/SIGKILL/disk-full
                 # mid-restore never leaves the user's file truncated/partial.
@@ -959,7 +1025,7 @@ def _restore_assigned_snapshots(repo_root: str, snaps: dict) -> list[str]:
                     try:
                         os.unlink(_tmp)
                     except OSError:
-                        pass
+                        logger.debug("revert temp unlink failed: %s", _tmp)
                     raise
             reverted.append(_fp)
         except Exception as _e:
@@ -998,7 +1064,7 @@ def _snapshot_dirty_path_set(repo_root: str) -> set:
         from .subagent_ipc import partition_changed_files
         _in_scope, _ = partition_changed_files(repo_root, [])
         return {os.path.normpath(_p["file"]) for _p in _in_scope if _p.get("file")}
-    except Exception:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError):  # git best-effort
         return set()
 
 
@@ -1021,7 +1087,7 @@ def _symbol_hint_for_source(src: str, fpath: str) -> list[str]:
             if syms:
                 return [f"{_kind_initial(k)} {n} L{s}-L{e}" for (n, k, s, e) in syms]
     except Exception:
-        pass
+        logger.debug("symbol hint via tree-sitter failed for %s", fpath, exc_info=True)
     # Fallback: stdlib ast for Python files (no grammar dependency).
     try:
         tree = ast.parse(src)
@@ -1030,9 +1096,10 @@ def _symbol_hint_for_source(src: str, fpath: str) -> list[str]:
             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                 end = getattr(node, "end_lineno", node.lineno)
                 out.append(f"{node.__class__.__name__[0]} {node.name} L{node.lineno}-L{end}")
-        return out
-    except Exception:
+    except (SyntaxError, RecursionError, MemoryError):  # broken/pathological source
         return []
+    else:
+        return out
 def _symbol_def_line(src: str, fpath: str, symbol: str) -> Optional[int]:
     """Return the 1-indexed definition line of *symbol* in *src*, or ``None``.
 
@@ -1051,7 +1118,7 @@ def _symbol_def_line(src: str, fpath: str, symbol: str) -> Optional[int]:
                 if _n == symbol:
                     return s
     except Exception:
-        pass
+        logger.debug("tree-sitter symbol lookup failed for %s", fpath, exc_info=True)
     # Fallback: stdlib ast for Python files (no grammar dependency).
     try:
         tree = ast.parse(src)
@@ -1060,7 +1127,7 @@ def _symbol_def_line(src: str, fpath: str, symbol: str) -> Optional[int]:
                     and node.name == symbol:
                 return node.lineno
     except Exception:
-        pass
+        logger.debug("ast symbol lookup failed for %s", fpath, exc_info=True)
     return None
 _DECOMPOSE_SYSTEM = """\
 You are a software engineering task orchestrator. Your job is to decompose a
@@ -1555,13 +1622,12 @@ class OrchestratorAgent:
             broken_subtasks = self._break_cycles(subtasks, cycles)
             if broken_subtasks is not None:
                 return self._run_dependency_aware(broken_subtasks, original_request=original_request)
-            else:
-                # Fall back to original order with warning
-                logger.warning("Could not break cycles, falling back to original order")
-                self._cb("orchestrator_warning", {
-                    "type": "dependency_cycle_fallback",
-                    "message": "Could not automatically break cycles, using original task order."
-                })
+            # Fall back to original order with warning
+            logger.warning("Could not break cycles, falling back to original order")
+            self._cb("orchestrator_warning", {
+                "type": "dependency_cycle_fallback",
+                "message": "Could not automatically break cycles, using original task order."
+            })
 
         idx_map = {st.task_id: i for i, st in enumerate(subtasks)}
         results: list[Any] = [None] * len(subtasks)
@@ -1934,6 +2000,7 @@ class OrchestratorAgent:
                 try:
                     _mtime = os.path.getmtime(_path)
                 except OSError:
+                    logger.debug("GC: getmtime failed for %s", _path)
                     continue
                 if _mtime < _deadline:
                     shutil.rmtree(_path, ignore_errors=True)
@@ -1959,8 +2026,8 @@ class OrchestratorAgent:
             so downstream code (review loop, shared memory, synthesis) works the same
             as the in-process path.
             """
-            from .subagent_ipc import SubagentTask, write_task, wait_for_result, clear_result
             from .agent_loop import AgentResult, AgentTurn
+            from .subagent_ipc import SubagentTask, clear_result, wait_for_result, write_task
 
             agent_id = subtask.task_id
             logger.info("SubAgent %s (IPC) dispatching: %s", agent_id, subtask.title)
@@ -2040,7 +2107,8 @@ class OrchestratorAgent:
             # and the manual-launch hint).  Derived from the SAME argv the
             # background spawn uses (asr_subagent_argv) via shlex.join, so the
             # worker invocation is defined in exactly one place.
-            _shell_argv = asr_subagent_argv(repo_root) + [
+            _shell_argv = [
+                *asr_subagent_argv(repo_root),
                 "--subagent-id", _worker_id, "--orch-pid", str(os.getpid()),
             ]
             if _provider:
@@ -2086,7 +2154,7 @@ class OrchestratorAgent:
                         _hb_turn = int(_st.get("turn", 0) or 0)
                         _hb_tool = str(_st.get("last_tool", "") or "")
                 except Exception:
-                    pass
+                    logger.debug("heartbeat read failed for %s", _aid)
                 self._event_dispatcher.emit(_aid, "subagent_waiting_ipc", {
                     "agent_id": _aid,
                     "elapsed_s": elapsed_s,
@@ -2155,6 +2223,15 @@ class OrchestratorAgent:
             # shared type); the IPC SubagentResult carries it.
             _ipc_unassigned: list[dict] = list(getattr(result, "unassigned_changes", []) or [])
 
+            # Per-subagent git-diff memo shared between the review loop and the
+            # diff cross-verification below — parity with the in-process path
+            # (_run_subagent). Without it the review computed ``git diff`` from
+            # scratch on every iteration AND again at cross-verification (3
+            # subprocess spawns vs 1-2).  Cleared before each retry (see below):
+            # the worker re-runs after a revert, mutating the worktree, so a stale
+            # entry keyed by assigned_files would serve the OLD diff to the next
+            # review (a correctness regression, not just a perf loss).
+            _ipc_diff_cache: dict = {}
             # ── Orchestrator review loop (reuses the in-process review helper).
             retry_count = 0
             while (
@@ -2165,8 +2242,8 @@ class OrchestratorAgent:
                 approved, feedback = self._review_subagent_result(
                     agent_id=agent_id,
                     subtask=subtask,
-                    result=agent_result,
                     repo_root=repo_root,
+                    diff_cache=_ipc_diff_cache,
                 )
                 if approved:
                     break
@@ -2197,6 +2274,10 @@ class OrchestratorAgent:
                             "SubAgent %s (IPC) reverted %d out-of-scope file(s) before retry: %s",
                             agent_id, len(_retry_rv), _retry_rv,
                         )
+                # The revert + upcoming re-dispatch mutate the worktree, so any
+                # diff cached this attempt is now stale — drop it before the worker
+                # re-runs (same invariant as _run_subagent's in-process retry).
+                _ipc_diff_cache.clear()
                 self._event_dispatcher.emit(agent_id, "subagent_retry", {
                     "task_id": subtask.task_id,
                     "retry": retry_count,
@@ -2212,14 +2293,14 @@ class OrchestratorAgent:
                     f"Original task: {subtask.description}"
                 )
                 ipc_task.max_turns = _base_max_turns
-                # write_task only mints a fresh epoch nonce when task.epoch is
-                # falsy; the retry loop reuses the SAME ipc_task object, so
-                # every attempt would otherwise share attempt-1's epoch and
-                # the epoch check could not distinguish a stale (attempt-1)
-                # result.json from the current attempt's. Sequential retries
-                # make an actual mix-up unlikely, but resetting here restores
-                # the defense-in-depth the epoch nonce is meant to provide.
-                ipc_task.epoch = 0
+                # write_task now mints a FRESH epoch nonce on every dispatch
+                # (see subagent_ipc.write_task — always-mint policy), so a
+                # re-dispatched task object automatically gets a distinct
+                # epoch and the epoch check can distinguish a stale
+                # (attempt-1) result.json from the current attempt's.  No
+                # caller-side `ipc_task.epoch = 0` reset is needed anymore;
+                # the explicit reset below was removed when the always-mint
+                # policy landed.
                 clear_result(repo_root, agent_id)
                 # Reuse mode: the worker polls ITS OWN directory (_worker_id,
                 # which differs from agent_id), not agent_id's dir. The initial
@@ -2320,6 +2401,7 @@ class OrchestratorAgent:
                             _worker_confirmed_exited = True
                             break
                     except Exception:
+                        logger.debug("idle-heartbeat read failed for %s", _worker_id)
                         break
                     time.sleep(0.2)
 
@@ -2328,7 +2410,10 @@ class OrchestratorAgent:
             # target), so without this the parallel poll loop would never see a
             # verdict here.  IPC applied_patches are clean {"file": ...} dicts,
             # so patch-file extraction is exact (no diff-text parsing needed).
-            _ipc_diff_cache: dict = {}
+            # Reuses _ipc_diff_cache threaded through the review loop above: on
+            # the common success path the reviewed file set equals the reported
+            # patch set, so the cross-verification diff is a cache hit (no new
+            # ``git diff`` subprocess).
             _diff_verdict = self._compute_diff_verdict(
                 agent_id=agent_id, result=agent_result,
                 repo_root=repo_root, diff_cache=_ipc_diff_cache,
@@ -2354,9 +2439,9 @@ class OrchestratorAgent:
             # mode — can SEE the scope violation at decision time and roll back /
             # re-direct, instead of the signal reaching only the event log.
             try:
-                setattr(agent_result, "_orch_unassigned", _ipc_unassigned)
+                agent_result._orch_unassigned = _ipc_unassigned
             except (AttributeError, TypeError):
-                pass
+                logger.debug("cannot attach _orch_unassigned to result")
             self._event_dispatcher.emit(agent_id, "subagent_complete", {
                 "task_id": subtask.task_id,
                 "status": agent_result.status,
@@ -2421,12 +2506,13 @@ class OrchestratorAgent:
                 "Auto-launched Terminal.app for sub-agent %s (worker %s)",
                 agent_id, worker_id,
             )
-            return True
         except Exception as e:
             logger.warning(
                 "Failed to auto-launch terminal for sub-agent %s: %s", agent_id, e,
             )
             return False
+        else:
+            return True
 
     def _spawn_ipc_worker_background(
         self, repo_root: str, worker_id: str, provider: str, model: str,
@@ -2446,7 +2532,8 @@ class OrchestratorAgent:
         """
         # argv from the single source of truth (asr_subagent_argv returns a
         # LIST, so there is no shlex round-trip to mangle Windows backslashes).
-        argv = asr_subagent_argv(repo_root) + [
+        argv = [
+            *asr_subagent_argv(repo_root),
             "--subagent-id", worker_id, "--orch-pid", str(os.getpid()),
         ]
         if provider:
@@ -2471,17 +2558,22 @@ class OrchestratorAgent:
                     try:
                         os.replace(_log_path, _log_path + ".old")
                     except OSError:
-                        pass
+                        logger.debug("worker log rotate failed: %s", _log_path)
             except OSError:
-                pass
-            _logf = open(_log_path, "ab")
+                logger.debug("worker log open failed; falling back to DEVNULL")
+            # SIM115 noqa: the handle is handed to Popen (stdout/stderr) which
+            # dups the fd; our copy is closed explicitly in the finally below —
+            # a with-block cannot span the Popen handoff + DEVNULL fallback.
+            _logf = open(_log_path, "ab")  # noqa: SIM115 — Popen fd handoff (dup 후 명시 close)
         except OSError:
             _logf = subprocess.DEVNULL
 
-        _kwargs: dict[str, Any] = dict(
-            cwd=repo_root, stdin=subprocess.DEVNULL,
-            stdout=_logf, stderr=subprocess.STDOUT,
-        )
+        _kwargs: dict[str, Any] = {
+            "cwd": repo_root,
+            "stdin": subprocess.DEVNULL,
+            "stdout": _logf,
+            "stderr": subprocess.STDOUT,
+        }
         if sys.platform == "win32":
             # New process group + no console window: Ctrl-C in the REPL must not
             # propagate to the worker, and no terminal should flash.
@@ -2507,7 +2599,7 @@ class OrchestratorAgent:
                 try:
                     _logf.close()
                 except OSError:
-                    pass
+                    logger.debug("worker log handle close failed")
 
         with self._bg_lock:
             self._ipc_worker_procs[worker_id] = _proc
@@ -2574,22 +2666,18 @@ class OrchestratorAgent:
         if self.orch_config.parallel:
             sub_rag = False  # FAISS C extension is not thread-safe; concurrent access causes heap corruption
 
-        # AST-only subtasks benefit from an internal planning phase (DISCOVER→PLAN→EDIT).
-        # Non-AST subtasks keep planning disabled — AgentLoop is more flexible without it.
-        _sub_planning = (subtask.preferred_lane == "planner")
+        # AST-only subtasks used to get an internal planning phase; with the
+        # planning_enabled flag gone, all subtasks run the direct tool loop.
 
         sub_config = replace(
             base,
             max_turns=base_max_turns,
             stream_callback=_sub_cb,
-            planning_enabled=_sub_planning,   # True for AST-only subtasks
             agent_id=agent_id,
             file_lock_manager=self._file_lock_mgr,
             is_subagent=True,              # skip small-model complexity gating
             rag_enabled=sub_rag,
             context_window_size=base.context_window_size,
-            self_planning_enabled=False,   # subagent task is already scoped; self-critique adds ~50s with no benefit
-            candidate_selection_enabled=False,  # likewise pre-scoped; candidate selection wastes LLM calls
         )
 
         # Ensure the subagent has a valid route_decision. Subagents are pre-scoped
@@ -2598,8 +2686,8 @@ class OrchestratorAgent:
         # bare AgentConfig() (e.g. /orchestrate REPL) leave it None — which makes
         # AgentLoop.run() hit the unhandled-lane guard and return partial_success.
         if getattr(sub_config, 'route_decision', None) is None:
-            from .task_router import RouteDecision, Lane, TaskKind
             from .enums import Complexity, Scope
+            from .task_router import Lane, RouteDecision, TaskKind
             sub_config.route_decision = RouteDecision(
                 task_kind=TaskKind.SINGLE_FILE_EDIT,
                 complexity=Complexity.MEDIUM,
@@ -2653,13 +2741,19 @@ class OrchestratorAgent:
         for fpath in (subtask.assigned_files or []):
             try:
                 abs_path = os.path.join(repo_root, fpath) if repo_root else fpath
+                # Bound the read like _capture_assigned_snapshots (5 MiB/file):
+                # an oversized assigned file must not be slurped fully into RAM
+                # just to build a best-effort symbol hint (and then parsed).
+                if os.path.getsize(abs_path) > _SNAPSHOT_MAX_BYTES:
+                    logger.debug("symbol hint skipped for oversized %s", fpath)
+                    continue
                 with open(abs_path, encoding="utf-8", errors="replace") as _f:
                     src = _f.read()
                 lines_out = _symbol_hint_for_source(src, fpath)
                 if lines_out:
                     hint_lines.append(f"[Symbol map for {fpath}]\n" + "\n".join(lines_out))
             except Exception:
-                pass
+                logger.debug("symbol hint failed for %s", fpath, exc_info=True)
         if hint_lines:
             task_text = task_text + "\n\n" + "\n".join(hint_lines)
 
@@ -2670,9 +2764,9 @@ class OrchestratorAgent:
         _revert_snapshots = _capture_assigned_snapshots(repo_root, subtask.assigned_files)
 
         # Bind this sub-agent's model to the current thread's run_store context so
-        # run-completion telemetry (add_run → _write_to_unified_store) and planner
-        # bias reads attribute to the sub-agent's model, not the parent session's
-        # planner model (the singleton run_store is shared across sub-agents).
+        # adaptive-hub persistence (per-model namespace) attributes to the sub-agent's
+        # model, not the parent session's planner model (the singleton run_store is
+        # shared across sub-agents).
         # Thread-local (per-thread): parallel sub-agents on distinct worker threads
         # are naturally isolated; model_context_scope restores the parent's context
         # on exit so sequential mode (which reuses the parent thread) does not leak
@@ -2704,7 +2798,6 @@ class OrchestratorAgent:
                 approved, feedback = self._review_subagent_result(
                     agent_id=agent_id,
                     subtask=subtask,
-                    result=result,
                     repo_root=repo_root,
                     diff_cache=_diff_cache,
                 )
@@ -2764,6 +2857,27 @@ class OrchestratorAgent:
                 result = retry_loop.run(retry_text)
             # ── end review loop ─────────────────────────────────────────────
 
+            # ── Cancelled/error-by-agent revert (IPC parity) ─────────────────
+            # _run_subagent_ipc restores the pre-run snapshot when the worker
+            # reports cancelled/error — its partial edits would otherwise
+            # linger in the working tree. The in-process path relied solely on
+            # AgentLoop's own rollback, which is PATCH-based only: it covers
+            # recorded apply_patch/edit_text targets and fires on
+            # AgentCancelled/exception, but NOT on a normal status="error"
+            # return, and NOT on content written via bash or untracked files.
+            # Mirror the IPC semantics so an aborted or failed in-process
+            # sub-agent leaves no half-applied edits behind either. (Same
+            # shared-worktree caveat as the IPC path: under parallel execution
+            # a still-running peer's edit to a shared file could be clobbered —
+            # the documented limitation of one shared tree.)
+            if result.status in ("cancelled", "error"):
+                _aborted_revert = _restore_assigned_snapshots(repo_root, _revert_snapshots)
+                if _aborted_revert:
+                    logger.info(
+                        "SubAgent %s (in-process) %s; reverted partial edits: %s",
+                        agent_id, result.status, _aborted_revert,
+                    )
+
             # ── Diff cross-verification ────────────────────────────────────────
             # Verify that what the subagent claims matches what actually changed.
             # Diff cross-verification (shared with the IPC path).
@@ -2788,6 +2902,16 @@ class OrchestratorAgent:
                 agent_id=agent_id, mode="in-process",
             )
 
+            # Attach the filtered out-of-scope signal onto the result (same
+            # mutation pattern as the IPC path) so poll_subagent — the
+            # orchestrator LLM's only window into a sub-agent in tool-loop
+            # mode — can SEE the scope violation at decision time, instead of
+            # the signal reaching only the event log.
+            try:
+                result._orch_unassigned = _proc_unassigned
+            except (AttributeError, TypeError):
+                logger.debug("cannot attach _orch_unassigned to result")
+
             # emit complete event (order guaranteed)
             self._event_dispatcher.emit(agent_id, "subagent_complete", {
                 "task_id": subtask.task_id,
@@ -2804,7 +2928,6 @@ class OrchestratorAgent:
                 "SubAgent %s (in-process) done: status=%s diff_verdict=%s",
                 agent_id, result.status, _diff_verdict,
             )
-            return result
         except Exception as e:
             # emit error event
             self._event_dispatcher.emit(agent_id, "subagent_error", {
@@ -2812,7 +2935,20 @@ class OrchestratorAgent:
                 "error": str(e),
                 "traceback": traceback.format_exc(),
             })
+            # Crash path (IPC parity): an unexpected exception inside the loop
+            # can leave partial edits in the tree — restore the pre-run
+            # snapshot before re-raising so the error result the caller wraps
+            # reflects a clean baseline (mirrors the worker-crash revert in
+            # _run_subagent_ipc).
+            _crash_revert = _restore_assigned_snapshots(repo_root, _revert_snapshots)
+            if _crash_revert:
+                logger.info(
+                    "SubAgent %s (in-process) crashed; reverted partial edits: %s",
+                    agent_id, _crash_revert,
+                )
             raise
+        else:
+            return result
         finally:
             # Restore the parent thread's model context (see _model_ctx_scope above).
             if _model_ctx_scope is not None:
@@ -2840,10 +2976,11 @@ class OrchestratorAgent:
                 # Signal truncation to the reviewer so it knows the diff is
                 # incomplete and can adjust its judgement accordingly (B6).
                 return f"{diff[:_cap]}\n[diff truncated: {_cap}/{len(diff)} chars]\n"
-            return diff
         except Exception as e:
             logger.warning("git diff failed: %s", e)
             return ""
+        else:
+            return diff
 
     def _cached_git_diff(
         self, cache: Optional[dict], repo_root: str, paths: list[str],
@@ -2890,11 +3027,11 @@ class OrchestratorAgent:
         try:
             import subprocess as _sp
             out = _sp.check_output(
-                ["git", "status", "-z", "--porcelain", "--untracked-files=all", "--"] + patch_files,
+                ["git", "status", "-z", "--porcelain", "--untracked-files=all", "--", *patch_files],
                 cwd=repo_root, stderr=_sp.DEVNULL, timeout=10,
             )
             return bool(out.strip())
-        except Exception:
+        except (_sp.CalledProcessError, _sp.TimeoutExpired, OSError):  # git best-effort
             return False
 
     @staticmethod
@@ -2930,10 +3067,10 @@ class OrchestratorAgent:
         # Check which assigned files are actually untracked (git reports "??" for them).
         try:
             out = _sp.check_output(
-                ["git", "status", "-z", "--porcelain", "--untracked-files=all", "--"] + assigned_files,
+                ["git", "status", "-z", "--porcelain", "--untracked-files=all", "--", *assigned_files],
                 cwd=repo_root, stderr=_sp.DEVNULL, timeout=10,
             )
-        except Exception:
+        except (_sp.CalledProcessError, _sp.TimeoutExpired, OSError):  # git best-effort
             return ""
         untracked: set[str] = set()
         parts = out.decode("utf-8", errors="replace").split("\x00")
@@ -2976,20 +3113,17 @@ class OrchestratorAgent:
                     break
                 _abs = os.path.join(repo_root, _untracked_file) if repo_root else _untracked_file
                 try:
-                    _size = os.path.getsize(_abs)
-                    with open(_abs, "rb") as _fh:
-                        content = _fh.read(_SYNTH_DIFF_FILE_BYTES)
+                    _body, _body_trunc, _size = _read_synth_diff_head(_abs)
                 except Exception:
+                    logger.debug("untracked file read failed: %s", _untracked_file, exc_info=True)
                     continue
                 _added: list[str] = []
                 _added.append("--- /dev/null")
                 _added.append(f"+++ b/{_untracked_file}")
-                _body = content.decode("utf-8", errors="replace")
                 _body_lines = _body.splitlines(keepends=False)
                 _added.append(f"@@ -0,0 +1,{len(_body_lines)} @@")
-                for _bl in _body_lines:
-                    _added.append(f"+{_bl}")
-                if _size > _SYNTH_DIFF_FILE_BYTES:
+                _added.extend(f"+{_bl}" for _bl in _body_lines)
+                if _body_trunc:
                     _added.append(
                         f"+[file content truncated: showing first "
                         f"{_SYNTH_DIFF_FILE_BYTES} of {_size} bytes]"
@@ -3120,7 +3254,7 @@ class OrchestratorAgent:
         # Empty assignment → all changed paths returned in the in-scope half.
         try:
             return partition_changed_files(repo_root, [])[0]
-        except Exception:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError):  # git best-effort
             return []
 
     def _detect_genuine_violations(
@@ -3190,6 +3324,7 @@ class OrchestratorAgent:
                 _ck = _sp.run(
                     ["git", "checkout", "HEAD", "--", rel],
                     cwd=repo_root, capture_output=True, timeout=10,
+                    check=False,
                 )
                 if _ck.returncode == 0:
                     reverted.append(rel)
@@ -3224,6 +3359,7 @@ class OrchestratorAgent:
                 _r = _sp.run(
                     ["git", "ls-files", "-z", "--"] + [_f for _f, _ in file_entries],
                     cwd=repo_root, capture_output=True, timeout=20,
+                    check=False,
                 )
                 if _r.returncode == 0:
                     tracked = {
@@ -3240,8 +3376,9 @@ class OrchestratorAgent:
                 _batch_ok = False
                 try:
                     _ck = _sp.run(
-                        ["git", "checkout", "HEAD", "--"] + _tracked_files,
+                        ["git", "checkout", "HEAD", "--", *_tracked_files],
                         cwd=repo_root, capture_output=True, timeout=30,
+                        check=False,
                     )
                     if _ck.returncode == 0:
                         reverted.extend(_tracked_files)
@@ -3273,6 +3410,7 @@ class OrchestratorAgent:
                     _tr = _sp.run(
                         ["git", "ls-files", "--error-unmatch", "--", _f],
                         cwd=repo_root, capture_output=True, timeout=10,
+                        check=False,
                     )
                     _is_tracked = (_tr.returncode == 0)
                 except Exception:
@@ -3421,9 +3559,9 @@ class OrchestratorAgent:
         else:
             _diff_verdict = "UNVERIFIABLE"
         try:
-            setattr(result, "_orch_diff_verdict", _diff_verdict)
+            result._orch_diff_verdict = _diff_verdict
         except (AttributeError, TypeError):
-            pass
+            logger.debug("cannot attach _orch_diff_verdict to result")
         return _diff_verdict
 
     def _locate_symbol(self, symbol: str, file_paths: list[str], repo_root: str) -> str:
@@ -3444,6 +3582,7 @@ class OrchestratorAgent:
                 with open(abs_path, encoding="utf-8", errors="replace") as f:
                     lines = f.readlines()
             except OSError:
+                logger.debug("locate_symbol: unreadable %s", rel_path)
                 continue
             line_no = _symbol_def_line("".join(lines), rel_path, symbol)
             if line_no:
@@ -3480,7 +3619,6 @@ Approve if the change correctly implements what was asked without breaking exist
         self,
         agent_id: str,
         subtask: "SubTaskSpec",
-        result: Any,
         repo_root: str,
         *,
         diff_cache: Optional[dict] = None,
@@ -3592,7 +3730,6 @@ Approve if the change correctly implements what was asked without breaking exist
         return approved, feedback
 
     # ── Result synthesis (legacy — used by run() for backward compat) ──────
-    # New code should use PlannerAgent.summarize_results() instead.
 
     def _synthesize(
         self,
@@ -3913,7 +4050,7 @@ Approve if the change correctly implements what was asked without breaking exist
             except concurrent.futures.TimeoutError:
                 return "running", None
             except Exception:
-                pass  # handled below
+                logger.debug("bg future.result raised (handled below): %s", agent_id, exc_info=True)
         if future.done():
             try:
                 result = future.result()
@@ -3977,7 +4114,6 @@ Approve if the change correctly implements what was asked without breaking exist
             description=_desc,
             assigned_files=list(_files),
             priority=_priority,
-            preferred_lane="main_agent",
         )
 
         # File-conflict guard for tool-loop spawns. The dependency-aware path
@@ -4393,9 +4529,9 @@ Approve if the change correctly implements what was asked without breaking exist
         * The orchestrator's own tool calls render through the normal design-chat
           UI (✓ lines) via the ``design_stream_callback``.
         """
-        from .design_chat_loop import DesignChatLoop
-        from .agent_loop_types import AgentCancelled
         from ..client import LLMMessage
+        from .agent_loop_types import AgentCancelled
+        from .design_chat_loop import DesignChatLoop
 
         self._current_request = request
         self._file_lock_mgr.reset()
@@ -4474,7 +4610,7 @@ Approve if the change correctly implements what was asked without breaking exist
             except Exception:
                 # Context inheritance is best-effort — never block the orchestrator.
                 # Fall back to a bare request (prior behavior).
-                pass
+                logger.warning("context inheritance failed — falling back to bare request", exc_info=True)
         if not _ctx_inherited:
             # No session context (no session_mgr / session_id, or the build failed):
             # append request as the sole user message — preserves the legacy contract.
@@ -4587,7 +4723,7 @@ Approve if the change correctly implements what was asked without breaking exist
             aids = list(self._bg_subagents.keys())
         if not aids:
             return
-        _remaining = {aid: per_agent_timeout for aid in aids}
+        _remaining = dict.fromkeys(aids, per_agent_timeout)
         while True:
             if _ce is not None and _ce.is_set():
                 return  # cancelled — don't block further
@@ -4610,7 +4746,7 @@ Approve if the change correctly implements what was asked without breaking exist
         try:
             ex.shutdown(wait=False)
         except Exception:
-            pass
+            logger.debug("bg executor shutdown failed", exc_info=True)
     def _cleanup_ipc_workers(self) -> None:
         """Write cancel + shutdown sentinels for all IPC workers spawned this run.
 
@@ -4654,7 +4790,7 @@ Approve if the change correctly implements what was asked without breaking exist
                 if _p.poll() is None:
                     _p.terminate()
             except Exception:
-                pass
+                logger.debug("worker terminate failed", exc_info=True)
         # All tracked workers are now terminated (or were already dead) — the
         # reusable-worker pool they backed is gone. Reset it here (the single
         # source of truth for worker death) so the next run() cannot reuse a
@@ -4719,7 +4855,7 @@ Approve if the change correctly implements what was asked without breaking exist
                     )
                     continue
             except Exception:
-                pass
+                logger.debug("worker idle-heartbeat read failed: %s", wid)
             # task.json absent → between tasks. Verify liveness before reusing.
             # Read the tracked Popen under ``_bg_lock`` for protocol consistency:
             # every other access (spawn / cleanup / abandon) holds ``_bg_lock``, so
@@ -4898,18 +5034,17 @@ Approve if the change correctly implements what was asked without breaking exist
                         try:
                             _proc.terminate()
                         except Exception:
-                            pass
-        else:
-            # (2b) Hard cancel: wait for a tracked Popen to exit, terminate if it
-            # lingers. _cleanup_ipc_workers is the belt-and-braces at run end.
-            if _proc is not None:
+                            logger.debug("worker terminate failed (grace path): %s", worker_id)
+        # (2b) Hard cancel: wait for a tracked Popen to exit, terminate if it
+        # lingers. _cleanup_ipc_workers is the belt-and-braces at run end.
+        elif _proc is not None:
+            try:
+                _proc.wait(timeout=grace_s)
+            except Exception:
                 try:
-                    _proc.wait(timeout=grace_s)
+                    _proc.terminate()
                 except Exception:
-                    try:
-                        _proc.terminate()
-                    except Exception:
-                        pass
+                    logger.debug("worker terminate failed (hard cancel): %s", worker_id)
 
         # (3) Revert partial edits to the captured pre-run baseline.
         if revert_snapshots:
@@ -4939,7 +5074,7 @@ Approve if the change correctly implements what was asked without breaking exist
 
         # Build adjacency list and indegree map
         adj = {tid: [] for tid in task_map}
-        indegree = {tid: 0 for tid in task_map}
+        indegree = dict.fromkeys(task_map, 0)
 
         for st in task_map.values():
             for dep in st.dependencies:
@@ -5026,16 +5161,14 @@ Approve if the change correctly implements what was asked without breaking exist
             return None
 
         # Create a copy of dependencies for modification
-        modified_tasks = []
-        for st in subtasks:
-            modified_tasks.append(SubTaskSpec(
+        modified_tasks = [SubTaskSpec(
                 task_id=st.task_id,
                 title=st.title,
                 description=st.description,
                 assigned_files=list(st.assigned_files),
                 dependencies=list(st.dependencies),
                 priority=st.priority
-            ))
+            ) for st in subtasks]
 
         modified_map = {st.task_id: st for st in modified_tasks}
 
@@ -5098,35 +5231,33 @@ Approve if the change correctly implements what was asked without breaking exist
 
         if not new_cycles:
             return modified_tasks
-        else:
-            logger.warning("Could not break all cycles with minimal removal, remaining: %s", new_cycles)
-            # Fallback: break cycles by removing all intra-cycle outgoing
-            # edges that POINT TO the first node — i.e. cycle members that
-            # DEPEND ON it. Same direction correction as the weakest step: an
-            # edge _break_node -> other means other depends on _break_node, so
-            # the live edge lives in modified_map[other].dependencies. (The
-            # prior reversed check removed _break_node's OWN deps, which often
-            # included no cycle member, leaving the cycle intact and returning
-            # None on tangled graphs.)
-            for cycle in new_cycles:
-                _break_node = cycle[0]
-                _removed = 0
-                for other in cycle:
-                    if other != _break_node and _break_node in modified_map[other].dependencies:
-                        modified_map[other].dependencies.remove(_break_node)
-                        _removed += 1
-                if _removed:
-                    logger.info(
-                        "Force-removed %d intra-cycle deps on %s to break cycle %s",
-                        _removed, _break_node, cycle,
-                    )
-            # Check again
-            _order2, new_cycles2 = self._detect_cycles_kahn(modified_map)
-            if not new_cycles2:
-                return modified_tasks
-            else:
-                logger.warning("Still could not break cycles after aggressive removal: %s", new_cycles2)
-                return None
+        logger.warning("Could not break all cycles with minimal removal, remaining: %s", new_cycles)
+        # Fallback: break cycles by removing all intra-cycle outgoing
+        # edges that POINT TO the first node — i.e. cycle members that
+        # DEPEND ON it. Same direction correction as the weakest step: an
+        # edge _break_node -> other means other depends on _break_node, so
+        # the live edge lives in modified_map[other].dependencies. (The
+        # prior reversed check removed _break_node's OWN deps, which often
+        # included no cycle member, leaving the cycle intact and returning
+        # None on tangled graphs.)
+        for cycle in new_cycles:
+            _break_node = cycle[0]
+            _removed = 0
+            for other in cycle:
+                if other != _break_node and _break_node in modified_map[other].dependencies:
+                    modified_map[other].dependencies.remove(_break_node)
+                    _removed += 1
+            if _removed:
+                logger.info(
+                    "Force-removed %d intra-cycle deps on %s to break cycle %s",
+                    _removed, _break_node, cycle,
+                )
+        # Check again
+        _order2, new_cycles2 = self._detect_cycles_kahn(modified_map)
+        if not new_cycles2:
+            return modified_tasks
+        logger.warning("Still could not break cycles after aggressive removal: %s", new_cycles2)
+        return None
 
     def _find_current_cycles(self, remaining: set, task_map: dict[str, SubTaskSpec]) -> list[list[str]]:
         """
@@ -5142,4 +5273,4 @@ Approve if the change correctly implements what was asked without breaking exist
             try:
                 self._cb_fn(event, data)
             except Exception:
-                pass  # non-critical — never block execution
+                logger.debug("_cb handler raised", exc_info=True)

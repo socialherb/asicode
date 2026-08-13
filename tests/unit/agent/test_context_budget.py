@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 
 import pytest
@@ -10,13 +11,14 @@ from external_llm.agent.context_budget import (
     _CONTEXT_LIMITS,
     _DEFAULT_CONTEXT_LIMIT,
     _MAX_OVERRIDE_REDUCTIONS,
+    ContextBudgetManager,
     _context_window_overrides,
     _is_context_length_error,
     _override_meta,
     _record_context_overflow,
     _resolve_base_context_limit,
     _resolve_context_limit,
-    ContextBudgetManager,
+    _structural_window_floor,
     repair_tool_message_sequence,
 )
 from external_llm.client import LLMMessage
@@ -29,6 +31,27 @@ def make_msg(role: str, content: str, **kwargs) -> LLMMessage:
 
 def make_manager(model: str = "gpt-4o", reserve: int = 4096) -> ContextBudgetManager:
     return ContextBudgetManager(model_name=model, reserve_for_output=reserve)
+
+
+def _bare_manager(model: str = "test") -> ContextBudgetManager:
+    """__new__-constructed manager with the minimal live-property surface.
+
+    context_limit/total_budget are now live properties (re-resolving
+    _resolve_context_limit on every access), so tests that need a tiny budget
+    patch the resolver with :func:`_tiny_limit` instead of assigning
+    instance attributes.
+    """
+    mgr = ContextBudgetManager.__new__(ContextBudgetManager)
+    mgr.model_name = model
+    mgr.reserve_for_output = 0
+    mgr._tool_schema_tokens = 0
+    return mgr
+
+
+def _tiny_limit(limit: int):
+    """Force a tiny LIVE context limit for the duration of a with-block."""
+    from unittest.mock import patch
+    return patch("external_llm.agent.context_budget._resolve_context_limit", return_value=limit)
 
 
 def _clear_overrides() -> None:
@@ -72,9 +95,15 @@ class TestResolveContextLimit:
         # the hard-cap front-trim effectively disabled for claude-sonnet).
         assert _resolve_context_limit("claude-sonnet-4-6") == 200_000
 
-    def test_claude_unknown_variant_returns_1m_fallback(self):
-        # Unlisted claude variants still fall back to 1M (no prefix matching).
-        assert _resolve_context_limit("claude-future-9") == _DEFAULT_CONTEXT_LIMIT
+    def test_claude_unknown_variant_uses_family_prefix_fallback(self):
+        # Unlisted claude variants (pinned dates, future generations) resolve
+        # via _FAMILY_PREFIX_LIMITS to the verified 200K family window — NOT
+        # the 1M default. Before the fix a pinned id like claude-opus-5-20260101
+        # took the 1M fallback against a real 200K window, leaving the
+        # pre-flight cap inert until the provider 400'd.
+        assert _resolve_context_limit("claude-future-9") == 200_000
+        assert _resolve_context_limit("claude-opus-5-20260101") == 200_000
+        assert _resolve_context_limit("anthropic/claude-sonnet-5-20260514") == 200_000
 
     def test_deepseek_v4_flash_returns_1m(self):
         # deepseek-v4-flash supports 1M native context (no explicit entry → fallback)
@@ -106,6 +135,11 @@ class TestResolveContextLimit:
     def test_qwen3_7_max_returns_1m_fallback(self):
         assert _resolve_context_limit("qwen3.7-max") == _DEFAULT_CONTEXT_LIMIT
 
+    def test_qwen3_8_max_returns_1m_fallback(self):
+        # Qwen3.8-max is the 2.4T MoE flagship (1M context, per Qwen Cloud docs).
+        # Like every other 1M opencode model it relies on the fallback.
+        assert _resolve_context_limit("qwen3.8-max") == _DEFAULT_CONTEXT_LIMIT
+
     def test_mimo_v2_5_returns_1m_fallback(self):
         assert _resolve_context_limit("mimo-v2.5") == _DEFAULT_CONTEXT_LIMIT
 
@@ -123,6 +157,23 @@ class TestResolveContextLimit:
 
     def test_minimax_m3_returns_1m_fallback(self):
         assert _resolve_context_limit("minimax-m3") == _DEFAULT_CONTEXT_LIMIT
+
+    def test_gpt_5_6_luna_returns_1m_fallback(self):
+        # GPT-5.6 Luna (OpenAI, served via opencode) has a 1.05M context window
+        # (OpenAI docs). The 1M fallback is a safe under-estimate (no over-allocation).
+        assert _resolve_context_limit("gpt-5.6-luna") == _DEFAULT_CONTEXT_LIMIT
+
+    def test_grok_4_5_returns_500k(self):
+        # Grok 4.5 (xAI, served via opencode) has a 500K context window — a
+        # reduction from Grok 4.3's 1M (xAI docs). MUST be explicit: the 1M
+        # fallback would over-allocate and risk HTTP errors on >500K requests.
+        assert _resolve_context_limit("grok-4.5") == 500_000
+
+    def test_grok_4_5_variant_uses_500k_family_limit(self):
+        # -fast/-mini variants of grok-4.5 share the verified 500K family
+        # window via _FAMILY_PREFIX_LIMITS (not the 1M over-allocation).
+        assert _resolve_context_limit("grok-4.5-fast") == 500_000
+        assert _resolve_context_limit("openrouter/x-ai/grok-4.5-mini") == 500_000
 
     def test_qwen_returns_default(self):
         assert _resolve_context_limit("qwen/qwen3.6-27b-20260422") == _DEFAULT_CONTEXT_LIMIT
@@ -178,13 +229,27 @@ class TestContextOverflowOverride:
         assert second < first
         assert second == max(8192, first * 3 // 4)
 
-    def test_minimum_floor_8k(self):
-        """_record_context_overflow never reduces below 8K."""
+    def test_override_floor_is_structural_minimum(self):
+        """_record_context_overflow never reduces below the structural minimum —
+        the largest tool-schema token count + output reserve + min usable budget.
+
+        Regression: the floor was a flat 8192 — below the ~21.7k tool-schema
+        tokens, so context_message_cap collapsed to its 512 floor and the
+        prompt 400'd forever with no diagnostic."""
         model = "tiny-model"
-        # Simulate reaching the floor
+        # Simulate reaching the old (too low) floor
         _context_window_overrides[model] = 9000
         _record_context_overflow(model)
-        assert _resolve_context_limit(model) >= 8192
+        limit = _resolve_context_limit(model)
+        assert limit == _structural_window_floor()
+        # And the message cap at that floor is actually usable, not the 512
+        # collapse: floor - max reserve - tool schemas == MIN_USABLE_MESSAGE_BUDGET.
+        from external_llm.agent._shared_utils import MIN_USABLE_MESSAGE_BUDGET, context_message_cap
+        cap = context_message_cap(
+            limit, 1024,
+            tool_tokens=_structural_window_floor() - 4096 - MIN_USABLE_MESSAGE_BUDGET,
+        )
+        assert cap >= MIN_USABLE_MESSAGE_BUDGET
 
     def test_override_does_not_affect_other_models(self):
         """Overflow for one model does not affect another."""
@@ -195,6 +260,38 @@ class TestContextOverflowOverride:
         """Unknown model overflow reduces from 1M fallback."""
         _record_context_overflow("custom-unknown-model")
         assert _resolve_context_limit("custom-unknown-model") == _DEFAULT_CONTEXT_LIMIT * 3 // 4
+
+
+class TestContextBudgetManagerLiveLimits:
+    """context_limit / total_budget must reflect runtime overrides LIVE.
+
+    Regression: both were construction-time snapshots — after a 400-driven
+    override the __init__ log and fit_messages warnings reported a cap that
+    was several 25%-steps stale, misleading anyone debugging from logs.
+    """
+
+    def teardown_method(self):
+        _clear_overrides()
+
+    def test_context_limit_property_reflects_override(self):
+        m = make_manager("gpt-4o")
+        base = _resolve_base_context_limit("gpt-4o")
+        assert m.context_limit == base  # no override yet → base limit
+        # Drive the estimate just below the floor so the clamp-UP path fires,
+        # regardless of the current schema token count (slimmed schemas moved
+        # the floor down — a hardcoded 30K no longer sits below it).
+        _floor = _structural_window_floor()
+        _record_context_overflow("gpt-4o", estimated_prompt_tokens=int(_floor / 0.85) - 1)
+        # Live: the property re-resolves instead of returning the __init__ snapshot.
+        # (floor/0.85 - 1)*0.85 < floor → the override clamps UP to the floor.
+        assert m.context_limit == _floor
+        assert m.context_limit != base
+
+    def test_total_budget_follows_live_context_limit(self):
+        m = make_manager("gpt-4o", reserve=4096)
+        _record_context_overflow("gpt-4o")
+        assert m.total_budget == m.context_limit - m.reserve_for_output - m._tool_schema_tokens
+        assert m.total_budget < _resolve_base_context_limit("gpt-4o") - 4096
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -289,13 +386,8 @@ class TestEstimateMessagesTokens:
 
 class TestFitMessages:
     def _make_manager_with_tiny_budget(self) -> ContextBudgetManager:
-        """Manager whose budget is very small (forces truncation)."""
-        mgr = ContextBudgetManager.__new__(ContextBudgetManager)
-        mgr.model_name = "test"
-        mgr.context_limit = 1000
-        mgr.reserve_for_output = 0
-        mgr.total_budget = 1000  # ~3500 chars budget
-        return mgr
+        """Manager whose budget is very small (forces the over-budget warning)."""
+        return _bare_manager()
 
     def test_messages_within_budget_returned_unchanged(self):
         mgr = make_manager("gpt-4o")  # 128k context
@@ -315,7 +407,8 @@ class TestFitMessages:
             msgs.append(make_msg("user", "u" * 200))
             msgs.append(make_msg("assistant", "a" * 200))
 
-        result = mgr.fit_messages(msgs)
+        with _tiny_limit(1000):
+            result = mgr.fit_messages(msgs)
         system_msgs = [m for m in result if m.role == "system"]
         assert len(system_msgs) == 1
         assert system_msgs[0].content == "SYS"
@@ -330,9 +423,9 @@ class TestFitMessages:
             make_msg("tool", large_tool_content),
             make_msg("assistant", "done"),
         ]
-        mgr.total_budget = 700  # below estimated tokens
 
-        result = mgr.fit_messages(msgs)
+        with _tiny_limit(700):  # below estimated tokens
+            result = mgr.fit_messages(msgs)
         tool_msgs = [m for m in result if m.role == "tool"]
         assert len(tool_msgs) == 1
         # No truncation — content unchanged
@@ -340,10 +433,7 @@ class TestFitMessages:
 
     def test_large_user_message_preserved(self):
         """Old user message unchanged — no truncation."""
-        mgr = ContextBudgetManager.__new__(ContextBudgetManager)
-        mgr.model_name = "test"
-        mgr.context_limit = 10_000
-        mgr.reserve_for_output = 0
+        mgr = _bare_manager()
         old_long = "B" * 3000
         msgs = [
             make_msg("system", "sys"),
@@ -356,9 +446,9 @@ class TestFitMessages:
             make_msg("user", "u4"),
         ]
         raw = mgr.estimate_messages_tokens(msgs)
-        mgr.total_budget = raw - 200
 
-        result = mgr.fit_messages(msgs)
+        with _tiny_limit(raw - 200):
+            result = mgr.fit_messages(msgs)
         # No truncation — all messages preserved unchanged
         user_msgs = [m for m in result if m.role == "user"]
         assert len(user_msgs) == 4
@@ -366,11 +456,7 @@ class TestFitMessages:
 
     def test_all_messages_preserved_even_when_over_budget(self):
         """All messages preserved unchanged even when over budget — no dropping."""
-        mgr = ContextBudgetManager.__new__(ContextBudgetManager)
-        mgr.model_name = "test"
-        mgr.context_limit = 200
-        mgr.reserve_for_output = 0
-        mgr.total_budget = 50  # extremely tight
+        mgr = _bare_manager()
 
         msgs = [
             make_msg("system", "s"),
@@ -378,7 +464,8 @@ class TestFitMessages:
             make_msg("assistant", "first assistant reply"),
             make_msg("user", "last user message"),
         ]
-        result = mgr.fit_messages(msgs)
+        with _tiny_limit(50):  # extremely tight
+            result = mgr.fit_messages(msgs)
         # All messages preserved (no dropping)
         assert len(result) == 4
         assert result[0].content == "s"
@@ -397,11 +484,7 @@ class TestFitMessages:
 
     def test_orphaned_tool_messages_not_dropped(self):
         """Orphaned tool messages preserved — no dropping."""
-        mgr = ContextBudgetManager.__new__(ContextBudgetManager)
-        mgr.model_name = "test"
-        mgr.context_limit = 200
-        mgr.reserve_for_output = 0
-        mgr.total_budget = 30
+        mgr = _bare_manager()
 
         msgs = [
             make_msg("system", "s"),
@@ -409,17 +492,14 @@ class TestFitMessages:
             make_msg("tool", "tool result orphan"),
             make_msg("user", "follow-up"),
         ]
-        result = mgr.fit_messages(msgs)
+        with _tiny_limit(30):
+            result = mgr.fit_messages(msgs)
         # All messages preserved (fit_messages does not drop anything)
         assert len(result) == 4
 
     def test_tool_message_following_assistant_with_tool_calls_is_kept(self):
         """Tool message that follows assistant with tool_calls is appended to result."""
-        mgr = ContextBudgetManager.__new__(ContextBudgetManager)
-        mgr.model_name = "test"
-        mgr.context_limit = 200
-        mgr.reserve_for_output = 0
-        mgr.total_budget = 30
+        mgr = _bare_manager()
 
         assistant_msg = make_msg("assistant", "calling tools")
         assistant_msg.tool_calls = [{"id": "call_1", "function": {"name": "read_file", "arguments": "{}"}}]
@@ -430,7 +510,8 @@ class TestFitMessages:
             tool_msg,
             make_msg("user", "follow-up"),
         ]
-        result = mgr.fit_messages(msgs)
+        with _tiny_limit(30):
+            result = mgr.fit_messages(msgs)
         # All messages preserved — tool message kept alongside assistant
         assert len(result) == 4
         assert any(getattr(m, 'role', '') == 'tool' and getattr(m, 'content', '') == 'tool result' for m in result)
@@ -668,8 +749,7 @@ class TestSlidingWindowHysteresis:
         swc = SlidingWindowContext(SlidingWindowConfig(context_window_size=60))
         sys_msg = LLMMessage(role="system", content="sys")
         msgs = [sys_msg]
-        for i in range(100):
-            msgs.append(LLMMessage(role="user", content=f"msg_{i}"))
+        msgs.extend(LLMMessage(role="user", content=f"msg_{i}") for i in range(100))
         out = swc.prepare_before_call(msgs)
 
         # Should keep system + compressed summary + last ~36 user messages
@@ -868,14 +948,6 @@ class TestOverrideTTLAndCap:
         """After _MAX_OVERRIDE_REDUCTIONS calls, further overflows don't reduce."""
         model = "gpt-4o"
         base = _resolve_base_context_limit(model)
-        for i in range(_MAX_OVERRIDE_REDUCTIONS + 1):
-            _record_context_overflow(model)
-        # Limit should be stable after cap reached
-        final = _resolve_context_limit(model)
-        expected = max(8192, base * 3 // 4)  # one reduction only (first)
-        # Each reduction is 75% of previous; after _MAX_OVERRIDE_REDUCTIONS stops
-        # Actually the last call doesn't reduce, so the value is after _MAX_OVERRIDE_REDUCTIONS calls
-        _clear_overrides()
         # Simulate _MAX_OVERRIDE_REDUCTIONS sequential reductions
         cur = base
         for _ in range(_MAX_OVERRIDE_REDUCTIONS):
@@ -948,7 +1020,35 @@ class TestOverrideEndToEndWiring:
         base = _resolve_base_context_limit(model)
         _record_context_overflow(model)
         assert _resolve_context_limit(model) != base
-        assert _resolve_context_limit(model) == max(8192, base * 3 // 4)
+        assert _resolve_context_limit(model) == max(_structural_window_floor(), base * 3 // 4)
+
+
+class TestContextMessageCapImpossibleBudget:
+    """A window where output reserve + tool schemas exceed the limit must be
+    diagnosed with the numbers, not silently collapsed to the 512 floor —
+    which hid the cause (and the fix) forever."""
+
+    def test_logs_structurally_impossible_budget(self, caplog):
+        from external_llm.agent._shared_utils import (
+            _IMPOSSIBLE_BUDGET_WARNED,
+            context_message_cap,
+        )
+        _IMPOSSIBLE_BUDGET_WARNED.clear()
+        with caplog.at_level(logging.ERROR, logger="external_llm.agent._shared_utils"):
+            cap = context_message_cap(8192, 1024, tool_tokens=21_737)
+        assert cap == 512  # floor preserved — behavior unchanged
+        assert any(
+            "structurally impossible" in r.getMessage()
+            and "8192" in r.getMessage() and "21737" in r.getMessage()
+            for r in caplog.records
+        ), "impossible budget was not diagnosed"
+
+    def test_no_log_when_budget_usable(self, caplog):
+        from external_llm.agent._shared_utils import context_message_cap
+        with caplog.at_level(logging.ERROR, logger="external_llm.agent._shared_utils"):
+            cap = context_message_cap(128_000, 4096, tool_tokens=21_737)
+        assert cap == 128_000 - 4096 - 21_737
+        assert not any("structurally impossible" in r.getMessage() for r in caplog.records)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -962,13 +1062,19 @@ class TestOverrideRegression:
     def teardown_method(self):
         _clear_overrides()
 
-    # ── P3: proportional headroom (0.85 × estimated_prompt_tokens) ────────────
+    # ── P3: proportional headroom (0.85 x estimated_prompt_tokens) ────────────
 
     def test_proportional_headroom_binding(self):
         """When estimate clamp is tighter than 75% reduction, 85% headroom binds."""
-        # gpt-4o (128K): 75% → 96K; estimate 10K → 85% → 8500 → override = 8500
+        # gpt-4o (128K): 75% → 96K; estimate 60K → 85% → 51K → override = 51K
+        _record_context_overflow("gpt-4o", estimated_prompt_tokens=60_000)
+        assert _resolve_context_limit("gpt-4o") == max(_structural_window_floor(), int(60_000 * 0.85))
+
+    def test_estimate_clamp_never_below_structural_floor(self):
+        """A small estimate must not drag the override below the structural
+        floor — below it the cap collapses to 512 and the prompt can never fit."""
         _record_context_overflow("gpt-4o", estimated_prompt_tokens=10_000)
-        assert _resolve_context_limit("gpt-4o") == max(8192, int(10_000 * 0.85))
+        assert _resolve_context_limit("gpt-4o") == _structural_window_floor()
 
     def test_proportional_headroom_larger_than_progressive(self):
         """When 75% progressive reduction is tighter than 85% estimate, progressive wins."""
@@ -986,11 +1092,11 @@ class TestOverrideRegression:
         _record_context_overflow("gpt-4o", estimated_prompt_tokens=90_000)
         override_large = _resolve_context_limit("gpt-4o")
         _clear_overrides()
-        _record_context_overflow("gpt-4o", estimated_prompt_tokens=30_000)
+        _record_context_overflow("gpt-4o", estimated_prompt_tokens=60_000)
         override_small = _resolve_context_limit("gpt-4o")
-        # 90K * 0.85 = 76_500 vs 30K * 0.85 = 25_500
+        # 90K * 0.85 = 76_500 vs 60K * 0.85 = 51_000 (both above the structural floor)
         assert override_small < override_large
-        assert override_small == max(8192, int(30_000 * 0.85))
+        assert override_small == max(_structural_window_floor(), int(60_000 * 0.85))
 
     # ── P1: reduction cap resilience (no crash / no silent None) ─────────────
 
@@ -1019,7 +1125,7 @@ class TestOverrideRegression:
         """After _MAX_OVERRIDE_REDUCTIONS reductions, further overflows stop changing."""
         model = "deepseek-r1"  # 64K — tighter, fewer reductions to floor
         limits = []
-        for i in range(_MAX_OVERRIDE_REDUCTIONS + 2):
+        for _ in range(_MAX_OVERRIDE_REDUCTIONS + 2):
             _record_context_overflow(model)
             limits.append(_resolve_context_limit(model))
         # The last two entries should be equal (cap reached)
@@ -1245,8 +1351,10 @@ class TestOverrideCacheForceSave:
 
     def test_force_save_skips_debounce(self, cache_file, monkeypatch):
         """force=True writes to disk even within the debounce window."""
+        import external_llm.agent.context_budget as cb
         from external_llm.agent.context_budget import _save_override_cache
         _enter_debounce_window(monkeypatch)
+        cb._override_dirty = True  # dirty process — a flush is legitimate
         _save_override_cache(force=True)
         assert cache_file.exists(), "force=True must write inside the debounce window"
 
@@ -1258,8 +1366,10 @@ class TestOverrideCacheForceSave:
         depending on timing" to hedge against. Without it the pair could not
         distinguish a working ``force`` from an ignored one.
         """
+        import external_llm.agent.context_budget as cb
         from external_llm.agent.context_budget import _save_override_cache
         _enter_debounce_window(monkeypatch)
+        cb._override_dirty = True  # dirty process — the guard must not suppress these
         _save_override_cache(force=False)
         assert not cache_file.exists(), "debounce did not suppress the write"
         _save_override_cache(force=True)
@@ -1272,6 +1382,7 @@ class TestOverrideCacheForceSave:
         monkeypatch.setattr(
             cb, "_last_cache_save", time.monotonic() - cb._CACHE_SAVE_INTERVAL - 1
         )
+        cb._override_dirty = True  # dirty process — write is legitimate
         cb._save_override_cache(force=False)
         assert cache_file.exists()
 
@@ -1292,6 +1403,7 @@ class TestOverrideCacheForceSave:
         monkeypatch.setattr(
             cb, "_last_cache_save", time.monotonic() - cb._CACHE_SAVE_INTERVAL - 1
         )
+        cb._override_dirty = True  # dirty process — write is legitimate
         cb._save_override_cache(force=False)
         assert cache_file.exists(), (
             "wall-clock backward jump suppressed a force=False save; "
@@ -1307,10 +1419,12 @@ class TestOverrideCacheSnapshotSafety:
 
     def test_snapshot_under_lock(self, cache_file):
         """Snapshot prevents 'dict changed size during iteration'."""
-        from external_llm.agent.context_budget import (
-            _save_override_cache, _override_meta,
-        )
         import threading
+
+        from external_llm.agent.context_budget import (
+            _override_meta,
+            _save_override_cache,
+        )
 
         # Simulate concurrent mutation during serialization
         _override_meta["test-model"] = {"ts": time.time(), "reductions": 1, "limit": 1000}
@@ -1341,9 +1455,7 @@ class TestMsgTokenCache:
 
     def test_cache_reuses_estimate(self):
         """Same LLMMessage returns cached value on second call."""
-        from external_llm.agent._shared_utils import (
-            _estimate_single_message_tokens, _cjk_aware_tokens,
-        )
+        from external_llm.agent._shared_utils import _estimate_single_message_tokens
         msg = LLMMessage(role="user", content="Hello world test message")
         first = _estimate_single_message_tokens(msg)
         # Second call should use cache
@@ -1461,13 +1573,70 @@ class TestEnvOverrideConstants:
         from external_llm.agent.context_budget import _MAX_OVERRIDE_REDUCTIONS
         assert _MAX_OVERRIDE_REDUCTIONS == 3
 
-    def test_env_override_format(self):
-        """The env-var reading code compiles and produces an int (no module reload)."""
+    # NOTE: the predecessor of the tests below re-implemented the parse *in the
+    # test* (`int(os.getenv("CONTEXT_OVERRIDE_TTL", "1800"))`) and asserted on
+    # its own local, so it passed no matter what the module did — it never
+    # touched production code. The tests here drive the real module instead.
+
+    @staticmethod
+    def _import_with(env_name: str, value: str, const: str) -> tuple[int, str]:
+        """Import context_budget in a subprocess with ``env_name=value`` set.
+
+        A subprocess is required because these constants are parsed in the
+        module body: this test process has already imported the module, so an
+        in-process monkeypatch of the environment cannot reach the parse.
+        Returns ``(returncode, stdout)``.
+        """
         import os
-        ttl_default = int(os.getenv("CONTEXT_OVERRIDE_TTL", "1800"))
-        max_red_default = int(os.getenv("CONTEXT_MAX_REDUCTIONS", "3"))
-        assert ttl_default == 1800
-        assert max_red_default == 3
+        import subprocess
+        import sys
+
+        r = subprocess.run(
+            [sys.executable, "-c",
+             f"import external_llm.agent.context_budget as m; print(m.{const})"],
+            capture_output=True, text=True, timeout=120,
+            check=False,  # returncode asserted below for a stderr-rich failure message
+            env={**os.environ, env_name: value},
+        )
+        assert r.returncode == 0, (
+            f"import aborted with {env_name}={value!r}:\n{r.stderr[-600:]}")
+        return r.returncode, r.stdout.strip()
+
+    @pytest.mark.parametrize("bad", ["", " ", "abc", "1800.5", "0", "-5"])
+    def test_malformed_ttl_falls_back_instead_of_aborting_import(self, bad):
+        """A malformed CONTEXT_OVERRIDE_TTL degrades to the default, never ImportError.
+
+        Regression: these constants were parsed with a bare ``int()`` in the
+        module body, and context_budget is imported by ``agent_loop`` — so
+        ``export CONTEXT_OVERRIDE_TTL=`` (empty, the ordinary way a shell
+        profile or a compose ``environment:`` entry blanks a var) raised
+        ValueError and took down every agent run.
+
+        ``0``/``-5`` are included because they parse fine but expire every
+        override the instant it is recorded, silently disabling the
+        overflow-recovery cache; they must fall back too.
+        """
+        _, out = self._import_with("CONTEXT_OVERRIDE_TTL", bad, "_OVERRIDE_TTL_SECONDS")
+        assert out == "1800"
+
+    def test_valid_ttl_is_still_honored(self):
+        """The fallback must not swallow a legitimate override."""
+        _, out = self._import_with("CONTEXT_OVERRIDE_TTL", "60", "_OVERRIDE_TTL_SECONDS")
+        assert out == "60"
+
+    @pytest.mark.parametrize("bad", ["", "abc", "-1"])
+    def test_malformed_max_reductions_falls_back(self, bad):
+        _, out = self._import_with("CONTEXT_MAX_REDUCTIONS", bad, "_MAX_OVERRIDE_REDUCTIONS")
+        assert out == "3"
+
+    def test_zero_max_reductions_is_honored_not_defaulted(self):
+        """0 is a meaningful setting here — "never step a model's window down".
+
+        Unlike a zero-second TTL it is coherent, so _env_int is called with
+        minimum=0 for this one constant and must not rewrite 0 to the default.
+        """
+        _, out = self._import_with("CONTEXT_MAX_REDUCTIONS", "0", "_MAX_OVERRIDE_REDUCTIONS")
+        assert out == "0"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1723,7 +1892,6 @@ class TestP3TTLResetInOverflow:
         """After TTL expiry, fresh overflow must reduce from base, not stale floor."""
         model = "gpt-4o"
         model_lower = model.lower().strip()
-        base = _resolve_base_context_limit(model)
 
         # Set up override then expire
         _record_context_overflow(model)
@@ -1762,11 +1930,12 @@ class TestEstimateToolSchemasCache:
     def test_same_list_uses_cache(self):
         """Same list object returns cached value; json.dumps called once."""
         from unittest.mock import patch
-        from external_llm.agent._shared_utils import (
-            estimate_tokens_from_tool_schemas,
-            _tool_schema_token_cache,
-        )
+
         import external_llm.agent._shared_utils as _su
+        from external_llm.agent._shared_utils import (
+            _tool_schema_token_cache,
+            estimate_tokens_from_tool_schemas,
+        )
         schemas = [{"name": "test", "description": "a tool"}]
         # Clear any prior cache entries
         _tool_schema_token_cache.clear()
@@ -1782,8 +1951,8 @@ class TestEstimateToolSchemasCache:
     def test_cache_respects_bounded_size(self):
         """Cache does not grow unboundedly with different list objects."""
         from external_llm.agent._shared_utils import (
-            estimate_tokens_from_tool_schemas,
             _tool_schema_token_cache,
+            estimate_tokens_from_tool_schemas,
         )
         _tool_schema_token_cache.clear()
         # Create 12 unique list objects (cache max is 8)
@@ -1818,8 +1987,7 @@ class TestToolRegistryMemo:
 
     def test_get_tool_schemas_memoizes_filtered_list(self):
         """Same lang_filter returns the SAME list object (memoized)."""
-        from external_llm.agent.tool_registry import ToolRegistry
-        from external_llm.agent.tool_registry import LanguageId
+        from external_llm.agent.tool_registry import LanguageId, ToolRegistry
         reg = object.__new__(ToolRegistry)
         r1 = reg.get_tool_schemas(lang_filter=LanguageId.TYPESCRIPT)
         r2 = reg.get_tool_schemas(lang_filter=LanguageId.TYPESCRIPT)
@@ -1829,8 +1997,7 @@ class TestToolRegistryMemo:
 
     def test_get_tool_names_memoizes_filtered_set(self):
         """Same lang_filter returns the SAME frozenset (memoized)."""
-        from external_llm.agent.tool_registry import ToolRegistry
-        from external_llm.agent.tool_registry import LanguageId
+        from external_llm.agent.tool_registry import LanguageId, ToolRegistry
         reg = object.__new__(ToolRegistry)
         n1 = reg.get_tool_names(lang_filter=LanguageId.TYPESCRIPT)
         n2 = reg.get_tool_names(lang_filter=LanguageId.TYPESCRIPT)
@@ -1870,8 +2037,7 @@ class TestToolRegistryMemo:
         satisfied by the lookup key, which encodes the filters. Sharing keeps one
         object per variant instead of one per registry.
         """
-        from external_llm.agent.tool_registry import ToolRegistry
-        from external_llm.agent.tool_registry import LanguageId
+        from external_llm.agent.tool_registry import LanguageId, ToolRegistry
         reg = object.__new__(ToolRegistry)
         reg._repo_language = LanguageId.TYPESCRIPT
         parent_result = reg.get_tool_schemas(lang_filter=LanguageId.TYPESCRIPT)
@@ -1890,8 +2056,7 @@ class TestEstimatorReasoningContentNonStr:
 
     def test_non_str_reasoning_uses_cjk_aware(self):
         """Non-string reasoning_content (e.g. bytes) should go through _cjk_aware_tokens."""
-        from external_llm.agent._shared_utils import _cjk_aware_tokens
-        from external_llm.agent._shared_utils import _estimate_single_message_tokens
+        from external_llm.agent._shared_utils import _cjk_aware_tokens, _estimate_single_message_tokens
         # Create a message with non-str reasoning_content (e.g. bytes)
         msg = LLMMessage(role="user", content="hello")
         # bytes object is not str — hits the fallback branch
@@ -1910,8 +2075,7 @@ class TestEstimatorReasoningContentNonStr:
 
     def test_str_reasoning_unaffected(self):
         """String reasoning_content continues to use _cjk_aware_tokens directly."""
-        from external_llm.agent._shared_utils import _cjk_aware_tokens
-        from external_llm.agent._shared_utils import _estimate_single_message_tokens
+        from external_llm.agent._shared_utils import _cjk_aware_tokens, _estimate_single_message_tokens
         msg = LLMMessage(role="user", content="hello")
         msg.reasoning_content = "This is a reasoning trace with 한글 text"
         est = _estimate_single_message_tokens(msg)
@@ -1931,9 +2095,9 @@ class TestToolSchemaTokenCacheEviction:
     def test_cache_evicts_oldest_past_cap(self):
         """After cap(8) entries, the 9th evicts the OLDEST (FIFO), not all."""
         from external_llm.agent._shared_utils import (
-            estimate_tokens_from_tool_schemas,
             _tool_schema_fingerprint,
             _tool_schema_token_cache,
+            estimate_tokens_from_tool_schemas,
         )
         _tool_schema_token_cache.clear()
         # Distinct-content schemas (distinct name-sets) are required now that the
@@ -1953,12 +2117,13 @@ class TestToolSchemaTokenCacheEviction:
 
     def test_cache_hit_for_surviving_entry(self):
         """A surviving entry (within cap) must still hit the cache (no json.dumps)."""
-        from external_llm.agent._shared_utils import (
-            estimate_tokens_from_tool_schemas,
-            _tool_schema_token_cache,
-        )
         from unittest.mock import patch
+
         import external_llm.agent._shared_utils as _su
+        from external_llm.agent._shared_utils import (
+            _tool_schema_token_cache,
+            estimate_tokens_from_tool_schemas,
+        )
 
         _tool_schema_token_cache.clear()
         # Fill to cap exactly (8 distinct name-sets, none evicted).
@@ -1995,8 +2160,8 @@ class TestEstimatorImageOcrAccounting:
     def test_flat_cap_is_a_floor_not_a_replacement(self):
         """Short OCR text must not drop the estimate below the provider cap."""
         from external_llm.agent._shared_utils import (
-            _estimate_single_message_tokens,
             _IMAGE_BLOCK_TOKEN_ESTIMATE,
+            _estimate_single_message_tokens,
         )
         msg = LLMMessage(role="user", content="")
         msg.images = [{"data": "x", "ocr_text": "hi"}]
@@ -2005,8 +2170,8 @@ class TestEstimatorImageOcrAccounting:
     def test_non_dict_image_entries_degrade_instead_of_raising(self):
         """The estimator must never crash a turn on a malformed images list."""
         from external_llm.agent._shared_utils import (
-            _estimate_single_message_tokens,
             _IMAGE_BLOCK_TOKEN_ESTIMATE,
+            _estimate_single_message_tokens,
         )
         msg = LLMMessage(role="user", content="")
         msg.images = [{"data": "x"}, "not-a-dict", None]
@@ -2033,9 +2198,153 @@ class TestImagesStayInMemory:
              r"(json\.dump|asdict|pickle\.dump|\.model_dump).*images",
              "--", "external_llm", "webapp"],
             cwd=repo, capture_output=True, text=True, timeout=30,
+            check=False,
         )
         assert hits.stdout == "", (
             "LLMMessage.images may now be persisted — see the invariant note on "
             "LLMMessage.images in external_llm/client.py before allowing this:\n"
             + hits.stdout
         )
+
+
+def test_resolve_context_limit_delegates_to_base(monkeypatch):
+    """R2: _resolve_context_limit must delegate the base resolution (Ollama API
+    / _CONTEXT_LIMITS / fallback) instead of re-implementing it — the base
+    function is the single source of truth shared with _record_context_overflow.
+
+    Override priority is tested separately (test_override_takes_priority);
+    this pins the delegation itself so a re-implementation cannot regress.
+    """
+    import external_llm.agent.context_budget as cb
+
+    _clear_overrides()
+    monkeypatch.setattr(cb, "_resolve_base_context_limit", lambda m, base_url=None: 424_242)
+    assert cb._resolve_context_limit("gpt-4o") == 424_242
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 14. Cross-process safety: dirty guard + merge-on-write
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestOverrideCacheCrossProcessSafety:
+    """Verify the two cross-process mechanisms on the shared override cache:
+
+    - **Dirty guard**: a process that only *loaded* the cache (import, never
+      recorded an overflow of its own) must not write — its atexit force-flush
+      would otherwise clobber entries a concurrent process wrote in the
+      meantime with a snapshot taken at import time.
+    - **Merge-on-write**: a dirty writer reconciles its in-memory snapshot with
+      whatever a concurrent process wrote to disk, keeping the freshest entry
+      per model (highest ``ts``) so neither writer loses data to
+      last-writer-wins.
+    """
+
+    def teardown_method(self):
+        import external_llm.agent.context_budget as cb
+        _clear_overrides()
+        cb._override_dirty = False
+
+    @staticmethod
+    def _write_disk(cache_file, data: dict) -> None:
+        """Simulate another process having persisted ``data`` to disk."""
+        import json
+        cache_file.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_clean_process_force_flush_writes_nothing(self, cache_file, monkeypatch):
+        """import-only process (dirty=False) must not write, even with force —
+        the pre-existing concurrent entry stays byte-identical."""
+        import json
+
+        import external_llm.agent.context_budget as cb
+        _entry = {"limit": 64_000, "ts": time.time(), "reductions": 1}
+        self._write_disk(cache_file, {"other-model": _entry})
+        cb._override_dirty = False  # clean process
+        cb._save_override_cache(force=True)
+        assert cache_file.exists()
+        assert json.loads(cache_file.read_text(encoding="utf-8")) == {"other-model": _entry}
+
+    def test_clean_process_regular_save_writes_nothing(self, cache_file, monkeypatch):
+        """Same guard for debounced saves, not just the atexit force-flush."""
+        import json
+
+        import external_llm.agent.context_budget as cb
+        _entry = {"limit": 64_000, "ts": time.time(), "reductions": 1}
+        self._write_disk(cache_file, {"other-model": _entry})
+        cb._override_dirty = False
+        cb._save_override_cache(force=False)
+        assert json.loads(cache_file.read_text(encoding="utf-8")) == {"other-model": _entry}
+
+    def test_dirty_process_flush_merges_concurrent_entry(self, cache_file, monkeypatch):
+        """A writer merges the concurrent process's entry instead of clobbering
+        it — the atexit flush of a dirty process keeps foreign entries."""
+        import json
+
+        import external_llm.agent.context_budget as cb
+        _disk_entry = {"limit": 100_000, "ts": time.time(), "reductions": 0}
+        self._write_disk(cache_file, {"disk-model": _disk_entry})
+        _enter_debounce_window(monkeypatch)  # keep dirty=True until the flush
+        _record_context_overflow("gpt-4o")
+        assert cb._override_dirty  # recording marks this process dirty
+        cb._save_override_cache(force=True)
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+        assert data["disk-model"] == _disk_entry  # preserved, not lost
+        assert "gpt-4o" in data  # own entry written alongside
+
+    def test_merge_keeps_fresher_disk_entry(self, cache_file, monkeypatch):
+        """When the concurrent entry is FRESHER than ours, the flush must keep
+        the disk version — our older snapshot must not regress it."""
+        import json
+
+        import external_llm.agent.context_budget as cb
+        _disk_ts = time.time() + 3600  # written after our in-memory entry
+        self._write_disk(cache_file, {"gpt-4o": {"limit": 32_000, "ts": _disk_ts, "reductions": 3}})
+        _enter_debounce_window(monkeypatch)
+        _record_context_overflow("gpt-4o")  # in-memory: 128K→96K, ts=now
+        cb._save_override_cache(force=True)
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+        assert data["gpt-4o"]["limit"] == 32_000  # fresher disk entry wins
+        assert data["gpt-4o"]["ts"] == _disk_ts
+
+    def test_merge_overwrites_staler_disk_entry(self, cache_file, monkeypatch):
+        """The reverse: our in-memory entry is fresher → it replaces the stale
+        disk entry (ts still within TTL so it is a merge decision, not a
+        TTL-drop)."""
+        import json
+
+        import external_llm.agent.context_budget as cb
+        _stale_ts = time.time() - 100  # valid TTL, but older than ours
+        self._write_disk(cache_file, {"gpt-4o": {"limit": 32_000, "ts": _stale_ts, "reductions": 3}})
+        _enter_debounce_window(monkeypatch)
+        _record_context_overflow("gpt-4o")
+        cb._save_override_cache(force=True)
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+        assert data["gpt-4o"]["limit"] == 96_000  # 128K * 0.75 — ours is fresher
+        assert data["gpt-4o"]["ts"] > _stale_ts
+
+    def test_overflow_forwards_base_url_to_resolver(self, cache_file, monkeypatch):
+        """R2: the (model, server) pair must reach the base-limit resolver so
+        the /api/show lookup hits the SAME server that returned the 400."""
+        import external_llm.agent.context_budget as cb
+        seen: list = []
+
+        def _fake_base(model, base_url=None):
+            seen.append((model, base_url))
+            return 128_000
+
+        monkeypatch.setattr(cb, "_resolve_base_context_limit", _fake_base)
+        _record_context_overflow("gpt-4o", base_url="http://ollama:11434")
+        assert seen == [("gpt-4o", "http://ollama:11434")]
+
+    def test_overflow_without_base_url_passes_none(self, cache_file, monkeypatch):
+        """Legacy call sites (no known server) pass None — the resolver's
+        default-server path is preserved."""
+        import external_llm.agent.context_budget as cb
+        seen: list = []
+
+        def _fake_base(model, base_url=None):
+            seen.append(base_url)
+            return 128_000
+
+        monkeypatch.setattr(cb, "_resolve_base_context_limit", _fake_base)
+        _record_context_overflow("gpt-4o")
+        assert seen == [None]

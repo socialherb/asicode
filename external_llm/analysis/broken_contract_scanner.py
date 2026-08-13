@@ -163,8 +163,8 @@ def _dotted_target(node: ast.AST) -> Optional[str]:
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Subscript):
-        base = _dotted_target(node.value)
-        return base  # drop the key, keep the base
+        # Drop the key, keep the base
+        return _dotted_target(node.value)
     return None
 
 
@@ -311,24 +311,23 @@ def _literal_str(node: ast.AST) -> str:
 def _literal_path(node: ast.AST) -> Optional[str]:
     """Return a stable key for an ``open()`` path argument.
 
-    Literal strings are used verbatim; ``self._path`` style attributes are
-    used as-is (without resolving the runtime value). Anything dynamic is
-    dropped (returns None) so we never falsely pair on a meaningless key.
+    Literal strings are used verbatim; ``self._path`` style attribute chains
+    are delegated to :func:`_dotted_target` (used as-is, without resolving the
+    runtime value).  Anything dynamic is dropped (returns None) so we never
+    falsely pair on a meaningless key — including top-level subscript access
+    (``paths["x"]``), which has no stable location.
     """
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
-    if isinstance(node, ast.Attribute):
-        loc = _dotted_target(node)
-        return loc
-    if isinstance(node, ast.Name):
-        return node.id
-    return None
+    if isinstance(node, ast.Subscript):
+        return None
+    return _dotted_target(node)
 
 
 # ── Pairing & caller asymmetry ───────────────────────────────────────────────
 
 
-def _member_caller_count(graph: Any, name: str, repo_root: str, file_path: str) -> int:
+def _member_caller_count(graph: Any, name: str, file_path: str) -> int:
     """Number of caller edges for *name* in the repo graph.
 
     Cross-file referenced-name semantics mirror ``cross_file_refs``:
@@ -345,17 +344,17 @@ def _member_caller_count(graph: Any, name: str, repo_root: str, file_path: str) 
         return -1
     # Suffix-fallback already handled inside get_callers, but the index keys
     # qualified names (``Class.method``). Try the file-scoped definition name
-    # as well in case the bare name does not index-match.
-    try:
-        syms = graph.get_symbols_in_file(file_path) or []
-        for sym in syms:
-            sym_name = getattr(sym, "name", "") or getattr(sym, "symbol_name", "")
-            if sym_name and sym_name.endswith(f".{name}"):
-                callers = graph.get_callers(sym_name) or []
-                if callers:
-                    return len(callers)
-    except Exception:
-        pass
+    # as well in case the bare name does not index-match.  B3: the former
+    # ``suppress(Exception)`` wrapper turned any graph bug here into a silent
+    # ``0`` (a false orphan report in the scan output) — graph access failures
+    # must propagate loudly instead.
+    syms = graph.get_symbols_in_file(file_path) or []
+    for sym in syms:
+        sym_name = getattr(sym, "name", "") or getattr(sym, "symbol_name", "")
+        if sym_name and sym_name.endswith(f".{name}"):
+            callers = graph.get_callers(sym_name) or []
+            if callers:
+                return len(callers)
     return 0
 
 
@@ -369,11 +368,8 @@ def _is_scanner_entry_point(name: str) -> bool:
     """
     if not name.startswith("scan_"):
         return False
-    try:
-        from ..agent.scanner_registry import get_registry
-        return name in get_registry().resident_entry_point_names()
-    except Exception:
-        return False
+    from ..agent.scanner_registry import get_registry
+    return name in get_registry().resident_entry_point_names()
 
 
 # ── Scanner entry point ──────────────────────────────────────────────────────
@@ -416,7 +412,7 @@ def scan_broken_contracts(
         tree = parse_cache.parse_ast(abs_path)
         if tree is None:
             continue
-        per_file = _scan_module(tree, fpath, repo_graph, repo_root, max_per_file)
+        per_file = _scan_module(tree, fpath, repo_graph, max_per_file)
         results.extend(per_file)
         if len(results) >= max_per_file * max(1, len(file_paths)):
             break
@@ -427,7 +423,6 @@ def _scan_module(
     tree: ast.Module,
     rel_path: str,
     graph: Any,
-    repo_root: str,
     max_per_file: int,
 ) -> list[BrokenContractCandidate]:
     """Group top-level & method defs by core name, validate pairs."""
@@ -462,7 +457,7 @@ def _scan_module(
             continue
         for i in range(len(members)):
             for j in range(i + 1, len(members)):
-                cand = _evaluate_pair(members[i], members[j], core, rel_path, graph, repo_root)
+                cand = _evaluate_pair(members[i], members[j], core, rel_path, graph)
                 if cand is not None:
                     candidates.append(cand)
                     if len(candidates) >= max_per_file:
@@ -477,7 +472,6 @@ def _evaluate_pair(
     core: str,
     rel_path: str,
     graph: Any,
-    repo_root: str,
 ) -> Optional[BrokenContractCandidate]:
     """Validate one candidate pair; return a BrokenContractCandidate or None."""
     a_writes, a_reads = a["writes"], a["reads"]
@@ -489,8 +483,8 @@ def _evaluate_pair(
         return None
 
     # Caller asymmetry via the graph.
-    a_calls = _member_caller_count(graph, a["name"], repo_root, rel_path)
-    b_calls = _member_caller_count(graph, b["name"], repo_root, rel_path)
+    a_calls = _member_caller_count(graph, a["name"], rel_path)
+    b_calls = _member_caller_count(graph, b["name"], rel_path)
     # Negative = graph unavailable for this symbol; cannot decide.
     if a_calls < 0 or b_calls < 0:
         return None

@@ -70,10 +70,7 @@ def _schema_param_types() -> dict[str, dict[str, str]]:
     global _PARAM_TYPES
     if _PARAM_TYPES is None:
         table: dict[str, dict[str, str]] = {}
-        try:
-            from .tool_schemas import AGENT_TOOL_SCHEMAS
-        except Exception:  # pragma: no cover - schemas always importable in practice
-            return {}
+        from .tool_schemas import AGENT_TOOL_SCHEMAS
         for schema in AGENT_TOOL_SCHEMAS:
             fn = schema.get("function", schema)
             name = fn.get("name")
@@ -220,7 +217,7 @@ class ArgumentRepairer:
             if declared == "string":
                 if isinstance(value, str):
                     continue
-                if isinstance(value, bool) or isinstance(value, (list, dict, tuple, set)):
+                if isinstance(value, (bool, list, dict, tuple, set)):
                     errors.append(_type_error(name, value, "a string"))
                 elif isinstance(value, (int, float)):
                     out[name] = str(value)

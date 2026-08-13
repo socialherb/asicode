@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import threading
 
-import external_llm.agent.tool_handlers.browser_tools as browser_tools
+from external_llm.agent.tool_handlers import browser_tools
 from external_llm.agent.tool_handlers.browser_tools import BrowserActionToolsMixin
 
 

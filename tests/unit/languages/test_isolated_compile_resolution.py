@@ -207,8 +207,12 @@ class TestKotlinResolutionSafety:
         assert "unresolved reference" in r.errors[0].message
 
     def test_genuine_syntax_error_still_fails(self):
+        # Content must be tree-sitter-clean so the mocked kotlinc verdict is
+        # what's exercised (the tree-sitter prefilter would otherwise
+        # short-circuit with its own errors — that path is covered separately
+        # in test_language_providers.py).
         out = "Server.kt:5:1: error: expecting member declaration\n"
-        r = self._validate(out)
+        r = self._validate(out, content="fun main() { println(1) }\n")
         assert r.ok is False
         assert len(r.errors) == 1
 

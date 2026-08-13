@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re as _re
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 # -----------------------------
 # pytest entry-point plugins → pip package
@@ -99,14 +102,8 @@ class FailureContext:
 # Public API
 # -----------------------------
 
-def analyze_failure(*, stage: str, raw_text: str, repo_root: Optional[str] = None) -> FailureContext:
-    """
-    Parse raw error/log text into FailureContext.
-
-    repo_root:
-      - if provided, can help choose "user code frame" by filtering paths.
-      - keep optional to avoid tight coupling.
-    """
+def analyze_failure(*, stage: str, raw_text: str) -> FailureContext:
+    """Parse raw error/log text into FailureContext."""
     raw = (raw_text or "").strip()
     if not raw:
         ctx = FailureContext(stage=stage, type="UnknownError", message="empty error text")
@@ -124,13 +121,13 @@ def analyze_failure(*, stage: str, raw_text: str, repo_root: Optional[str] = Non
         ctx.fingerprint = _fingerprint(ctx)
         return ctx
 
-    ctx = _try_parse_pytest(stage, raw, repo_root=repo_root)
+    ctx = _try_parse_pytest(stage, raw)
     if ctx:
         ctx.fingerprint = _fingerprint(ctx)
         return ctx
 
     # 2) Fallback: python traceback parser
-    ctx = _try_parse_python_traceback(stage, raw, repo_root=repo_root)
+    ctx = _try_parse_python_traceback(stage, raw)
     if ctx:
         ctx.fingerprint = _fingerprint(ctx)
         return ctx
@@ -199,7 +196,7 @@ def _try_parse_diff_format(stage: str, raw: str) -> Optional[FailureContext]:
     return None
 
 
-def _try_parse_pytest(stage: str, raw: str, repo_root: Optional[str]) -> Optional[FailureContext]:
+def _try_parse_pytest(stage: str, raw: str) -> Optional[FailureContext]:
     """
     Parse pytest output (including collection/import errors).
 
@@ -260,11 +257,10 @@ def _try_parse_pytest(stage: str, raw: str, repo_root: Optional[str]) -> Optiona
     return ctx
 
 
-def _try_parse_python_traceback(stage: str, raw: str, repo_root: Optional[str]) -> Optional[FailureContext]:
-    if "Traceback (most recent call last):" not in raw:
+def _try_parse_python_traceback(stage: str, raw: str) -> Optional[FailureContext]:
+    if "Traceback (most recent call last):" not in raw and "SyntaxError" not in raw and "IndentationError" not in raw:
         # Also catch SyntaxError blocks that might not have full traceback
-        if "SyntaxError" not in raw and "IndentationError" not in raw:
-            return None
+        return None
 
     # Exception type is usually last line: "TypeError: ..."
     ex_type, ex_msg = _extract_exception_tail(raw)
@@ -281,7 +277,7 @@ def _try_parse_python_traceback(stage: str, raw: str, repo_root: Optional[str]) 
         ctx.type = "ImportError"
         ctx.details["missing_module"] = _extract_missing_module(raw)
 
-    frames = _extract_traceback_frames(raw, repo_root=repo_root, max_frames=8)
+    frames = _extract_traceback_frames(raw, max_frames=8)
     ctx.traceback = frames
     pf = _pick_primary_frame(frames)
     if pf:
@@ -312,12 +308,12 @@ def _extract_exception_tail(raw: str) -> tuple[Optional[str], Optional[str]]:
     for ln in reversed(lines[-40:]):
         _stripped = ln.strip()
         # Remove pytest "E   " prefix
-        if _stripped.startswith("E ") or _stripped.startswith("E\t"):
+        if _stripped.startswith(("E ", "E\t")):
             _stripped = _stripped[1:].lstrip()
         _colon_idx = _stripped.find(":")
         if _colon_idx >= 0:
             _ex_type = _stripped[:_colon_idx].strip()
-            if _ex_type.isidentifier() and (_ex_type.endswith("Error") or _ex_type.endswith("Exception") or _ex_type == "AssertionError"):
+            if _ex_type.isidentifier() and (_ex_type.endswith(("Error", "Exception")) or _ex_type == "AssertionError"):
                 return _ex_type, _stripped
         # Handle standalone AssertionError without colon
         if _stripped.startswith("AssertionError"):
@@ -338,7 +334,7 @@ def _extract_missing_module(raw: str) -> Optional[str]:
     return None
 
 
-def _extract_traceback_frames(raw: str, repo_root: Optional[str], max_frames: int) -> list[TraceFrame]:
+def _extract_traceback_frames(raw: str, max_frames: int) -> list[TraceFrame]:
     frames: list[TraceFrame] = []
     _lines = raw.splitlines()
     for i, _ln in enumerate(_lines):
@@ -352,6 +348,7 @@ def _extract_traceback_frames(raw: str, repo_root: Optional[str], max_frames: in
             try:
                 _line_no = int(_line_str.strip())
             except (ValueError, TypeError):
+                logger.debug("traceback line no parse failed", exc_info=True)
                 continue
             _text = _lines[i + 1].strip() if i + 1 < len(_lines) else ""
             frames.append(TraceFrame(file=_file, line=_line_no, func=_func, text=_text))

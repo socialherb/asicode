@@ -2,7 +2,7 @@
 
 import time
 
-from external_llm.agent.tool_result_cache import ToolResultCache
+from external_llm.agent.tool_result_cache import ToolResultCache, _path_sig
 
 
 class TestToolResultCache:
@@ -395,3 +395,118 @@ class TestInvalidatePathsCountAccuracy:
     def test_empty_paths_count_is_zero_when_already_empty(self):
         cache = ToolResultCache()
         assert cache.invalidate_paths(frozenset()) == 0
+
+
+class TestPathSignatureValidation:
+    """External-writer guard: path-scoped entries must be dropped when the
+    file changed behind the registry's back (background job still writing,
+    user editor, parallel session) — TTL alone cannot catch that."""
+
+    def test_unchanged_file_still_hits(self, tmp_path):
+        cache = ToolResultCache()
+        p = tmp_path / "f.py"
+        p.write_text("a" * 100)
+        args = {"path": str(p)}
+        cache.set("read_file", args, {"content": "old"}, paths=frozenset({str(p)}))
+        assert cache.get("read_file", args) == {"content": "old"}
+        assert cache.get("read_file", args) == {"content": "old"}  # still fresh
+
+    def test_file_modified_externally_drops_entry(self, tmp_path):
+        cache = ToolResultCache()
+        p = tmp_path / "f.py"
+        p.write_text("a" * 100)
+        args = {"path": str(p)}
+        cache.set("read_file", args, {"content": "old"}, paths=frozenset({str(p)}))
+        assert cache.get("read_file", args) == {"content": "old"}
+        p.write_text("b" * 200)  # external write — different size AND mtime
+        assert cache.get("read_file", args) is None
+
+    def test_file_deleted_drops_entry(self, tmp_path):
+        cache = ToolResultCache()
+        p = tmp_path / "f.py"
+        p.write_text("content")
+        args = {"path": str(p)}
+        cache.set("read_file", args, {"content": "old"}, paths=frozenset({str(p)}))
+        p.unlink()
+        assert cache.get("read_file", args) is None
+
+    def test_file_recreated_with_same_signature_still_hits(self, tmp_path):
+        """Deletion+recreation is only caught when the signature changes;
+        identical bytes at a later mtime still differ by mtime_ns."""
+        cache = ToolResultCache()
+        p = tmp_path / "f.py"
+        p.write_text("same")
+        args = {"path": str(p)}
+        cache.set("read_file", args, {"content": "old"}, paths=frozenset({str(p)}))
+        p.unlink()
+        p.write_text("same")  # same size, NEW mtime → signature differs
+        assert cache.get("read_file", args) is None
+
+    def test_directory_scope_detects_child_add_removal(self, tmp_path):
+        """Direct-child create/delete bumps the dir mtime, so a directory-
+        scoped entry (glob etc.) is dropped on structural changes."""
+        cache = ToolResultCache()
+        args = {"pattern": "*"}
+        cache.set("glob", args, {"matches": []}, paths=frozenset({str(tmp_path)}))
+        assert cache.get("glob", args) == {"matches": []}
+        (tmp_path / "new.txt").write_text("x")
+        assert cache.get("glob", args) is None
+
+    def test_unspecified_scope_ignores_file_changes(self, tmp_path):
+        """No paths → no signature to validate; the TTL alone governs."""
+        cache = ToolResultCache()
+        p = tmp_path / "f.py"
+        p.write_text("a" * 100)
+        args = {"path": str(p)}
+        cache.set("read_file", args, {"content": "old"})
+        p.write_text("b" * 200)
+        assert cache.get("read_file", args) == {"content": "old"}  # TTL governs
+
+    def test_multi_path_scope_drops_on_any_change(self, tmp_path):
+        cache = ToolResultCache()
+        p1 = tmp_path / "a.py"
+        p2 = tmp_path / "b.py"
+        p1.write_text("1")
+        p2.write_text("2")
+        args = {"paths": [str(p1), str(p2)]}
+        cache.set(
+            "find_references", args, {"refs": []},
+            paths=frozenset({str(p1), str(p2)}),
+        )
+        assert cache.get("find_references", args) == {"refs": []}
+        p2.write_text("22")
+        assert cache.get("find_references", args) is None
+
+    def test_pre_read_signature_detects_mid_read_rewrite(self, tmp_path):
+        """TOCTOU regression: set() must honor the caller's PRE-read signatures
+        (the file state the handler saw), not the POST-read state. A write
+        landing during the handler's read previously baked stale content +
+        fresh signature into the cache — the guard never fired and the stale
+        result was served for the whole TTL."""
+        cache = ToolResultCache()
+        p = tmp_path / "f.py"
+        p.write_text("VERSION = 1\n")
+        args = {"path": str(p)}
+        pre_sigs = {str(p): _path_sig(str(p))}  # captured BEFORE the handler read
+        p.write_text("VERSION = 2  # rewritten by a parallel session\n")  # mid-read write
+        cache.set(
+            "read_file", args, {"content": "VERSION = 1\n"},
+            paths=frozenset({str(p)}), file_sigs=pre_sigs,
+        )
+        # Current signature (v2) != stored pre-read signature (v1) → stale.
+        assert cache.get("read_file", args) is None
+
+    def test_pre_read_signature_unchanged_still_hits(self, tmp_path):
+        """Pre-read signatures that still match must keep the entry fresh —
+        the pre-capture path must not break the normal hit case."""
+        cache = ToolResultCache()
+        p = tmp_path / "f.py"
+        p.write_text("VERSION = 1\n")
+        args = {"path": str(p)}
+        pre_sigs = {str(p): _path_sig(str(p))}
+        cache.set(
+            "read_file", args, {"content": "VERSION = 1\n"},
+            paths=frozenset({str(p)}), file_sigs=pre_sigs,
+        )
+        assert cache.get("read_file", args) == {"content": "VERSION = 1\n"}
+        assert cache.get("read_file", args) == {"content": "VERSION = 1\n"}  # still fresh

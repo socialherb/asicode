@@ -1,8 +1,8 @@
 """Regression tests for ``RAGSearcher`` shared-instance index race.
 
 Covers a defect fixed in this change: ``RAGSearcher`` is shared **by reference**
-across in-process parallel subagents (``ToolRegistry.clone_for_subagent`` /
-``clone_with_filter`` both assign ``clone._rag_searcher = self._rag_searcher``).
+across in-process parallel subagents (``ToolRegistry.clone_for_subagent``
+assigns ``clone._rag_searcher = self._rag_searcher``).
 A subagent's write-success callback (``_invalidate_cache_after_write`` →
 ``invalidate_files``) mutates the five parallel arrays
 (``_rel_paths`` / ``_doc_token_counts`` / ``_doc_lengths`` / ``_doc_texts`` /
@@ -38,6 +38,7 @@ the silent-corruption mode cannot recur.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import threading
 from pathlib import Path
@@ -92,7 +93,7 @@ def test_concurrent_search_and_invalidate_no_crash(tmp_path: Path) -> None:
                 for r in res:
                     if not r.file.startswith("doc"):
                         raise AssertionError(f"unexpected result file: {r.file}")
-            except BaseException as e:  # noqa: BLE001 — surface any failure
+            except BaseException as e:  # surface any failure
                 errors.append(e)
                 stop.set()
                 return
@@ -105,14 +106,13 @@ def test_concurrent_search_and_invalidate_no_crash(tmp_path: Path) -> None:
                 k = i % _N_DOCS
                 target = tmp_path / f"doc{k}.py"
                 if i % 3 == 0:
-                    try:
-                        target.unlink()  # exercise _remove_doc_at (delete path)
-                    except FileNotFoundError:
-                        pass  # sibling writer may have unlinked first
+                    # exercise _remove_doc_at (delete path); sibling writer may have unlinked first
+                    with contextlib.suppress(FileNotFoundError):
+                        target.unlink()
                 else:
                     _write_doc(tmp_path, k, payload=i)  # exercise UPDATE / NEW path
                 searcher.invalidate_files([f"doc{k}.py"])
-            except BaseException as e:  # noqa: BLE001
+            except BaseException as e:
                 errors.append(e)
                 stop.set()
                 return
@@ -156,10 +156,9 @@ def test_index_arrays_consistent_under_concurrent_invalidate(tmp_path: Path) -> 
             k = i % _N_DOCS
             target = tmp_path / f"doc{k}.py"
             if i % 4 == 0:
-                try:
+                # concurrent reader/writer may have removed it first
+                with contextlib.suppress(FileNotFoundError):
                     target.unlink()
-                except FileNotFoundError:
-                    pass  # concurrent reader/writer may have removed it first
             else:
                 _write_doc(tmp_path, k, payload=i)
             searcher.invalidate_files([f"doc{k}.py"])

@@ -44,6 +44,11 @@ class TestNormalizeRelPath:
     def test_leading_slash_removed(self):
         assert normalize_rel_path("/foo/bar.py") == "foo/bar.py"
 
+    def test_leading_backslash_removed(self):
+        # backslash-absolute ("\\foo") normalizes like "/foo" —
+        # backslash conversion runs before leading-slash stripping
+        assert normalize_rel_path("\\foo/bar.py") == "foo/bar.py"
+
     def test_reject_absolute_windows(self):
         assert normalize_rel_path("C:\\foo\\bar.py") == ""
         assert normalize_rel_path("D:\\foo.txt") == ""

@@ -24,6 +24,7 @@ Pinned here:
 from __future__ import annotations
 
 import re
+from typing import ClassVar
 
 from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.agent.symbol_search import SymbolSearcher
@@ -97,8 +98,8 @@ class TestOutlineExtent:
     which fail the call outright and cost a turn.
     """
 
-    # alpha spans 5–7, Beta spans 9–11, VERSION is one line (3).
-    _HEAD = [
+    # alpha spans 5-7, Beta spans 9-11, VERSION is one line (3).
+    _HEAD: ClassVar[list] = [
         "import os",          # 1
         "",                   # 2
         "VERSION = 3",        # 3
@@ -144,7 +145,7 @@ class TestOutlineExtent:
         assert "class Beta" not in res.content, "range must stop at the symbol's end"
 
     def test_one_line_symbol_prints_a_bare_line_number(self, tmp_path):
-        """"3–3" reads like a mistake and says nothing "3" does not."""
+        """"3-3" reads like a mistake and says nothing "3" does not."""
         self._big_module(tmp_path)
         res = _reg(tmp_path).dispatch("read_file", {"path": "big.py"})
         assert re.search(r"lines\s+3\s+\[constant\] VERSION", res.content), res.content[:400]
@@ -430,7 +431,6 @@ class TestReadSymbolCharBudget:
         line (see ``test_oversized_single_line_advances_and_flags_partial``) is
         ordinary line-boundary truncation and must NOT set the flag, or it stops
         being a reliable signal of unrecoverable loss."""
-        budget = _cfg.lines.READ_FILE_MAX_CHARS
         params = ", ".join(f"a{i}=1" for i in range(9000))  # def line > budget
         _write(tmp_path, "one.py", f"def target({params}):\n    return 1\n")
         res = _reg(tmp_path).dispatch("read_symbol", {"name": "target"})
@@ -458,8 +458,7 @@ class TestReadSymbolCharBudget:
 
 def _range_err(tmp_path, **args):
     _write(tmp_path, "big.py", "".join(f"l{i}=1\n" for i in range(1, 201)))
-    res = _reg(tmp_path).dispatch("read_file", {"path": "big.py", **args})
-    return res
+    return _reg(tmp_path).dispatch("read_file", {"path": "big.py", **args})
 
 
 def test_inverted_range_says_so(tmp_path):

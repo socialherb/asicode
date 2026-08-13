@@ -1,17 +1,21 @@
-"""Context Budget Manager – token-aware message fitting (budget check only, no truncation)."""
+"""Context Budget Manager - token-aware message fitting (budget check only, no truncation)."""
 from __future__ import annotations
 
 import atexit
+import contextlib
+import dataclasses
 import json
 import logging
-import dataclasses
 import os
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import (
+    TYPE_CHECKING,
+    Optional,  # f821-protected
+)
 
-from external_llm.agent.message_shapes import is_tool_result, is_tool_call, _is_anthropic_tool_result
-from typing import Optional  # f821-protected
+from external_llm.agent.config.thresholds import _env_int
+from external_llm.agent.message_shapes import _is_anthropic_tool_result, is_tool_call, is_tool_result
 
 if TYPE_CHECKING:
     pass
@@ -38,22 +42,34 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "gpt-4o":           128_000,
     "gpt-4o-mini":      128_000,
     "gpt-4o-2024-08-06": 128_000,
+    "o3":               200_000,
     "o3-mini":          200_000,
     "o3-mini-high":     200_000,
     "o4-mini":          200_000,
     "o4-mini-high":     200_000,
-    # Anthropic — all modern Claude models (Sonnet/Opus/Haiku generations 3–5)
+    # Anthropic — all modern Claude models (Sonnet/Opus/Haiku generations 3-5)
     # share a 200K context window. Listed explicitly (no prefix matching) per the
     # table's design; new variants must be added here or they fall back to 1M.
+    # That warning described a real defect for six of them, including the two
+    # flagship ids the CLI was actively offering (claude-opus-5, claude-fable-5)
+    # — see test_model_catalog_context_parity, which now fails when a catalog
+    # model reaches this table without a decision.
+    "claude-fable-5":            200_000,
+    "claude-opus-5":             200_000,
+    "claude-sonnet-5":           200_000,
     "claude-haiku-4-5":          200_000,
     "claude-haiku-4-5-20251001": 200_000,
     "claude-sonnet-4-6":         200_000,
     "claude-sonnet-4-5":         200_000,
-    "claude-sonnet-5":           200_000,
-    "claude-3-5-sonnet-20241022": 200_000,
-    "claude-3-sonnet":           200_000,
     "claude-opus-4-8":           200_000,
     "claude-opus-4-7":           200_000,
+    "claude-opus-4-6":           200_000,
+    "claude-3-5-sonnet-20241022": 200_000,
+    "claude-3-5-haiku-20241022": 200_000,
+    "claude-3-sonnet":           200_000,
+    "claude-3-opus-20240229":    200_000,
+    "claude-3-sonnet-20240229":  200_000,
+    "claude-3-haiku-20240307":   200_000,
     # DeepSeek — original deepseek-r1 (64K context); deepseek-chat/reasoner are
     # deprecated aliases for deepseek-v4-flash thinking/non-thinking → 1M fallback.
     "deepseek-r1":       64_000,
@@ -66,7 +82,7 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "glm-5-turbo":      200_000,
     "glm-5":            200_000,
     "glm-4.7":          128_000,
-    # Qwen3 (opencode provider) — 3.7-max/plus, 3.6-plus, 3.5-plus are 1M (fallback)
+    # Qwen3 (opencode provider) — 3.8-max/3.7-max/plus, 3.6-plus, 3.5-plus are 1M (fallback)
     # qwen3.6 is the base model at 262_144 (= 2^18 = binary 256K). Source: openrouter.ai.
     "qwen3.6":          262_144,
     # Xiaomi MiMo (opencode) — v2.5-pro/v2.5/v2-pro are 1M (fallback)
@@ -88,11 +104,63 @@ _CONTEXT_LIMITS: dict[str, int] = {
     # hy3-preview is aliased to hy3 in _MODEL_ALIASES (asi.py); both resolve here.
     "hy3":              128_000,
     "hy3-preview":      128_000,
+    # Grok 4.5 (opencode) — 500K context (xAI docs: a reduction from Grok 4.3's 1M).
+    # MUST be explicit: the _DEFAULT_CONTEXT_LIMIT fallback is 1M, which would
+    # over-allocate and risk HTTP errors on >500K-token requests.
+    "grok-4.5":         500_000,
 }
+
+
+# Family-prefix fallback (verified windows) — catches ids whose EXACT name is
+# not in _CONTEXT_LIMITS but whose family window is known: pinned-date ids
+# (claude-opus-5-20260101), -fast/-mini variants (grok-4.5-fast), future
+# generational ids (claude-fable-6). Without it they silently took the 1M
+# fallback against a 200K/500K real window, leaving the pre-flight cap inert
+# until the provider 400'd. Values MUST be at or below the family's real
+# window (over-allocation risks HTTP errors; under-allocation only trims early).
+_FAMILY_PREFIX_LIMITS: tuple[tuple[str, int], ...] = (
+    ("claude-", 200_000),   # every claude-* entry above is 200K — shared by pinned dates
+    ("grok-4.5", 500_000),  # grok-4.5 variants share the 500K window
+)
 
 
 # Default context limit (fallback for unknown models).
 _DEFAULT_CONTEXT_LIMIT = 1_000_000
+
+# Catalog models for which reaching _DEFAULT_CONTEXT_LIMIT is a DECISION, not a
+# miss. The fallback is silent and errs toward over-allocation, so "absent from
+# _CONTEXT_LIMITS" cannot distinguish "1M is right" from "nobody added it" —
+# which is exactly how six Claude ids sat at 1M against a real 200K window.
+# test_model_catalog_context_parity requires every model_catalog id to appear in
+# _CONTEXT_LIMITS or here, so adding a model forces the question to be answered.
+_FALLBACK_IS_CORRECT: frozenset[str] = frozenset({
+    # ── Verified 1M+ (sources in the _CONTEXT_LIMITS header above) ──────────
+    "deepseek-v4-flash", "deepseek-v4-pro",
+    "deepseek-chat", "deepseek-reasoner",   # aliases of v4-flash thinking/non-thinking
+    "kimi-k3",                              # 1,048,576 = 2^20
+    "minimax-m3",
+    "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro",
+    "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus",
+    # Gemini long-context line — 1M input across the 2.0/2.5 pro+flash tiers.
+    "gemini-2.5-pro", "gemini-2.5-flash",
+    "gemini-2.0-flash", "gemini-2.0-flash-001", "gemini-2.0-flash-lite-001",
+
+    # ── UNVERIFIED: window not confirmed against a provider source ──────────
+    # These keep the 1M fallback, i.e. exactly the behaviour they had before
+    # this gate existed — listing them changes nothing at runtime, it only
+    # records that the number is unknown rather than agreed. If any is in fact
+    # smaller, the symptom is the pre-flight cap in agent_loop staying inert
+    # until the provider 400s, after which _record_context_overflow converges
+    # on the real size. Move an entry into _CONTEXT_LIMITS once its window is
+    # published.
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite",
+    "gemini-3.1-pro", "gemini-3-flash",
+    "qwen3.8-max",
+})
+
+# Models already warned about the 1M fallback (once per model per process).
+_warned_unknown_models: set[str] = set()
 
 # Runtime overrides: model → reduced context limit set after a context-length 400.
 # Allows the reactive backstop to progressively reduce a misconfigured limit until
@@ -108,8 +176,19 @@ _override_lock = threading.RLock()  # RLock allows nested acquire by same thread
 # Overrides self-expire after _OVERRIDE_TTL_SECONDS of inactivity, preventing a
 # single spurious 400 from permanently shrinking the window.  Additionally, each
 # model has a _MAX_OVERRIDE_REDUCTIONS cap to avoid unbounded ratcheting.
-_OVERRIDE_TTL_SECONDS = int(os.getenv("CONTEXT_OVERRIDE_TTL", "1800"))      # 30 minutes
-_MAX_OVERRIDE_REDUCTIONS = int(os.getenv("CONTEXT_MAX_REDUCTIONS", "3"))   # max step-downs per model
+# Parsed via _env_int, NOT a bare int(): these run at module import time, and
+# this module is imported by agent_loop, so a bare int() turns any malformed
+# value into an ImportError that kills every agent run. `export
+# CONTEXT_OVERRIDE_TTL=` (empty — the common way to "unset" a var in a shell
+# profile or a docker-compose `environment:` entry) was enough to do it, since
+# int("") raises. Config parsing must degrade to the default, never abort the
+# process. _env_int also rejects out-of-range values that silently disabled the
+# mechanism they configure: TTL <= 0 expires every override the instant it is
+# recorded, so the overflow-recovery cache stops working with no error at all.
+# MAX_REDUCTIONS takes minimum=0 because 0 is a coherent setting there ("never
+# step a model's window down"), unlike a zero-second TTL.
+_OVERRIDE_TTL_SECONDS = _env_int("CONTEXT_OVERRIDE_TTL", 1800)              # 30 minutes
+_MAX_OVERRIDE_REDUCTIONS = _env_int("CONTEXT_MAX_REDUCTIONS", 3, minimum=0)  # max step-downs per model
 
 # Model → {ts: float, reductions: int, limit: int}
 _override_meta: dict[str, dict] = {}
@@ -131,34 +210,63 @@ _OVERRIDE_CACHE_FILE = os.environ.get("ASICODE_CONTEXT_OVERRIDE_CACHE") or os.pa
     os.path.expanduser("~"), ".cache", "asicode", "context_override_cache.json",
 )
 _last_cache_save: float = 0
+# True once THIS process has recorded an overflow of its own — i.e. its
+# in-memory snapshot has diverged from the on-disk baseline loaded at import.
+# Both the atexit force-flush and debounced saves check this, so a process that
+# merely *imported* the module (a short-lived subagent worker, a test
+# subprocess, a webapp that never hit a 400) never overwrites entries a
+# concurrent process wrote to disk. Verified necessity: a bare
+# ``import external_llm.agent.context_budget`` was enough to clobber the file.
+_override_dirty: bool = False
 _CACHE_SAVE_INTERVAL = 5.0  # seconds between disk writes (debounce)
+
+
+def _read_override_cache() -> dict[str, dict]:
+    """Read & validate the on-disk override cache → ``{model: entry}``.
+
+    Best-effort: a missing or unreadable file yields ``{}``.  Each entry is
+    validated in isolation (must be a dict containing ``"limit"``) so one
+    corrupt entry does not discard the rest, and entries older than
+    ``_OVERRIDE_TTL_SECONDS`` are dropped — they would be ignored on load
+    anyway and must not be echoed back to disk by a merge-on-write flush.
+    Shared by the import-time load and the save-path merge so the two never
+    disagree about what counts as a valid entry.
+    """
+    try:
+        if not os.path.exists(_OVERRIDE_CACHE_FILE):
+            return {}
+        with open(_OVERRIDE_CACHE_FILE, encoding="utf-8") as _f:
+            _data = json.load(_f)
+    except Exception:
+        logger.debug("context_budget: override cache load failed", exc_info=True)  # best-effort (file-level: missing, corrupt JSON, IO error)
+        return {}
+    _now = time.time()
+    _out: dict[str, dict] = {}
+    for _model, _entry in _data.items():
+        try:
+            if not isinstance(_entry, dict) or "limit" not in _entry:
+                continue
+            if _now - _entry.get("ts", 0) < _OVERRIDE_TTL_SECONDS:
+                _out[_model] = _entry
+        except Exception:
+            logger.debug("context_budget: skipping corrupt override entry for %r", _model)
+            continue  # skip corrupt entry, keep processing rest
+    return _out
 
 
 def _ensure_override_cache_loaded() -> None:
     """Load persisted overrides from disk (best-effort, called once at module init).
 
-    Each entry is processed in its own try/except so a single corrupt entry
-    (missing ``"limit"``, non-dict value, etc.) does **not** discard all
-    remaining valid entries beyond it.
+    Populates ``_context_window_overrides`` / ``_override_meta`` from the
+    validated snapshot returned by :func:`_read_override_cache`.  Does NOT mark
+    the cache dirty — loading establishes the baseline against which the dirty
+    guard measures divergence, so a process that only imports this module (and
+    never records an overflow of its own) will not clobber entries a concurrent
+    process wrote to disk.
     """
-    try:
-        if not os.path.exists(_OVERRIDE_CACHE_FILE):
-            return
-        with open(_OVERRIDE_CACHE_FILE, encoding="utf-8") as _f:
-            _data = json.load(_f)
-        _now = time.time()
-        for _model, _entry in _data.items():
-            try:
-                if not isinstance(_entry, dict) or "limit" not in _entry:
-                    continue
-                _ts = _entry.get("ts", 0)
-                if _now - _ts < _OVERRIDE_TTL_SECONDS:
-                    _context_window_overrides[_model] = _entry["limit"]
-                    _override_meta[_model] = _entry
-            except Exception:
-                continue  # skip corrupt entry, keep processing rest
-    except Exception:
-        pass  # best-effort (file-level: missing, corrupt JSON, IO error)
+    for _model, _entry in _read_override_cache().items():
+        _context_window_overrides[_model] = _entry["limit"]
+        _override_meta[_model] = _entry
 
 
 def _save_override_cache(force: bool = False) -> None:
@@ -166,14 +274,31 @@ def _save_override_cache(force: bool = False) -> None:
 
     Writes to a temp file then atomically renames to the target path so a
     concurrent reader or writer never sees a partial/corrupted JSON file.
-    The temp file uses a UUID suffix so concurrent writers (e.g. atexit flush
-    vs. worker thread) do not collide on the same path.
+    The temp file uses a pid+time_ns suffix so concurrent writers (e.g. atexit
+    flush vs. worker thread, or two overlapping processes) do not collide.
+
+    Two cross-process safety mechanisms (CLI + webapp + parallel subagents all
+    share one cache file):
+
+    1. **Dirty guard** — a process that only *loaded* the cache (never recorded
+       an overflow of its own) returns immediately.  Without this, its atexit
+       force-flush would overwrite the shared file with a snapshot taken at
+       import time, silently deleting entries a concurrent process wrote in the
+       meantime.  ``force`` bypasses the debounce but NOT this guard: a clean
+       process flushes nothing.
+
+    2. **Merge-on-write** — reconcile the in-memory snapshot with whatever a
+       concurrent process wrote to disk, keeping the freshest entry per model
+       (highest ``ts``) so neither writer loses data to last-writer-wins.
 
     Args:
         force: When True, skip the debounce interval check and write immediately.
                Used by ``atexit`` flush to prevent losing the last override write.
+               The dirty guard still applies — a clean process flushes nothing.
     """
-    global _last_cache_save
+    global _last_cache_save, _override_dirty
+    if not _override_dirty:
+        return
     _now = time.monotonic()
     if not force and _now - _last_cache_save < _CACHE_SAVE_INTERVAL:
         return
@@ -181,24 +306,31 @@ def _save_override_cache(force: bool = False) -> None:
     try:
         os.makedirs(os.path.dirname(_OVERRIDE_CACHE_FILE), exist_ok=True)
         _tmp = _OVERRIDE_CACHE_FILE + ".tmp." + str(os.getpid()) + "." + str(time.time_ns())
-        # Snapshot + debounce update under lock — prevents 'dictionary changed size
-        # during iteration' when a concurrent writer mutates _override_meta while
-        # the atexit flush handler serializes it.  Debounce update inside the lock
-        # prevents a race window where two threads pass the debounce check before
-        # either writes, then both write.
+        # Snapshot + merge + debounce update under lock — prevents 'dictionary
+        # changed size during iteration' when a concurrent writer mutates
+        # _override_meta while we serialize it, and the debounce update inside
+        # the lock prevents a race where two threads pass the debounce check
+        # before either writes.
         with _override_lock:
-            _snapshot = dict(_override_meta)
+            _merged = _read_override_cache()
+            for _model, _entry in _override_meta.items():
+                _disk = _merged.get(_model)
+                if _disk is None or _entry.get("ts", 0) >= _disk.get("ts", 0):
+                    _merged[_model] = _entry
+            _snapshot = _merged
             _last_cache_save = time.monotonic()
+            _override_dirty = False
         with open(_tmp, "w", encoding="utf-8") as _f:
             json.dump(_snapshot, _f, ensure_ascii=False)
         os.replace(_tmp, _OVERRIDE_CACHE_FILE)  # atomic on POSIX & Windows
     except Exception:
         # P5: Clean up tmp file on failure (best-effort) to prevent file leaks.
-        try:
+        # Re-mark dirty so a later flush retries the write rather than silently
+        # dropping the in-memory override.
+        _override_dirty = True
+        with contextlib.suppress(OSError):  # tmp cleanup is best-effort
             if _tmp and os.path.exists(_tmp):
                 os.unlink(_tmp)
-        except Exception:
-            pass
 
 
 # Load persisted overrides at module init.
@@ -210,7 +342,7 @@ _ensure_override_cache_loaded()
 atexit.register(lambda: _save_override_cache(force=True))
 
 
-def _resolve_base_context_limit(model_name: str) -> int:
+def _resolve_base_context_limit(model_name: str, base_url: Optional[str] = None) -> int:
     """Compute the configured context limit WITHOUT runtime overrides.
 
     Like ``_resolve_context_limit`` but skips ``_context_window_overrides`` so
@@ -218,43 +350,99 @@ def _resolve_base_context_limit(model_name: str) -> int:
     """
     model_lower = model_name.lower().strip()
 
-    # 0. Dynamic query from Ollama API (Option B) — for native Ollama format only
+    # 0. Dynamic query from Ollama API (Option B) — for native Ollama format only.
+    #    Runs BEFORE the bare-name reduction and on the raw tag: an Ollama tag is
+    #    the one spelling where the colon is part of the model id rather than a
+    #    routing prefix, so normalising first would hand /api/show a name Ollama
+    #    does not serve.
     if ":" in model_lower and "/" not in model_lower:
         from external_llm.ollama_api import query_ollama_num_ctx
-        api_ctx = query_ollama_num_ctx(model_lower)
+        api_ctx = query_ollama_num_ctx(model_lower, base_url_hint=base_url)
         if api_ctx is not None:
+            logger.debug("num_ctx=%d from Ollama API for model %s", api_ctx, model_lower)
             return api_ctx
 
-    # 1. Exact match in _CONTEXT_LIMITS
-    if model_lower in _CONTEXT_LIMITS:
-        return _CONTEXT_LIMITS[model_lower]
+    # 1. Exact match in _CONTEXT_LIMITS, on the BARE catalog id.
+    #    The table is keyed on bare ids but a model arrives spelled however its
+    #    route spells it, and the lookup was exact — so every OpenRouter slug
+    #    (``anthropic/claude-sonnet-5``) missed the entry its own bare form
+    #    (``claude-sonnet-5``) hits, and took the 1M fallback against a 200K
+    #    window. Shares model_registry's normaliser rather than repeating it.
+    from external_llm.model_registry import bare_model_name
+    bare = bare_model_name(model_lower)
+    if bare in _CONTEXT_LIMITS:
+        return _CONTEXT_LIMITS[bare]
 
-    # 2. Fallback
+    # 1b. Family-prefix fallback (verified family window) — see
+    #     _FAMILY_PREFIX_LIMITS: pinned-date ids and variants that exact match
+    #     misses resolve to the family's verified window instead of the 1M
+    #     over-allocation.
+    for _prefix, _limit in _FAMILY_PREFIX_LIMITS:
+        if bare.startswith(_prefix):
+            return _limit
+
+    # 2. Fallback — 1M default. Warn ONCE per unknown model so a silent
+    #    over-allocation surfaces early (known 1M models in _FALLBACK_IS_CORRECT
+    #    stay quiet; the warning is for models nobody has classified yet).
+    if bare not in _FALLBACK_IS_CORRECT and bare not in _warned_unknown_models:
+        _warned_unknown_models.add(bare)
+        logger.warning(
+            "No context-window entry for model %r — using %d fallback. "
+            "If its real window is smaller, add it to _CONTEXT_LIMITS or "
+            "_FAMILY_PREFIX_LIMITS in context_budget.py.",
+            model_name, _DEFAULT_CONTEXT_LIMIT,
+        )
     return _DEFAULT_CONTEXT_LIMIT
 
 
-def _record_context_overflow(model: str, estimated_prompt_tokens: int | None = None) -> None:
+def _structural_window_floor() -> int:
+    """The smallest context window at which a prompt can still fit.
+
+    Largest tool-schema token count across all variants + the max output
+    reserve (4096) + ``MIN_USABLE_MESSAGE_BUDGET``. ``_record_context_overflow``
+    must never reduce below this: below it ``context_message_cap`` collapses to
+    its 512 floor and the prompt 400s forever — the 25% reduction steps can't
+    help because the schemas alone exceed the window.
+    """
+    from ._shared_utils import MIN_USABLE_MESSAGE_BUDGET, estimate_tokens_from_tool_schemas
+    from .tool_schemas import TOOL_SCHEMA_VARIANTS
+    _max_tool_tokens = max(
+        estimate_tokens_from_tool_schemas(s) for s in TOOL_SCHEMA_VARIANTS.values()
+    )
+    return _max_tool_tokens + 4096 + MIN_USABLE_MESSAGE_BUDGET
+
+
+def _record_context_overflow(model: str, estimated_prompt_tokens: int | None = None, base_url: Optional[str] = None) -> None:
     """Record a context-length overflow for ``model``, reducing its effective limit.
 
     Called when a provider returns HTTP 400 with a "context length exceeded" or
-    equivalent message.  Reduces the limit by 25% (floor 8K) so subsequent calls
-    pre-trim more aggressively.  Repeated overflows progressively reduce until
-    the provider stops rejecting the prompt.
+    equivalent message.  Reduces the limit by 25% (floor: the structural minimum
+    — see ``_structural_window_floor``) so subsequent calls pre-trim more
+    aggressively.  Repeated overflows progressively reduce until the provider
+    stops rejecting the prompt.
 
     When ``estimated_prompt_tokens`` is provided, the new limit is clamped below
     that value so a single overflow can converge in one shot instead of requiring
     multiple turns of progressive reduction.
 
+    Args:
+        base_url: The Ollama server the failing request actually used. Threaded
+            through to ``_resolve_base_context_limit`` so the /api/show lookup
+            hits the SAME (model, server) cache entry as the request path —
+            otherwise a separate POST goes to the *default* server, whose
+            num_ctx may differ from the server that returned the 400.
+
     Thread-safe: the base limit is computed outside ``_override_lock`` (avoiding
     blocking concurrent ``_resolve_context_limit`` callers during any Ollama HTTP
     round-trip), then the dict update uses the lock for RMW safety.
     """
+    global _override_dirty
     model_lower = model.lower().strip()
 
     # P3: Compute base limit OUTSIDE the lock — _resolve_base_context_limit may
     # issue an Ollama HTTP request (blocking ~5s), and holding _override_lock
     # during I/O would stall all other callers of _resolve_context_limit.
-    base_limit = _resolve_base_context_limit(model_lower)
+    base_limit = _resolve_base_context_limit(model_lower, base_url)
 
     with _override_lock:
         meta = _override_meta.get(model_lower, {})
@@ -287,19 +475,28 @@ def _record_context_overflow(model: str, estimated_prompt_tokens: int | None = N
 
         # Use any existing override as the starting point for progressive reduction.
         current = _context_window_overrides.get(model_lower) or base_limit
-        reduced = max(8192, current * 3 // 4)
+        # Never reduce below the structural minimum (tool schemas + output
+        # reserve + min usable message budget): below it context_message_cap
+        # collapses to its 512 floor and no prompt can ever fit — 25% steps
+        # can't help because the schemas alone exceed the window.
+        _floor = _structural_window_floor()
+        reduced = max(_floor, current * 3 // 4)
         if estimated_prompt_tokens is not None:
             # Proportional headroom: the 400 error proves the estimator
             # *underestimated* the real prompt, so a flat -512 is insufficient.
             # Use 85% of the estimated size so the override actually fits within the
             # real (unknown) window — fast 1-shot convergence for typical errors.
-            reduced = min(reduced, max(8192, int(estimated_prompt_tokens * 0.85)))
+            reduced = min(reduced, max(_floor, int(estimated_prompt_tokens * 0.85)))
         _context_window_overrides[model_lower] = reduced
         _override_meta[model_lower] = {
             "ts": time.time(),
             "reductions": reductions + 1,
             "limit": reduced,
         }
+        # Mark the cache dirty: THIS process has now diverged from the on-disk
+        # baseline, so the next save / atexit flush is a legitimate write (and
+        # the merge-on-write reconciles it with any concurrent writer's entry).
+        _override_dirty = True
 
         # ── Logging ──────────────────────────────────────────────────────────
         if base_limit == _DEFAULT_CONTEXT_LIMIT:
@@ -374,7 +571,7 @@ def _is_context_length_error(exc: Exception) -> bool:
     return False
 
 
-def _resolve_context_limit(model_name: str) -> int:
+def _resolve_context_limit(model_name: str, base_url: Optional[str] = None) -> int:
     """Return the context window limit for a given model name.
 
     Priority:
@@ -383,8 +580,11 @@ def _resolve_context_limit(model_name: str) -> int:
          0. Dynamic query from Ollama /api/show (Option B) — if the model has an
             explicit ``num_ctx`` set in its Modelfile, use it.  Only triggers for
             Ollama-native model tags (colon-delimited, no path separator).
-         1. Exact match in ``_CONTEXT_LIMITS`` — all known variants must be listed
-            explicitly; no prefix matching.
+         1. Exact match in ``_CONTEXT_LIMITS`` — all known variants must be
+            listed explicitly.
+         1a. Family-prefix fallback in ``_FAMILY_PREFIX_LIMITS`` (pinned date
+            ids like ``claude-opus-5-20260101`` and ``-fast``/-mini variants) —
+            conservative under-allocation, never over-allocation.
          2. 1M fallback for unknown models.
 
     Thread-safe (uses ``_override_lock``).
@@ -410,21 +610,12 @@ def _resolve_context_limit(model_name: str) -> int:
     if _needs_flush:
         _save_override_cache()
 
-    # 0. Dynamic query from Ollama API (Option B) — for native Ollama format only
-    if ":" in model_lower and "/" not in model_lower:
-        from external_llm.ollama_api import query_ollama_num_ctx
-        api_ctx = query_ollama_num_ctx(model_lower)
-        if api_ctx is not None:
-            logger.debug("num_ctx=%d from Ollama API for model %s", api_ctx, model_lower)
-            return api_ctx
-
-    # 1. Exact match in _CONTEXT_LIMITS (no prefix matching — every variant must
-    #    be listed explicitly to avoid silent wrong answers for future models).
-    if model_lower in _CONTEXT_LIMITS:
-        return _CONTEXT_LIMITS[model_lower]
-
-    # 2. Fallback — preemptive trim with 1M is advisory; the API enforces the real limit.
-    return _DEFAULT_CONTEXT_LIMIT
+    # 0-2. Delegate base resolution (Ollama API query / _CONTEXT_LIMITS / 1M
+    #      fallback) — single source of truth shared with _record_context_overflow.
+    #      ``base_url`` is forwarded so the Ollama /api/show query hits the SAME
+    #      (model, server) cache entry providers.py uses, avoiding a redundant
+    #      POST when the explicit base_url differs from OLLAMA_BASE_URL env.
+    return _resolve_base_context_limit(model_lower, base_url)
 
 class ContextBudgetManager:
     """Manages token budget for LLM context windows.
@@ -438,7 +629,6 @@ class ContextBudgetManager:
     def __init__(self, model_name: str, reserve_for_output: int=4096,
                  tool_schemas: Optional[list] = None):
         self.model_name = model_name
-        self.context_limit = _resolve_context_limit(model_name)
         _adaptive_max = max(512, self.context_limit // 5)
         self.reserve_for_output = min(reserve_for_output, _adaptive_max)
         # Tool-schema tokens are deducted from the budget to match
@@ -447,13 +637,30 @@ class ContextBudgetManager:
         if tool_schemas:
             from external_llm.agent._shared_utils import estimate_tokens_from_tool_schemas
             self._tool_schema_tokens = estimate_tokens_from_tool_schemas(tool_schemas)
-        self.total_budget = self.context_limit - self.reserve_for_output - self._tool_schema_tokens
         logger.info(
             'ContextBudgetManager: model=%s limit=%d budget=%d (reserve=%d, tool_schemas=%d) '
             '(no truncation — sliding window handles context management)',
             model_name, self.context_limit, self.total_budget,
             self.reserve_for_output, self._tool_schema_tokens,
         )
+
+    @property
+    def context_limit(self) -> int:
+        """Live context limit — re-resolves on every access so runtime overrides
+        from ``_record_context_overflow`` (and their TTL expiry) are reflected
+        immediately instead of a construction-time snapshot.
+
+        The guard paths (agent_loop preemptive_trim, ``_resolve_context_limit``)
+        all use the live value; the old snapshot made the __init__ log and
+        ``fit_messages`` warnings report a cap that could be several 25%-steps
+        stale after a 400-driven override — misleading when debugging with logs.
+        """
+        return _resolve_context_limit(self.model_name)
+
+    @property
+    def total_budget(self) -> int:
+        """Live budget = live context limit - output reserve - tool-schema tokens."""
+        return self.context_limit - self.reserve_for_output - self._tool_schema_tokens
 
     @staticmethod
     def estimate_tokens(text: str) -> int:

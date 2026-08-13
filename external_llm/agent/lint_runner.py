@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
@@ -40,6 +41,49 @@ class LintResult:
     error: Optional[str] = None
     stderr: Optional[str] = None  # ruff's stderr output (for debugging)
 
+    @property
+    def fixable_count(self) -> int:
+        """Number of issues carrying an auto-fix suggestion (``fix`` set)."""
+        return sum(1 for i in self.issues if i.fix)
+
+
+def _lint_summary(issues: list[LintIssue]) -> str:
+    """Shared summary line: ``"N lint issue(s) found"`` or ``"no lint issues"``.
+
+    Single source for the summary string emitted by all four lint runners
+    (ruff, generic, eslint, gofmt+golangci-lint).  ``run_ruff`` appends the
+    ``auto-fixable`` / ``truncated`` suffixes on top of the base string.
+    """
+    return f"{len(issues)} lint issue(s) found" if issues else "no lint issues"
+
+
+def _parse_lint_json(
+    stdout: str,
+    tool: str,
+    parse: Callable[[list], list[LintIssue]],
+    max_issues: int = 0,
+) -> list[LintIssue]:
+    """Parse *tool*'s JSON lint stdout into ``LintIssue``s.
+
+    Single source for the JSON-parse skeleton shared by the ruff and eslint
+    runners: the ``stdout.strip()`` guard, the decode tolerance (a malformed
+    tool response logs a warning and yields no issues — it must never fail the
+    lint gate), and the ``max_issues`` truncation.
+
+    *parse* converts the decoded JSON array into issues; the two runners'
+    schemas differ (ruff: flat issue objects; eslint: per-file ``messages``).
+    """
+    issues: list[LintIssue] = []
+    if stdout.strip():
+        try:
+            raw = json.loads(stdout)
+            issues.extend(parse(raw))
+        except (json.JSONDecodeError, KeyError):
+            logger.warning("Failed to parse %s output", tool)
+    if max_issues > 0 and len(issues) > max_issues:
+        issues = issues[:max_issues]
+    return issues
+
 
 class LintRunner:
     """
@@ -69,34 +113,19 @@ class LintRunner:
             severity_filter: Filter issues by severity (error, warning, info).
                              If None, all issues are returned.
         """
-        abs_path = self._resolve_path(path)
-        if abs_path is None:
-            return LintResult(
-                ok=False,
-                summary=f"invalid path: {path!r}",
-                error=f"Path not found or outside repo: {path!r}",
-            )
+        abs_path, err = self._resolve_path_or_error(path)
+        if err is not None:
+            return err
 
-        #ruff execution
-        try:
-            proc = subprocess.run(
-                ["ruff", "check", "--output-format=json", str(abs_path)],
-                cwd=self.repo_root,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            stderr_output = proc.stderr
-        except FileNotFoundError:
-            logger.debug("ruff not installed; skipping lint")
-            return LintResult(ok=True, skipped=True, summary="ruff not installed; lint skipped")
-        except subprocess.TimeoutExpired:
-            return LintResult(ok=False, summary="ruff timed out", error="ruff timed out after 30s")
-        except Exception as e:
-            return LintResult(ok=False, summary=str(e), error=str(e))
+        proc, err = self._run_lint_command(
+            ["ruff", "check", "--output-format=json", str(abs_path)], "ruff")
+        if err is not None:
+            return err
+        assert proc is not None  # (proc, None) arm per _run_lint_command contract
+        stderr_output = proc.stderr
 
         # When ruff returned an error (e.g., syntax error, file not found)
-        if proc.returncode != 0 and proc.returncode != 1:
+        if proc.returncode not in {0, 1}:
             # ruff's common exit codes:
             # 0: success (no issues found)
             # 1: Issues found
@@ -107,39 +136,32 @@ class LintRunner:
             return LintResult(
                 ok=False, summary=error_msg, error=error_msg, stderr=stderr_output)
 
-        issues: list[LintIssue] = []
-        if proc.stdout.strip():
-            try:
-                raw = json.loads(proc.stdout)
-                for item in raw:
-                    loc = item.get("location", {})
-                    fix_info = item.get("fix", {})
-                    severity = item.get("severity", "error")
-
-                    # Apply severity filter
-                    if severity_filter is None or severity == severity_filter:
-                        issues.append(LintIssue(
-                            file=self._normalize_file_path(item.get("filename", path)),
-                            line=loc.get("row", 0),
-                            col=loc.get("column", 0),
-                            code=item.get("code", ""),
-                            message=item.get("message", ""),
-                            severity=severity,
-                            fix=fix_info.get("message") if fix_info else None))
-            except (json.JSONDecodeError, KeyError):
-                logger.warning("Failed to parse ruff output")
-
-        # Limit issues to max_issues if specified
-        if max_issues > 0 and len(issues) > max_issues:
-            issues = issues[:max_issues]
+        issues = _parse_lint_json(
+            proc.stdout, "ruff",
+            lambda raw: [
+                LintIssue(
+                    file=self._normalize_file_path(item.get("filename", path)),
+                    line=item.get("location", {}).get("row", 0),
+                    col=item.get("location", {}).get("column", 0),
+                    code=item.get("code", ""),
+                    message=item.get("message", ""),
+                    severity=item.get("severity", "error"),
+                    fix=(item.get("fix") or {}).get("message"),
+                )
+                for item in raw
+                if severity_filter is None or item.get("severity", "error") == severity_filter
+            ],
+            max_issues,
+        )
 
         ok = len(issues) == 0
+        summary = _lint_summary(issues)
         if issues:
-            summary = f"{len(issues)} lint issue(s) found"
+            fixable = sum(1 for i in issues if i.fix)
+            if fixable:
+                summary += f" ({fixable} auto-fixable)"
             if max_issues > 0 and len(issues) == max_issues:
                 summary += f" (truncated to {max_issues})"
-        else:
-            summary = "no lint issues"
 
         return LintResult(ok=ok, issues=issues, summary=summary)
 
@@ -176,33 +198,17 @@ class LintRunner:
         max_issues: int = DEFAULT_MAX_ISSUES,
     ) -> LintResult:
         """Run a generic lint command. Gracefully skips if the tool is not installed."""
-        abs_path = self._resolve_path(path)
-        if abs_path is None:
-            return LintResult(
-                ok=False,
-                summary=f"invalid path: {path!r}",
-                error=f"Path not found or outside repo: {path!r}",
-            )
+        _abs_path, err = self._resolve_path_or_error(path)
+        if err is not None:
+            return err
 
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=self.repo_root,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except FileNotFoundError:
-            tool = cmd[0] if cmd else "linter"
-            logger.debug("%s not installed; skipping lint", tool)
-            return LintResult(ok=True, skipped=True, summary=f"{tool} not installed; lint skipped")
-        except subprocess.TimeoutExpired:
-            return LintResult(ok=False, summary="lint timed out", error="lint timed out after 30s")
-        except Exception as e:
-            return LintResult(ok=False, summary=str(e), error=str(e))
+        proc, err = self._run_lint_command(cmd, cmd[0] if cmd else "linter")
+        if err is not None:
+            return err
+        assert proc is not None  # (proc, None) arm per _run_lint_command contract
 
         if proc.returncode == 0:
-            return LintResult(ok=True, summary="no lint issues")
+            return LintResult(ok=True, summary=_lint_summary([]))
 
         # Parse generic output: each non-empty line is an issue
         issues: list[LintIssue] = []
@@ -217,7 +223,7 @@ class LintRunner:
                 break
 
         ok = len(issues) == 0
-        summary = f"{len(issues)} lint issue(s) found" if issues else "no lint issues"
+        summary = _lint_summary(issues)
         return LintResult(ok=ok, issues=issues, summary=summary)
 
     def _run_eslint(
@@ -226,54 +232,50 @@ class LintRunner:
         max_issues: int = DEFAULT_MAX_ISSUES,
     ) -> LintResult:
         """Run eslint on a TS/JS file. Gracefully skips if eslint is not installed."""
-        abs_path = self._resolve_path(path)
-        if abs_path is None:
+        abs_path, err = self._resolve_path_or_error(path)
+        if err is not None:
+            return err
+
+        proc, err = self._run_lint_command(
+            ["npx", "eslint", "--format=json", str(abs_path)], "eslint")
+        if err is not None:
+            return err
+        assert proc is not None  # (proc, None) arm per _run_lint_command contract
+
+        # ESLint exit codes: 0 = clean, 1 = findings (JSON always emitted to
+        # stdout). Anything else is a fatal run failure (invalid config,
+        # unresolvable file) and must surface as an error — mirror run_ruff.
+        # rc==1 with EMPTY stdout is also a failure (e.g. npx could not
+        # resolve the eslint package and printed only to stderr): a findings
+        # run always emits JSON, so rc != 0 with no stdout can never mean
+        # "no lint issues".
+        if proc.returncode not in (0, 1) or (
+                proc.returncode == 1 and not proc.stdout.strip()):
+            error_msg = f"eslint failed with exit code {proc.returncode}"
+            if proc.stderr:
+                error_msg += f": {proc.stderr[:200]}"
             return LintResult(
-                ok=False,
-                summary=f"invalid path: {path!r}",
-                error=f"Path not found or outside repo: {path!r}",
-            )
+                ok=False, summary=error_msg, error=error_msg, stderr=proc.stderr)
 
-        try:
-            proc = subprocess.run(
-                ["npx", "eslint", "--format=json", str(abs_path)],
-                cwd=self.repo_root,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except FileNotFoundError:
-            logger.debug("npx/eslint not installed; skipping lint")
-            return LintResult(ok=True, skipped=True, summary="eslint not installed; lint skipped")
-        except subprocess.TimeoutExpired:
-            return LintResult(ok=False, summary="eslint timed out", error="eslint timed out after 30s")
-        except Exception as e:
-            return LintResult(ok=False, summary=str(e), error=str(e))
-
-        issues: list[LintIssue] = []
-        if proc.stdout.strip():
-            try:
-                raw = json.loads(proc.stdout)
-                for file_entry in raw:
-                    for msg in file_entry.get("messages", []):
-                        severity = "error" if msg.get("severity", 0) >= 2 else "warning"
-                        issues.append(LintIssue(
-                            file=self._normalize_file_path(
-                                file_entry.get("filePath", path)),
-                            line=msg.get("line", 0),
-                            col=msg.get("column", 0),
-                            code=msg.get("ruleId", "") or "",
-                            message=msg.get("message", ""),
-                            severity=severity,
-                        ))
-            except (json.JSONDecodeError, KeyError):
-                logger.warning("Failed to parse eslint output")
-
-        if max_issues > 0 and len(issues) > max_issues:
-            issues = issues[:max_issues]
+        issues = _parse_lint_json(
+            proc.stdout, "eslint",
+            lambda raw: [
+                LintIssue(
+                    file=self._normalize_file_path(fe.get("filePath", path)),
+                    line=msg.get("line", 0),
+                    col=msg.get("column", 0),
+                    code=msg.get("ruleId", "") or "",
+                    message=msg.get("message", ""),
+                    severity="error" if msg.get("severity", 0) >= 2 else "warning",
+                )
+                for fe in raw
+                for msg in fe.get("messages", [])
+            ],
+            max_issues,
+        )
 
         ok = len(issues) == 0
-        summary = f"{len(issues)} lint issue(s) found" if issues else "no lint issues"
+        summary = _lint_summary(issues)
         return LintResult(ok=ok, issues=issues, summary=summary)
 
     def _run_go_lint(
@@ -288,34 +290,22 @@ class LintRunner:
         formatting regressions (e.g. LLM-emitted space indentation in a
         tab-indented file) are not silently accepted.
         """
-        abs_path = self._resolve_path(path)
-        if abs_path is None:
-            return LintResult(
-                ok=False,
-                summary=f"invalid path: {path!r}",
-                error=f"Path not found or outside repo: {path!r}",
-            )
+        abs_path, err = self._resolve_path_or_error(path)
+        if err is not None:
+            return err
 
         all_issues: list[LintIssue] = []
         gofmt_available = True
 
         # ── Pass 1: gofmt -d (formatting check) ──────────────────────────
-        try:
-            proc = subprocess.run(
-                ["gofmt", "-d", str(abs_path)],
-                cwd=self.repo_root,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except FileNotFoundError:
-            gofmt_available = False
-            logger.debug("gofmt not installed; skipping gofmt check")
-        except subprocess.TimeoutExpired:
-            logger.warning("gofmt timed out for %s", path)
-        except Exception as e:
-            logger.debug("gofmt error: %s", e)
+        proc, err = self._run_lint_command(["gofmt", "-d", str(abs_path)], "gofmt")
+        if err is not None:
+            # Soft failure — log and continue (gofmt missing also skips pass 2).
+            gofmt_available = not err.skipped
+            if not err.skipped:
+                logger.warning("gofmt check failed for %s: %s", path, err.summary)
         else:
+            assert proc is not None  # (proc, None) arm per _run_lint_command contract
             # gofmt -d prints diff to stdout when file is unformatted.
             # Extract line numbers from diff hunk headers (e.g. @@ -10,6 +10,8 @@)
             if proc.stdout.strip():
@@ -336,21 +326,15 @@ class LintRunner:
 
         # ── Pass 2: golangci-lint ─────────────────────────────────────────
         if gofmt_available:
-            try:
-                proc = subprocess.run(
-                    ["golangci-lint", "run", str(abs_path)],
-                    cwd=self.repo_root,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-            except FileNotFoundError:
-                logger.debug("golangci-lint not installed; skipping")
-            except subprocess.TimeoutExpired:
-                logger.warning("golangci-lint timed out for %s", path)
-            except Exception as e:
-                logger.debug("golangci-lint error: %s", e)
+            proc, err = self._run_lint_command(
+                ["golangci-lint", "run", str(abs_path)], "golangci-lint", timeout=60)
+            if err is not None:
+                if not err.skipped:
+                    logger.warning(
+                        "golangci-lint check failed for %s: %s", path, err.summary)
+                # Tool missing: helper already logged at debug — continue.
             else:
+                assert proc is not None  # (proc, None) arm per _run_lint_command contract
                 if proc.returncode != 0:
                     for line in (proc.stdout + proc.stderr).splitlines():
                         stripped = line.strip()
@@ -365,9 +349,56 @@ class LintRunner:
             all_issues = all_issues[:max_issues]
 
         ok = len(all_issues) == 0
-        summary = f"{len(all_issues)} lint issue(s) found" if all_issues else "no lint issues"
+        summary = _lint_summary(all_issues)
         return LintResult(ok=ok, issues=all_issues, summary=summary)
 
+    def _resolve_path_or_error(
+        self, path: str
+    ) -> tuple[Optional[Path], Optional[LintResult]]:
+        """Resolve *path* for linting: ``(abs_path, None)`` or ``(None, error)``.
+        Thin wrapper over :meth:`_resolve_path` that maps a ``None`` (not found /
+        outside repo) to the standard invalid-path ``LintResult`` — the shared
+        guard for all four lint runners.
+        """
+        abs_path = self._resolve_path(path)
+        if abs_path is None:
+            return None, LintResult(
+                ok=False,
+                summary=f"invalid path: {path!r}",
+                error=f"Path not found or outside repo: {path!r}",
+            )
+        return abs_path, None
+    def _run_lint_command(
+        self,
+        cmd: list[str],
+        tool: str,
+        timeout: int = 30,
+    ) -> tuple[Optional[subprocess.CompletedProcess], Optional[LintResult]]:
+        """Run *cmd* under the shared subprocess skeleton (single source).
+        Returns ``(proc, None)`` on completion, or ``(None, result)`` when the
+        command could not run — tool missing (→ ``skipped``), timeout (→ error),
+        or unexpected failure (→ error).  The gofmt/golangci-lint passes treat
+        the ``(None, result)`` arm as non-fatal (log and continue).
+        """
+        try:
+            return subprocess.run(
+                cmd,
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            ), None
+        except FileNotFoundError:
+            logger.debug("%s not installed; skipping lint", tool)
+            return None, LintResult(
+                ok=True, skipped=True, summary=f"{tool} not installed; lint skipped")
+        except subprocess.TimeoutExpired:
+            return None, LintResult(
+                ok=False, summary=f"{tool} timed out",
+                error=f"{tool} timed out after {timeout}s")
+        except Exception as e:
+            return None, LintResult(ok=False, summary=str(e), error=str(e))
     def _resolve_path(self, path: str) -> Optional[Path]:
         """Resolve *path* within repo_root, return None if it escapes or is absent.
 
@@ -388,9 +419,10 @@ class LintRunner:
                 return None
             if not p.exists():
                 return None
-            return p
         except Exception:
-            return None  # non-critical — never block execution
+            logger.debug("path resolution failed", exc_info=True)  # non-critical — never block execution
+            return None
+        return p
 
     def _normalize_file_path(self, file_path: str) -> str:
         """
@@ -403,6 +435,6 @@ class LintRunner:
             if abs_path.is_absolute():
                 return str(abs_path.relative_to(self.repo_root))
         except (ValueError, TypeError):
-            pass
+            logger.debug("path normalization failed", exc_info=True)
         return file_path
 

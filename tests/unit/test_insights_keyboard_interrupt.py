@@ -19,7 +19,7 @@ import ast
 from pathlib import Path
 
 import asi
-
+from external_llm.repl import repl_impl
 
 # ═══════════════════════════════════════════════════════════════
 # Language invariant — the load-bearing reason the fix is needed
@@ -31,7 +31,7 @@ def test_except_exception_does_not_catch_keyboard_interrupt():
     def _inner():
         try:
             raise KeyboardInterrupt
-        except Exception:  # noqa: B902 — the whole point of the test
+        except Exception:  # the whole point of the test
             return "caught-by-exception"
 
     try:
@@ -78,7 +78,11 @@ def test_keyboard_interrupt_handler_runs_finally_and_returns_false():
 # Source-level mutation guard — both closures must keep the handler
 # ═══════════════════════════════════════════════════════════════
 
-_TREE = ast.parse(Path(asi.__file__).read_text())
+_TREE = ast.parse(
+    Path(asi.__file__).read_text(encoding="utf-8")
+    + "\n"
+    + Path(repl_impl.__file__).read_text(encoding="utf-8")
+)
 
 
 def _find_func(tree, name):

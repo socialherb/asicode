@@ -9,6 +9,7 @@ Handles:
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -66,7 +67,7 @@ def _clean_diff_lines(text: str, strict: bool) -> list[str]:
         ln = raw
 
         # --- strip agent hints / chain hints injected by LLM ---
-        if ln.startswith("[CHAIN-HINT]") or ln.startswith("[TOOL CHAIN HINT]"):
+        if ln.startswith(("[CHAIN-HINT]", "[TOOL CHAIN HINT]")):
             continue
         if ln.startswith("Typical next steps"):
             continue
@@ -140,10 +141,9 @@ def _clean_diff_lines(text: str, strict: bool) -> list[str]:
                 kept.append(ln)
                 result = _count_hunk_body(lines, i)
                 if result is not None:
-                    end, actual_old, actual_new, claimed_old, claimed_new = result
+                    end, _actual_old, _actual_new, _claimed_old, _claimed_new = result
                     # Accept hunk body up to end (may be truncated LLM output)
-                    for j in range(i + 1, end):
-                        kept.append(lines[j])
+                    kept.extend(lines[j] for j in range(i + 1, end))
                     i = end
                 else:
                     i += 1
@@ -202,15 +202,13 @@ def _is_diff_header_line(ln: str) -> bool:
         return False
     if ln.startswith("diff --git "):
         return True
-    if ln.startswith("--- a/") or ln.startswith("--- /dev/null"):
+    if ln.startswith(("--- a/", "--- /dev/null")):
         return True
-    if ln.startswith("+++ b/") or ln.startswith("+++ /dev/null"):
+    if ln.startswith(("+++ b/", "+++ /dev/null")):
         return True
     if ln.startswith(("new file mode ", "deleted file mode ", "old mode ", "new mode ")):
         return True
-    if ln.startswith(("similarity index ", "rename from ", "rename to ")):
-        return True
-    return False
+    return bool(ln.startswith(("similarity index ", "rename from ", "rename to ")))
 
 
 def _count_hunk_body(lines: list[str], start: int) -> tuple[int, int, int, int, int] | None:
@@ -251,9 +249,13 @@ def _count_hunk_body(lines: list[str], start: int) -> tuple[int, int, int, int, 
         # Single "--- comment" without matching "+++" is NOT a boundary
         # (safe: SQL/Lua comments are consumed as deletion lines if they
         # appear inside a hunk body; at hunk boundaries they stay noise).
-        if ln.startswith("--- ") and not ln.startswith(("--- a/", "--- /dev/null")):
-            if i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
-                break  # bare file header pair → hunk boundary
+        if (
+            ln.startswith("--- ")
+            and not ln.startswith(("--- a/", "--- /dev/null"))
+            and i + 1 < len(lines)
+            and lines[i + 1].startswith("+++ ")
+        ):
+            break  # bare file header pair → hunk boundary
         # No-newline-at-EOF marker (\) — meta, not counted
         if ln.startswith("\\ "):
             i += 1
@@ -317,8 +319,7 @@ def _recount_hunks(lines: list[str]) -> list[str]:
             actual_old = actual_new = 0
 
         out.append(f"@@ -{old_a},{actual_old} +{new_a},{actual_new} @@")
-        for j in range(i + 1, end):
-            out.append(lines[j])
+        out.extend(lines[j] for j in range(i + 1, end))
         i = end
 
     return out
@@ -344,8 +345,7 @@ def _rewrite_patch_paths(lines: list[str], target_rel: str) -> list[str]:
             if parsed:
                 end, _, _, _, _ = parsed
                 # Copy hunk body as-is (no path rewriting inside hunks)
-                for j in range(i + 1, end):
-                    out.append(lines[j])
+                out.extend(lines[j] for j in range(i + 1, end))
                 i = end
             else:
                 i += 1
@@ -411,6 +411,7 @@ REASON_UNKNOWN = "UNKNOWN"
 REASON_CONFLICT_MARKERS = "CONFLICT_MARKERS"
 REASON_SKIPPED_LARGE_FILE = "SKIPPED_LARGE_FILE"
 REASON_SKIPPED_BINARY_FILE = "SKIPPED_BINARY_FILE"
+REASON_3WAY_SKIPPED_UNVERIFIABLE = "3WAY_SKIPPED_UNVERIFIABLE"
 
 
 def _classify_git_apply_output(out: str) -> str:
@@ -465,8 +466,25 @@ def _run_git_apply(repo: Path, args: list[str], input_text: str | None = None) -
     except Exception as e:
         return -1, f"git apply exception: {e}"
 
-def _git_status_porcelain(repo: Path, *, include_untracked: bool = True) -> str:
-    """Return `git status --porcelain` output (best-effort)."""
+_GIT_STATUS_TIMEOUT_MARKER = "[git-status-timeout]"
+
+
+def _clip_git_status(raw: str | None, limit: int = 2000) -> str:
+    """Clip git-status output for diagnostics; surface timeouts instead of ""."""
+    if raw is None:
+        return _GIT_STATUS_TIMEOUT_MARKER
+    return raw[:limit]
+
+
+def _git_status_porcelain(repo: Path, *, include_untracked: bool = True) -> str | None:
+    """Return `git status --porcelain` output, or None if it could not be obtained.
+
+    Returns:
+        str  — genuine git output (``""`` is a *verified* "no changes").
+        None — unknown: git status timed out or raised. Callers MUST NOT treat
+               None as "clean": a hung git would otherwise masquerade as a
+               pristine tree (e.g. 3-way merge against a dirty worktree).
+    """
     try:
         cmd = ["git", "status", "--porcelain"]
         if not include_untracked:
@@ -481,27 +499,42 @@ def _git_status_porcelain(repo: Path, *, include_untracked: bool = True) -> str:
         )
         return (p.stdout or b"").decode("utf-8", errors="replace").strip()
     except subprocess.TimeoutExpired:
-        # Distinguish a hung git from a genuinely clean tree: returning "" makes
-        # _is_worktree_clean() report True, so a timeout would silently masquerade
-        # as "no changes" and let _rollback conclude there is nothing to restore.
+        # Distinguish a hung git from a genuinely clean tree: returning "" would
+        # make _is_worktree_clean() report True, letting a timeout masquerade as
+        # "no changes" and skip rollback/3-way safety entirely. None = unknown.
         logger.warning(
-            "git status timed out (repo=%s); returning empty — rollback/clean "
-            "checks may misjudge a timeout as 'no changes'",
+            "git status timed out (repo=%s); returning None — callers must treat "
+            "an unverifiable status as unknown, never as 'clean'",
             repo,
         )
-        return ""
-    except Exception:
-        return ""
+        return None
+    except OSError as e:
+        logger.warning(
+            "git status failed (repo=%s); returning None — callers must treat "
+            "an unverifiable status as unknown, never as 'clean': %s",
+            repo, e,
+        )
+        return None
 
 
-def _is_worktree_clean(repo: Path) -> bool:
-    """True if there are no uncommitted *tracked* changes (best-effort).
+def _is_worktree_clean(repo: Path) -> bool | None:
+    """Whether there are uncommitted *tracked* changes; None if unverifiable.
+
+    Returns:
+        True  — verified clean (no tracked changes).
+        False — verified dirty.
+        None  — unverifiable (git status timed out / failed). Callers MUST NOT
+                treat None as clean — skip the risky operation instead (the
+                apply_patch 3-way gate refuses the merge on None).
 
     NOTE:
     - Untracked files (??) are ignored, because they don't affect `git apply --3way`
       safety for tracked file merges, and blocking on them hurts UX.
     """
-    return _git_status_porcelain(repo, include_untracked=False).strip() == ""
+    raw = _git_status_porcelain(repo, include_untracked=False)
+    if raw is None:
+        return None
+    return raw.strip() == ""
 
 
 
@@ -536,7 +569,7 @@ def _extract_files_from_git_apply_output(stderr_text: str) -> list[str]:
     normed: set[str] = set()
     for f in files:
         f = f.strip().strip('"').strip("'")
-        if f.startswith("a/") or f.startswith("b/"):
+        if f.startswith(("a/", "b/")):
             f = f[2:]
         f = f.rstrip(".,;:")
         if f and f not in ("dev/null", "/dev/null"):
@@ -548,9 +581,10 @@ def _is_probably_binary_file(path: Path, sniff_bytes: int) -> bool:
     try:
         with open(path, "rb") as f:
             b = f.read(max(1, sniff_bytes))
-        return b"\x00" in b
-    except Exception:
+    except OSError:
         return False
+    else:
+        return b"\x00" in b
 
 
 def _has_conflict_markers(path: Path, max_bytes: int) -> bool:
@@ -591,8 +625,9 @@ def _has_conflict_markers(path: Path, max_bytes: int) -> bool:
                 continue
             if any(c > s for c in closes):
                 return True
+    except OSError:
         return False
-    except Exception:
+    else:
         return False
 
 
@@ -602,8 +637,8 @@ def _resolve_inside_repo_path(repo: Path, rel: str) -> Path:
     p = (base / rel).resolve()
     try:
         p.relative_to(base)
-    except ValueError:
-        raise ValueError(f"path_outside_repo: {rel}")
+    except ValueError as e:
+        raise ValueError(f"path_outside_repo: {rel}") from e
     return p
 
 
@@ -611,10 +646,17 @@ def _resolve_inside_repo_path(repo: Path, rel: str) -> Path:
 # 3-way fallback logic (deduplicated)
 # =========================================================
 
-def _git_status_untracked(repo: Path) -> set[str]:
+def _git_status_untracked(repo: Path) -> set[str] | None:
     """
     Return current untracked file paths (relative, normalized with '/').
     Uses porcelain -z for robustness.
+
+    Returns:
+        set[str] — genuine result (possibly empty).
+        None     — unknown: git status timed out / failed. A None PRE-apply
+                   snapshot must NOT be treated as "no pre-existing untracked
+                   files": _rollback would then `git clean` user files that
+                   pre-existed (fail-closed: skip the cleanup instead).
     """
     try:
         p = subprocess.run(
@@ -650,25 +692,33 @@ def _git_status_untracked(repo: Path) -> set[str]:
 
             i += 1
 
-        return untracked
     except subprocess.TimeoutExpired:
-        # An empty set means "nothing was pre-existing untracked", so on a timeout
-        # _rollback could wrongly delete files it considers newly-created. Log so a
-        # hung git is observable instead of silently degrading rollback safety.
+        # An empty set would mean "nothing was pre-existing untracked", so on a
+        # timeout _rollback could wrongly delete files it considers newly-created.
+        # None = unknown: callers fail closed instead of deleting.
         logger.warning(
-            "git status -z timed out (repo=%s); returning empty set — rollback "
-            "snapshot may be incomplete (nothing recorded as pre-existing untracked)",
+            "git status -z timed out (repo=%s); returning None — rollback must "
+            "fail closed (nothing provably pre-existing untracked)",
             repo,
         )
-        return set()
-    except Exception:
-        return set()
+        return None
+    except OSError as e:
+        logger.warning(
+            "git status -z failed (repo=%s); returning None — rollback must "
+            "fail closed (nothing provably pre-existing untracked): %s",
+            repo, e,
+        )
+        return None
+    else:
+        return untracked
 
 
 def _capture_rollback_snapshot(repo: Path, touched_files: list[str]) -> dict[str, Any]:
     """
     Capture enough info to rollback *completely*:
     - untracked files before apply attempt (so we don't delete user-owned untracked files)
+      (None if `git status` timed out — _rollback then fail-closes the
+      newly-created-untracked cleanup instead of deleting files)
     - existence of touched paths before apply (so we can delete newly-created touched files/dirs)
     """
     pre_untracked = _git_status_untracked(repo)
@@ -695,14 +745,12 @@ def _delete_path_best_effort(p: Path) -> None:
                         child.unlink(missing_ok=True)
                     elif child.is_dir():
                         child.rmdir()
-                except Exception:
-                    pass
-            try:
+                except OSError as e:
+                    logger.debug("delete_path_best_effort child %s: %s", child, e)
+            with contextlib.suppress(OSError):
                 p.rmdir()
-            except Exception:
-                pass
-    except Exception:
-        pass
+    except OSError as e:
+        logger.debug("delete_path_best_effort %s: %s", p, e)
 
 
 def _parse_porcelain_z_paths(raw: str) -> list[str]:
@@ -791,38 +839,54 @@ def _rollback(repo: Path, touched_files: list[str], snapshot: dict[str, Any] | N
                     if p.exists():
                         report["attempted"] = True
                         _delete_path_best_effort(p)
-            except Exception:
+            except (ValueError, OSError) as e:
+                logger.debug("rollback delete-new-touched skip %s: %s", rel, e)
                 continue
     except Exception as e:
         logger.warning("Rollback delete-new-touched failed: %s", e)
 
     # 3) Delete newly-created untracked files (delta from pre_untracked)
     try:
-        pre_untracked: set[str] = set((snapshot or {}).get("pre_untracked") or set())
+        snap = snapshot or {}
+        pre_unknown = "pre_untracked" in snap and snap.get("pre_untracked") is None
         post_untracked = _git_status_untracked(repo)
-        created = sorted(p for p in (post_untracked - pre_untracked) if p)
+        if pre_unknown or post_untracked is None:
+            # P-2 (timeout tri-state): the untracked delta cannot be computed
+            # safely — deleting "newly-created" files could remove files that
+            # pre-existed (pre-apply snapshot unknown) or that the apply never
+            # touched (post-apply status unknown). Fail closed: skip cleanup.
+            reason = "pre_untracked_unknown" if pre_unknown else "post_untracked_unknown"
+            logger.warning(
+                "rollback: %s (git status timed out); skipping newly-created-"
+                "untracked cleanup (fail-closed)",
+                reason,
+            )
+            report["cleanup_skipped_reason"] = reason
+        else:
+            pre_untracked: set[str] = set(snap.get("pre_untracked") or set())
+            created = sorted(p for p in (post_untracked - pre_untracked) if p)
 
-        if created:
-            report["attempted"] = True
-            # Use git clean with explicit pathspecs (safer than global clean)
-            # Batch to avoid argv limits
-            BATCH = 50
-            for i in range(0, len(created), BATCH):
-                batch = created[i : i + BATCH]
-                subprocess.run(
-                    ["git", "clean", "-fd", "--", *batch],
-                    cwd=str(repo),
-                    check=False,
-                    timeout=30,  # bound HTTP request; TimeoutExpired caught below
-                )
-            # Extra safety: best-effort delete if git clean didn't remove something
-            for rel in created:
-                try:
-                    p = _resolve_inside_repo_path(repo, rel)
-                    if p.exists():
-                        _delete_path_best_effort(p)
-                except Exception:
-                    pass
+            if created:
+                report["attempted"] = True
+                # Use git clean with explicit pathspecs (safer than global clean)
+                # Batch to avoid argv limits
+                BATCH = 50
+                for i in range(0, len(created), BATCH):
+                    batch = created[i : i + BATCH]
+                    subprocess.run(
+                        ["git", "clean", "-fd", "--", *batch],
+                        cwd=str(repo),
+                        check=False,
+                        timeout=30,  # bound HTTP request; TimeoutExpired caught below
+                    )
+                # Extra safety: best-effort delete if git clean didn't remove something
+                for rel in created:
+                    try:
+                        p = _resolve_inside_repo_path(repo, rel)
+                        if p.exists():
+                            _delete_path_best_effort(p)
+                    except (ValueError, OSError) as e:
+                        logger.debug("rollback clean-new-untracked skip %s: %s", rel, e)
     except Exception as e:
         logger.warning("Rollback clean-new-untracked failed: %s", e)
 
@@ -950,7 +1014,7 @@ def apply_patch(
 
     raw = "" if diff_text is None else str(diff_text)
 
-    # Detect and wrap hunk‑only diffs (no file headers)
+    # Detect and wrap hunk-only diffs (no file headers)
     lines = raw.strip().splitlines()
     first_non_empty = None
     for line in lines:
@@ -966,12 +1030,12 @@ def apply_patch(
     )
     if is_hunk_only:
         if not file_path_hint:
-            msg = "Hunk‑only patch requires the 'path' parameter to determine the target file"
+            msg = "Hunk-only patch requires the 'path' parameter to determine the target file"
             return False, msg, "MISSING_PATH_HINT", {"execution_steps": execution_steps}
         # Normalize path: ensure it's relative and inside repo_root
         norm = normalize_rel_path(file_path_hint)
         if not norm:
-            msg = f"Invalid or unsafe path in hunk‑only patch: {file_path_hint}"
+            msg = f"Invalid or unsafe path in hunk-only patch: {file_path_hint}"
             return False, msg, "PATH_INVALID", {"execution_steps": execution_steps}
         # Construct full unified diff headers
         header = f"diff --git a/{norm} b/{norm}\n--- a/{norm}\n+++ b/{norm}\n"
@@ -1068,9 +1132,33 @@ def apply_patch(
             autostash_used = False
             autostash_pop_ok = False
             autostash_pop_error = ""
-            dirty_before = _git_status_porcelain(repo)[:2000]
+            dirty_before = _git_status_porcelain(repo)  # str | None (None = status timed out)
 
-            if not _is_worktree_clean(repo):
+            clean_state = _is_worktree_clean(repo)  # True/False/None
+            if clean_state is None:
+                # P-2 (timeout tri-state): cleanliness cannot be verified — a
+                # hung git would hang the stash push too, so treating unknown
+                # as dirty cannot protect the tree. The only safe response is
+                # to NOT run a 3-way merge against an unverifiable worktree.
+                # --check was a non-mutating dry run, so the tree is untouched
+                # here; fall back to the generic conflict failure so
+                # patch_engine can run its repair ladder.
+                _cleanup_reject_files(repo, touched_files)
+                return False, (
+                    "3-way merge skipped: worktree cleanliness unverifiable "
+                    "(git status timed out)"
+                ), REASON_3WAY_SKIPPED_UNVERIFIABLE, {
+                    "touched_files": touched_files,
+                    "failed_files": sorted(
+                        set(touched_files) | set(_extract_files_from_git_apply_output(out))
+                    ),
+                    "rollback_performed": False,
+                    "rollback_skipped_reason": "worktree_clean_unverifiable",
+                    "used_strategy": "git-apply-3way-skipped-unverifiable",
+                    "git_status_porcelain_before": _clip_git_status(dirty_before),
+                    "execution_steps": execution_steps,
+                }
+            if clean_state is False:
                 try:
                     # Stash tracked changes (untracked are ignored by our cleanliness policy anyway)
                     p = subprocess.run(
@@ -1113,29 +1201,22 @@ def apply_patch(
                     autostash_pop_error = str(e)
                     execution_steps.append({"step": "autostash_pop", "status": "exception", "error": autostash_pop_error})
 
-            try:
-                if isinstance(d, dict):
-                    d["autostash_used"] = bool(autostash_used)
-                    d["autostash_pop_ok"] = bool(autostash_pop_ok)
-                    d["autostash_pop_error"] = str(autostash_pop_error or "")
-                    d["git_status_porcelain_before"] = dirty_before
-                    d["git_status_porcelain_after"] = _git_status_porcelain(repo)[:2000]
-                    d["used_strategy"] = "git-apply-3way-autostash" if autostash_used else (d.get("used_strategy") or "")
-            except Exception:
-                pass
+            if isinstance(d, dict):
+                d["autostash_used"] = bool(autostash_used)
+                d["autostash_pop_ok"] = bool(autostash_pop_ok)
+                d["autostash_pop_error"] = str(autostash_pop_error or "")
+                d["git_status_porcelain_before"] = _clip_git_status(dirty_before)
+                d["git_status_porcelain_after"] = _clip_git_status(_git_status_porcelain(repo))
+                d["used_strategy"] = "git-apply-3way-autostash" if autostash_used else (d.get("used_strategy") or "")
 
             if ok:
                 return ok, msg, r, d
 
             # 3way failed too; DO NOT fall through to generic failure path,
             # because that path overwrites details and drops autostash metadata.
-            try:
-                if isinstance(d, dict):
-                    # Ensure execution_steps is present for UI/debug consistency
-                    if not d.get("execution_steps"):
-                        d["execution_steps"] = execution_steps
-            except Exception:
-                pass
+            if isinstance(d, dict) and not d.get("execution_steps"):
+                # Ensure execution_steps is present for UI/debug consistency
+                d["execution_steps"] = execution_steps
 
             return False, msg, r, d
 
@@ -1276,7 +1357,7 @@ def apply_patch(
                             for k in range(len(file_lines)):
                                 t = file_lines[k].lstrip()
                                 # Cover def/class/async def (but not async for/async with)
-                                if not (t.startswith(("def ", "class ")) or t.startswith("async def ")):
+                                if not (t.startswith(("def ", "class ", "async def "))):
                                     continue
                                 j = k + 1
                                 while j < len(file_lines) and file_lines[j].strip() == "":
@@ -1368,17 +1449,13 @@ def apply_patch(
                 m = re.search(r'File\s+"([^"]+)",\s+line\s+(\d+)', raw)
                 if m:
                     err["file"] = m.group(1)
-                    try:
+                    with contextlib.suppress(ValueError):
                         err["line"] = int(m.group(2))
-                    except Exception:
-                        pass
 
                 for ln in raw.splitlines():
                     if "^" in ln:
-                        try:
+                        with contextlib.suppress(ValueError):
                             err["column"] = ln.index("^") + 1
-                        except Exception:
-                            pass
                         break
 
                 m2 = re.search(r'(\w+(?:Error|Exception)):\s*(.+?)(?:\n|$)', raw)
@@ -1403,8 +1480,8 @@ def apply_patch(
                                 marker = ">>>" if (i + 1) == L else "   "
                                 out_lines.append(f"{marker} {i+1:4d} | {lines[i]}")
                             err["excerpt"] = "\n".join(out_lines)
-                except Exception:
-                    pass
+                except (OSError, ValueError) as e:
+                    logger.debug("py_compile excerpt enrichment failed: %s", e)
 
                 execution_steps.append({
                     "step": "pycompile",

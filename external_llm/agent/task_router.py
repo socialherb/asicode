@@ -14,12 +14,12 @@ Execution modes:
 - planner:     Structured operation pipeline for AST-supported language edits
 - main_agent:  Tool-use loop for non-structured files, exploratory/ambiguous edits
 - clarify:     Handled inside PLANNER via Semantic-Fit Judge (not a separate lane)
-- read_only:   Handled inside PLANNER as READ_ONLY_ANALYSIS operations (not a lane)
+- read_only:   Handled inside PLANNER (not a separate lane)
 
 FAST_PATH has been absorbed into PLANNER:
 - Trivial edits → DeterministicPlanBuilder (LLM 0-call)
 - CSS/HTML → ANCHOR_EDIT operations
-- Low confidence → SpecResolver handles file discovery
+- Low confidence → planner lane handles file discovery
 
 Helper is NOT a lane. Helper is a tool capability (delegate_to_helper) that the
 Developer can call from any lane when it needs a subordinate model for code generation.
@@ -31,10 +31,9 @@ import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from ..languages import LanguageRegistry
-from .config.thresholds import config as _cfg
 from .enums import Complexity, Scope
 from .intent_models import IntentResult
 from .intent_resolver import create_intent_resolver
@@ -60,15 +59,9 @@ class TaskKind(str, Enum):
 
 
 class Lane(str, Enum):
-    PLANNER = "planner"              # Structured pipeline: spec → plan → execute
+    # PLANNER (structured spec → plan → execute pipeline) was removed with the
+    # lane it named; MAIN_AGENT is the only lane the router can return.
     MAIN_AGENT = "main_agent"        # Tool-use loop: _run_llm_loop directly
-
-
-# File extensions recognized as AST-parseable (used for lane decisions).
-AST_EXTENSIONS = frozenset({
-    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt",
-    ".rb", ".cs", ".cpp", ".c", ".h",
-})
 
 
 # ── Data Classes ─────────────────────────────────────────────────────────────
@@ -87,7 +80,6 @@ class RouteDecision:
     requires_planner: bool = False
 
     # Config overrides — None means keep existing value
-    planning_enabled: Optional[bool] = None
     self_review_enabled: Optional[bool] = None
     auto_test_on_patch: Optional[bool] = None
     rag_enabled: Optional[bool] = None
@@ -223,8 +215,8 @@ class DeterministicClassifier:
     def _has_edit_intent(text: str) -> bool:
         """Structural fallback for edit intent when IntentResult is absent.
         Uses language-neutral structural signals only.
-        Defaults to True (presume edit) because PLANNER correctly handles
-        non-edit requests as READ_ONLY_ANALYSIS at the plan level.
+        Defaults to True (presume edit) because PLANNER handles
+        non-edit requests at the plan level.
         """
         return True
 
@@ -312,7 +304,6 @@ class DeterministicClassifier:
     def extract_features(
         self,
         request: str,
-        repo_root: Optional[str] = None,
         intent_result: Optional["IntentResult"] = None,
     ) -> RouteFeatures:
         """Extract structural features from request. Keywords → features, NOT lanes."""
@@ -478,9 +469,7 @@ class DeterministicClassifier:
         # otherwise the `word_count > 25` (MEDIUM) guard shadows it and the
         # branch is unreachable. Such requests are underspecified and riskier,
         # so they deserve HIGH.
-        if f.requests_refactor and f.file_count == 0 and f.word_count >= 30:
-            complexity = Complexity.HIGH
-        elif f.file_count >= 3 or f.word_count > 60:
+        if (f.requests_refactor and f.file_count == 0 and f.word_count >= 30) or f.file_count >= 3 or f.word_count > 60:
             complexity = Complexity.HIGH
         elif f.is_multi_file or f.file_count >= 2 or f.word_count > 25:
             complexity = Complexity.MEDIUM
@@ -524,7 +513,6 @@ class DeterministicClassifier:
         - Any language/file type — MAIN_AGENT is a capability lane, not a file-type lane
 
         Infra features (self-review, RAG) are enabled proportionally to complexity.
-        Only the planning pipeline itself is skipped (planning_enabled=False).
         """
         _conf = self._compute_confidence(f)
         _reason = self._build_main_agent_reason(f)
@@ -537,7 +525,6 @@ class DeterministicClassifier:
             requires_planner=False,
             confidence=_conf,
             reasoning=_reason,
-            planning_enabled=False,                           # MAIN_AGENT = direct tool loop
             self_review_enabled=f.complexity != Complexity.LOW,  # Self-review is useful for complex changes
             auto_test_on_patch=f.requests_test_work,          # Only when the user explicitly requests it
             rag_enabled=False,                                 #RAG (topic) PLANNER tier dedicated (tier check)
@@ -586,12 +573,11 @@ class DeterministicClassifier:
     def classify(
         self,
         request: str,
-        repo_root: Optional[str] = None,
         intent_result: Optional["IntentResult"] = None,
     ) -> RouteDecision:
         """Feature-based routing: extract_features() → decide_flow()."""
         features = self.extract_features(
-            request, repo_root=repo_root, intent_result=intent_result,
+            request, intent_result=intent_result,
         )
         return self.decide_flow(features, intent_result=intent_result)
 
@@ -600,35 +586,26 @@ class DeterministicClassifier:
 
 class TaskRouter:
     """
-    Two-stage hybrid router: Deterministic + Explore-First.
+    Router: intent resolution + deterministic classification → MAIN_AGENT.
 
-    Stage 1: DeterministicClassifier (always runs, ~0ms, no LLM cost)
-    Stage 2: Explore-First (when deterministic confidence < EXPLORE_FIRST_THRESHOLD
-             AND lane is PLANNER or MAIN_AGENT — triggers file exploration for accurate
-             routing, replacing the old LLM classification stage which always returned
-             confidence=0.80 and masked real uncertainty)
+    Single-stage routing — the old two-stage "Deterministic + Explore-First"
+    design (and its EXPLORE_FIRST_THRESHOLD gate) was removed with the PLANNER
+    lane (Tier 3 consolidation):
+    - Intent Resolution: LLM-powered, language-neutral intent analysis
+      (intent_type, lane_hint, confidence).
+    - DeterministicClassifier: ~0ms, no LLM cost. Always returns the
+      MAIN_AGENT lane (PLANNER permanently disabled); RouteFeatures drive
+      only task_kind/complexity/scope metadata, not lane selection.
 
     Usage:
         router = TaskRouter(llm_client=svc.llm_service.client, model=svc.model)
         decision = router.route(request_text, repo_root=repo_root)
-        # decision.lane → which execution path to use
+        # decision.lane → always MAIN_AGENT (only lane the router can return)
     """
 
-    # Replaces old LLM_FALLBACK_THRESHOLD (0.85) + EXPLORE_CONFIDENCE_THRESHOLD (0.60) pair.
-    # When deterministic confidence < this, go straight to Explore-First instead of LLM guessing.
-    EXPLORE_FIRST_THRESHOLD = _cfg.scores.EXPLORE_FIRST_THRESHOLD
-
     # Lane-specific default config overrides (only fills None fields in RouteDecision)
-    _LANE_DEFAULTS: dict[str, dict[str, Any]] = {
-        Lane.PLANNER: {
-            "planning_enabled": True,
-            "self_review_enabled": True,
-            "auto_test_on_patch": False,
-            "rag_enabled": True,
-            "multi_agent": None,
-        },
+    _LANE_DEFAULTS: ClassVar[dict[str, dict[str, Any]]] = {
         Lane.MAIN_AGENT: {
-            "planning_enabled": False,
             "self_review_enabled": False,
             "auto_test_on_patch": False,
             "rag_enabled": False,
@@ -640,24 +617,19 @@ class TaskRouter:
         self,
         llm_client: Any = None,
         model: str = "",
-        repo_root: Optional[str] = None,
     ):
         self._deterministic = DeterministicClassifier()
         self._intent_resolver = create_intent_resolver(
             llm_client=llm_client,
             model=model,
-            repo_root=repo_root,
             enable_cache=True,
         )
-        self._repo_root = repo_root
 
-    def route(self, request: str, repo_root: Optional[str] = None) -> RouteDecision:
+    def route(self, request: str) -> RouteDecision:
         """
         Route a user request to an execution lane.
         Returns RouteDecision with lane, task_kind, complexity, scope, confidence.
         """
-        root = repo_root or self._repo_root
-
         # Stage 0: Intent Resolution (language-neutral, LLM-powered)
         intent_result = self._intent_resolver.resolve(request)
         logger.info(
@@ -670,7 +642,7 @@ class TaskRouter:
 
         # Stage 1: Deterministic (with IntentResult as primary signal source)
         decision = self._deterministic.classify(
-            request, repo_root=root, intent_result=intent_result,
+            request, intent_result=intent_result,
         )
         logger.info(
             "Router stage-1: kind=%s lane=%s confidence=%.2f reason=%r",
@@ -680,7 +652,7 @@ class TaskRouter:
             decision.reasoning,
         )
 
-        # Attach intent result for downstream reuse (SpecResolver, etc.)
+        # Attach intent result for downstream reuse (planner lane, etc.)
         decision.intent_result = intent_result
 
         # decide_flow() in DeterministicClassifier always routes to MAIN_AGENT
@@ -689,9 +661,8 @@ class TaskRouter:
         # MAIN_AGENT runs the direct LLM tool-use loop.
 
         # Apply lane-specific config defaults (only fills None fields)
-        decision = self._apply_lane_defaults(decision)
+        return self._apply_lane_defaults(decision)
 
-        return decision
 
     def _apply_lane_defaults(self, decision: RouteDecision) -> RouteDecision:
         """Apply default config overrides for the selected lane (only fills None fields)."""

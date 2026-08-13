@@ -17,13 +17,15 @@ SUGGEST is automatically downgraded to NOTIFY when model_tier == "none".
 """
 
 from __future__ import annotations
+
 import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import ClassVar, Optional
 
 from external_llm.editor.agent.autonomous.trigger_engine import TriggerEvent, TriggerKind
+
 # Module-level mapping: TriggerKind → feature name (used by TriggerPolicy._evaluate)
 _KIND_TO_FEATURE: dict = {
     TriggerKind.FILE_MODIFIED:       "file_review",
@@ -67,7 +69,7 @@ class TriggerPolicy:
     })
 
     # Per-kind cooldown (seconds between same-kind events)
-    _KIND_COOLDOWN: dict[str, float] = {
+    _KIND_COOLDOWN: ClassVar[dict[str, float]] = {
         "file_modified":       15.0,
         "test_failed":         10.0,
         "test_recovered":      10.0,
@@ -112,9 +114,8 @@ class TriggerPolicy:
             return ActionDecision(kind=ActionKind.IGNORE)
 
         # Per-file cooldown
-        if event.source_file:
-            if now - self._file_last.get(event.source_file, 0) < self._FILE_COOLDOWN:
-                return ActionDecision(kind=ActionKind.IGNORE)
+        if event.source_file and now - self._file_last.get(event.source_file, 0) < self._FILE_COOLDOWN:
+            return ActionDecision(kind=ActionKind.IGNORE)
 
         # Per-kind cooldown
         cooldown = self._KIND_COOLDOWN.get(kind_str, 10.0)

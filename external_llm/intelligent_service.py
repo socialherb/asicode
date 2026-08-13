@@ -15,6 +15,7 @@ Handles general requests like "create login functionality" by:
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 from collections.abc import Callable
@@ -64,7 +65,7 @@ class IntelligentLLMService:
         provider_stripped = (provider or "").strip()
         if provider_stripped.lower() == "ollama" and timeout == DEFAULT_LLM_TIMEOUT:
             timeout = OLLAMA_LLM_TIMEOUT
-            logger.info(f"Using extended timeout for Ollama: {timeout}s")
+            logger.info("Using extended timeout for Ollama: %ss", timeout)
 
         # Core LLM service
         self.llm_service = ExternalLLMService(
@@ -78,9 +79,7 @@ class IntelligentLLMService:
         self.provider = provider
         self.model = model or self.llm_service.model
 
-        logger.info(
-            f"Initialized IntelligentLLMService: provider={provider}, model={self.model}"
-        )
+        logger.info("Initialized IntelligentLLMService: provider=%s, model=%s", provider, self.model)
 
     def _emit_progress(
         self,
@@ -95,9 +94,11 @@ class IntelligentLLMService:
             return
         try:
             progress_callback(phase, message, current, total)
-        except Exception:
-            # Never fail the run because UI/log streaming failed.
-            return
+        except Exception as exc:
+            # Never fail the run because UI/log streaming failed. Logged at
+            # debug: a failing callback is a client-side problem, but a silent
+            # swallow hides it even from debug traces.
+            logger.debug("progress emit failed (phase=%s): %s", phase, exc)
 
     def handle_request(
         self,
@@ -106,6 +107,7 @@ class IntelligentLLMService:
         target_file: Optional[str] = None,
         mode: str = "auto",  # "auto", "single", "multi", "llm_plan", "agent"
         temperature: float = 0.0,
+        system_prompt: Optional[str] = None,
         context_variant: str = "v7",
         max_tokens: int = _cfg.tokens.INTELLIGENT_SERVICE_DEFAULT,
         progress_callback: Optional[Callable[[str, str, Optional[int], Optional[int]], None]] = None,
@@ -122,6 +124,8 @@ class IntelligentLLMService:
             target_file: Specific target file (optional)
             mode: "auto" (智能判断), "single" (单文件), "multi" (多文件计划), "llm_plan" (LLM-based plan)
             temperature: LLM temperature
+            system_prompt: Optional system-prompt override (patch generation only;
+                          ignored by the agent lane, which owns its own prompt)
             context_variant: Context variant for LLM ("v7", "super", "hybrid")
             max_tokens: Maximum tokens for LLM response (default 4096)
 
@@ -145,10 +149,11 @@ class IntelligentLLMService:
             analysis = analyzer.analyze(user_request)
 
             logger.info(
-                f"Request analysis: intent={analysis.intent}, "
-                f"feature={analysis.feature_name}, "
-                f"confidence={analysis.confidence:.2f}, "
-                f"needs_planning={analysis.needs_planning}"
+                "Request analysis: intent=%s, feature=%s, confidence=%.2f, needs_planning=%s",
+                analysis.intent,
+                analysis.feature_name,
+                analysis.confidence,
+                analysis.needs_planning,
             )
 
             # Step 2: Analyze project
@@ -157,7 +162,7 @@ class IntelligentLLMService:
             project_structure = project_analyzer.analyze()
 
             frameworks_str = ', '.join(project_structure.frameworks) if project_structure.frameworks else str(project_structure.framework)
-            logger.info(f"Project analysis: frameworks=[{frameworks_str}], types={project_structure.project_types}")
+            logger.info("Project analysis: frameworks=[%s], types=%s", frameworks_str, project_structure.project_types)
 
             # Step 3: Determine execution mode
             # User wants LLM-driven, hierarchical, step-by-step implementation
@@ -187,9 +192,13 @@ class IntelligentLLMService:
                 exec_mode = "multi_file"
                 llm_planning = True  # Use LLM planning by default
 
-            logger.info(f"Execution mode: {exec_mode}, LLM planning: {llm_planning}")
-            logger.info(f"Analysis: intent={analysis.intent}, needs_planning={analysis.needs_planning}, "
-                       f"confidence={analysis.confidence:.2f}")
+            logger.info("Execution mode: %s, LLM planning: %s", exec_mode, llm_planning)
+            logger.info(
+                "Analysis: intent=%s, needs_planning=%s, confidence=%.2f",
+                analysis.intent,
+                analysis.needs_planning,
+                analysis.confidence,
+            )
 
             # Step 4: Execute based on mode
             self._emit_progress(progress_callback, "executing", f"Executing {exec_mode} operation...", 3, 5)
@@ -202,37 +211,37 @@ class IntelligentLLMService:
                     project_structure,
                     target_file,
                     temperature,
+                    system_prompt,
                     context_variant,
                     max_tokens,
                     progress_callback=progress_callback,
                 )
-            elif exec_mode == "agent":
+            if exec_mode == "agent":
+                if system_prompt:
+                    logger.debug("handle_request: system_prompt ignored in agent mode (AgentLoop owns its prompt)")
                 return self._handle_agent_mode(
                     repo_path,
                     user_request,
                     analysis,
                     project_structure,
-                    temperature,
                     context_variant,
-                    max_tokens,
-                    llm_planning=llm_planning,
                     progress_callback=progress_callback,
                     max_attempts=agent_max_attempts,
                     run_tests=agent_run_tests,
                 )
-            else:
-                # multi_file mode (includes llm_planning flag)
-                return self._handle_multi_file(
-                    repo_path=repo_path,
-                    user_request=user_request,
-                    analysis=analysis,
-                    project_structure=project_structure,
-                    temperature=temperature,
-                    context_variant=context_variant,
-                    max_tokens=max_tokens,
-                    llm_planning=llm_planning,
-                    progress_callback=progress_callback,
-                )
+            # multi_file mode (includes llm_planning flag)
+            return self._handle_multi_file(
+                repo_path=repo_path,
+                user_request=user_request,
+                analysis=analysis,
+                project_structure=project_structure,
+                temperature=temperature,
+                system_prompt=system_prompt,
+                context_variant=context_variant,
+                max_tokens=max_tokens,
+                llm_planning=llm_planning,
+                progress_callback=progress_callback,
+            )
 
         except Exception as e:
             logger.exception("Error in intelligent request handling")
@@ -252,10 +261,7 @@ class IntelligentLLMService:
         user_request: str,
         analysis: RequestAnalysis,
         project_structure: ProjectStructure,
-        temperature: float,
         context_variant: str = "v7",
-        max_tokens: int = _cfg.tokens.INTELLIGENT_SERVICE_DEFAULT,
-        llm_planning: bool = True,
         progress_callback: Optional[Callable[[str, str, Optional[int], Optional[int]], None]] = None,
         max_attempts: int = 3,
         run_tests: bool = True,
@@ -269,9 +275,9 @@ class IntelligentLLMService:
         TestRunner, path security) is preserved inside ToolRegistry.
         """
         from .agent.agent_loop import AgentLoop
-        from .agent.tool_registry import AgentConfig, ToolRegistry
-        from .agent.task_router import Lane, RouteDecision, TaskKind
         from .agent.enums import Complexity, Scope
+        from .agent.task_router import Lane, RouteDecision, TaskKind
+        from .agent.tool_registry import AgentConfig, ToolRegistry
 
         def _stream_cb(event: str, data: dict) -> None:
             if not progress_callback:
@@ -287,8 +293,10 @@ class IntelligentLLMService:
                     data.get("turn"),
                     self._agent_max_turns,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                # Streaming must never break the agent run; the exception is
+                # still worth a debug trace (silent swallow hides it entirely).
+                logger.debug("agent stream cb failed: %s", exc)
 
         self._agent_max_turns = max(1, int(max_attempts or 1)) * 10  # turns ≈ 10x legacy attempts
 
@@ -329,7 +337,7 @@ class IntelligentLLMService:
         )
 
         # Build project context for the agent system prompt
-        context = self._build_agent_context(repo_path, analysis, project_structure, context_variant)
+        context = self._build_agent_context(repo_path, analysis, project_structure)
 
         try:
             agent_result = loop.run(user_request, context)
@@ -351,7 +359,6 @@ class IntelligentLLMService:
         repo_path: Path,
         analysis: RequestAnalysis,
         project_structure: ProjectStructure,
-        context_variant: str,
     ) -> str:
         """Build a compact project context string for the agent system prompt."""
         parts = []
@@ -474,10 +481,9 @@ class IntelligentLLMService:
             # Ollama provider: try UNIFIED_DIFF even for new files
             # (Ollama seems better at diff generation than FILE block generation)
             if self.provider.lower() in ['ollama']:
-                logger.info(f"Ollama provider - using UNIFIED_DIFF for new file {target_file}")
+                logger.info("Ollama provider - using UNIFIED_DIFF for new file %s", target_file)
                 return OutputMode.UNIFIED_DIFF, "v7"
-            else:
-                return OutputMode.FULL_FILE, "v7"
+            return OutputMode.FULL_FILE, "v7"
 
         # Existing file: apply heuristics
         file_path = repo_path / target_file.lstrip('/')
@@ -487,11 +493,14 @@ class IntelligentLLMService:
             # Gemini provider: prefer UNIFIED_DIFF even for large changes
             # (Gemini produces stable unified diffs, reduce FULL_FILE frequency)
             if self.provider.lower() in ['google', 'gemini']:
-                logger.info(f"Gemini provider - using UNIFIED_DIFF for {target_file} despite change_size_hint={change_size_hint}")
+                logger.info(
+                    "Gemini provider - using UNIFIED_DIFF for %s despite change_size_hint=%s",
+                    target_file,
+                    change_size_hint,
+                )
                 return OutputMode.UNIFIED_DIFF, "v7"
-            else:
-                logger.info(f"Using FULL_FILE mode for {target_file} due to change_size_hint={change_size_hint}")
-                return OutputMode.FULL_FILE, "v7"
+            logger.info("Using FULL_FILE mode for %s due to change_size_hint=%s", target_file, change_size_hint)
+            return OutputMode.FULL_FILE, "v7"
 
         # Heuristic 2: File size (lines)
         try:
@@ -505,14 +514,14 @@ class IntelligentLLMService:
                     # For large files, consider using FULL_FILE if change is likely significant
                     # This is a conservative heuristic - we still use UNIFIED_DIFF by default
                     # but log the info for debugging
-                    logger.debug(f"Large file detected: {target_file} has {line_count} lines")
+                    logger.debug("Large file detected: %s has %s lines", target_file, line_count)
 
                     # If we have a hint that it's a medium or large change, use FULL_FILE
                     if change_size_hint in ['medium', 'large', 'rewrite']:
-                        logger.info(f"Using FULL_FILE for large file {target_file} with {change_size_hint} change")
+                        logger.info("Using FULL_FILE for large file %s with %s change", target_file, change_size_hint)
                         return OutputMode.FULL_FILE, "v7"
         except (OSError, UnicodeDecodeError) as e:
-            logger.warning(f"Could not read file {target_file} for size check: {e}")
+            logger.warning("Could not read file %s for size check: %s", target_file, e)
 
         # Default: use UNIFIED_DIFF mode for modifications
         return OutputMode.UNIFIED_DIFF, "v7"
@@ -521,16 +530,11 @@ class IntelligentLLMService:
         """Convert OutputMode enum to string for generate_patch"""
         if mode == OutputMode.UNIFIED_DIFF:
             return "diff"
-        elif mode == OutputMode.FULL_FILE:
+        if mode == OutputMode.FULL_FILE:
             return "full_file"  # dedicated full_file mode (FILE blocks only, no "Prefer unified diff")
-        elif mode == OutputMode.ASICODE_BLOCK:
+        if mode in (OutputMode.ASICODE_BLOCK, OutputMode.TARGETED_BLOCK, OutputMode.PLAN_JSON):
             return "auto"
-        elif mode == OutputMode.TARGETED_BLOCK:
-            return "auto"
-        elif mode == OutputMode.PLAN_JSON:
-            return "auto"
-        else:
-            return "diff"  # fallback
+        return "diff"  # fallback
 
     def _handle_single_file(
         self,
@@ -540,6 +544,7 @@ class IntelligentLLMService:
         project_structure: ProjectStructure,
         target_file: Optional[str],
         temperature: float,
+        system_prompt: Optional[str] = None,
         context_variant: str = "v7",
         max_tokens: int = _cfg.tokens.INTELLIGENT_SERVICE_DEFAULT,
         progress_callback: Optional[Callable[[str, str, Optional[int], Optional[int]], None]] = None,
@@ -566,9 +571,9 @@ class IntelligentLLMService:
         operation = "create" if not file_exists else "modify"
 
         # Estimate change size for heuristic decisions
-        change_size_hint = self._estimate_change_size(user_request, operation, target_file)
+        change_size_hint = self._estimate_change_size(operation)
         if change_size_hint:
-            logger.debug(f"Change size hint for {target_file}: {change_size_hint}")
+            logger.debug("Change size hint for %s: %s", target_file, change_size_hint)
 
         # Determine initial output mode with change size hint
         output_mode, context_variant = self._determine_output_mode(
@@ -589,7 +594,6 @@ class IntelligentLLMService:
 
         result = None
         last_error = None
-        fallback_used = False
         used_output_mode = None
         failure_reason = None
         prev_failure_reason = None
@@ -616,7 +620,7 @@ class IntelligentLLMService:
                 enhanced_context += "\n\n**ERROR FEEDBACK (previous attempt failed)**:\n"
                 enhanced_context += error_feedback
                 error_feedback_included = True
-                logger.info(f"Included error feedback for {target_file} (attempt {i+1})")
+                logger.info("Included error feedback for %s (attempt %s)", target_file, i + 1)
 
             # Convert mode to string for generate_patch
             mode_str = self._output_mode_to_string(current_mode)
@@ -635,31 +639,32 @@ class IntelligentLLMService:
                 user_request=enhanced_context,
                 target_file=target_file,
                 temperature=temperature,
+                system_prompt=system_prompt,
                 context_variant=context_variant,
                 output_mode=mode_str,
                 max_tokens=max_tokens,
             )
 
             if result.get("success"):
-                logger.info(f"Success with {current_mode.value} mode")
+                logger.info("Success with %s mode", current_mode.value)
                 break  # Success, exit retry loop
 
             last_error = result.get("error", "")
-            logger.warning(f"Failed with {current_mode.value} mode: {last_error}")
+            logger.warning("Failed with %s mode: %s", current_mode.value, last_error)
 
             # Extract failure reason from error
             failure_reason = self._extract_failure_reason(last_error)
             # Check if same failure reason repeated
             if prev_failure_reason and failure_reason == prev_failure_reason:
                 same_failure_repeat = True
-                logger.warning(f"Same failure reason repeated: {failure_reason}, skipping further retries")
+                logger.warning("Same failure reason repeated: %s, skipping further retries", failure_reason)
                 break  # Exit retry loop, will proceed to fallback
             prev_failure_reason = failure_reason
 
             # Check if we should retry with next mode
             if i < len(modes_to_try) - 1:
                 next_mode = modes_to_try[i + 1]
-                logger.info(f"Retrying with {next_mode.value} after {current_mode.value} failed")
+                logger.info("Retrying with %s after %s failed", next_mode.value, current_mode.value)
                 # Optional: add a small delay or modify temperature?
             else:
                 # No more modes to try
@@ -667,7 +672,7 @@ class IntelligentLLMService:
 
         # If all modes failed, use fallback template
         if not result or not result.get("success"):
-            logger.info(f"All output modes failed for {target_file}, using fallback template")
+            logger.info("All output modes failed for %s, using fallback template", target_file)
             # Ensure result dict exists
             if not result:
                 result = {}
@@ -677,14 +682,21 @@ class IntelligentLLMService:
             result["retry_count"] = i+1 if 'i' in locals() else len(modes_to_try)
             result["error_feedback_included"] = error_feedback_included
             result["same_failure_repeat"] = same_failure_repeat
-            # Create a FileOperation for the target file
-            fallback_operation = FileOperation(
-                file_path=target_file,
-                operation="create" if not file_exists else "modify",
-                description=f"Create {target_file}" if not file_exists else f"Modify {target_file}",
-                instructions=f"Create {target_file} for {user_request[:100]}..." if not file_exists else f"Modify {target_file} for {user_request[:100]}...",
-            )
-            default_patch = self._create_default_file_patch(repo_path, fallback_operation)
+            # Create a FileOperation for the target file.
+            # Fallback template is CREATE-only: writing placeholder content over an
+            # existing file would destroy the user's code (multi-file path already
+            # guards with `operation.operation == "create"` — keep parity here).
+            if not file_exists:
+                fallback_operation = FileOperation(
+                    file_path=target_file,
+                    operation="create",
+                    description=f"Create {target_file}",
+                    instructions=f"Create {target_file} for {user_request[:100]}...",
+                )
+                default_patch = self._create_default_file_patch(repo_path, fallback_operation)
+            else:
+                # Modify failure — protect the existing file; report failure.
+                default_patch = ""
             if default_patch:
                 result["success"] = True
                 result["patch"] = default_patch
@@ -692,7 +704,7 @@ class IntelligentLLMService:
                 result["explanation"] = f"Created default {target_file} (LLM failed)"
                 result["fallback_used"] = True
                 result["fallback_reason"] = last_error or "all_modes_failed"
-                logger.info(f"Created default file for {target_file}")
+                logger.info("Created default file for %s", target_file)
             else:
                 # Fallback also failed
                 result["success"] = False
@@ -725,6 +737,7 @@ class IntelligentLLMService:
         analysis: RequestAnalysis,
         project_structure: ProjectStructure,
         temperature: float,
+        system_prompt: Optional[str] = None,
         context_variant: str = "v7",
         max_tokens: int = _cfg.tokens.INTELLIGENT_SERVICE_DEFAULT,
         llm_planning: bool = False,
@@ -736,17 +749,19 @@ class IntelligentLLMService:
         """Handle multi-file operation with planning"""
 
         # Debug logging
-        logger.info(f"_handle_multi_file: llm_planning={llm_planning}, has_client={hasattr(self.llm_service, 'client')}")
+        logger.info(
+            "_handle_multi_file: llm_planning=%s, has_client=%s", llm_planning, hasattr(self.llm_service, 'client')
+        )
         if hasattr(self.llm_service, 'client'):
-            logger.info(f"client type: {type(self.llm_service.client)}, client value: {self.llm_service.client}")
+            logger.info("client type: %s, client value: %s", type(self.llm_service.client), self.llm_service.client)
 
         # Create execution plan
         if force_context_variant:
             # Force context expansion for planning attempt (best-effort; planner may ignore)
-            logger.info(f"Agent override: force_context_variant={force_context_variant}")
+            logger.info("Agent override: force_context_variant=%s", force_context_variant)
 
         if force_output_mode:
-            logger.info(f"Agent override: force_output_mode={force_output_mode.value}")
+            logger.info("Agent override: force_output_mode=%s", force_output_mode.value)
 
         if llm_planning and hasattr(self.llm_service, 'client'):
             # Use LLM-enhanced planner
@@ -756,11 +771,19 @@ class IntelligentLLMService:
                 llm_model=self.llm_service.model,
                 temperature=temperature,
             )
-            logger.info(f"Using LLM-enhanced multi-file planner with client: {self.llm_service.client}, model: {self.llm_service.model}")
+            logger.info(
+                "Using LLM-enhanced multi-file planner with client: %s, model: %s",
+                self.llm_service.client,
+                self.llm_service.model,
+            )
         else:
             # Use rule-based planner
             planner = MultiFilePlanner(str(repo_path))
-            logger.info(f"Using rule-based multi-file planner (llm_planning={llm_planning}, has_client={hasattr(self.llm_service, 'client')})")
+            logger.info(
+                "Using rule-based multi-file planner (llm_planning=%s, has_client=%s)",
+                llm_planning,
+                hasattr(self.llm_service, 'client'),
+            )
 
         self._emit_progress(progress_callback, "planning", "Creating execution plan...", 3, None)
         plan = planner.create_plan(user_request)
@@ -784,20 +807,27 @@ class IntelligentLLMService:
                     if filtered_ops:
                         plan.operations = filtered_ops  # type: ignore[attr-defined]
                         logger.info(
-                            f"Agent targeting active: filtered operations {len(original_ops)} -> {len(filtered_ops)}"
+                            "Agent targeting active: filtered operations %s -> %s", len(original_ops), len(filtered_ops)
                         )
                     else:
                         logger.info("Agent targeting had no matching operations; running full plan.")
             except Exception as e:
-                logger.warning(f"Agent targeting filter failed; running full plan: {e}")
+                logger.warning("Agent targeting filter failed; running full plan: %s", e)
 
         logger.info(
-            f"Created plan: {len(plan.operations)} operations, "
-            f"complexity={plan.complexity}"
+            "Created plan: %s operations, complexity=%s",
+            len(plan.operations),
+            plan.complexity,
         )
         # Log instructions for each operation
         for i, op in enumerate(plan.operations):
-            logger.debug(f"Operation {i+1}: {op.file_path} - instructions length: {len(op.instructions)}, description: {op.description}")
+            logger.debug(
+                "Operation %s: %s - instructions length: %s, description: %s",
+                i + 1,
+                op.file_path,
+                len(op.instructions),
+                op.description,
+            )
 
         # Execute plan step by step
         operations_results = []
@@ -810,8 +840,11 @@ class IntelligentLLMService:
                                   i + 1,
                                   len(plan.operations))
             logger.info(
-                f"Executing operation {i+1}/{len(plan.operations)}: "
-                f"{operation.operation} {operation.file_path}"
+                "Executing operation %s/%s: %s %s",
+                i + 1,
+                len(plan.operations),
+                operation.operation,
+                operation.file_path,
             )
 
             # Determine file path and existence
@@ -820,9 +853,9 @@ class IntelligentLLMService:
             file_exists = target_path.exists()
 
             # Estimate change size for heuristic decisions
-            change_size_hint = self._estimate_change_size(user_request, operation.operation, file_path)
+            change_size_hint = self._estimate_change_size(operation.operation)
             if change_size_hint:
-                logger.debug(f"Change size hint for {file_path}: {change_size_hint}")
+                logger.debug("Change size hint for %s: %s", file_path, change_size_hint)
 
             # Determine initial output mode with change size hint
             output_mode, _ = self._determine_output_mode(
@@ -847,7 +880,6 @@ class IntelligentLLMService:
 
             result = None
             last_error = None
-            fallback_used = False
             used_output_mode = None
             failure_reason = None
             prev_failure_reason = None
@@ -872,7 +904,7 @@ class IntelligentLLMService:
                     operation_request += "\n\n**ERROR FEEDBACK (previous attempt failed)**:\n"
                     operation_request += error_feedback
                     error_feedback_included = True
-                    logger.info(f"Included error feedback for {file_path} (attempt {retry_idx+1})")
+                    logger.info("Included error feedback for %s (attempt %s)", file_path, retry_idx + 1)
 
                 # Convert mode to string for generate_patch
                 mode_str = self._output_mode_to_string(current_mode)
@@ -881,7 +913,12 @@ class IntelligentLLMService:
                 target_path.parent.mkdir(parents=True, exist_ok=True)
 
                 # Call LLM for this file
-                logger.debug(f"LLM request for {operation.file_path} (mode: {current_mode.value}): {operation_request[:200]}...")
+                logger.debug(
+                    "LLM request for %s (mode: %s): %s...",
+                    operation.file_path,
+                    current_mode.value,
+                    operation_request[:200],
+                )
                 effective_cv = force_context_variant or context_variant
 
                 result = self.llm_service.generate_patch(
@@ -889,32 +926,39 @@ class IntelligentLLMService:
                     user_request=operation_request,
                     target_file=file_path,
                     temperature=temperature,
+                    system_prompt=system_prompt,
                     context_variant=effective_cv,
                     output_mode=mode_str,
                     max_tokens=max_tokens,
                 )
-                logger.debug(f"LLM result for {operation.file_path}: success={result.get('success')}, error={result.get('error')}, patch_len={len(result.get('patch', ''))}")
+                logger.debug(
+                    "LLM result for %s: success=%s, error=%s, patch_len=%s",
+                    operation.file_path,
+                    result.get('success'),
+                    result.get('error'),
+                    len(result.get('patch', '')),
+                )
 
                 if result.get("success"):
-                    logger.info(f"Success with {current_mode.value} mode")
+                    logger.info("Success with %s mode", current_mode.value)
                     break  # Success, exit retry loop
 
                 last_error = result.get("error", "")
-                logger.warning(f"Failed with {current_mode.value} mode: {last_error}")
+                logger.warning("Failed with %s mode: %s", current_mode.value, last_error)
 
                 # Extract failure reason from error
                 failure_reason = self._extract_failure_reason(last_error)
                 # Check if same failure reason repeated
                 if prev_failure_reason and failure_reason == prev_failure_reason:
                     same_failure_repeat = True
-                    logger.warning(f"Same failure reason repeated: {failure_reason}, skipping further retries")
+                    logger.warning("Same failure reason repeated: %s, skipping further retries", failure_reason)
                     break  # Exit retry loop, will proceed to fallback
                 prev_failure_reason = failure_reason
 
                 # Check if we should retry with next mode
                 if retry_idx < len(modes_to_try) - 1:
                     next_mode = modes_to_try[retry_idx + 1]
-                    logger.info(f"Retrying with {next_mode.value} after {current_mode.value} failed")
+                    logger.info("Retrying with %s after %s failed", next_mode.value, current_mode.value)
                 else:
                     # No more modes to try
                     break
@@ -933,7 +977,7 @@ class IntelligentLLMService:
 
                 # Try to create a default file if it's a "create" operation
                 if operation.operation == "create":
-                    logger.info(f"Attempting to create default file for {operation.file_path}")
+                    logger.info("Attempting to create default file for %s", operation.file_path)
                     default_patch = self._create_default_file_patch(repo_path, operation)
                     if default_patch:
                         result["success"] = True
@@ -942,7 +986,7 @@ class IntelligentLLMService:
                         result["explanation"] = f"Created default {operation.file_path} (LLM failed)"
                         result["fallback_used"] = True
                         result["fallback_reason"] = last_error or "all_modes_failed"
-                        logger.info(f"Created default file for {operation.file_path}")
+                        logger.info("Created default file for %s", operation.file_path)
                     else:
                         # Fallback also failed
                         result["success"] = False
@@ -991,7 +1035,7 @@ class IntelligentLLMService:
 
             if not result.get("success"):
                 all_success = False
-                logger.warning(f"Operation failed for {operation.file_path}: {result.get('error')}")
+                logger.warning("Operation failed for %s: %s", operation.file_path, result.get("error"))
                 # Continue with next operation (don't stop)
 
         # Combine all patches
@@ -1000,9 +1044,11 @@ class IntelligentLLMService:
         # Analyze overall failure patterns
         failed_operations = [op for op in operations_results if not op.get("success")]
         if failed_operations:
-            logger.info(f"Multi-file execution summary: {len(failed_operations)}/{len(operations_results)} operations failed")
+            logger.info(
+                "Multi-file execution summary: %s/%s operations failed", len(failed_operations), len(operations_results)
+            )
             for op in failed_operations[:3]:  # Log first 3 failures
-                logger.info(f"  Failed: {op['file']} - {op.get('error', 'unknown error')}")
+                logger.info("  Failed: %s - %s", op["file"], op.get("error", "unknown error"))
 
         return {
             "success": all_success,
@@ -1199,21 +1245,23 @@ class IntelligentLLMService:
                         instructions = f"Create a new Python file at {operation.file_path} with proper imports, functions, classes, and docstrings."
                 else:
                     instructions = f"Create a new file at {operation.file_path} for {original_request[:100]}..."
-            else:  # modify
-                if operation.file_path == 'main.py' and 'route' in operation.description.lower():
-                    instructions = "Modify main.py to add a new route for the editor page. Include:\n- Import for editor service router\n- Route registration in the app\n- Proper route configuration\n- Update any necessary middleware or dependencies"
-                else:
-                    instructions = f"Modify the file {operation.file_path} to {operation.description}"
+            elif operation.file_path == 'main.py' and 'route' in operation.description.lower():
+                instructions = "Modify main.py to add a new route for the editor page. Include:\n- Import for editor service router\n- Route registration in the app\n- Proper route configuration\n- Update any necessary middleware or dependencies"
+            else:
+                instructions = f"Modify the file {operation.file_path} to {operation.description}"
 
         # Enhance instructions for main.py modifications
-        if operation.file_path == 'main.py' and operation.operation == 'modify':
-            if '**Important for main.py modifications**' not in instructions:  # Avoid duplication
-                instructions += "\n\n**Important for main.py modifications**:"
-                instructions += "\n- Find the correct location in the existing main.py file"
-                instructions += "\n- Maintain existing imports and structure"
-                instructions += "\n- Add imports at the top if needed"
-                instructions += "\n- Add routes after other route definitions"
-                instructions += "\n- Ensure proper indentation and syntax"
+        if (
+            operation.file_path == "main.py"
+            and operation.operation == "modify"
+            and "**Important for main.py modifications**" not in instructions  # Avoid duplication
+        ):
+            instructions += "\n\n**Important for main.py modifications**:"
+            instructions += "\n- Find the correct location in the existing main.py file"
+            instructions += "\n- Maintain existing imports and structure"
+            instructions += "\n- Add imports at the top if needed"
+            instructions += "\n- Add routes after other route definitions"
+            instructions += "\n- Ensure proper indentation and syntax"
 
         parts.append("**Specific Instructions**:")
         parts.append(instructions)
@@ -1222,8 +1270,7 @@ class IntelligentLLMService:
         # Dependencies
         if operation.dependencies:
             parts.append("**Dependencies** (already created):")
-            for dep in operation.dependencies:
-                parts.append(f"- `{dep}`")
+            parts.extend(f"- `{dep}`" for dep in operation.dependencies)
             parts.append("")
 
         # Template reference
@@ -1300,19 +1347,25 @@ class IntelligentLLMService:
     def _combine_patches(self, operations_results: list[dict]) -> str:
         """Combine patches from multiple operations"""
 
-        patches = []
 
-        for result in operations_results:
-            if result.get("success") and result.get("patch"):
-                patches.append(result["patch"])
+        patches = [result["patch"] for result in operations_results if result.get("success") and result.get("patch")]
 
         return "\n\n".join(patches)
 
     def _create_default_file_patch(self, repo_path: Path, operation: FileOperation) -> str:
-        """Create a default file patch when LLM fails to generate one"""
+        """Create a default file patch when LLM fails to generate one
+
+        CREATE-only: refuses to run when the target already exists so a caller
+        bug can never clobber user code with placeholder content.
+        """
 
         file_path = operation.file_path.lstrip('/')
         target_path = repo_path / file_path
+
+        # Defensive guard: never overwrite an existing file.
+        if target_path.exists():
+            logger.warning("Default-file fallback skipped: %s already exists", file_path)
+            return ""
 
         # Ensure parent directory exists
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1433,11 +1486,12 @@ index 0000000..e69de29
         # Write the file
         try:
             target_path.write_text(content, encoding='utf-8')
-            logger.info(f"Created default file: {file_path}")
-            return diff
+            logger.info("Created default file: %s", file_path)
         except Exception as e:
-            logger.error(f"Failed to create default file {file_path}: {e}")
+            logger.exception("Failed to create default file %s: %s", file_path, e)
             return ""
+        else:
+            return diff
 
     def _generate_multi_file_explanation(
         self,
@@ -1470,7 +1524,7 @@ index 0000000..e69de29
 
         return "\n".join(lines)
 
-    def _estimate_change_size(self, user_request: str, operation: str, file_path: str) -> Optional[str]:
+    def _estimate_change_size(self, operation: str) -> Optional[str]:
         """
         Estimate change size based on operation type.
 
@@ -1480,7 +1534,7 @@ index 0000000..e69de29
         """
         if operation == 'create':
             return 'medium'
-        elif operation == 'modify':
+        if operation == 'modify':
             return 'small'
         return None
 
@@ -1498,10 +1552,7 @@ index 0000000..e69de29
             # Extract file extension for pattern analysis
             file_ext = 'unknown'
             if target_file and target_file != 'unknown':
-                if '.' in target_file:
-                    file_ext = target_file.split('.')[-1]
-                else:
-                    file_ext = 'no_extension'
+                file_ext = target_file.split('.')[-1] if '.' in target_file else 'no_extension'
 
             failure_type = 'unknown'
             if 'empty_patch' in error:
@@ -1512,9 +1563,11 @@ index 0000000..e69de29
                 failure_type = 'invalid_diff'
 
             logger.info(
-                f"Failure analysis - Type: {failure_type}, "
-                f"Mode: {output_mode}, File: .{file_ext}, "
-                f"Error: {error[:100]}..."
+                "Failure analysis - Type: %s, Mode: %s, File: .%s, Error: %s...",
+                failure_type,
+                output_mode,
+                file_ext,
+                error[:100],
             )
 
             # Simple recommendations based on failure patterns
@@ -1554,16 +1607,18 @@ index 0000000..e69de29
         # Original context lines
         if file_path.exists():
             try:
-                content = file_path.read_text(encoding="utf-8", errors="replace")
-                lines = content.splitlines()
-                if lines:
+                # P25-3: this read the WHOLE file to render 30 lines into the
+                # retry feedback (which goes back into the LLM prompt) — a
+                # multi-hundred-MB file was fully materialised on every
+                # failed-patch retry. Head-only now.
+                with file_path.open(encoding="utf-8", errors="replace") as f:
+                    head = [ln.rstrip("\n") for ln in itertools.islice(f, 30)]
+                if head:
                     feedback_lines.append("- Original file context (first 30 lines):")
-                    for i, line in enumerate(lines[:30]):
+                    for i, line in enumerate(head):
                         feedback_lines.append(f"  {i+1}: {line}")
-                        if i >= 29:
-                            break
             except Exception as e:
-                logger.warning(f"Could not read original file for error feedback: {e}")
+                logger.warning("Could not read original file for error feedback: %s", e)
         else:
             feedback_lines.append("- Original file: does not exist (new file creation)")
 
@@ -1583,21 +1638,20 @@ index 0000000..e69de29
 
         if "empty_patch" in error_lower:
             return "empty_patch"
-        elif "git_apply_check_failed" in error_lower:
+        if "git_apply_check_failed" in error_lower:
             return "git_apply_failed"
-        elif "missing_hunks" in error_lower:
+        if "missing_hunks" in error_lower:
             return "missing_hunks"
-        elif "header-only" in error_lower or "header only" in error_lower:
+        if "header-only" in error_lower or "header only" in error_lower:
             return "header_only"
-        elif "invalid_diff" in error_lower:
+        if "invalid_diff" in error_lower:
             return "invalid_diff"
-        elif "no diff found" in error_lower or "no_diff" in error_lower:
+        if "no diff found" in error_lower or "no_diff" in error_lower:
             return "no_diff"
-        elif "inconsistent hunk line counts" in error_lower:
+        if "inconsistent hunk line counts" in error_lower:
             return "inconsistent_hunk_lines"
-        else:
-            # Return first 50 chars as reason
-            return error[:50].replace("\n", " ").strip()
+        # Return first 50 chars as reason
+        return error[:50].replace("\n", " ").strip()
 
     def _analysis_to_dict(self, analysis: RequestAnalysis) -> dict:
         """Convert analysis to dict"""
@@ -1676,8 +1730,7 @@ def create_intelligent_service_from_env(
         if prov != "ollama":
             logger.warning("No API key found for %s (set %s or pass api_key)", prov, api_key_var)
             return None
-        else:
-            logger.info("Ollama provider doesn't require API key, using empty string")
+        logger.info("Ollama provider doesn't require API key, using empty string")
     api_key = resolved_key
 
     m = (model or os.getenv("EXTERNAL_LLM_MODEL", "") or "").strip() or None
@@ -1700,7 +1753,8 @@ def create_intelligent_service_from_env(
             base_url=base_url,
         )
         logger.info("Intelligent LLM service created: %s (%s)", prov, svc.model)
-        return svc
     except Exception as e:
-        logger.error("Failed to create intelligent LLM service: %s", e)
+        logger.exception("Failed to create intelligent LLM service: %s", e)
         return None
+    else:
+        return svc

@@ -31,7 +31,7 @@ def _patch_rich_md_tables_wrap() -> None:
     marker attr before patching).
     """
     try:
-        from rich.markdown import TableElement as _TE
+        from rich.markdown import TableElement as _TE  # noqa: N814 — private lazy-import alias
     except Exception:
         _log.debug("rich.markdown not available — fold patch skipped")
         return

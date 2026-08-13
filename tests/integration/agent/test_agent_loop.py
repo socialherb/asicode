@@ -1,10 +1,7 @@
 """
 Integration tests for AgentLoop.
 """
-import json
 from unittest.mock import Mock, patch
-
-import pytest
 
 from external_llm.agent.agent_loop import AgentResult
 from external_llm.agent.tool_registry import ToolResult
@@ -85,15 +82,16 @@ def test_agent_loop_basic_execution(agent_loop, mock_llm_client):
     assert isinstance(result, AgentResult)
     # Implementation returns text_reply for text-only LLM responses (no tool calls)
     assert result.status in ("success", "text_reply")
-    # The mock should return our custom response, but if not, accept default
-    # TODO: Investigate why mock override doesn't work
-    # assert result.final_message == "I have completed the task successfully."
-    assert result.final_message in ("I have completed the task successfully.", "Test response")
+    # The mock override MUST reach the result. The old response-cache path
+    # (long removed) returned the fixture default "Test response" for repeated
+    # identical-message calls, which is why this was once a weak either-or
+    # assertion with a TODO. The cache is gone — restore the exact contract.
+    assert result.final_message == "I have completed the task successfully."
     assert len(result.turns) == 0  # No tool calls were made
     assert "turns_used" in result.metadata
     assert result.metadata["turns_used"] == 0
-    # Verify LLM was called (may be chat or chat_with_tools)
-    # mock_llm_client.chat_with_tools.assert_called_once()
+    # Verify the LLM was actually exercised through the native-tools path
+    assert mock_llm_client.chat_with_tools.called
 
 
 def test_agent_loop_with_tool_calls(agent_loop, mock_llm_client, temp_repo_root):
@@ -187,57 +185,55 @@ def test_agent_loop_max_turns(agent_loop, mock_llm_client):
     # assert "max_turns" in result.metadata.get("status_detail", "").lower()
 
 
-@pytest.mark.xfail(reason=(
-    "metadata['plan'] is never populated — the planning phase does not run "
-    "from config.planning_enabled alone on the MAIN_AGENT path"
-), strict=True)
-def test_agent_loop_with_planning(agent_loop, mock_llm_client):
-    """Test agent with planning enabled."""
-    agent_loop.config.planning_enabled = True
+def test_agent_loop_has_no_planning_phase(agent_loop, mock_llm_client):
+    """No planning phase exists on the MAIN_AGENT lane.
 
-    # Mock planning response
-    mock_plan_response = Mock()
-    mock_plan_response.content = json.dumps({
-        "analysis": "Test analysis",
-        "approach": "Test approach",
-        "subtasks": [
-            {"id": 1, "title": "Read file", "files": ["sample.py"], "description": "Read the file"}
-        ],
-        "risks": ["None"]
-    })
-    mock_plan_response.tool_calls = []
-    mock_plan_response.prompt_tokens = 100
-    mock_plan_response.completion_tokens = 50
-    mock_plan_response.raw_response = None
-    mock_plan_response.cache_read_input_tokens = 0
-    mock_plan_response.cache_creation_input_tokens = 0
+    Contract (current): the PLANNER lane was removed from task_router (Lane
+    holds only MAIN_AGENT) and the planning_enabled config flag was removed
+    entirely. ctx.plan is never written, so metadata["plan"] stays None.
+    """
 
-    # Mock execution response
-    mock_exec_response = Mock()
-    mock_exec_response.content = "Task completed"
-    mock_exec_response.tool_calls = []
-    mock_exec_response.prompt_tokens = 120
-    mock_exec_response.completion_tokens = 30
-    mock_exec_response.raw_response = None
+    # Mock first LLM response with a tool call
+    mock_response1 = Mock()
+    mock_response1.content = ""
+    mock_response1.tool_calls = [{
+        "id": "call_1",
+        "name": "find_symbol",
+        "args": {"name": "hello"}
+    }]
+    mock_response1.prompt_tokens = 100
+    mock_response1.completion_tokens = 50
+    mock_response1.raw_response = None
 
-    # First call is for planning, second for execution
-    _responses(mock_llm_client, mock_plan_response, mock_exec_response)
+    # Mock second LLM response with final answer
+    mock_response2 = Mock()
+    mock_response2.content = "I have completed the task successfully."
+    mock_response2.tool_calls = []
+    mock_response2.prompt_tokens = 120
+    mock_response2.completion_tokens = 30
+    mock_response2.raw_response = None
 
-    result = agent_loop.run("Test request with planning")
+    _responses(mock_llm_client, mock_response1, mock_response2)
+
+    with patch.object(agent_loop.registry, 'dispatch') as mock_dispatch:
+        mock_dispatch.return_value = ToolResult(ok=True, content="File content")
+        result = agent_loop.run("Test request with planning")
+
     assert result.status in ("success", "text_reply")
-    assert "plan" in result.metadata
-    plan = result.metadata["plan"]
-    assert plan["analysis"] == "Test analysis"
-    assert len(plan["subtasks"]) == 1
+    # The planning phase does not exist on the MAIN_AGENT lane — no plan is
+    # ever produced.
+    assert result.metadata.get("plan") is None
 
 
-@pytest.mark.xfail(reason=(
-    "self-review is disabled in this configuration (returns 'lgtm - self- "
-    "review disabled.'), so the LGTM summary the test asserts is never "
-    "produced"
-), strict=True)
 def test_agent_loop_with_self_review(agent_loop, mock_llm_client, sample_patch):
-    """Test agent with self-review enabled after patch."""
+    """Self-review metadata reflects the disabled mini-loop contract.
+
+    Contract (current): _run_self_review is deliberately short-circuited (the
+    mini-loop added latency and false rejections) and returns the fixed string
+    "lgtm — self-review disabled." The config flag is still honored — it gates
+    whether the review runs and what metadata["self_review"]["enabled"] says —
+    but the summary is always the fixed LGTM and issues_found is always False.
+    """
     agent_loop.config.self_review_enabled = True
     agent_loop.config.max_review_turns = 3  # Ensure default is set
 
@@ -277,10 +273,9 @@ def test_agent_loop_with_self_review(agent_loop, mock_llm_client, sample_patch):
             call_count += 1
             if tool == "apply_patch":
                 return ToolResult(ok=True, content="Patch applied successfully")
-            elif tool == "git_diff":
+            if tool == "git_diff":
                 return ToolResult(ok=True, content="diff --git a/sample.py b/sample.py\n@@ -1,7 +1,10 @@\n+Some changes")
-            else:
-                return ToolResult(ok=True, content="OK")
+            return ToolResult(ok=True, content="OK")
         mock_dispatch.side_effect = dispatch_side_effect
         result = agent_loop.run("Apply patch with review")
 
@@ -288,7 +283,9 @@ def test_agent_loop_with_self_review(agent_loop, mock_llm_client, sample_patch):
     assert "self_review" in result.metadata
     review = result.metadata["self_review"]
     assert review["enabled"] is True
-    assert review["summary"] == "LGTM"
+    # Fixed summary: the self-review mini-loop is deliberately short-circuited
+    # in _run_self_review — the exact string is the contract.
+    assert review["summary"] == "lgtm — self-review disabled."
     assert review["issues_found"] is False
 
 
@@ -344,15 +341,10 @@ def test_agent_loop_cancellation(agent_loop, mock_llm_client):
     mock_llm_client.chat_with_tools.side_effect = slow_chat
 
     result = agent_loop.run("Test request")
-    assert result.status == "cancelled" or result.status == "error"
+    assert result.status in {"cancelled", "error"}
     # Note: actual cancellation handling might vary
 
 
-@pytest.mark.xfail(reason=(
-    "run ends status='error' under the trimming config; the real sliding- "
-    "window contract needs re-deriving rather than the old mock's "
-    "assumption"
-), strict=True)
 def test_agent_loop_context_trimming(agent_loop, mock_llm_client):
     """Test context sliding window trimming."""
     agent_loop.config.context_window_size = 2  # Keep only 2 non-system messages
@@ -372,7 +364,7 @@ def test_agent_loop_context_trimming(agent_loop, mock_llm_client):
         mock_response.completion_tokens = 50
         mock_response.raw_response = None
         # Add get method for dict-like access
-        mock_response.get = Mock(side_effect=lambda k, default=None: getattr(mock_response, k, default))
+        mock_response.get = Mock(side_effect=lambda k, default=None, _mr=mock_response: getattr(_mr, k, default))
         mock_responses.append(mock_response)
 
     # Final response
@@ -397,12 +389,13 @@ def test_agent_loop_context_trimming(agent_loop, mock_llm_client):
     # Context trimming should have prevented unbounded growth
 
 
-@pytest.mark.xfail(reason=(
-    "only 2 of the 3 parallel calls reach dispatch — prepared_calls "
-    "filtering differs from what the mock assumes"
-), strict=True)
 def test_agent_loop_parallel_tool_execution(agent_loop, mock_llm_client):
-    """Test agent with parallel tool execution enabled."""
+    """Parallel tool execution dispatches all prepared calls in one batch.
+
+    All tool names must be registered: unregistered names are filtered out of
+    prepared_calls before dispatch. git_status was retired from the registry,
+    so grep (read-only, parallel-safe) stands in for it here.
+    """
     agent_loop.config.parallel_tool_execution_enabled = True
 
     # Mock response with multiple tool calls
@@ -416,8 +409,8 @@ def test_agent_loop_parallel_tool_execution(agent_loop, mock_llm_client):
         },
         {
             "id": "call_2",
-            "name": "git_status",
-            "args": {}
+            "name": "grep",
+            "args": {"pattern": "hello"}
         },
         {
             "id": "call_3",
@@ -454,19 +447,27 @@ def test_agent_loop_parallel_tool_execution(agent_loop, mock_llm_client):
     mock_parallel.assert_called_once()
 
 
-@pytest.mark.xfail(reason=(
-    "only 1 dispatch instead of the expected 2+: the automatic git_diff "
-    "observation is not injected after a successful patch"
-), strict=True)
 def test_agent_loop_auto_observation(agent_loop, mock_llm_client, sample_patch):
-    """Test auto-observation injects git_diff after successful patch."""
+    """Auto-observation injects a real git diff after a successful patch.
+
+    Contract (current): after apply_patch/write_plan succeeds, the pipeline
+    collects touched_files from the ToolResult metadata, runs
+    ``git diff -- <paths>`` via subprocess (NOT registry.dispatch), and injects
+    the result as a ``[auto_observation]`` user message, firing the
+    "auto_observation" stream callback. Early-finish then completes the run
+    without another LLM turn.
+    """
     # Enable auto-observation
     agent_loop.config.auto_observation_enabled = True
     # Ensure early-exit path is eligible for this test
     agent_loop.config.auto_test_on_patch = False
     agent_loop.config.self_review_enabled = False
 
-    # Mock response with patch (no final LLM turn needed due to early-exit)
+    # Capture stream callbacks (the auto_observation event rides on _cb)
+    events: list[tuple[str, dict]] = []
+    agent_loop.config.stream_callback = lambda ev, data: events.append((ev, data))
+
+    # Mock LLM response with patch (no final LLM turn needed due to early-exit)
     mock_response = Mock()
     mock_response.content = ""
     mock_response.tool_calls = [{
@@ -482,21 +483,18 @@ def test_agent_loop_auto_observation(agent_loop, mock_llm_client, sample_patch):
 
     _responses(mock_llm_client, mock_response)
 
-    # Mock tool results: patch success, then git_diff for auto-observation
-    with patch.object(agent_loop.registry, 'dispatch') as mock_dispatch:
-        _dispatch_results(mock_dispatch,
-            ToolResult(ok=True, content="Patch applied"),   # apply_patch
-            ToolResult(ok=True, content="diff --git ..."),  # auto git_diff
-        )
-        result = agent_loop.run("Test auto-observation")
+    # REAL dispatch: apply_patch actually applies the patch to temp_repo_root,
+    # so the touched_files metadata and the follow-up git diff are genuine.
+    result = agent_loop.run("Test auto-observation")
 
-    assert result.status in ("success", "text_reply")
+    assert result.status == "success"
     # Check that final_message is not empty (auto-completion occurred)
     assert result.final_message and len(result.final_message.strip()) > 0
-    # Auto-observation should have triggered git_diff
-    assert mock_dispatch.call_count >= 2
-    # Second call should be git_diff
-    assert mock_dispatch.call_args_list[1][0][0] == "git_diff"
+    # Auto-observation fired exactly once, carrying the real diff
+    obs_events = [e for e in events if e[0] == "auto_observation"]
+    assert len(obs_events) == 1
+    diff = obs_events[0][1]["diff"]
+    assert "self.memory" in diff
 
 
 def test_agent_loop_auto_repair_apply_patch_hunk_only(agent_loop, mock_llm_client):
@@ -545,14 +543,13 @@ def test_agent_loop_auto_repair_apply_patch_hunk_only(agent_loop, mock_llm_clien
             if call_counts[tool] == 1:
                 # First call fails (simulating git apply error for hunk-only)
                 return ToolResult(ok=False, content="", error="patch fragment without header")
-            else:
-                # Second call succeeds after auto-repair
-                # Verify that patch now contains headers
-                patch_text = args.get("patch", "")
-                assert "diff --git a/sample.py b/sample.py" in patch_text
-                assert "--- a/sample.py" in patch_text
-                assert "+++ b/sample.py" in patch_text
-                return ToolResult(ok=True, content="Patch applied")
+            # Second call succeeds after auto-repair
+            # Verify that patch now contains headers
+            patch_text = args.get("patch", "")
+            assert "diff --git a/sample.py b/sample.py" in patch_text
+            assert "--- a/sample.py" in patch_text
+            assert "+++ b/sample.py" in patch_text
+            return ToolResult(ok=True, content="Patch applied")
         # Other tools not used
         return ToolResult(ok=True, content="")
 

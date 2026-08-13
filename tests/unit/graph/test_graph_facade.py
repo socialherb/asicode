@@ -40,6 +40,28 @@ def test_facade_lazy_init_builds_on_first_access():
         shutil.rmtree(repo, ignore_errors=True)
 
 
+def test_facade_py_files_returns_uncapped_walked_list():
+    """``py_files`` exposes the walked .py list for a PLAIN-mode build.
+
+    The facade builds via GraphBuilder.build_repo_graph → build() (no
+    collect_imported_names); the structural-scan tool unions this into its
+    cross-file-ref input, so it must be populated here too — not just under
+    the gate's names-collecting mode (2026-08-11).
+    """
+    repo = _make_repo(
+        {
+            "a.py": "def fa(): pass\n",
+            "sub/b.py": "def fb(): pass\n",
+            "c.ts": "export const c = 1;\n",
+        }
+    )
+    try:
+        facade = RepositoryGraphFacade(repo_root=repo)
+        assert facade.py_files == ["a.py", "sub/b.py"]  # .ts never walked as py
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
 # ── get_symbol() ───────────────────────────────────────────────────────────────
 
 def test_get_symbol_simple_name():
@@ -235,5 +257,54 @@ def test_get_symbol_file():
         fp = facade.get_symbol_file("my_fn")
         assert fp is not None
         assert "mod.py" in fp
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+# ── Batched incremental invalidation (P3, 2026-08-11) ─────────────────────────
+
+def test_facade_invalidate_files_handles_mixed_reparse_and_deleted():
+    """invalidate_files splits paths into reparse (existing) + remove (deleted).
+
+    The facade used to call reparse_file/remove_file per path; P3 batches each
+    set. A mix of edited + deleted files must leave the graph with the edited
+    files' NEW symbols and the deleted files' symbols gone — same observable
+    state as the per-path loop, but built with one _remove_files pass.
+    """
+    repo = _make_repo({
+        "a.py": "def a():\n    return 1\n",
+        "b.py": "def b():\n    return 2\n",
+        "c.py": "def c():\n    return 3\n",
+    })
+    try:
+        facade = RepositoryGraphFacade(repo_root=repo)
+        facade._ensure_graph()
+        assert {s.name for s in facade._graph.symbols.values()} == {"a", "b", "c"}
+
+        # Edit a.py (new symbol), delete b.py, leave c.py untouched.
+        (Path(repo) / "a.py").write_text("def a():\n    return 1\n\ndef a2():\n    return 11\n")
+        (Path(repo) / "b.py").unlink()
+
+        facade.invalidate_files(["a.py", "b.py"])
+
+        names = {s.name for s in facade._graph.symbols.values()}
+        assert names == {"a", "a2", "c"}, names
+        assert "b.py" not in [rel for rel, _p, _st in facade._graph._py_stamps]
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_facade_invalidate_files_skips_non_language_paths():
+    """Non-language paths (UNKNOWN LanguageId) are filtered before the batch."""
+    repo = _make_repo({"a.py": "def a():\n    return 1\n"})
+    try:
+        facade = RepositoryGraphFacade(repo_root=repo)
+        facade._ensure_graph()
+        before = {s.name for s in facade._graph.symbols.values()}
+
+        # A README and a .txt are not language files -> filtered, no crash.
+        facade.invalidate_files(["README.md", "notes.txt", "nonexistent.py"])
+
+        assert {s.name for s in facade._graph.symbols.values()} == before
     finally:
         shutil.rmtree(repo, ignore_errors=True)

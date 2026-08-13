@@ -1,0 +1,3 @@
+# First-party ImportError fallbacks (dead fallbacks: a first-party
+# module can never fail to import at runtime).  Regenerate with:
+#   scripts/check_no_new_first_party_import_fallback.py --write-baseline

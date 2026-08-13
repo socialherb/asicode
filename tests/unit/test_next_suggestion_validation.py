@@ -15,7 +15,6 @@ as mutation guards: remove any guard and the corresponding test fails.
 """
 import asi
 
-
 # ─── _text_has_hangul ────────────────────────────────────────────────────────
 
 def test_text_has_hangul_detects_syllables():
@@ -24,7 +23,7 @@ def test_text_has_hangul_detects_syllables():
 
 
 def test_text_has_hangul_detects_compat_jamo():
-    # Compatibility Jamo block (3130–318F), e.g. ﾟ-free Hangul consonants.
+    # Compatibility Jamo block (3130-318F), e.g. ﾟ-free Hangul consonants.
     assert asi._text_has_hangul("\u3131")  # ㄱ
 
 

@@ -53,6 +53,13 @@ class AutonomousTaskQueue:
         self._counter = 0
         # Number of tasks rejected because MAX_PENDING was reached (observability).
         self._dropped_count = 0
+        # Wake signal for the drain loop: set when a task is enqueued or a
+        # concurrency slot frees (task_done), so a blocked drain thread returns
+        # immediately instead of sleeping out the full poll interval. The drain
+        # loop clears it before each drain; level-triggered, so no wake is lost
+        # between get_nowait() and wait(). ProactiveRunner.stop() also sets it
+        # to wake the drain thread for prompt shutdown.
+        self.wake = threading.Event()
 
     def _purge_tombstones_locked(self) -> int:
         """Drop superseded/orphaned (tombstone) tasks from the heap, re-queueing
@@ -73,6 +80,7 @@ class AutonomousTaskQueue:
             try:
                 task = self._pq.get_nowait()
             except queue.Empty:
+                logger.debug("tombstone purge: queue drained", exc_info=True)
                 break
             sf = task.event.source_file
             if sf and self._pending_file_map.get(sf) != task.task_id:
@@ -137,6 +145,9 @@ class AutonomousTaskQueue:
                 task_id=task_id,
             )
             self._pq.put(task)
+            # Wake any drain thread blocked in wait(): the new task is runnable
+            # (or will be, once a concurrency slot frees).
+            self.wake.set()
 
             if event.source_file:
                 self._pending_file_map[event.source_file] = task_id
@@ -164,6 +175,7 @@ class AutonomousTaskQueue:
                 try:
                     task = self._pq.get_nowait()
                 except queue.Empty:
+                    logger.debug("get_nowait: queue drained", exc_info=True)
                     break
                 sf = task.event.source_file
                 if sf:
@@ -208,6 +220,9 @@ class AutonomousTaskQueue:
         """Must be called when a task finishes (success or error)."""
         with self._lock:
             self._running_count = max(0, self._running_count - 1)
+        # A concurrency slot freed — wake the drain thread so a pending task
+        # starts immediately instead of waiting out the poll interval.
+        self.wake.set()
         logger.debug("Task %s done. Running: %d", task_id, self._running_count)
 
     # ── Status ────────────────────────────────────────────────────────────────

@@ -9,8 +9,7 @@ Design notes:
   decide between full-project and file-only scavenge. Leaf-only targets skip
   the expensive full-project walk (the historical ~90s cost).
 - Candidates are normalized to ``VultureCandidate`` (kept even when this entry
-  point is absent — ``StructuralWorkset.from_vulture_candidates`` and the
-  executor still consume it).
+  point is absent — the executor still consumes it).
 - Non-authoritative: results are supplementary dead-code evidence, not
   deterministic DELETE ops. ``public_dead_code_scanner`` remains the primary
   cross-file reachability signal.
@@ -27,16 +26,19 @@ dependency handling and structured result access.
 
 from __future__ import annotations
 
+import ast
 import datetime as _dt
 import logging
 import os
 import sys
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Generic, Optional, TypeVar
 
 from external_llm.agent.config.thresholds import config as _cfg
-from external_llm.analysis.unused_import_scanner import _has_noqa_comment as _has_noqa_comment
+from external_llm.analysis.unused_import_scanner import _has_noqa_comment
+from external_llm.common.cache_utils import _capped_put
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,19 @@ _VULTURE_KIND_MAP: dict[str, str] = {
     "property": "property",
 }
 
+# asicode kind -> vulture CLI error code (vulture/core.py:32-38). vulture's
+# own get_unused_code() applies NO comment-based suppression (that lives in its
+# CLI), so the scanner implements the flake8-style V-code contract itself.
+_VULTURE_CODE_BY_KIND: dict[str, str] = {
+    "attribute": "V101",
+    "class": "V102",
+    "function": "V103",
+    "import": "V104",
+    "method": "V105",
+    "property": "V106",
+    "variable": "V107",
+}
+
 # Kinds that ``public_dead_code_scanner`` already covers — and covers BETTER,
 # because it resolves cross-file references (vulture only sees per-file usage).
 # vulture reports module-level functions/classes as exactly these two kinds;
@@ -68,6 +83,10 @@ _VULTURE_KIND_MAP: dict[str, str] = {
 # function/class here is pure noise + false-positive risk → excluded by default.
 # Override via ``exclude_kinds`` (pass an empty collection to keep everything).
 _PUBLIC_DEAD_CODE_OVERLAP_KINDS: frozenset[str] = frozenset({"function", "class"})
+
+# Bounded retries when vulture hits files that vanished between enumeration
+# and read (TOCTOU under parallel sessions / editors / transient probes).
+_VANISHED_RETRIES = 3
 
 # Dunder / protocol names — never dead code (used via implicit protocol).
 # Includes NON-dunder framework-protocol methods that are invoked by the
@@ -98,14 +117,46 @@ _VISITOR_BASE_NAMES: frozenset[str] = frozenset({
 _VISITOR_HOOK_PREFIXES: tuple[str, ...] = ("visit_", "leave_")
 _VISITOR_HOOK_EXACT: frozenset[str] = frozenset({"on_visit", "on_leave", "generic_visit"})
 
+# Framework base classes whose members are consumed by the framework with no
+# static caller — vulture reports them as dead, they are live by contract.
+# Detection is STRUCTURAL (inheritance evidence), never name-shape alone:
+#   Enum/IntEnum/StrEnum/Flag        — enum members (``NAME = value`` in body)
+#   BaseModel (+ pydantic validators) — pydantic fields / ``model_config`` /
+#                                       ``@model_validator``-decorated methods
+#   BaseHTTPRequestHandler           — ``do_VERB`` verbs, ``log_message``,
+#                                      ``server_version`` / ``protocol_version``,
+#                                      ``close_connection`` (http.server protocol)
+# A coincidentally named business attribute in a non-framework class is never
+# suppressed (see ``_framework_live_for_file``).
+_ENUM_BASE_NAMES: frozenset[str] = frozenset({
+    "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
+})
+_PYDANTIC_BASE_NAMES: frozenset[str] = frozenset({
+    "BaseModel", "BaseSettings", "RootModel",
+})
+_PYDANTIC_FIELD_DECORATORS: frozenset[str] = frozenset({
+    "model_validator", "field_validator", "computed_field", "serializer", "validator",
+})
+_HTTP_BASE_NAMES: frozenset[str] = frozenset({
+    "BaseHTTPRequestHandler", "StreamingHTTPRequestHandler", "SimpleHTTPRequestHandler",
+})
+_HTTP_PROTOCOL_ATTRS: frozenset[str] = frozenset({
+    "server_version", "protocol_version", "log_message", "close_connection",
+})
+
 
 # ── noqa suppression ──────────────────────────────────────────────────────────
 
 # Module-level cache keyed by (path → mtime, lines): the scanner may run many
 # times in one long-lived process, and the scanned files are edited between
 # runs — a path-only cache would serve stale lines and suppress/flag against
-# code that no longer exists. mtime comparison invalidates per file; storing
-# one entry per path keeps the cache bounded by the file count.
+# code that no longer exists. mtime comparison invalidates per file. Entries
+# are FIFO-bounded via _capped_put: a long-lived process (REPL/orchestrator,
+# test runs) accumulates paths from every repo it ever scans, and each entry
+# holds the FULL file content — an entry cap keeps that growth bounded while
+# comfortably covering one repo's full-scan working set (this repo: ~209 py
+# files, avg ~28KB → cap 256 ≈ ~7MB worst-typical).
+_SOURCE_LINES_CACHE_MAX_ENTRIES: int = 256
 _source_lines_cache: dict[str, tuple[float, list[str]]] = {}
 
 def _source_line_has_noqa(abs_path: str, lineno: int, codes: set[str] | None = None) -> bool:
@@ -121,7 +172,7 @@ def _source_line_has_noqa(abs_path: str, lineno: int, codes: set[str] | None = N
                 cached = (mtime, fh.read().splitlines())
         except OSError:
             cached = (mtime, [])
-        _source_lines_cache[abs_path] = cached
+        _capped_put(_source_lines_cache, abs_path, cached, _SOURCE_LINES_CACHE_MAX_ENTRIES)
     lines = cached[1]
     if 1 <= lineno <= len(lines):
         return _has_noqa_comment(lines[lineno - 1], codes)
@@ -162,6 +213,50 @@ def _is_cancelled(cancel_event: Any) -> bool:
     return cancel_event is not None and cancel_event.is_set()
 
 
+def _scavenge_tolerant(
+    v: Any,
+    scan_paths: list[str],
+    exclude_patterns: list[str],
+) -> None:
+    """Run ``v.scavenge()``, surviving files that vanish between enumeration
+    and read.
+
+    ``vulture.utils.get_modules`` resolves its whole path list BEFORE any
+    parsing and ``sys.exit()``s — raising ``SystemExit`` (a ``BaseException``,
+    invisible to ``except Exception``) — when a path in the list no longer
+    exists.  Under parallel sessions / editors / transient test probes a file
+    can disappear in that window (observed 2026-08-08: a sibling worker's
+    transient probe killed the zero-tolerance structural gate mid-run).
+
+    Because get_modules completes before parsing starts, the SystemExit
+    carries zero partial state: dropping the vanished paths and retrying is
+    safe.  If no listed path is missing, the SystemExit is re-raised
+    (unexpected — never mask it).  Bounded by ``_VANISHED_RETRIES``.
+    """
+    pending = list(scan_paths)
+    for _ in range(_VANISHED_RETRIES + 1):
+        try:
+            v.scavenge(pending, exclude=exclude_patterns)
+        except SystemExit:
+            kept = [p for p in pending if os.path.exists(p)]
+            if len(kept) == len(pending):
+                raise  # no listed path vanished — unexpected SystemExit
+            logger.warning(
+                "[VULTURE_SCANNER] %d path(s) vanished mid-scan — retrying "
+                "without them",
+                len(pending) - len(kept),
+            )
+            pending = kept
+        else:
+            return
+    # Bounded retries exhausted with a live vanished path each time — the
+    # environment is churning too hard to scan; fail loudly rather than
+    # silently skipping candidates.
+    raise SystemExit(
+        f"vulture: {len(pending)} path(s) kept vanishing during scan"
+    )
+
+
 def _scavenge_with_cancel(
     v: Any,
     scan_paths: list[str],
@@ -193,7 +288,7 @@ def _scavenge_with_cancel(
     if _is_cancelled(cancel_event):
         return False
     if cancel_event is None:
-        v.scavenge(scan_paths, exclude=exclude_patterns)
+        _scavenge_tolerant(v, scan_paths, exclude_patterns)
         return True
 
     import threading
@@ -203,8 +298,8 @@ def _scavenge_with_cancel(
 
     def _run() -> None:
         try:
-            v.scavenge(scan_paths, exclude=exclude_patterns)
-        except BaseException as exc:  # noqa: BLE001 - re-raise on the caller
+            _scavenge_tolerant(v, scan_paths, exclude_patterns)
+        except BaseException as exc:  # re-raise on the caller
             err.append(exc)
         finally:
             done.set()
@@ -221,6 +316,330 @@ def _scavenge_with_cancel(
     return True
 
 
+# ── Pre-processing fingerprint caches ─────────────────────────────────────────
+# The two pre-processing passes below (_dispatch_names_for_file /
+# _visitor_hooks_for_file) are pure functions of file content, and the scanner
+# runs repeatedly over the same tree in one long-lived process (exploration
+# cycles), so unchanged files are reused instead of re-tokenized / re-parsed on
+# every scan. Fingerprint = (st_mtime_ns, st_size) — the same invalidation
+# contract as the shared RAG index (PERF-4): a path-only cache would serve
+# stale results for files edited between runs. Bounded by LRU eviction.
+_T = TypeVar("_T")
+
+
+class _FingerprintCache(Generic[_T]):
+    """Per-path result cache keyed by a (st_mtime_ns, st_size) fingerprint."""
+
+    __slots__ = ("_data", "_maxsize")
+
+    def __init__(self, maxsize: int = 4096) -> None:
+        self._data: OrderedDict[str, tuple[tuple[int, int], _T]] = OrderedDict()
+        self._maxsize = maxsize
+
+    def get(self, path: str, fingerprint: tuple[int, int]) -> _T | None:
+        entry = self._data.get(path)
+        if entry is None:
+            return None
+        if entry[0] != fingerprint:
+            # Content changed since cached (file edited) — drop stale entry.
+            del self._data[path]
+            return None
+        self._data.move_to_end(path)
+        return entry[1]
+
+    def put(self, path: str, fingerprint: tuple[int, int], result: _T) -> None:
+        self._data[path] = (fingerprint, result)
+        self._data.move_to_end(path)
+        while len(self._data) > self._maxsize:
+            self._data.popitem(last=False)
+
+
+def _stat_fingerprint(path: str) -> tuple[int, int] | None:
+    """(st_mtime_ns, st_size) of *path*, or None if it cannot be stat'ed."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        logger.debug("cannot stat %s", path)
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+_dispatch_names_cache: _FingerprintCache[frozenset[str]] = _FingerprintCache()
+_visitor_hooks_cache: _FingerprintCache[frozenset[tuple[str, int]]] = (
+    _FingerprintCache()
+)
+_framework_live_cache: _FingerprintCache[frozenset[tuple[int, str]]] = (
+    _FingerprintCache()
+)
+
+
+def _dispatch_names_for_file(path: str) -> frozenset[str]:
+    """Identifier-shaped string literals in one file (fingerprint-cached)."""
+    fp = _stat_fingerprint(path)
+    if fp is None:
+        return frozenset()
+    cached = _dispatch_names_cache.get(path, fp)
+    if cached is not None:
+        return cached
+
+    import ast
+    import tokenize
+
+    names: set[str] = set()
+    try:
+        with open(path, "rb") as fh:
+            for tok in tokenize.tokenize(fh.readline):
+                if tok.type != tokenize.STRING:
+                    continue
+                try:
+                    val = ast.literal_eval(tok.string)
+                except Exception:
+                    val = None
+                if isinstance(val, str) and val.isidentifier():
+                    names.add(val)
+    except (OSError, SyntaxError, tokenize.TokenError):
+        # Unreadable / broken file → no names (recomputed once fixed).
+        logger.debug("skipping unreadable/broken file %s", path)
+    result = frozenset(names)
+    _dispatch_names_cache.put(path, fp, result)
+    return result
+
+
+def _visitor_hooks_for_file(path: str) -> frozenset[tuple[str, int]]:
+    """Visitor-protocol hook locations in one file (fingerprint-cached)."""
+    fp = _stat_fingerprint(path)
+    if fp is None:
+        return frozenset()
+    cached = _visitor_hooks_cache.get(path, fp)
+    if cached is not None:
+        return cached
+
+    import ast
+
+    hooks: set[tuple[str, int]] = set()
+    try:
+        with open(path, encoding="utf-8") as _f:
+            tree = ast.parse(_f.read())
+    except (OSError, SyntaxError):
+        return frozenset()
+
+    class_bases: dict[str, list[str]] = {}
+    methods: list[tuple[int, str, str]] = []  # (lineno, name, enclosing_class)
+
+    class _Mapper(ast.NodeVisitor):
+        def __init__(self):
+            self.stack: list[str] = []
+
+        def visit_ClassDef(self, node):
+            self.stack.append(node.name)
+            class_bases[node.name] = [
+                b.id if isinstance(b, ast.Name)
+                else (b.attr if isinstance(b, ast.Attribute) else None)
+                for b in node.bases
+            ]
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def _record(self, node):
+            if self.stack:
+                methods.append((node.lineno, node.name, self.stack[-1]))
+            self.generic_visit(node)
+
+        visit_FunctionDef = _record
+        visit_AsyncFunctionDef = _record
+
+    _Mapper().visit(tree)
+    if class_bases:
+
+        def _is_visitor(cn: str, _seen: set[str] | None = None) -> bool:
+            _seen = _seen if _seen is not None else set()
+            if cn in _seen or cn not in class_bases:
+                return False
+            _seen.add(cn)
+            return any(
+                b in _VISITOR_BASE_NAMES
+                or (b in class_bases and _is_visitor(b, _seen))
+                for b in class_bases[cn]
+            )
+
+        abs_path = os.path.abspath(path)
+        for lineno, name, cn in methods:
+            if (
+                name in _VISITOR_HOOK_EXACT
+                or name.startswith(_VISITOR_HOOK_PREFIXES)
+            ) and _is_visitor(cn):
+                hooks.add((abs_path, lineno))
+    result = frozenset(hooks)
+    _visitor_hooks_cache.put(path, fp, result)
+    return result
+
+
+def _framework_live_for_file(path: str) -> frozenset[tuple[int, str]]:
+    """``(lineno, name)`` pairs consumed by frameworks vulture cannot see.
+
+    Vulture's per-file reachability has no view of framework dispatch, so
+    these categories read as "unused" while being live by contract:
+
+      - enum members (``Enum``/``IntEnum``/``StrEnum``/``Flag`` subclasses):
+        ``NAME = value`` in the class body.
+      - pydantic fields / settings / validators (``BaseModel`` subclasses):
+        annotated class-body fields, ``model_config = ...``, and
+        ``@model_validator``-/``@field_validator``-decorated methods.
+      - dataclass fields: ``@dataclass`` class-body annotated assignments.
+      - http.server protocol surface (``BaseHTTPRequestHandler`` subclasses):
+        ``do_VERB`` handlers, ``log_message``, and the ``server_version`` /
+        ``protocol_version`` / ``close_connection`` attributes.
+      - foreign-object attribute assignment ANYWHERE: ``obj.attr = ...`` /
+        ``obj.attr += ...`` where ``obj`` is not the bare ``self`` Name
+        (e.g. ``_session.default_buffer.on_text_changed += cb``,
+        ``conn.row_factory = sqlite3.Row``,
+        ``self._options.include_partial_messages = True``).  A bare
+        ``self.x = ...`` stays a vulture-checkable instance attribute —
+        except ``self.close_connection`` inside an HTTP handler, which is
+        protocol state the server reads back.
+
+    Detection is STRUCTURAL (base-class inheritance / decorator evidence /
+    AST target shape), never name-pattern matching — a business attribute
+    coincidentally named ``do_something`` outside an HTTP handler is never
+    suppressed.
+    """
+    fp = _stat_fingerprint(path)
+    if fp is None:
+        return frozenset()
+    cached = _framework_live_cache.get(path, fp)
+    if cached is not None:
+        return cached
+
+    import ast
+
+    live: set[tuple[int, str]] = set()
+    try:
+        with open(path, encoding="utf-8") as _f:
+            tree = ast.parse(_f.read())
+    except (OSError, SyntaxError):
+        return frozenset()
+
+    def _base_name(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return ""
+
+    def _deco_name(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        if isinstance(node, ast.Call):
+            return _deco_name(node.func)
+        return ""
+
+    # Same-file class → direct base names, for inherited framework detection
+    # (e.g. ``class ExternalLLMRequest(_BaseModel)`` where ``_BaseModel``
+    # itself subclasses pydantic ``BaseModel``).  Collected in one pre-pass so
+    # an ancestor chain anywhere in the file is resolvable.
+    _class_bases: dict[str, set[str]] = {}
+    for _node in ast.walk(tree):
+        if isinstance(_node, ast.ClassDef):
+            _class_bases[_node.name] = {
+                _base_name(b) for b in _node.bases
+            }
+
+    def _inherits_from(cls_name: str, candidates: frozenset[str],
+                       _seen: set[str] | None = None) -> bool:
+        """True when *cls_name* (or a same-file ancestor) inherits a candidate."""
+        if _seen is None:
+            _seen = set()
+        if cls_name in _seen or cls_name not in _class_bases:
+            return False
+        _seen.add(cls_name)
+        bases = _class_bases[cls_name]
+        return bool(bases & candidates) or any(
+            _inherits_from(b, candidates, _seen)
+            for b in bases if b in _class_bases
+        )
+
+    class _Mapper(ast.NodeVisitor):
+        def __init__(self) -> None:
+            # Stack of enclosing-class "is HTTP handler" flags — foreign-attr
+            # suppression inside an HTTP handler needs to know the context.
+            self._http_stack: list[bool] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            base_names = {_base_name(b) for b in node.bases}
+            deco_names = {_deco_name(d) for d in node.decorator_list}
+            is_enum = bool(base_names & _ENUM_BASE_NAMES)
+            is_pydantic = _inherits_from(node.name, _PYDANTIC_BASE_NAMES)
+            is_dataclass = "dataclass" in deco_names
+            is_http = _inherits_from(node.name, _HTTP_BASE_NAMES)
+            is_visitor = _inherits_from(node.name, _VISITOR_BASE_NAMES)
+
+            # Class-body members the framework consumes directly.
+            for stmt in node.body:
+                if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                    targets = (
+                        stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                    )
+                    for t in targets:
+                        if not isinstance(t, ast.Name):
+                            continue
+                        if (
+                            (is_enum or is_pydantic or is_dataclass)
+                            or (is_http and t.id in _HTTP_PROTOCOL_ATTRS)
+                            or (
+                                is_visitor and (
+                                    t.id.startswith("visit_")
+                                    or t.id.startswith("leave_")
+                                )
+                            )
+                        ):
+                            # Enum member / pydantic or dataclass field / HTTP
+                            # protocol attr / visitor method alias — all
+                            # consumed by the framework, never dead code.
+                            live.add((stmt.lineno, t.id))
+                elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if is_http and (
+                        stmt.name.startswith("do_") or stmt.name == "log_message"
+                    ):
+                        live.add((stmt.lineno, stmt.name))
+                    if is_pydantic and any(
+                        _deco_name(d) in _PYDANTIC_FIELD_DECORATORS
+                        for d in stmt.decorator_list
+                    ):
+                        live.add((stmt.lineno, stmt.name))
+                        # vulture reports the DECORATOR line as first_lineno
+                        # for decorated defs, not the ``def`` line — record
+                        # both so the suppression matches either reporting.
+                        for d in stmt.decorator_list:
+                            live.add((getattr(d, "lineno", 0), stmt.name))
+
+            self._http_stack.append(is_http)
+            self.generic_visit(node)
+            self._http_stack.pop()
+
+        def _mark_foreign_targets(self, node: ast.AST) -> None:
+            targets = getattr(node, "targets", None)
+            if targets is None:
+                targets = [node.target]
+            for t in targets:
+                if not isinstance(t, ast.Attribute):
+                    continue
+                is_bare_self = (
+                    isinstance(t.value, ast.Name) and t.value.id == "self"
+                )
+                in_http = bool(self._http_stack) and self._http_stack[-1]
+                if (not is_bare_self) or (in_http and t.attr in _HTTP_PROTOCOL_ATTRS):
+                    live.add((node.lineno, t.attr))
+
+        visit_Assign = _mark_foreign_targets
+        visit_AugAssign = _mark_foreign_targets
+        visit_AnnAssign = _mark_foreign_targets
+
+    _Mapper().visit(tree)
+    result = frozenset(live)
+    _framework_live_cache.put(path, fp, result)
+    return result
 def _collect_dispatch_live_names(scan_paths: list[str], cancel_event: Any = None) -> frozenset[str]:
     """Identifier-shaped string literals found across *scan_paths*.
 
@@ -238,26 +657,11 @@ def _collect_dispatch_live_names(scan_paths: list[str], cancel_event: Any = None
     consulted only for ``method``/``function`` candidates (variables/attributes
     keep reporting).
     """
-    import ast
-    import tokenize
-
     seen: set[str] = set()
     for path in scan_paths:
         if _is_cancelled(cancel_event):
             break
-        try:
-            with open(path, "rb") as fh:
-                for tok in tokenize.tokenize(fh.readline):
-                    if tok.type != tokenize.STRING:
-                        continue
-                    try:
-                        val = ast.literal_eval(tok.string)
-                    except Exception:
-                        continue
-                    if isinstance(val, str) and val.isidentifier():
-                        seen.add(val)
-        except (OSError, SyntaxError, tokenize.TokenError):
-            continue
+        seen.update(_dispatch_names_for_file(path))
     return frozenset(seen)
 
 
@@ -277,65 +681,11 @@ def _collect_visitor_hook_linenos(scan_paths: list[str], cancel_event: Any = Non
     coincidentally named business method (e.g. ``visit_url`` in a non-visitor
     class) is NOT collected, so real dead code there is still reported.
     """
-    import ast
-
     seen: set[tuple[str, int]] = set()
     for path in scan_paths:
         if _is_cancelled(cancel_event):
             break
-        try:
-            with open(path, encoding="utf-8") as _f:
-                tree = ast.parse(_f.read())
-        except (OSError, SyntaxError):
-            continue
-
-        class_bases: dict[str, list[str]] = {}
-        methods: list[tuple[int, str, str]] = []  # (lineno, name, enclosing_class)
-
-        class _Mapper(ast.NodeVisitor):
-            def __init__(self):
-                self.stack: list[str] = []
-
-            def visit_ClassDef(self, node):
-                self.stack.append(node.name)
-                class_bases[node.name] = [
-                    b.id if isinstance(b, ast.Name)
-                    else (b.attr if isinstance(b, ast.Attribute) else None)
-                    for b in node.bases
-                ]
-                self.generic_visit(node)
-                self.stack.pop()
-
-            def _record(self, node):
-                if self.stack:
-                    methods.append((node.lineno, node.name, self.stack[-1]))
-                self.generic_visit(node)
-
-            visit_FunctionDef = _record
-            visit_AsyncFunctionDef = _record
-
-        _Mapper().visit(tree)
-        if not class_bases:
-            continue
-
-        def _is_visitor(cn: str, _seen: set[str] | None = None) -> bool:
-            _seen = _seen if _seen is not None else set()
-            if cn in _seen or cn not in class_bases:
-                return False
-            _seen.add(cn)
-            return any(
-                b in _VISITOR_BASE_NAMES
-                or (b in class_bases and _is_visitor(b, _seen))
-                for b in class_bases[cn]
-            )
-
-        abs_path = os.path.abspath(path)
-        for lineno, name, cn in methods:
-            if (
-                name in _VISITOR_HOOK_EXACT
-                or name.startswith(_VISITOR_HOOK_PREFIXES)
-            ) and _is_visitor(cn):
-                seen.add((abs_path, lineno))
+        seen.update(_visitor_hooks_for_file(path))
     return seen
 
 
@@ -350,12 +700,12 @@ class VultureCandidate:
     kind: str  # "function" | "class" | "variable" | "import" | "attribute" | "parameter" | "property"
     lineno: int
     end_lineno: int
-    vulture_confidence: int  # raw Vulture confidence 0–100
+    vulture_confidence: int  # raw Vulture confidence 0-100
     message: str
-    normalized_confidence: float = 0.0  # 0.0–1.0, asicode remapped
+    normalized_confidence: float = 0.0  # 0.0-1.0, asicode remapped
     evidence_sources: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict:  # noqa: V105 — serialization contract: ScannerRegistry.run() calls this via hasattr(c, "to_dict"); per-file scans (pre-commit) only see same-file calls, so vulture reports it dead while it is live by contract
         return {
             "file": self.file,
             "name": self.name,
@@ -376,7 +726,7 @@ def _compute_normalized_confidence(
     name: str,
     kind: str,
 ) -> float:
-    """Remap Vulture raw confidence (0–100) to asicode normalized (0.0–1.0).
+    """Remap Vulture raw confidence (0-100) to asicode normalized (0.0-1.0).
 
     Adjustments (name/kind heuristics only):
 
@@ -445,10 +795,8 @@ def _dedup_candidates(candidates: list[VultureCandidate]) -> list[VultureCandida
 
             # Merge: keep highest-confidence as base, combine evidence_sources
             base = max(cluster, key=lambda c: c.vulture_confidence)
-            kinds = sorted(set(c.kind for c in cluster))
-            sources = sorted(set(
-                src for c in cluster for src in c.evidence_sources
-            ))
+            kinds = sorted({c.kind for c in cluster})
+            sources = sorted({src for c in cluster for src in c.evidence_sources})
             min_lineno = min(c.lineno for c in cluster)
             max_end = max(c.end_lineno for c in cluster)
 
@@ -542,7 +890,7 @@ def scan_vulture_dead_code(
             enumerated explicitly (vendored dirs never parsed), so cross-file
             reachability stays accurate without the ~15x cost of parsing
             ``.venv`` / ``node_modules``.
-        min_confidence: Vulture minimum confidence (0–100).
+        min_confidence: Vulture minimum confidence (0-100).
         exclude_patterns: Glob patterns to exclude (e.g. ``["*test*", "*migrations*"]``).
         max_per_file: Max candidates emitted per file. This is a REPORTING cap,
             not a dead-code-detection threshold: vulture may emit more than this
@@ -599,12 +947,23 @@ def scan_vulture_dead_code(
             p if os.path.isabs(p) else os.path.join(repo_root, p)
             for p in file_paths
         ]
+        # String-based dispatch (handler maps resolved via getattr) is a
+        # CROSS-FILE mechanism: the map usually lives in a registry file
+        # OUTSIDE the leaf-scanned targets. file_paths_only must therefore
+        # still collect identifier-shaped string literals from the whole
+        # project — otherwise every dynamically dispatched method in a
+        # leaf-scanned file is a false positive (the registry's
+        # ``"name": "_handler"`` literals are invisible to a target-only
+        # tokenize pass). Mirrors ``cross_file_referenced_names``, which the
+        # structural-scanner gate also computes repo-wide in per-file mode.
+        dispatch_scan_paths = _collect_project_py_files(repo_root)
     else:
         # full_project: enumerate the project .py set explicitly so vendored
         # dirs are never parsed, while vulture still sees every project module
         # for cross-file reachability. The result whitelist (file_paths, below)
         # then restricts reported candidates to the requested targets.
         scan_paths = _collect_project_py_files(repo_root)
+        dispatch_scan_paths = scan_paths
 
     # Names referenced as identifier-shaped string literals → dispatch-live
     # (handler maps resolved via getattr). Collected once; consulted per
@@ -615,7 +974,56 @@ def scan_vulture_dead_code(
         logger.debug("[VULTURE_SCANNER] cancelled before pre-processing")
         return []
 
-    _dispatch_live = _collect_dispatch_live_names(scan_paths, cancel_event=cancel_event)
+    _dispatch_live = _collect_dispatch_live_names(dispatch_scan_paths, cancel_event=cancel_event)
+
+    # In ``file_paths_only`` scope vulture parses ONLY the target files, so its
+    # global used-names basis lacks cross-file usage: methods called from other
+    # modules and imports consumed elsewhere (e.g. TYPE_CHECKING imports used
+    # only in string annotations) come back as false positives. The repo graph
+    # is repo-wide — seed a live-name set from caller edges (the same signal
+    # ``compute_cross_file_referenced_names_light`` seeds from) and suppress any
+    # candidate whose name has ≥1 caller outside the scanned targets. This
+    # mirrors vulture's full-project semantics, where those same names are
+    # used somewhere in the scanned set and never reported. Two sources:
+    #   1. definitions of the target files with ≥1 caller edge, and
+    #   2. names the target files IMPORT whose name has callers elsewhere —
+    #      the import itself may be consumed only via string annotations
+    #      (``-> "ToolResult"``), which vulture cannot see either way.
+    _caller_live: set[str] = set()
+    if (
+        scope == "file_paths_only"
+        and repo_graph is not None
+        and hasattr(repo_graph, "get_callers")
+    ):
+        try:
+            for p in file_paths:
+                abs_p = p if os.path.isabs(p) else os.path.join(repo_root, p)
+                rel_p = os.path.relpath(abs_p, repo_root)
+                if hasattr(repo_graph, "get_symbols_in_file"):
+                    for sym in repo_graph.get_symbols_in_file(rel_p) or []:
+                        name = sym.name if hasattr(sym, "name") else ""
+                        if name and repo_graph.get_callers(name):
+                            _caller_live.add(name)
+                try:
+                    with open(abs_p, "rb") as fh:
+                        _tree = ast.parse(fh.read(), filename=abs_p)
+                except (OSError, SyntaxError, ValueError):
+                    _tree = None
+                if _tree is not None:
+                    for node in ast.walk(_tree):
+                        if isinstance(node, ast.Import):
+                            for a in node.names:
+                                _n = a.asname or a.name.partition(".")[0]
+                                if _n and repo_graph.get_callers(_n):
+                                    _caller_live.add(_n)
+                        elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
+                            for a in node.names:
+                                if a.name != "*":
+                                    _n = a.asname or a.name
+                                    if _n and repo_graph.get_callers(_n):
+                                        _caller_live.add(_n)
+        except Exception:
+            logger.debug("[VULTURE_SCANNER] caller-live lookup failed", exc_info=True)
 
     # Visitor-protocol methods (visit_<Node>/leave_<Node>/on_visit/...) in
     # libcst/ast visitor subclasses — framework-dispatched via getattr, no
@@ -680,12 +1088,11 @@ def scan_vulture_dead_code(
                 continue
 
             # file_paths whitelist filter
-            if file_paths:
-                if not any(
-                    rel_file == fp or abs_file == os.path.abspath(fp)
-                    for fp in file_paths
-                ):
-                    continue
+            if file_paths and not any(
+                rel_file == fp or abs_file == os.path.abspath(fp)
+                for fp in file_paths
+            ):
+                continue
 
             # Filter dunder protocol names (always-live, regardless of kind)
             if name in _ALWAYS_LIVE:
@@ -706,6 +1113,11 @@ def scan_vulture_dead_code(
             if kind in ("method", "function") and name in _dispatch_live:
                 continue
 
+            # Suppress names with ≥1 caller edge in the repo graph (leaf-scope
+            # cross-file usage — see the _caller_live seed above).
+            if name in _caller_live:
+                continue
+
             # Suppress framework-dispatched visitor hooks (visit_<Node>/
             # leave_<Node>/on_visit/on_leave/generic_visit) in libcst/ast
             # visitor subclasses. The (abs_file, lineno) match is inherently
@@ -715,14 +1127,29 @@ def scan_vulture_dead_code(
             if (abs_file, first_lineno) in _visitor_hooks:
                 continue
 
+            # Suppress framework-consumed definitions (enum members, pydantic /
+            # dataclass fields, http.server protocol surface, foreign-object
+            # attribute assignments). Location-precise (file+lineno+name): only
+            # the exact definition the framework consumes is dropped.
+            if (first_lineno, name) in _framework_live_for_file(abs_file):
+                continue
+
             # Per-file reporting cap. This bounds emitted candidates per file; the
             # raw vulture output may exceed it. Downstream aggregates are post-cap,
             # NOT raw counts — see the max_per_file docstring.
             count = per_file_counts.get(rel_file, 0)
             if count >= max_per_file:
                 continue
-            # noqa(F841) on the flagged line suppresses the candidate
-            if first_lineno and _source_line_has_noqa(abs_file, first_lineno, {"F841"}):
+            # an inline noqa comment on the flagged line suppresses the
+            # candidate: legacy F841 (ruff's unused-variable code) plus the
+            # vulture code for this kind (V101-V107). vulture's own
+            # get_unused_code() applies no noqa filtering, so the flake8-style
+            # contract is implemented here (see _VULTURE_CODE_BY_KIND).
+            suppress_codes: set[str] = {"F841"}
+            v_code = _VULTURE_CODE_BY_KIND.get(kind)
+            if v_code:
+                suppress_codes.add(v_code)
+            if first_lineno and _source_line_has_noqa(abs_file, first_lineno, suppress_codes):
                 continue
 
             per_file_counts[rel_file] = count + 1

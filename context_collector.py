@@ -20,6 +20,8 @@ from config import (
     KOTLIN_MAX_SYMBOLS,
     KOTLIN_SYMBOL_SCAN_LIMIT,
 )
+from path_security import resolve_inside_repo
+from utils.string_helper import utf8_trailing_incomplete_len
 
 logger = logging.getLogger(__name__)
 
@@ -37,14 +39,49 @@ def _decode_bytes_best_effort(raw: bytes) -> tuple[str, str]:
     for enc in ("utf-8", "utf-8-sig", "cp949", "euc-kr"):
         try:
             return raw.decode(enc, errors="strict"), enc
-        except Exception:
-            pass
+        except UnicodeDecodeError as e:
+            logger.debug("strict decode %s failed: %s", enc, e)
     return raw.decode("utf-8", errors="replace"), "utf-8(replace)"
 
 
-def _read_text_best_effort(fp: Path) -> tuple[str, str]:
-    raw = fp.read_bytes()
-    return _decode_bytes_best_effort(raw)
+# P20-4 / P2 (2026-08-12): snippet reads are bounded exactly like the sibling
+# readers in llm_execution._read_text_best_effort / ui_tools._read_file /
+# external_llm.service. This is the SINGLE SOURCE OF TRUTH — the three sibling
+# modules import this constant (they used to keep private copies, which could
+# drift apart and re-open the P19-1 multi-GB full-read bug class).
+_SNIPPET_READ_MAX_BYTES = 1024 * 1024
+# Import parsing only ever needs the module block at the head of a file.
+_COLLECT_READ_MAX_BYTES = 256 * 1024
+
+
+def _read_text_best_effort(fp: Path, *, max_bytes: int | None = None) -> tuple[str, str, bool]:
+    """Best-effort bounded read.
+
+    - Strict decodes first (utf-8/utf-8-sig/cp949/euc-kr); fallback to utf-8
+      with replacement keeps visibility (no silent drop).
+    - P20-4: with ``max_bytes``, read at most that many bytes and report
+      ``truncated`` when the file is larger — callers only need a bounded
+      window (snippet / import head), so a multi-GB dump used to be read in
+      full and decoded up to 4x just to show its head.
+    - P20-5: an incomplete trailing UTF-8 sequence at the cut point is trimmed
+      so the strict ladder can still succeed (no 4x-fail + replace re-decode).
+
+    Returns: (text, encoding_used, truncated)
+    """
+    size = fp.stat().st_size
+    if max_bytes is None:
+        raw = fp.read_bytes()
+        truncated = False
+    else:
+        truncated = size > max_bytes
+        with fp.open("rb") as f:
+            raw = f.read(max_bytes)
+        if truncated:
+            trim = utf8_trailing_incomplete_len(raw)
+            if trim:
+                raw = raw[: len(raw) - trim]
+    text, enc_used = _decode_bytes_best_effort(raw)
+    return text, enc_used, truncated
 
 
 def _truncate_utf8_bytes_safe(s: str, max_bytes: int) -> tuple[str, bool]:
@@ -112,14 +149,10 @@ def _parse_python_imports(text: str, rel_path: str | None = None) -> list[str]:
             # Convert filesystem path to module-like (pkg.sub)
             base_mod = str(bd).replace("\\", "/").strip("/")
             base_mod = base_mod.replace("/", ".") if base_mod else ""
-            if suffix:
-                mod = (base_mod + "." + suffix) if base_mod else suffix
-            else:
-                mod = base_mod
+            mod = (base_mod + "." + suffix if base_mod else suffix) if suffix else base_mod
 
         # Normalize leading/trailing dots
-        mod = mod.strip().strip(".")
-        return mod
+        return mod.strip().strip(".")
 
     for line in (text or "").splitlines():
         stripped = line.strip()
@@ -202,11 +235,10 @@ def _find_kotlin_files_for_symbol(
 
     target_parts = Path(target_rel).parts if target_rel else ()
     scored: list[tuple[int, str]] = []
-    for fp in matches[:max(1, int(limit))]:
-        try:
-            rel = fp.relative_to(repo)
-        except ValueError:
-            continue
+    for fp in matches[: max(1, int(limit))]:
+        # rglob results are always lexically under repo (symlinks are not
+        # followed), so relative_to cannot fail here — no guard needed.
+        rel = fp.relative_to(repo)
         rels = str(rel).replace("\\", "/")
         common = sum(1 for a, b in zip(target_parts, rel.parts, strict=False) if a == b)
         scored.append((common, rels))
@@ -248,9 +280,18 @@ def collect_related_files_shallow(
         meta["reason"] = "empty_target"
         return [], meta
 
-    repo = Path(repo_root).resolve()
-    fp = repo / rel
-    if not fp.exists() or not fp.is_file():
+    # P20-1: strict resolution + containment check. normalize_rel_path_fast
+    # strips leading ./ and / but does NOT reject ".." — a prompt-supplied
+    # "Target file: ../sibling/app.py" used to read outside the repo here
+    # (external-LLM / plan-json paths already refused it; instruction and
+    # legacy-diff modes did not). resolve_inside_repo also rejects symlink
+    # escapes (resolve() + relative_to containment).
+    try:
+        fp = resolve_inside_repo(repo_root, target_rel)
+    except ValueError:
+        meta["reason"] = "path_outside_repo"
+        return [], meta
+    if not fp.is_file():
         meta["reason"] = "target_missing"
         return [], meta
 
@@ -263,8 +304,10 @@ def collect_related_files_shallow(
         return selected, meta
 
     try:
-        text, enc_used = _read_text_best_effort(fp)
+        text, enc_used, read_truncated = _read_text_best_effort(fp, max_bytes=_COLLECT_READ_MAX_BYTES)
         meta["encoding_used"] = enc_used
+        if read_truncated:
+            meta["read_truncated"] = True
     except Exception:
         # Keep contract: return (list[str], meta)
         meta["reason"] = "read_error"
@@ -329,14 +372,21 @@ def read_file_snippet_context(
         meta["reason"] = "missing_args"
         return "", meta
 
-    fp = Path(repo_root).resolve() / reln
-    if not fp.exists() or not fp.is_file():
+    # P20-1: strict resolution + containment (see collect_related_files_shallow).
+    try:
+        fp = resolve_inside_repo(repo_root, rel_path)
+    except ValueError:
+        meta["reason"] = "path_outside_repo"
+        return "", meta
+    if not fp.is_file():
         meta["reason"] = "missing_file"
         return "", meta
 
     try:
-        text, enc_used = _read_text_best_effort(fp)
+        text, enc_used, read_truncated = _read_text_best_effort(fp, max_bytes=_SNIPPET_READ_MAX_BYTES)
         meta["encoding_used"] = enc_used
+        if read_truncated:
+            meta["read_truncated"] = True
     except Exception:
         meta["reason"] = "read_error"
         return "", meta
@@ -345,12 +395,13 @@ def read_file_snippet_context(
     hit = None
     try:
         rx = re.compile(around_regex)
+    except re.error as e:
+        logger.debug("invalid around_regex %r: %s", around_regex, e)
+    else:
         for i, ln in enumerate(lines):
             if rx.search(ln):
                 hit = i
                 break
-    except Exception:
-        pass
 
     if hit is None:
         hit = 0
@@ -370,6 +421,11 @@ def read_file_snippet_context(
     else:
         body = body2
         meta["truncated"] = False
+
+    if read_truncated:
+        # P20-4: the source read was bounded — the head is not the whole file.
+        # Same marker contract as _format_snippet(read_truncated=True) (P19-1).
+        body = body.rstrip("\n") + "\n...[TRUNCATED]...\n"
 
     meta["included"] = True
     meta["bytes_total"] = len(body.encode("utf-8", errors="strict"))

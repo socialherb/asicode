@@ -25,13 +25,16 @@ import threading
 import time
 import weakref
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
-from typing import Any  # f821-protected
+from typing import (
+    Any,  # f821-protected
+    Optional,
+)
 
 from ..common.file_lock import cross_process_flock
+from ..common.repo_files import canonical_repo_key
 
 # Module-level lazy tokenizer singleton — identical pattern to
 # ``rag_searcher._TOKENIZER``. Avoids re-constructing the CodeTokenizer
@@ -41,38 +44,38 @@ from ..common.file_lock import cross_process_flock
 _TOKENIZER: Any = None  # CodeTokenizer — lazy init
 
 __all__ = [
+    # Two-tier archive (hard budget without losing durable insights)
+    "ARCHIVE_INDEX_MAX_ENTRIES",
     "COMPACT_BUDGET_BYTES",
     "NUDGE_AGE_DAYS_THRESHOLD",
     "NUDGE_BYTES_THRESHOLD",
     "NUDGE_COUNT_THRESHOLD",
+    "PROMOTE_MAX_BYTES",
+    "PROMOTE_MAX_ENTRIES",
+    "PROMOTE_MIN_SCORE",
     "InsightEntry",
     "InsightsStats",
+    "append_entries_to_archive",
     "atomic_write_text",
+    "build_archive_index",
     "build_compact_messages",
     "build_verify_messages",
     "compute_stats",
     "drop_entry",
+    "enforce_budget_by_demotion",
     "entry_age_days",
+    "insights_archive_path",
     "insights_path",
     "insights_write_lock",
+    "load_archive_file",
     "load_insights_file",
     "parse_insights",
     "parse_timestamp",
+    "select_demotion_candidates",
     "select_entries_older_than",
+    "select_promotable_entries",
     "serialize_insights",
     "should_nudge",
-    # Two-tier archive (hard budget without losing durable insights)
-    "ARCHIVE_INDEX_MAX_ENTRIES",
-    "PROMOTE_MAX_BYTES",
-    "PROMOTE_MAX_ENTRIES",
-    "PROMOTE_MIN_SCORE",
-    "append_entries_to_archive",
-    "build_archive_index",
-    "enforce_budget_by_demotion",
-    "insights_archive_path",
-    "load_archive_file",
-    "select_demotion_candidates",
-    "select_promotable_entries",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -136,8 +139,16 @@ class InsightsStats:
 
 
 def insights_path(repo_root: str) -> str:
-    """Return the canonical insights file path under ``repo_root``."""
-    return os.path.join(repo_root, ".asicode", "design_insights.md")
+    """Return the canonical insights file path under ``repo_root``.
+
+    ``repo_root`` is canonicalized via :func:`canonical_repo_key` so the
+    active-file caches (``_ACTIVE_CONTENT_CACHE`` / ``_ACTIVE_WRITE_VERSIONS``)
+    and every writer agree on ONE spelling per repo — ``/var`` vs
+    ``/private/var`` (macOS) or a trailing slash would otherwise split one repo
+    across two of the 8 cache slots and let an invalidator bump a version
+    counter the reader never checks.
+    """
+    return os.path.join(canonical_repo_key(repo_root), ".asicode", "design_insights.md")
 
 
 def _load_file_safe(path: str) -> str:
@@ -203,15 +214,12 @@ def parse_timestamp(header_line: str) -> Optional[float]:
     # this branch the offset suffix would be silently dropped and the LOCAL
     # wall-clock misread as UTC — skewing every age computation by the zone
     # offset (9h for KST).
-    try:
+    with suppress(ValueError, TypeError):
         return datetime.datetime.strptime(s[:22], "%Y-%m-%d %H:%M %z").timestamp()
-    except (ValueError, TypeError):
-        pass
     candidate = s[:16]  # legacy 'YYYY-MM-DD HH:MM' is exactly 16 chars
-    try:
+    with suppress(ValueError, TypeError):
         return calendar.timegm(time.strptime(candidate, "%Y-%m-%d %H:%M"))
-    except (ValueError, TypeError):
-        return None
+    return None
 
 
 def entry_age_days(entry: "InsightEntry", now: Optional[float] = None) -> Optional[float]:
@@ -451,10 +459,8 @@ def atomic_write_text(path: str, content: str) -> None:
             os.fsync(fh.fileno())  # durability: ensure data is on disk before rename
         os.replace(tmp_path, path)
     except BaseException:
-        try:
+        with suppress(OSError):
             os.unlink(tmp_path)
-        except OSError:
-            pass
         raise
 
 
@@ -482,8 +488,16 @@ _ARCHIVE_PREAMBLE = (
 
 
 def insights_archive_path(repo_root: str) -> str:
-    """Return the canonical archive file path under ``repo_root``."""
-    return os.path.join(repo_root, ".asicode", "design_insights_archive.md")
+    """Return the canonical archive file path under ``repo_root``.
+
+    Same canonicalization as :func:`insights_path` — the archive caches
+    (``_ARCHIVE_PARSED_CACHE`` / ``_ARCHIVE_ANALYZED_CACHE`` /
+    ``_ARCHIVE_WRITE_VERSIONS``) and :func:`_archive_invalidate` all derive
+    their key from this one function, so a spelling variant of ``repo_root``
+    can neither occupy a second cache slot nor desync the write-version
+    counter (C2: raw-key cache split in multi-repo sessions).
+    """
+    return os.path.join(canonical_repo_key(repo_root), ".asicode", "design_insights_archive.md")
 
 
 def load_archive_file(repo_root: str) -> str:
@@ -506,13 +520,26 @@ _ARCHIVE_ANALYZED_CACHE: dict[
     str, tuple[int, int, int, list[InsightEntry], list[frozenset[str]], dict[str, int], float]
 ] = {}
 # Bounded entry cap (P4): these path-keyed caches grew unboundedly in a long-
-# lived REPL visiting many repos. FIFO eviction under the GIL is consistent with
-# the lock-free, single-threaded design (the current repo is the newest entry).
+# lived REPL visiting many repos. LRU eviction (pop-before-reinsert so the
+# current repo IS the newest entry) under the GIL is consistent with the
+# lock-free, single-threaded design.
 _ARCHIVE_CACHE_MAX_ENTRIES: int = 8
 
 
-def _archive_capped_put(cache: dict, key, value, sibling_versions: dict | None = None) -> None:
-    """Set ``cache[key] = value`` then FIFO-evict the oldest entry if over cap.
+def _archive_capped_put(
+    cache: dict, key, value,
+    sibling_versions: dict | None = None, sibling_cache: dict | None = None,
+) -> None:
+    """Set ``cache[key] = value`` then evict the least-recently-used entry if over cap.
+
+    Re-inserting an existing key does NOT refresh its dict position, so the key
+    is popped first (C1): the re-put lands at the back, making the (re-)active
+    repo the most-recently-used entry and stale repos the eviction candidates.
+    Without the pop, an active repo — re-put every turn its archive changes —
+    keeps its ORIGINAL position and becomes the first eviction candidate once
+    cap+1 repos are visited, forcing a full archive re-read+re-parse every turn
+    in multi-repo sessions. Mirrors ``_shared_utils._capped_put``, the twin of
+    this function, which has always popped first; this one had not.
 
     Pure-dict, no lock needed (matches the lock-free cache family).
 
@@ -534,7 +561,14 @@ def _archive_capped_put(cache: dict, key, value, sibling_versions: dict | None =
     lockstep is a safe false-miss / re-read, never a stale hit. See
     :func:`_archive_signature` for why the version counter exists
     (belt-and-suspenders against same-mtime+same-size writes, fix #2).
+
+    When ``sibling_cache`` is also given, the version pop is SKIPPED for keys
+    that still live in the sibling content cache: the version dict then stays
+    bounded by the UNION of both content caches, and an eviction from one cache
+    no longer forces a false-miss (full re-parse + re-tokenize) on the other
+    for a path that is still hot there.
     """
+    cache.pop(key, None)  # refresh insertion order — re-put lands at the BACK
     cache[key] = value
     while len(cache) > _ARCHIVE_CACHE_MAX_ENTRIES:
         try:
@@ -547,6 +581,11 @@ def _archive_capped_put(cache: dict, key, value, sibling_versions: dict | None =
             break
         cache.pop(_oldest, None)
         if sibling_versions is not None:
+            if sibling_cache is not None and _oldest in sibling_cache:
+                # The evicted path still lives in the sibling content cache —
+                # keep its write version so the sibling does not false-miss
+                # (re-parse + re-tokenize) on its next request.
+                continue
             sibling_versions.pop(_oldest, None)
 
 
@@ -582,7 +621,8 @@ def _parsed_archive_cached(repo_root: str) -> list[InsightEntry]:
     content = load_archive_file(repo_root)
     entries = parse_insights(content)[1] if content.strip() else []
     _archive_capped_put(_ARCHIVE_PARSED_CACHE, path, (mtime_ns, size, version, entries),
-                        sibling_versions=_ARCHIVE_WRITE_VERSIONS)
+                        sibling_versions=_ARCHIVE_WRITE_VERSIONS,
+                        sibling_cache=_ARCHIVE_ANALYZED_CACHE)
     return entries
 
 
@@ -623,6 +663,7 @@ def _archive_analyzed_cached(
         _ARCHIVE_ANALYZED_CACHE, path,
         (mtime_ns, size, version, entries, toksets, df, avgdl),
         sibling_versions=_ARCHIVE_WRITE_VERSIONS,
+        sibling_cache=_ARCHIVE_PARSED_CACHE,
     )
     return entries, toksets, df, avgdl
 
@@ -636,7 +677,6 @@ def _archive_invalidate(repo_root: str) -> None:
     for #2).  Each repo root tracks its own version independently, avoiding
     cross-repo false-invalidation in multi-repo orchestrator mode.
     """
-    global _ARCHIVE_WRITE_VERSIONS  # per-path monotonic counter
     path = insights_archive_path(repo_root)
     _ARCHIVE_WRITE_VERSIONS[path] = _ARCHIVE_WRITE_VERSIONS.get(path, 0) + 1
     _ARCHIVE_PARSED_CACHE.pop(path, None)
@@ -700,7 +740,6 @@ def _active_invalidate(repo_root: str) -> None:
     write still mis-matches on the version component. Mirrors
     :func:`_archive_invalidate`.
     """
-    global _ACTIVE_WRITE_VERSIONS
     path = insights_path(repo_root)
     _ACTIVE_WRITE_VERSIONS[path] = _ACTIVE_WRITE_VERSIONS.get(path, 0) + 1
     _ACTIVE_CONTENT_CACHE.pop(path, None)
@@ -921,13 +960,10 @@ def select_promotable_entries(
         return []
     # Module-level lazy tokenizer singleton (fixes #4: no per-turn init).
     global _TOKENIZER  # lazy sentinel
-    try:
-        if _TOKENIZER is None:
-            from external_llm.agent.rag_configs import CodeTokenizer
-            _TOKENIZER = CodeTokenizer()
-        tok = _TOKENIZER
-    except Exception:
-        return []  # non-critical — never block injection
+    if _TOKENIZER is None:
+        from external_llm.agent.rag_configs import CodeTokenizer
+        _TOKENIZER = CodeTokenizer()
+    tok = _TOKENIZER
     qset = set(tok.tokenize(task_query))
     if not qset:
         return []
@@ -945,14 +981,14 @@ def select_promotable_entries(
     # IDF depends ONLY on the query token (+ corpus stats df/n_docs, which are
     # loop-invariant) — NOT on the entry — so precompute it once over qset
     # (turn 13112 perf #8, symmetric to the tf_norm hoist below). Previously
-    # math.log was recomputed on every entry × every shared term.
+    # math.log was recomputed on every entry x every shared term.
     idf_map = {
         qt: math.log((n_docs - df.get(qt, 0) + 0.5) / (df.get(qt, 0) + 0.5) + 1.0)
         for qt in qset
     }
     # ── Score each entry ───────────────────────────────────────────────
     scored: list[tuple[float, InsightEntry]] = []
-    for entry, etoks in zip(entries, toksets):
+    for entry, etoks in zip(entries, toksets, strict=True):
         shared = qset & etoks
         if not shared:
             continue

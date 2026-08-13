@@ -26,7 +26,6 @@ from external_llm.agent.intent_models import IntentResolutionConfig
 from external_llm.agent.intent_resolver import IntentResolver
 from external_llm.client import LLMResponse, effective_content
 
-
 # ── pure-function tests for the canonical extractor ─────────────────────────
 
 
@@ -185,3 +184,35 @@ def test_intent_still_uses_content_when_present():
     result = resolver.resolve("Add validate() method to UserModel")
     assert result.intent_type == "feature"
     assert "UserModel" in result.modify_symbols
+
+
+def test_compress_preserves_turns_when_response_truly_empty():
+    """A genuinely empty helper-model response must NOT advance compressed_up_to.
+
+    effective_content() recovers reasoning_content, but when the helper model
+    returns an empty completion (no content, no reasoning) the pointer must
+    stay put: advancing it would silently drop the turns from context with no
+    summary covering them — the same loss the exception path avoids. They stay
+    verbatim so the next compression cycle retries.
+    """
+    cm = SessionCompressionContext("/tmp/nonexistent-repo")
+    turns = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "recent1"},
+        {"role": "assistant", "content": "recent2"},
+    ]
+    session = _make_session(turns)
+    cm.compress_old_turns(
+        session, _FakeClient(_resp(content="", reasoning="")), "glm-5.2", recent_keep=2,
+    )
+
+    assert session.compressed_up_to == 0, "pointer advanced despite empty summary"
+    assert session.compressed_summary == ""
+
+    # Next cycle with a healthy helper model succeeds normally (retry works).
+    cm.compress_old_turns(
+        session, _FakeClient(_resp(content="real summary")), "glm-5.2", recent_keep=2,
+    )
+    assert session.compressed_summary == "real summary"
+    assert session.compressed_up_to == 2

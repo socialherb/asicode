@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # confusables break Latin keyword matching; full Unicode confusable folding
 # is deliberately out of scope (it would weaken the conservative bias).
 _APOSTROPHE_VARIANTS = "'\u02bc\u2018\u2019\u02b9\u0060\u00b4"
-_APOSTROPHE_TRANS = str.maketrans({c: "'" for c in _APOSTROPHE_VARIANTS})
+_APOSTROPHE_TRANS = str.maketrans(dict.fromkeys(_APOSTROPHE_VARIANTS, "'"))
 
 
 def _normalize(text: str) -> str:
@@ -204,13 +204,13 @@ def classify_user_approval(
             raw = (judge_fn(prompt) or "").strip().lower()
             if raw == "approved":
                 return UserApproval.APPROVED
-            elif raw == "denied":
+            if raw == "denied":
                 return UserApproval.DENIED
-            else:
-                logger.debug("LLM judge returned ambiguous classification: %r", raw)
-                return UserApproval.AMBIGUOUS
+            logger.debug("LLM judge returned ambiguous classification: %r", raw)
         except Exception as e:
             logger.warning("LLM judge failed, falling back to heuristic: %s", e)
+        else:
+            return UserApproval.AMBIGUOUS
 
     # Heuristic classifier (default path; see module docstring). Denial is
     # checked BEFORE affirmative: this is the conservative choice for a gate
