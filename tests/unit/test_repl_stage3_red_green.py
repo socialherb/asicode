@@ -1164,6 +1164,47 @@ class TestSpawnedReplStage3:
         finally:
             sess.close()
 
+    def test_no_api_key_immune_to_ambient_env(self, tmp_path):
+        """`--no-api-key` must strip ALL per-provider API-key env vars, so the
+        "OPENAI_API_KEY not set" prompt is deterministic even when the ambient
+        environment (shell-exported or .env-loaded) supplies any of them.
+
+        Regression for the .env environment-dependency issue: with a root .env
+        (or a shell) exporting API keys, these tests used to intermittently
+        miss the key prompt and stall (30s timeout) because OPENAI_API_KEY was
+        still set when /model openai/... switched provider.
+        """
+        from tests.unit.pty_driver import SpawnPtySession
+
+        repo = str(tmp_path)
+        ambient = {
+            "OPENAI_API_KEY": "sk-ambient-openai",
+            "ANTHROPIC_API_KEY": "sk-ant-ambient",
+            "DEEPSEEK_API_KEY": "sk-ambient-deepseek",
+            "ZAI_API_KEY": "zai-ambient",
+            "OPENCODE_API_KEY": "oc-ambient",
+            "GOOGLE_API_KEY": "goog-ambient",
+            "OPENROUTER_API_KEY": "or-ambient",
+            "OLLAMA_API_KEY": "ollama-ambient",
+        }
+        sess = SpawnPtySession(
+            [sys.executable, self.CHILD, "--repo", repo, "--no-api-key"],
+            cwd=os.getcwd(),
+            env=ambient,
+            timeout=90,
+        )
+        try:
+            self._wait_prompt(sess)
+            self._send_cmd(sess, "/model openai/gpt-4o")
+            sess.wait_for(b"OPENAI_API_KEY not set in environment.", timeout=30)
+            self._send_cmd(sess, "\r")
+            sess.wait_for(b"no API key provided", timeout=30)
+            self._send_cmd(sess, "exit")
+            sess.wait_for(b"session ended.", timeout=30)
+            assert sess.wait(timeout=30) == 0
+        finally:
+            sess.close()
+
     def test_session_aj_unknown_provider(self, tmp_path):
         """/model with an unknown provider -> unknown-provider hint + key
         prompt; empty key -> cancelled."""

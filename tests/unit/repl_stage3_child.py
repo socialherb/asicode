@@ -288,8 +288,12 @@ def _main() -> int:
             ns.model = "deepseek-reasoner"
         if ns.no_api_key:
             # Force the prompt path even when the parent shell exports a key.
-            os.environ.pop("OPENAI_API_KEY", None)
-            os.environ.pop("ANTHROPIC_API_KEY", None)
+            # Remove ALL per-provider API-key env vars (not just the two below):
+            # a dev shell may export any of them, and .env's keys are loaded the
+            # same way. The "not set in environment" prompt must be deterministic
+            # regardless of ambient environment.
+            for _env_var in asi._API_KEY_ENV_MAP.values():
+                os.environ.pop(_env_var, None)
 
         # ── undo checkpoint path ──
         if ns.undo_cp:
