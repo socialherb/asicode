@@ -240,3 +240,126 @@ class TestFindAnchorLine:
         lines = ["x = 1\n"]
         # '(' is an invalid regex; _match_anchor catches re.error -> no match.
         assert _find_anchor_line(lines, "(") is None
+
+
+# -- _match_anchor edge inputs ---------------------------------------------
+
+
+class TestMatchAnchorEdge:
+    def test_empty_pattern_or_line_returns_false(self):
+        from external_llm.agent.anchor_shared import _match_anchor
+
+        assert _match_anchor("", "x = 1") is False
+        assert _match_anchor("x", "") is False
+
+
+# -- resolve_multiline_anchor: uniqueness guard -----------------------------
+
+
+class TestResolveMultilineNotUnique:
+    def test_ambiguous_first_line_rejected(self):
+        """First line matching >1 location with default occurrence and no
+        context must fail loudly (anchor_not_unique) rather than anchor at the
+        last match — delete/insert on the wrong block is irreversible."""
+        lines = ["a = 1", "b = 2", "a = 1"]
+        out = resolve_multiline_anchor(lines, "a = 1\nb = 2")
+        assert out["ok"] is False
+        assert out["failure_class"] == "anchor_not_unique"
+        assert out["match_count"] == 2
+
+    def test_occurrence_disambiguates(self):
+        lines = ["a = 1", "b = 2", "a = 1"]
+        out = resolve_multiline_anchor(lines, "a = 1\nb = 2", occurrence=1)
+        assert out["ok"] is True
+        assert out["anchor"] == 0
+
+
+# -- _fuzzy_find_anchor_line gates ------------------------------------------
+
+
+class TestFuzzyFindAnchorLine:
+    """_fuzzy_find_anchor_line의 4개 게이트를 각각 고정한다."""
+
+    def test_too_few_tokens_rejected(self):
+        from external_llm.agent.anchor_shared import _fuzzy_find_anchor_line
+
+        assert _fuzzy_find_anchor_line(["x y z"], "a b") == (None, 0.0)
+
+    def test_no_overlapping_candidates(self):
+        from external_llm.agent.anchor_shared import _fuzzy_find_anchor_line
+
+        lines = ["one two three", "four five six"]
+        assert _fuzzy_find_anchor_line(lines, "alpha beta gamma delta") == (None, 0.0)
+
+    def test_blank_lines_skipped_in_candidate_scan(self):
+        from external_llm.agent.anchor_shared import _fuzzy_find_anchor_line
+
+        lines = ["", "   ", "alpha beta gamma delta"]
+        lineno, score = _fuzzy_find_anchor_line(lines, "alpha beta gamma delta")
+        assert lineno == 2 and score == 1.0
+
+    def test_below_threshold_rejected(self):
+        from external_llm.agent.anchor_shared import _fuzzy_find_anchor_line
+
+        lines = ["alpha beta gamma"]
+        # 3/4 토큰 오버랩 = 0.75 < threshold 0.9
+        assert _fuzzy_find_anchor_line(lines, "alpha beta gamma delta", threshold=0.9) == (None, 0.0)
+
+    def test_tie_margin_gate_rejects(self, caplog):
+        from external_llm.agent.anchor_shared import _fuzzy_find_anchor_line
+
+        lines = ["alpha beta gamma delta x", "alpha beta gamma delta y"]
+        out = _fuzzy_find_anchor_line(lines, "alpha beta gamma delta")
+        assert out == (None, 0.0)
+        assert "ANCHOR_FUZZY_AMBIGUOUS" in caplog.text
+
+    def test_indent_mismatch_rejects_root_snippet_into_deeper_context(self, caplog):
+        from external_llm.agent.anchor_shared import _fuzzy_find_anchor_line
+
+        lines = ["    alpha beta gamma delta"]
+        out = _fuzzy_find_anchor_line(lines, "alpha beta gamma delta", snippet_lines=["x = 1"])
+        assert out == (None, 0.0)
+        assert "ANCHOR_FUZZY_INDENT_MISMATCH" in caplog.text
+
+    def test_success_returns_lineno_and_score(self, caplog):
+        from external_llm.agent.anchor_shared import _fuzzy_find_anchor_line
+
+        lines = ["noise", "alpha beta gamma delta"]
+        lineno, score = _fuzzy_find_anchor_line(lines, "alpha beta gamma delta", edit_mode="insert_after")
+        assert lineno == 1 and score == 1.0
+        assert "ANCHOR_FUZZY_MATCH" in caplog.text
+
+    def test_indent_compatible_snippet_accepts(self):
+        from external_llm.agent.anchor_shared import _fuzzy_find_anchor_line
+
+        lines = ["    alpha beta gamma delta"]
+        out = _fuzzy_find_anchor_line(lines, "alpha beta gamma delta", snippet_lines=["    y = 2"])
+        assert out[0] == 0
+
+
+# -- _inherit_anchor_indent_if_bare -----------------------------------------
+
+
+class TestInheritAnchorIndentIfBare:
+    def test_bare_snippet_inherits_anchor_indent(self):
+        from external_llm.agent.anchor_shared import _inherit_anchor_indent_if_bare
+
+        out = _inherit_anchor_indent_if_bare(["x = 1"], "    y = 2")
+        assert out == ["    x = 1"]
+
+    def test_snippet_with_own_indent_unchanged(self):
+        from external_llm.agent.anchor_shared import _inherit_anchor_indent_if_bare
+
+        out = _inherit_anchor_indent_if_bare(["  x = 1"], "    y = 2")
+        assert out == ["  x = 1"]
+
+    def test_bare_anchor_keeps_bare_snippet(self):
+        from external_llm.agent.anchor_shared import _inherit_anchor_indent_if_bare
+
+        out = _inherit_anchor_indent_if_bare(["x = 1"], "y = 2")
+        assert out == ["x = 1"]
+
+    def test_empty_insert_lines_unchanged(self):
+        from external_llm.agent.anchor_shared import _inherit_anchor_indent_if_bare
+
+        assert _inherit_anchor_indent_if_bare([], "    y = 2") == []

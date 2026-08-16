@@ -54,6 +54,7 @@ class TriggerEngine:
         self._lock = threading.Lock()
         self._schedule_timers: list[threading.Timer] = []
         self._running = False
+        self._epoch = 0  # bumped on every stop(); in-flight _fire re-arms only if unchanged
 
     # ── Registration ──────────────────────────────────────────────────────────
 
@@ -88,6 +89,7 @@ class TriggerEngine:
         """Stop all sources. Thread-safe."""
         with self._lock:
             self._running = False
+            self._epoch += 1  # invalidate any in-flight _fire that started before this stop
             timers = list(self._schedule_timers)
             self._schedule_timers.clear()
         for t in timers:
@@ -145,6 +147,7 @@ class TriggerEngine:
         holder: list[Optional[threading.Timer]] = [None]
 
         def _fire():
+            epoch = self._epoch  # captured before emit — stop() during emit bumps it
             if not self._running:
                 return
             self.emit(TriggerEvent(
@@ -153,10 +156,19 @@ class TriggerEngine:
                 severity=0,
                 metadata={"label": label, "interval": interval_seconds},
             ))
-            # Re-arm: remove completed timer from list, register the new one
+            # Re-arm: remove completed timer from list, register the new one.
+            # stop() may have run during emit() (e.g. from a callback) — the
+            # unlocked check above cannot see that, so re-check under the lock:
+            # re-arming into a cleared list would leak the timer here and
+            # resurrect the schedule after a later start().
+            # The epoch check additionally covers stop() followed by start():
+            # _running alone is True again after a restart, so an in-flight
+            # tick from before the stop must not re-arm into the new epoch.
             next_t = threading.Timer(interval_seconds, _fire)
             next_t.daemon = True
             with self._lock:
+                if not self._running or self._epoch != epoch:
+                    return
                 if holder[0] in self._schedule_timers:
                     self._schedule_timers.remove(holder[0])
                 self._schedule_timers.append(next_t)

@@ -297,6 +297,241 @@ class TestVerdictForSession:
         for s in sugg:
             assert f"- {s}" in out  # every suggestion preserved
 
+    def test_plan_included_when_present(self):
+        # The structured plan (output_format schema: "structured plan for asicode
+        # to execute") must reach the design session — previously parsed and
+        # stored but never surfaced (dead contract).
+        from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
+        from external_llm.repl.collaborate.claude_session import SessionResult
+        plan = {"steps": [{"action": "read_file", "path": "ui/"}], "goal": "locate UI"}
+        result = SessionResult(verdict=CollaborationVerdict(
+            status="success", summary="s", details="d", plan=plan,
+        ))
+        out = format_verdict_for_session(result, "task")
+        assert "plan:" in out
+        assert '"goal": "locate UI"' in out
+        assert "read_file" in out
+
+    def test_metadata_included_when_present(self):
+        from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
+        from external_llm.repl.collaborate.claude_session import SessionResult
+        result = SessionResult(verdict=CollaborationVerdict(
+            status="success", summary="s", details="d",
+            metadata={"tokens": 1234, "tool_calls": 7},
+        ))
+        out = format_verdict_for_session(result, "task")
+        assert "metadata:" in out
+        assert '"tokens": 1234' in out
+
+    def test_plan_metadata_omitted_when_absent(self):
+        # Absent plan/metadata must not produce empty stub lines in the injection text.
+        from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
+        from external_llm.repl.collaborate.claude_session import SessionResult
+        result = SessionResult(verdict=CollaborationVerdict(
+            status="success", summary="s", details="d",
+        ))
+        out = format_verdict_for_session(result, "task")
+        assert "plan:" not in out
+        assert "metadata:" not in out
+
+    def test_plan_metadata_unserializable_values_safe(self):
+        # Untrusted model output can carry non-JSON types — must not crash injection.
+        from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
+        from external_llm.repl.collaborate.claude_session import SessionResult
+        result = SessionResult(verdict=CollaborationVerdict(
+            status="success", summary="s", details="d",
+            plan={"when": object()},
+            metadata={"blob": object()},
+        ))
+        out = format_verdict_for_session(result, "task")  # no exception
+        assert "plan:" in out
+        assert "metadata:" in out
+
+    def test_plan_metadata_sdk_xml_tags_stripped(self):
+        # Same leak-guard as details: SDK/verdict XML tags must not reach the design LLM.
+        from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
+        from external_llm.repl.collaborate.claude_session import SessionResult
+        result = SessionResult(verdict=CollaborationVerdict(
+            status="success", summary="s", details="d",
+            plan={"steps": ["run <status>check</status> now"]},
+            metadata={"note": "<plan>leak</plan>"},
+        ))
+        out = format_verdict_for_session(result, "task")
+        assert "<status>" not in out
+        assert "<plan>" not in out
+        assert "check" in out  # inner text preserved
+
+
+class TestOrchestratorNonSdkBranches:
+    """run()/interrupt()/digest branches reachable without the Claude SDK.
+
+    _ensure_session() returns the cached session when already set, so a fake
+    session injected via orch._session exercises the full run() flow without
+    claude_agent_sdk installed.
+    """
+
+    def test_run_success_path(self):
+        import asyncio
+
+        from external_llm.repl.collaborate import CollaborationVerdict
+        from external_llm.repl.collaborate.claude_session import SessionResult
+
+        class FakeSession:
+            def __init__(self):
+                self.queries = []
+            async def query(self, prompt):
+                self.queries.append(prompt)
+                return SessionResult(
+                    verdict=CollaborationVerdict(status="success", summary="done"),
+                    duration_seconds=1.5,
+                    tool_calls_count=3,
+                )
+
+        registry = ToolRegistry(repo_root=".", config=AgentConfig())
+        orch = CollaborationOrchestrator(registry, CollaborationOrchestratorConfig())
+        fake = FakeSession()
+        orch._session = fake  # bypass the SDK gate — _ensure_session returns cached
+
+        result = asyncio.run(orch.run("review the change", enable_preprocessing=False))
+        assert result.verdict.summary == "done"
+        assert len(fake.queries) == 1
+        assert "review the change" in fake.queries[0]
+
+    def test_run_error_path(self):
+        import asyncio
+
+        from external_llm.repl.collaborate import CollaborationVerdict
+        from external_llm.repl.collaborate.claude_session import SessionResult
+
+        class FakeSession:
+            async def query(self, prompt):
+                return SessionResult(
+                    verdict=CollaborationVerdict(), error="agent gave up",
+                )
+
+        registry = ToolRegistry(repo_root=".", config=AgentConfig())
+        orch = CollaborationOrchestrator(registry, CollaborationOrchestratorConfig())
+        orch._session = FakeSession()
+        result = asyncio.run(orch.run("task", enable_preprocessing=False))
+        assert result.error == "agent gave up"
+
+    def test_run_with_preprocessing_digest_phase(self):
+        # enable_preprocessing=True runs the digest phase (dispatch calls)
+        # before querying the session.
+        import asyncio
+        from types import SimpleNamespace
+
+        from external_llm.repl.collaborate import CollaborationVerdict
+        from external_llm.repl.collaborate.claude_session import SessionResult
+
+        class FakeSession:
+            async def query(self, prompt):
+                return SessionResult(
+                    verdict=CollaborationVerdict(status="success", summary="ok"),
+                )
+
+        registry = ToolRegistry(repo_root=".", config=AgentConfig())
+        registry.dispatch = lambda name, args: SimpleNamespace(ok=True, content="digest-piece")
+        orch = CollaborationOrchestrator(registry, CollaborationOrchestratorConfig())
+        orch._session = FakeSession()
+        result = asyncio.run(orch.run("task"))
+        assert result.verdict.summary == "ok"
+
+    def test_digest_optional_collector_failures_guarded(self):
+        # Git/scan collectors only run when enabled — their failure paths are
+        # individually guarded like the base collectors.
+        registry = ToolRegistry(repo_root=".", config=AgentConfig())
+        def boom(name, args):
+            raise RuntimeError("tool unavailable")
+        registry.dispatch = boom
+        config = CollaborationOrchestratorConfig(
+            include_git_history=True,
+            include_scanner_results=True,
+        )
+        orch = CollaborationOrchestrator(registry, config)
+        assert orch._generate_digest_sync("find bugs") == ""
+
+    def test_interrupt_and_session_property(self):
+        import asyncio
+
+        class FakeSession:
+            def __init__(self):
+                self.interrupted = False
+            async def interrupt(self):
+                self.interrupted = True
+
+        registry = ToolRegistry(repo_root=".", config=AgentConfig())
+        orch = CollaborationOrchestrator(registry, CollaborationOrchestratorConfig())
+        assert orch.session is None
+        fake = FakeSession()
+        orch._session = fake
+        assert orch.session is fake
+        asyncio.run(orch.interrupt())
+        assert fake.interrupted
+        # No session → no-op, not an error
+        orch._session = None
+        asyncio.run(orch.interrupt())
+
+    def test_write_tools_warning(self, caplog):
+        # allow_write_tools=True with the default bypassPermissions mode must
+        # warn that destructive tools will run without user approval.
+        import logging
+        registry = ToolRegistry(repo_root=".", config=AgentConfig())
+        config = CollaborationOrchestratorConfig(allow_write_tools=True)
+        with caplog.at_level(
+            logging.WARNING,
+            logger="external_llm.repl.collaborate.collaboration_orchestrator",
+        ):
+            CollaborationOrchestrator(registry, config)
+        assert any("destructive tools" in r.message for r in caplog.records)
+
+    def test_generate_digest_sync_survives_dispatch_failures(self):
+        # Each collector is individually guarded — a failing tool must not
+        # kill the whole digest.
+        registry = ToolRegistry(repo_root=".", config=AgentConfig())
+        def boom(name, args):
+            raise RuntimeError("tool unavailable")
+        registry.dispatch = boom
+        orch = CollaborationOrchestrator(registry, CollaborationOrchestratorConfig())
+        assert orch._generate_digest_sync("find bugs") == ""
+
+    def test_generate_digest_optional_collectors(self):
+        from types import SimpleNamespace
+        registry = ToolRegistry(repo_root=".", config=AgentConfig())
+        def fake_dispatch(name, args):
+            return SimpleNamespace(ok=True, content="collector-content")
+        registry.dispatch = fake_dispatch
+        config = CollaborationOrchestratorConfig(
+            include_git_history=True,
+            include_scanner_results=True,
+        )
+        orch = CollaborationOrchestrator(registry, config)
+        out = orch._generate_digest_sync("find bugs")
+        assert "## Project Info" in out
+        assert "## Relevant Files" in out
+        assert "## Recent Git History" in out
+        assert "collector-content" in out  # scan result included
+
+
+class TestSessionHandoffTrimEdge:
+    """build_session_handoff summary-trim edge (avail <= marker length)."""
+
+    def test_summary_trimmed_to_avail_when_marker_does_not_fit(self):
+        from types import SimpleNamespace
+
+        from external_llm.repl.collaborate import build_session_handoff
+        session = SimpleNamespace(
+            compressed_summary="S" * 100,
+            compressed_up_to=0,
+            archived_count=0,
+            turns=[],
+        )
+        # max_chars leaves avail=8 after the header — too small for the
+        # "…(truncated) " marker, so the plain tail-cut branch applies.
+        out = build_session_handoff(session, max_chars=60)
+        assert len(out) == 60
+        assert out.endswith("SSSSSSSS")  # summary[-8:]
+
 
 class TestOrchestratorSdkGate:
     """_ensure_session owns the 'clear ImportError on missing SDK' contract.

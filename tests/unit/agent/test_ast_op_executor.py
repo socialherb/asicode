@@ -912,3 +912,239 @@ class TestListRemove:
                 lambda lines, node, value: (lines, True),
             )
             assert ok is False and new == src
+
+
+# ── RED→GREEN gap coverage (round 32-6 tool_handlers) ───────────────────────
+
+class TestRedGreenGaps:
+    """Edge branches not hit by the suites above (dispatch, name-safety, and
+    list/import edge shapes)."""
+
+    def test_find_func_node_parent_class_method_missing(self):
+        tree = ast.parse("class A:\n    def m(self):\n        pass\n")
+        assert EX._find_func_node(tree, "missing", "A") is None
+
+    def test_apply_dispatch_remaining_op_types(self):
+        src = "from m import a, b\nclass C:\n    x: int = 1\n\nL = ['a', 'b']\n"
+        out = EX.apply(src, [
+            {"type": "remove_import_name", "module": "m", "name": "a"},
+            {"type": "add_class_field", "class_name": "C", "field_name": "y", "field_type": "float", "field_default": "2.0"},
+            {"type": "delete_stmt", "pattern": "x: int = 1"},
+            {"type": "list_remove", "list_name": "L", "value": "a"},
+        ])
+        assert out.success, out.ops_failed
+        assert "from m import b" in out.new_source
+        assert "y: float = 2.0" in out.new_source
+        assert "x: int = 1" not in out.new_source
+        assert "L = ['b']" in out.new_source
+
+    def test_apply_handler_exception_recorded(self):
+        """A non-str value trips .strip() inside the handler — the apply loop
+        catches it per-op and records the failure instead of aborting."""
+        out = EX.apply("L = [1]\n", [{"type": "list_append", "list_name": "L", "value": 123}])
+        assert not out.success
+        assert any("list_append" in f and "strip" in f for f in out.ops_failed)
+
+    def test_ws_tolerant_span_empty_old(self):
+        assert EX._ws_tolerant_span("a = 1\n", "") is None
+
+    def test_replace_expr_scoped_no_match_in_function(self):
+        src = "def f():\n    return 1\n"
+        out = EX.apply(src, [{"type": "replace_expr", "old": "zzz", "new": "yyy"}], symbol="f")
+        assert not out.success
+        assert "no match found" in out.ops_failed[0]
+
+    def test_replace_expr_scoped_parse_failure(self):
+        out = EX.apply("def f(:\n", [{"type": "replace_expr", "old": "x", "new": "y"}], symbol="f")
+        assert not out.success
+        # The handler aborts loudly, but the final compile() rollback message is
+        # authoritative (the broken source is never returned).
+        assert "syntax error" in out.ops_failed[0]
+
+    def test_replace_expr_unscoped_no_match(self):
+        out = EX.apply("x = 1\n", [{"type": "replace_expr", "old": "zzz", "new": "y"}])
+        assert not out.success
+        assert "no match found" in out.ops_failed[0]
+
+    def test_replace_expr_unscoped_multiple_matches(self):
+        out = EX.apply("x = 1\nx = 2\n", [{"type": "replace_expr", "old": "x", "new": "y"}])
+        assert not out.success
+        assert "no match found" in out.ops_failed[0]
+
+    def test_add_import_unparseable_import_and_source(self):
+        """Both parses fail → idempotency/merge checks are skipped and the
+        import is still inserted textually (final compile rolls back)."""
+        out = EX.apply("def f(:\n", [{"type": "add_import", "import": "import ("}])
+        assert not out.success
+
+    def test_add_import_module_grouped_placement(self):
+        # Plain `import os` already satisfies the idempotency check (module
+        # binding present), so the grouped-placement branch is reached only when
+        # the existing import is aliased (`import os as o`).
+        src = "import os as o\nimport sys\n\nx = 1\n"
+        out = EX.apply(src, [{"type": "add_import", "import": "from os import path"}])
+        assert out.success, out.ops_failed
+        assert out.new_source.startswith("import os as o\nfrom os import path\nimport sys\n")
+
+    def test_add_import_after_backslash_continuation(self):
+        src = "from m import \\\n    a\n\nx = 1\n"
+        out = EX.apply(src, [{"type": "add_import", "import": "import sys"}])
+        assert out.success, out.ops_failed
+        assert out.new_source.startswith("from m import \\\n    a\nimport sys\n")
+
+    def test_add_import_after_multi_line_backslash_continuation(self):
+        src = "from m import \\\n    a, \\\n    b\n\nx = 1\n"
+        out = EX.apply(src, [{"type": "add_import", "import": "import sys"}])
+        assert out.success, out.ops_failed
+        assert out.new_source.startswith("from m import \\\n    a, \\\n    b\nimport sys\n")
+
+    def test_add_guard_idempotent_via_func_text(self):
+        src = "def f(x):\n    if x:\n        return x\n    return 1\n"
+        out = EX.apply(src, [{"type": "add_guard", "statement": "if x:\n        return x"}], symbol="f")
+        assert out.success
+        assert out.new_source == src
+        assert out.changed is False
+
+    def test_add_guard_vararg_kwarg_always_available(self):
+        src = "def f(*args, **kw):\n    return args\n"
+        out = EX.apply(src, [{"type": "add_guard", "statement": "if args:\n        return args"}], symbol="f")
+        assert out.success, out.ops_failed
+        assert "if args:" in out.new_source
+
+    def test_add_guard_nested_def_walrus_with_names(self):
+        src = (
+            "def f():\n"
+            "    def g():\n"
+            "        pass\n"
+            "    if (y := 1):\n"
+            "        pass\n"
+            "    with open('f') as fh:\n"
+            "        pass\n"
+            "    return g, y, fh\n"
+        )
+        out = EX.apply(
+            src,
+            [{"type": "add_guard", "statement": "if g and y and fh:\n        return g"}],
+            symbol="f",
+        )
+        assert out.success, out.ops_failed
+        assert "if g and y and fh:" in out.new_source
+
+    def test_add_guard_guard_parse_failure_retry_and_total_failure(self):
+        src = "def f(x):\n    return x\n"
+        # Unparseable alone; parses with a dummy body appended → name-safety runs.
+        out = EX.apply(src, [{"type": "add_guard", "statement": "if x"}], symbol="f")
+        assert not out.success
+        # Unparseable even with a body → guard_names empty → inserted verbatim →
+        # the final compile() rollback reports the syntax error.
+        out2 = EX.apply(src, [{"type": "add_guard", "statement": "if :"}], symbol="f")
+        assert not out2.success
+        assert "syntax error" in out2.ops_failed[0]
+
+    def test_add_guard_loop_derive_variable_and_safety(self):
+        src = "def f(items):\n    x = 1\n    for it in items:\n        print(it)\n"
+        out = EX.apply(
+            src,
+            [{"type": "add_guard", "insert_scope": "for_loop", "statement": "if x:\n            break"}],
+            symbol="f",
+        )
+        assert out.success, out.ops_failed
+        assert "for it in items:\n        if x:" in out.new_source
+        # Derivation resolves the loop variable from the guard's own names.
+        out2 = EX.apply(
+            src,
+            [{"type": "add_guard", "insert_scope": "for_loop", "statement": "if it:\n            break"}],
+            symbol="f",
+        )
+        assert out2.success, out2.ops_failed
+        assert "if it:" in out2.new_source
+
+    def test_add_guard_loop_derive_parse_failure(self):
+        """An unparseable guard statement makes the loop-variable derivation
+        fall back to '' (no discriminator) — the verbatim insert then trips the
+        final compile() rollback."""
+        src = "def f(items):\n    for it in items:\n        print(it)\n"
+        out = EX.apply(
+            src,
+            [{"type": "add_guard", "insert_scope": "for_loop", "statement": "if :"}],
+            symbol="f",
+        )
+        assert not out.success
+        assert "syntax error" in out.ops_failed[0]
+
+    def test_add_guard_loop_guard_no_names_safe(self):
+        src = "def f(items):\n    for it in items:\n        print(it)\n"
+        out = EX.apply(
+            src,
+            [{"type": "add_guard", "insert_scope": "for_loop", "statement": "if True:\n            pass", "loop_variable": "it"}],
+            symbol="f",
+        )
+        assert out.success, out.ops_failed
+
+    def test_delete_stmt_scoped_parse_failure(self):
+        out = EX.apply("def f(:\n", [{"type": "delete_stmt", "pattern": "x"}], symbol="f")
+        assert not out.success
+        assert "syntax error" in out.ops_failed[0]
+
+    def test_delete_stmt_unscoped_no_match(self):
+        out = EX.apply("x = 1\n", [{"type": "delete_stmt", "pattern": "zzz"}])
+        assert not out.success
+        assert "no match found" in out.ops_failed[0]
+
+    def test_remove_import_name_unparseable_source(self):
+        out = EX.apply("def f(:\n", [{"type": "remove_import_name", "module": "m", "name": "a"}])
+        assert not out.success
+
+    def test_remove_import_name_module_mismatch(self):
+        out = EX.apply("from m import a\n", [{"type": "remove_import_name", "module": "other", "name": "a"}])
+        assert not out.success
+        assert "no match found" in out.ops_failed[0]
+
+    def test_remove_import_name_preserves_asname(self):
+        src = "from m import A as B, C\n"
+        out = EX.apply(src, [{"type": "remove_import_name", "module": "m", "name": "C"}])
+        assert out.success, out.ops_failed
+        assert "from m import A as B" in out.new_source
+
+    def test_add_class_field_no_docstring_after_class_def(self):
+        src = "class C:\n    def m(self):\n        pass\n"
+        out = EX.apply(src, [{"type": "add_class_field", "class_name": "C", "field_name": "x", "field_type": "int"}])
+        assert out.success, out.ops_failed
+        assert out.new_source == "class C:\n    x: int\n    def m(self):\n        pass\n"
+
+    def test_add_class_field_validation_rollback(self):
+        src = "class C:\n    pass\n"
+        out = EX.apply(src, [{"type": "add_class_field", "class_name": "C", "field_name": "x", "field_type": "x y"}])
+        assert not out.success
+
+    def test_resolve_module_level_list_multi_target_skipped(self):
+        src = "a = b = [1]\n"
+        out = EX.apply(src, [{"type": "list_append", "list_name": "a", "value": "x"}])
+        assert not out.success
+        assert "no match found" in out.ops_failed[0]
+
+    def test_list_remove_inline_odd_spacing_no_comma(self):
+        src = 'L = ["a" , "b"]\n'
+        out = EX.apply(src, [{"type": "list_remove", "list_name": "L", "value": "a"}])
+        assert not out.success
+        assert "no match found" in out.ops_failed[0]
+
+    def test_list_remove_value_with_double_quote_inline(self):
+        src = 'L = ["a\\"b"]\n'
+        out = EX.apply(src, [{"type": "list_remove", "list_name": "L", "value": 'a"b'}])
+        assert not out.success
+        assert "no match found" in out.ops_failed[0]
+
+    def test_name_safety_info_source_parse_failure(self):
+        func_node = ast.parse("def f():\n    return 1\n").body[0]
+        names, _first_def, avail = EX._compute_name_safety_info("if x:", func_node, "def broken(:\n")
+        assert names == {"x"}
+        assert "os" not in avail  # unparseable source → module walk skipped
+
+    def test_name_safety_info_module_scope_names(self):
+        src = "import os\nfrom collections import OrderedDict\nGLOBAL_X = 1\n\ndef f():\n    return 1\n"
+        func_node = ast.parse(src).body[3]
+        _, _, avail = EX._compute_name_safety_info("if GLOBAL_X:", func_node, src)
+        assert "os" in avail
+        assert "OrderedDict" in avail
+        assert "GLOBAL_X" in avail

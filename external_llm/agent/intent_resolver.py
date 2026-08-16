@@ -463,7 +463,12 @@ Be concise and accurate. Return JSON only."""
             # Attempt partial recovery: extract complete fields before truncation point.
             # JSON truncation typically cuts in the middle of a string value or array.
             # We can recover fields that finished serializing before the cut.
-            recovered = self._recover_truncated_json(raw_json)
+            # IR-B2: recover from the FULL tail (raw[brace_start:]), not the
+            # rfind('}')-bounded slice.  In a truncated response the last '}'
+            # belongs to a complete NESTED object/array, not the root — the
+            # slice silently discarded every top-level field after it before
+            # recovery could see them.
+            recovered = self._recover_truncated_json(raw[brace_start:])
             if recovered:
                 logger.info(
                     "IntentResolver: partial JSON recovery succeeded — fields=%s",
@@ -523,7 +528,16 @@ Be concise and accurate. Return JSON only."""
     def _build_intent_result(self, original_request: str, result_dict: dict[str, Any]) -> IntentResult:
         """Build IntentResult from parsed LLM response."""
         # Apply limits
-        search_terms = result_dict.get("search_terms", [])[:self.config.max_search_terms]
+        # IR-B3: search_terms is the ONLY role field without an isinstance(str)
+        # filter — siblings modify/reference/target_symbols and target_files all
+        # filter.  An unhashable entry (nested list) used to raise TypeError in
+        # IntentResult.__post_init__ (set-membership dedup), collapsing the whole
+        # LLM result to the minimal fallback via the outer except.
+        _raw_search_terms = result_dict.get("search_terms", [])
+        search_terms = [
+            s for s in (_raw_search_terms if isinstance(_raw_search_terms, list) else [])
+            if isinstance(s, str) and s
+        ][:self.config.max_search_terms]
         # target_files: prefer LLM output (semantically informed) over regex.
         # The grounding engine validates paths against filesystem later.
         target_files: list[str] = []
@@ -638,7 +652,21 @@ Be concise and accurate. Return JSON only."""
         # downstream via a cardinality gate:
 
         # scope_hint / complexity_hint / is_test_write / is_style_fix
-        _scope_hint = Scope(result_dict.get("scope_hint", "single_file"))
+        # IR-B1: LLM free-text output may deviate from the enum vocabulary
+        # ("project-wide", "SINGLE_FILE", non-string).  An unconditional
+        # Scope(...) raise used to propagate to the outer except in
+        # _resolve_with_llm, silently collapsing the ENTIRE successful LLM
+        # resolution into the low-confidence minimal fallback.  Defensive
+        # default: single_file, preserving every other extracted field.
+        _scope_raw = result_dict.get("scope_hint", "single_file")
+        try:
+            _scope_hint = Scope(_scope_raw)
+        except ValueError:
+            logger.warning(
+                "IntentResolver: invalid scope_hint %r — defaulting to single_file",
+                _scope_raw,
+            )
+            _scope_hint = Scope.SINGLE_FILE
 
         # project_wide scope_hint contradicts a specific scope_phase — clear scope_phase
         # so downstream resolution doesn't constrain grounding to a narrow system domain.

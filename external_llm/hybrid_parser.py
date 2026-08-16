@@ -114,7 +114,10 @@ class HybridOutputParser:
         pattern = r'```diff\s*\n(.*?)\n```'
         matches = re.findall(pattern, text, re.DOTALL)
 
-        diff = matches[0].strip() if matches else text.strip()
+        # A multi-file patch may be split across several ```diff fences (one file per
+        # fence). Taking only the first would silently drop every subsequent file's
+        # changes — the patch would "succeed" but only touch the first file.
+        diff = "\n\n".join(m.strip() for m in matches) if matches else text.strip()
 
         if not diff:
             return ParseResult(success=False, error="No diff found")

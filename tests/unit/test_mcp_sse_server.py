@@ -316,6 +316,13 @@ def test_list_mcp_tools_has_schema_shape():
     assert set(tools[0]) == {"name", "description", "parameters"}
 
 
+def test_list_mcp_tools_none_registry_fallback():
+    """registry=None falls back to the static AGENT_TOOL_SCHEMAS (L128)."""
+    tools = list_mcp_tools(None)
+    assert isinstance(tools, list)
+    assert all("name" in t for t in tools)
+
+
 def test_run_sse_server_wires_shared_handler_and_clean_shutdown(monkeypatch):
     """_run_sse_server must inject the shared JSON-RPC handler and shut down
     cleanly on KeyboardInterrupt (Ctrl-C from the CLI)."""
@@ -575,3 +582,95 @@ def test_shutdown_drops_all_sessions():
             reader.read_event()
     finally:
         reader._sock.close()
+
+
+# ── RED→GREEN: uncovered branches ────────────────────────────────────────────
+
+
+def test_sse_post_wrong_path_404(sse_server):
+    """POST to a non-/message path answers 404 (L151-152)."""
+    status, data = _post(
+        sse_server.host, sse_server.port, "/wrong",
+        {"jsonrpc": "2.0", "id": 1, "method": "mcp.ping"},
+    )
+    assert status == 404
+    assert b"endpoint" in data
+
+
+def test_sse_post_invalid_content_length_400(sse_server):
+    """A non-numeric Content-Length on a live session answers 400 (L160-162)."""
+    sock, rest = _open_sse(sse_server.host, sse_server.port)
+    reader = _SseReader(sock, rest)
+    _, endpoint = reader.read_event()
+    try:
+        conn = HTTPConnection(sse_server.host, sse_server.port, timeout=5)
+        conn.request(
+            "POST", endpoint, body=b"{}",
+            headers={"Content-Type": "application/json", "Content-Length": "abc"},
+        )
+        resp = conn.getresponse()
+        assert resp.status == 400
+        resp.read()
+        conn.close()
+    finally:
+        sock.close()
+
+
+def test_sse_post_body_too_large_413(sse_server):
+    """A body over the size cap on a live session answers 413 (L164-168)."""
+    from external_llm.editor.agent.mcp._session_queue import _MAX_MESSAGE_BODY_BYTES
+
+    sock, rest = _open_sse(sse_server.host, sse_server.port)
+    reader = _SseReader(sock, rest)
+    _, endpoint = reader.read_event()
+    try:
+        # Send only the headers with an oversized Content-Length; the server
+        # must answer 413 without us shipping the (1 MiB+) body.
+        conn = socket.create_connection((sse_server.host, sse_server.port), timeout=5)
+        conn.sendall(
+            f"POST {endpoint} HTTP/1.1\r\nHost: localhost\r\nContent-Type: "
+            f"application/json\r\nContent-Length: {_MAX_MESSAGE_BODY_BYTES + 1}\r\n\r\n".encode()
+        )
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        assert b" 413 " in buf.split(b"\r\n")[0], buf
+        conn.close()
+    finally:
+        sock.close()
+
+
+def test_sse_delete_wrong_path_404(sse_server):
+    """DELETE to a non-/message path answers 404 (L207-208)."""
+    conn = HTTPConnection(sse_server.host, sse_server.port, timeout=5)
+    conn.request("DELETE", "/wrong")
+    resp = conn.getresponse()
+    assert resp.status == 404
+    resp.read()
+    conn.close()
+
+
+def test_sse_stream_client_disconnect_logged(sse_server, caplog):
+    """A client that vanishes mid-stream logs 'disconnected' on the next
+    write instead of crashing the stream thread (L241-243)."""
+    import logging
+    import struct
+
+    sock, rest = _open_sse(sse_server.host, sse_server.port)
+    reader = _SseReader(sock, rest)
+    event, endpoint = reader.read_event()
+    assert event == "endpoint"
+    # RST the connection so the server's next write fails hard.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    sock.close()
+    with caplog.at_level(logging.DEBUG, logger="external_llm.editor.agent.mcp.sse_server"):
+        _post(
+            sse_server.host, sse_server.port, endpoint,
+            {"jsonrpc": "2.0", "id": 1, "method": "mcp.ping"},
+        )
+        assert _wait_until(
+            lambda: any("client disconnected" in r.message for r in caplog.records)
+        )

@@ -237,6 +237,16 @@ pip install -e '.[dev,lint,rag]'
 # Run tests
 pytest
 
+# Coverage measurement — use the wrapper, NOT `coverage run -m pytest`:
+# the default `-n auto` addopts makes xdist workers separate interpreters,
+# so a plain coverage run records only the main process (~0%). scripts/cov.sh
+# injects coverage into every process via COVERAGE_PROCESS_START (a1_coverage.pth,
+# auto-created on first use) and merges the per-process data files with
+# `coverage combine`.
+./scripts/cov.sh [pytest args...]     # default: tests/unit -q
+# CI (lint.yml unit job) runs the same wrapper and enforces the coverage
+# ratchet in [tool.coverage.report] fail_under.
+
 # Run linting
 ruff check
 ruff format --check

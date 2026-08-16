@@ -41,7 +41,6 @@ from ._shared_utils import (
     estimate_cost,
     estimate_tokens_from_msgs,
     make_tool_signature,
-    preemptive_trim,
     render_file_diagnostics_block,
 )
 from .agent_context_manager import (
@@ -578,7 +577,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
 
         for candidate in candidates:
             path = normalize_rel_path_fast(str(candidate))
-            if not path:
+            if not path:  # pragma: no cover — regex candidates are always non-empty, so normalize_rel_path_fast can never return "" here
                 continue
             try:
                 full_path = repo_root / path
@@ -988,8 +987,8 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         # Pre-flight: fit messages to budget. fit_messages never truncates —
         # it returns the ORIGINAL list (docstring contract) — so there is no
         # "messages were dropped" signal here; actual drops surface via the
-        # repair_tool_message_sequence count below (and the preemptive_trim
-        # guard). A len() comparison would be permanently dead code.
+        # repair_tool_message_sequence count below. A len() comparison would
+        # be permanently dead code.
         if self._context_budget:
             messages = self._context_budget.fit_messages(messages)
 
@@ -1025,10 +1024,13 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
 
         _est_tokens: int | None = None
 
-        # Pre-flight: hard input token guard — prevents HTTP 400 from API providers
-        # when accumulated context exceeds the model's context window (e.g. DeepSeek 1M).
-        # preemptive_trim is a last-resort safety net; normal context management is
-        # handled by the sliding-window compressor in context_manager.py.
+        # Pre-flight: structural-collapse guard — raises a clear error when the
+        # output reserve + tool schemas ALONE exhaust the window (the call would
+        # 400 even with zero chat history). preemptive_trim was REMOVED (2026-08):
+        # oversized prompts are enforced by the provider's own limit, with the
+        # 400 → _record_context_overflow override backstop lowering the effective
+        # limit for subsequent calls. Normal context management is handled by the
+        # sliding-window compressor in context_manager.py.
         if self._context_budget:
             _ctx_limit = _resolve_context_limit(self.model, base_url=getattr(self.llm_client, "base_url", None))
             _safety_margin = config.tokens.CONTEXT_HARD_CAP_SAFETY_MARGIN
@@ -1048,47 +1050,6 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                     f"toolset or raise the model's context window (e.g. num_ctx)."
                 )
             _est_tokens = estimate_tokens_from_msgs(messages)
-            if _est_tokens > _cap:
-                _before = len(messages)
-                messages = preemptive_trim(messages, max_tokens=_cap, preserve_last=2)
-                _after = len(messages)
-                logger.warning(
-                    "[CONTEXT_HARD_CAP] estimated %d tokens > cap %d "
-                    "(limit=%d, reserved %d for output/tool-schemas); preemptive_trim: %d→%d messages",
-                    _est_tokens,
-                    _cap,
-                    _ctx_limit,
-                    _ctx_limit - _cap,
-                    _before,
-                    _after,
-                )
-                self._cb(
-                    "agent_working",
-                    {
-                        "reason": "context_hard_cap",
-                        "estimated": _est_tokens,
-                        "cap": _cap,
-                        "kept": _after,
-                        "dropped": _before - _after,
-                    },
-                )
-
-                # Re-run tool message repair after trim — trim may have broken
-                # assistant(tool_calls)↔tool pairings by slicing in the middle
-                # of an exchange group, leaving orphaned tool messages.
-                from .context_budget import repair_tool_message_sequence
-
-                _before_repair2 = len(messages)
-                messages = repair_tool_message_sequence(messages)
-                _repair_dropped = _before_repair2 - len(messages)
-                if _repair_dropped:
-                    logger.info("_llm_call_with_tools: post-trim repair removed %d orphaned messages", _repair_dropped)
-
-                # P2: Recalculate _est_tokens after trim — the pre-trim estimate
-                # would cause _record_context_overflow to compute a stale (too high)
-                # override, defeating 1-shot convergence.
-                _est_tokens = estimate_tokens_from_msgs(messages)
-
         _max_tokens = max_tokens if max_tokens is not None else config.tokens.AGENT_TOOL_CALL
 
         def call_llm() -> dict[str, Any]:
@@ -1187,53 +1148,10 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 "finish_reason": _finish_reason,
             }
 
-        def _re_trim_context_overflow() -> int | None:
-            """Re-trim messages after a context-override reduction (in-turn recovery).
-
-            Called by _retry_on_rate_limit after recording a context-length 400 override.
-            Reassigns ``messages`` in the enclosing scope so ``call_llm`` picks up the
-            reduced message list on the next retry.
-
-            Returns:
-                The POST-trim estimated token count when trim actually reduced the
-                estimate (caller should retry, and record a second 400 against this
-                accurate size).  None when no progress was made (reduction cap reached
-                or last-2 messages already exceed the new cap) — caller should fall
-                through and let the original 400 error propagate.
-            """
-            nonlocal messages
-            _before_est = estimate_tokens_from_msgs(messages)
-            _new_limit = _resolve_context_limit(self.model, base_url=getattr(self.llm_client, "base_url", None))
-            _new_cap = context_message_cap(_new_limit, config.tokens.CONTEXT_HARD_CAP_SAFETY_MARGIN, tool_schemas)
-            if _new_cap < MIN_USABLE_MESSAGE_BUDGET:
-                # Structural collapse (reserve + schemas exceed the window):
-                # re-trimming messages cannot create budget that never existed.
-                # Skip the trim and return None so the caller propagates the
-                # original 400 immediately instead of more doomed attempts.
-                return None
-            messages = preemptive_trim(messages, max_tokens=_new_cap, preserve_last=2)
-            from .context_budget import repair_tool_message_sequence
-
-            messages = repair_tool_message_sequence(messages)
-            _after_est = estimate_tokens_from_msgs(messages)
-            _reduced = _after_est < _before_est
-            logger.info(
-                "[CONTEXT_OVERFLOW_RETRY] %s — re-trimmed to %d messages "
-                "(new cap=%d, before_est=%s, after_est=%s, reduced=%s)",
-                self.model,
-                len(messages),
-                _new_cap,
-                _before_est,
-                _after_est,
-                _reduced,
-            )
-            return _after_est if _reduced else None
-
         return self._retry_on_rate_limit(
             call_llm,
             "native tool calling",
             _estimated_prompt_tokens=_est_tokens,
-            overflow_retry_cb=_re_trim_context_overflow,
         )
 
     @staticmethod
@@ -1357,7 +1275,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                     "error_type": error_type,
                 }
                 if extra:
-                    payload.update(extra)
+                    payload.update(extra)  # pragma: no cover — loop_t0 is a named param, so **extra is always empty at the 3 internal call sites
                 self._cb("error", payload)
                 # Record the final failure after all retries are exhausted —
                 # this is the single logical LLM call that ultimately failed.
@@ -1535,7 +1453,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
 
         # Unreachable: every retry path either returns or re-raises (exhaustion
         # branch of _handle_retry_error, non-retriable except handlers).
-        raise AssertionError("invariant: _retry_on_rate_limit exited without a response")
+        raise AssertionError("invariant: _retry_on_rate_limit exited without a response")  # pragma: no cover
 
     # Message management
     # ------------------------------------------------------------------

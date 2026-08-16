@@ -1255,24 +1255,24 @@ def apply_patch(
     execution_steps.append(step_apply)
     if rc2 != 0:
         reason = _classify_git_apply_output(out2)
-        # Why no autostash here (unlike the --check-failure branch, Fix 2 ~L815)?
+            # Why no autostash here (unlike the `--check`-failure branch, Fix 2)?
         #  (a) It would be a NON-FIX: autostash would pop user-WIP back AFTER the 3-way
-        #      attempt, only for the `_rollback()` at L922 to `git restore --staged
+            #      attempt, only for `_rollback()` to `git restore --staged
         #      --worktree` it right back to HEAD. Protecting WIP on this path would
-        #      require SKIPPING L922's rollback (mirroring Fix 2), not adding autostash.
-        #  (b) Reachability is TOCTOU-only: `--check` (L769) and `git apply` (L902) use
-        #      identical flags (`--recount --whitespace=nowarn`) and equivalent logic on a
-        #      static tree, so check-pass + apply-fail implies a concurrent edit in the
-        #      ms-window between the two subprocess calls. Rare in practice (intra-process
-        #      writes are serialized by the write lock; only external/IPC-subagent edits
-        #      can race it).
+            #      require SKIPPING `_rollback()` (mirroring Fix 2), not adding autostash.
+            #  (b) Reachability is TOCTOU-only: `git apply --check` and the `git apply`
+            #      call use identical flags (`--recount --whitespace=nowarn`) and
+            #      equivalent logic on a static tree, so check-pass + apply-fail implies
+            #      a concurrent edit in the ms-window between the two subprocess calls.
+            #      Rare in practice (intra-process writes are serialized by the write
+            #      lock; only external/IPC-subagent edits can race it).
         #  (c) Plain `git apply` (no --3way) is transactional on failure — it leaves the
         #      worktree UNMUTATED (verified: multi-file partial patches apply nothing) —
-        #      so L922's rollback is effectively a no-op that guarantees a clean known
+            #      so `_rollback()` is effectively a no-op that guarantees a clean known
         #      state (asserted by test_rollback_on_failure: "file == original"). Skipping
         #      it would trade a rare TOCTOU WIP-loss for a rare corruption risk; not
         #      clearly better, hence the deliberate asymmetry. Do NOT "symmetrize" by
-        #      adding autostash — it is defeated by L922.
+            #      adding autostash — it is defeated by `_rollback()`.
         if reason == REASON_CONFLICT and not skip_3way:
             ok, msg, r, d = _try_3way_fallback(repo, cleaned, touched_files, snapshot=rollback_snapshot)
             if ok:

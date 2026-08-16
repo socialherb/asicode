@@ -95,6 +95,29 @@ class TestCollaborationVerdict:
         assert v.summary == "42"
         assert v.details == "None"
 
+    def test_from_result_message_object_with_result_attr(self):
+        # The live SDK path hands a ResultMessage-like object carrying .result
+        # (not a bare dict) — must read through the attribute.
+        class _FakeResultMessage:
+            def __init__(self):
+                self.result = {"status": "success", "summary": "via attr", "plan": {"steps": ["x"]}}
+        v = CollaborationVerdict.from_result_message(_FakeResultMessage())
+        assert v.status == "success"
+        assert v.summary == "via attr"
+        assert v.plan == {"steps": ["x"]}
+
+    def test_from_result_message_none_falls_back_to_empty(self):
+        # Neither a dict nor a .result-bearing object → defensive empty data.
+        v = CollaborationVerdict.from_result_message(None)
+        assert v.status == "needs_review"
+        assert v.confidence == 0.5
+
+    def test_from_result_message_metadata_non_dict_reset(self):
+        v = CollaborationVerdict.from_result_message(
+            {"status": "success", "metadata": "oops"}
+        )
+        assert v.metadata == {}
+
     def test_post_init_normalizes_confidence_on_direct_construction(self):
         # __post_init__ protects **every** construction path, not just
         # from_result_message. The literal-float sites in claude_session.py were

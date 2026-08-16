@@ -103,3 +103,51 @@ def test_build_skips_broken_file_without_corrupting_others(tmp_path, monkeypatch
     assert "good.py" in g.file_symbols
     assert "bad.py" not in g.file_symbols
     assert any("RuntimeError" in tag for tag in g.build_exception_types)
+
+
+# --- RG-B1: positional-only args (def f(a, /, b)) must survive ----------------
+def test_signature_extraction_posonly_preserved():
+    """RG-B1: ``def f(a, /, b)`` previously dropped ``a`` and the ``/`` separator
+    → rendered ``def f(b)`` (LLM-facing signature corrupted, a parameter lost)."""
+    sym = _only_symbol(_build_graph("def f(a, /, b):\n    return\n"))
+    assert sym.signature == "def f(a, /, b)", sym.signature
+
+
+def test_signature_extraction_posonly_with_kwonly():
+    sym = _only_symbol(_build_graph("def f(a, /, b, *, c):\n    return\n"))
+    assert sym.signature == "def f(a, /, b, *, c)", sym.signature
+
+
+def test_signature_extraction_posonly_with_vararg():
+    # both '/' and *args coexist (def f(a, /, *args, b)) — the '/' is always
+    # rendered when posonlyargs exist, independent of vararg.
+    sym = _only_symbol(_build_graph("def f(a, /, *args, b):\n    return\n"))
+    assert sym.signature == "def f(a, /, *args, b)", sym.signature
+
+
+def test_signature_extraction_posonly_defaults_merged_offset():
+    """RG-B1: ``defaults`` spans BOTH posonlyargs and regular args. The offset
+    must be computed over the combined list, else a posonlyarg default
+    misaligns with the wrong regular arg."""
+    sym = _only_symbol(_build_graph("def f(a=1, /, b=2):\n    return\n"))
+    assert sym.signature == "def f(a = 1, /, b = 2)", sym.signature
+
+
+def test_signature_hash_posonly_no_collision():
+    """RG-B1: ``def f(b)`` and ``def f(a, /, b)`` previously collided to the
+    same hash — a posonly arg added/removed was invisible to change detection.
+    A posonly↔regular conversion (API-breaking) must also change the hash."""
+    v = GraphVisitor("mod.py", "/repo")
+    h_plain = v._compute_signature_hash(ast.parse("def f(a, b):\n    pass\n").body[0])
+    h_posonly = v._compute_signature_hash(ast.parse("def f(a, /, b):\n    pass\n").body[0])
+    h_drop = v._compute_signature_hash(ast.parse("def f(b):\n    pass\n").body[0])
+    assert h_plain != h_posonly, "posonly<->regular conversion not detected"
+    assert h_drop != h_posonly, "posonly arg removal not detected (collision with f(b))"
+
+
+def test_signature_hash_encodes_posonly_boundary_marker():
+    """The '/' marker is encoded so the hash reflects posonly boundaries."""
+    src = "def f(a, /, b):\n    return\n"
+    sym = _only_symbol(_build_graph(src))
+    expected = hashlib.sha1(b"f,a,/,b", usedforsecurity=False).hexdigest()[:8]
+    assert sym.signature_hash == expected

@@ -320,3 +320,164 @@ def test_run_mcp_server_unknown_mode_exits(monkeypatch):
     """Unknown mode still exits via sys.exit after the boot self-check."""
     with pytest.raises(SystemExit):
         mcp_server_mod.run_mcp_server(_FakeRegistry(), mode="bogus")
+
+
+# ── RED→GREEN: uncovered branches ────────────────────────────────────────────
+
+
+class _BoomStdout:
+    """stdout stand-in whose write always raises OSError (closed pipe)."""
+
+    def write(self, s: str) -> int:
+        raise OSError("stdout closed")
+
+    def flush(self) -> None:
+        pass
+
+
+def test_empty_line_skipped(monkeypatch):
+    """A blank line on stdin is skipped, not parsed (L199)."""
+    registry = _FakeRegistry()
+    server = _StdioServer(registry, monkeypatch)
+    server.feed.feed("")
+    server.request("mcp.initialize", rid=1)
+    resp = server.capture.read_response()
+    assert resp["id"] == 1
+    server.stop()
+
+
+def test_tool_call_handler_raise_maps_to_internal_error(monkeypatch):
+    """_run_tool_call's defensive except maps a handler crash to a JSON-RPC
+    internal error (L181-182)."""
+    registry = _FakeRegistry()
+
+    def _boom(reg, request):
+        raise RuntimeError("tool boom")
+
+    monkeypatch.setattr(mcp_server_mod, "_handle_jsonrpc", _boom)
+    server = _StdioServer(registry, monkeypatch)
+    server.feed.feed(_call_tool(1))
+    resp = server.capture.read_response()
+    assert resp["id"] == 1
+    assert resp["error"]["code"] == -32603
+    assert "tool boom" in resp["error"]["message"]
+    server.stop()
+
+
+def test_inline_handler_raise_maps_to_internal_error(monkeypatch):
+    """The inline path's defensive except maps a handler crash to a JSON-RPC
+    internal error (L228-229 + _rpc_error body)."""
+    registry = _FakeRegistry()
+
+    def _boom(reg, request):
+        raise RuntimeError("inline boom")
+
+    monkeypatch.setattr(mcp_server_mod, "_handle_jsonrpc", _boom)
+    server = _StdioServer(registry, monkeypatch)
+    server.request("mcp.ping", rid=1)
+    resp = server.capture.read_response()
+    assert resp["id"] == 1
+    assert resp["error"]["code"] == -32603
+    assert "inline boom" in resp["error"]["message"]
+    server.stop()
+
+
+def test_tool_response_write_oserror_logged(monkeypatch):
+    """A tool response write on a closed stdout is swallowed, not a crash
+    (L185-188)."""
+    feed = _LineFeed()
+    monkeypatch.setattr("sys.stdin", feed)
+    monkeypatch.setattr("sys.stdout", _BoomStdout())
+    monkeypatch.setattr(mcp_server_mod, "build_asr_mcp_server", lambda *a, **k: None)
+    registry = _FakeRegistry()
+    thread = threading.Thread(
+        target=mcp_server_mod._run_stdio_server, args=(registry,), daemon=True
+    )
+    thread.start()
+    feed.feed(_call_tool(1))
+    assert registry.started.wait(timeout=2)
+    registry.release.set()  # dispatch returns → _write hits the OSError
+    time.sleep(0.2)
+    feed.close()  # EOF → drain (tool thread already done)
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_inline_write_oserror_breaks_loop(monkeypatch):
+    """An inline response write on a closed stdout ends the read loop
+    (L232-234)."""
+    feed = _LineFeed()
+    monkeypatch.setattr("sys.stdin", feed)
+    monkeypatch.setattr("sys.stdout", _BoomStdout())
+    monkeypatch.setattr(mcp_server_mod, "build_asr_mcp_server", lambda *a, **k: None)
+    thread = threading.Thread(
+        target=mcp_server_mod._run_stdio_server, args=(_FakeRegistry(),), daemon=True
+    )
+    thread.start()
+    feed.feed(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "mcp.ping"}))
+    thread.join(timeout=5)
+    assert not thread.is_alive()  # broke out of the loop without EOF
+
+
+def test_keyboard_interrupt_exits_promptly(monkeypatch):
+    """Ctrl+C exits promptly without draining in-flight calls (L235-238)."""
+
+    class _KbFeed:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr("sys.stdin", _KbFeed())
+    monkeypatch.setattr("sys.stdout", _Capture())
+    monkeypatch.setattr(mcp_server_mod, "build_asr_mcp_server", lambda *a, **k: None)
+    with pytest.raises(KeyboardInterrupt):
+        mcp_server_mod._run_stdio_server(_FakeRegistry())
+
+
+def test_eof_drain_timeout_warns_and_exits(monkeypatch, caplog):
+    """EOF with a still-running tool logs a bounded-timeout warning instead
+    of waiting forever (L250/L255)."""
+    monkeypatch.setattr(mcp_server_mod, "_DRAIN_TIMEOUT_SECONDS", 0.1)
+    registry = _FakeRegistry()
+    server = _StdioServer(registry, monkeypatch)
+    server.feed.feed(_call_tool(1))
+    assert registry.started.wait(timeout=2)
+    server.feed.close()  # EOF → drain; tool stays blocked on release
+    with caplog.at_level(logging.WARNING, logger="external_llm.editor.agent.mcp.server"):
+        server.thread.join(timeout=5)
+    assert not server.thread.is_alive()
+    assert any(
+        "in-flight tool call(s) still running" in r.message for r in caplog.records
+    )
+
+
+def test_run_mcp_server_sse_and_http_modes_dispatch(monkeypatch):
+    """run_mcp_server routes sse/http modes to their launchers (L105/L107)."""
+    calls: list[str] = []
+    monkeypatch.setattr(mcp_server_mod, "_run_sse_server", lambda *a, **k: calls.append("sse"))
+    monkeypatch.setattr(
+        mcp_server_mod, "_run_streamable_server", lambda *a, **k: calls.append("http")
+    )
+    mcp_server_mod.run_mcp_server(_FakeRegistry(), mode="sse")
+    mcp_server_mod.run_mcp_server(_FakeRegistry(), mode="http")
+    assert calls == ["sse", "http"]
+
+
+def test_boot_freshness_self_check_stale_warns(monkeypatch, caplog):
+    """Stale scanner sources at boot produce a restart warning (L69)."""
+
+    class _StaleRegistry:
+        def verify_loaded_sources(self):
+            return ["external_llm/agent/structural_scanners/x.py"]
+
+        def source_versions(self):
+            return {}
+
+    monkeypatch.setattr(
+        "external_llm.agent.scanner_registry.get_registry", lambda: _StaleRegistry()
+    )
+    with caplog.at_level(logging.WARNING, logger="external_llm.editor.agent.mcp.server"):
+        mcp_server_mod._log_scanner_freshness_at_startup()
+    assert "stale source" in caplog.text

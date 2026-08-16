@@ -9,6 +9,9 @@ already used it). The two workers walk the AST read-only — GraphVisitor is an
 table keyed by ``id(node)`` — so sharing one tree object is safe.
 """
 import ast
+import sys
+import threading
+import time
 
 import pytest
 
@@ -23,7 +26,7 @@ def _isolated_caches():
     """Reset both process-wide caches around every test."""
     parse_cache.clear()
     _extract_cache.clear()
-    rg_module._extract_cache_gc_deficit = 0
+    _extract_cache._gc_deficit = 0
     yield
     parse_cache.clear()
     _extract_cache.clear()
@@ -148,3 +151,61 @@ def test_py_size_gate_single_source_of_truth():
 
     assert rg_module._MAX_PY_BYTES == cg_module._MAX_PY_BYTES
     assert cg_module._MAX_PY_BYTES == config.lines.CALLGRAPH_PY_MAX_BYTES
+
+
+# ── thread safety (C1/C2, 2026-08-12) ─────────────────────────────────────
+
+
+def test_concurrent_parse_no_races_no_byte_drift(tmp_path, monkeypatch):
+    """C2: concurrent parse_ast/read_source across threads must not raise and
+    must never desync the byte accounting.
+
+    Pre-fix the same harness raised ``KeyError: 'dictionary is empty'``
+    (``_evict_lru``'s popitem racing another thread's eviction) and drifted
+    ``_bytes`` to ~31x the real resident cost (lost updates on the global
+    read-modify-write) — which silently collapsed the hit rate toward 0% for
+    the rest of the process lifetime (``clear()`` was the only reset).
+
+    The byte invariant is the regression core: ``_bytes`` (budget driver)
+    must equal the sum of resident entry costs.  Shrinking
+    ``_MAX_CACHE_BYTES`` forces the eviction path under contention.
+    """
+    files = []
+    for i in range(40):
+        p = tmp_path / f"m{i}.py"
+        p.write_text(f"def f{i}():\n    return {i}\n", encoding="utf-8")
+        files.append(str(p))
+    monkeypatch.setattr(parse_cache, "_MAX_CACHE_BYTES", 10_000)  # force evictions
+
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        errors: list[str] = []
+        stop = threading.Event()
+
+        def worker(n: int) -> None:
+            try:
+                i = 0
+                while not stop.is_set():
+                    p = files[i % len(files)]
+                    parse_cache.parse_ast(p)
+                    parse_cache.read_source(p)
+                    i += 1
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(f"worker{n}: {type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(6)]
+        for t in threads:
+            t.start()
+        time.sleep(1.0)
+        stop.set()
+        for t in threads:
+            t.join(timeout=15)
+        assert not errors, f"concurrent parse_cache access raised: {errors[:3]}"
+        with parse_cache._lock:
+            tracked = parse_cache._bytes
+            real = sum(cost for _, (_, cost) in parse_cache._cache.items())
+        assert tracked == real, f"byte accounting drift: tracked {tracked} != real {real}"
+        assert parse_cache.cache_info().currsize > 0, "cache must still hold entries"
+    finally:
+        sys.setswitchinterval(old)

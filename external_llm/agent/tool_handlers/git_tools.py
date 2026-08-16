@@ -2116,7 +2116,7 @@ class ShellToolsMixin:
         # NOTE: _re is the module-level `import re as _re` (see top of file).
         # Do NOT re-import here — a local `import re as _re` makes Python treat
         # _re as a function-local name across the WHOLE body, so the earlier
-        # _re.search() calls (find -o grouping, ~L175) raise UnboundLocalError
+        # _re.search() calls (find -o grouping, above) raise UnboundLocalError
         # before this line ever runs.
         _scan_command = _normalize_for_scan(_blank_heredoc_bodies(command, interpreter_names=_SHELL_INTERPRETERS))
         # A heredoc body is script text, not shell syntax, so an apostrophe in
@@ -2804,7 +2804,23 @@ class ShellToolsMixin:
             # Truncate command to fit one line
             cmd = j.command.replace("\n", "\\n")[:77]
             elapsed = f"{j.elapsed:.1f}s"
-            lines.append(f"{j.job_id:<14} {j.status:<12} {elapsed:<10} {cmd}")
+            # Tail preview — merge BOTH streams: a verdict may land on stderr
+            # only (test-failure summaries), so the old stdout-priority pick
+            # (stdout or stderr) hid it whenever stdout held boilerplate.
+            # Each stream keeps a tail slice so neither can swallow the other
+            # within the one-line budget.  Single line: newlines collapsed.
+            if j.stdout and j.stderr:
+                _slice = 64
+                preview = (
+                    f"out: {j.stdout[-_slice:]} | err: {j.stderr[-_slice:]}"
+                ).replace("\n", "\\n")
+            else:
+                preview = (j.stdout or j.stderr or "").replace("\n", "\\n")
+            if preview:
+                lines.append(f"{j.job_id:<14} {j.status:<12} {elapsed:<10} {cmd}")
+                lines.append(f"{'':<38}│ {preview[-160:]}")
+            else:
+                lines.append(f"{j.job_id:<14} {j.status:<12} {elapsed:<10} {cmd}")
 
         return self._make_result(ok=True, content="\n".join(lines))
 
@@ -2861,8 +2877,26 @@ class ShellToolsMixin:
             parts.append(f"\n[stdout]\n{info.stdout}")
         if info.stderr:
             parts.append(f"\n[stderr]\n{info.stderr}")
+        content = "\n".join(parts)
 
-        return self._make_result(ok=True, content="\n".join(parts))
+        # F1: bound the render at the same budget as every other tool result.
+        # The live buffer accumulates up to _OUTPUT_BUF_CAP (2 MiB) per stream
+        # — 35x the bash cap — and even the reaped ring's 32 KiB tail is far
+        # past it; an unbounded job payload would blow the turn's context
+        # budget the way bash did before _truncate_bash_output (same
+        # head+tail preserve, same notice — the cancel/rerun paths below
+        # already do this).  `job` is in _SERIAL_TOOLS, so this protects the
+        # whole turn, not just one message.
+        # F5-followup: true_len uses the captures' `total` counters (what the
+        # process actually printed) rather than len() of the capped text — a
+        # job that wrote 100 MB must not be reported as having lost the ~130 KB
+        # the bounded capture happened to retain.
+        from ..config.thresholds import config as _thresholds
+        content = _truncate_bash_output(
+            content, _thresholds.tokens.BASH_OUTPUT_MAX_CHARS,
+            true_len=info.stdout_total + info.stderr_total,
+        )
+        return self._make_result(ok=True, content=content)
 
     def _job_kill(self, args: dict[str, Any]) -> "ToolResult":
         """Kill a background job."""

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .hybrid_parser import ParseResult
 from .output_modes import OutputMode
+from .patch_engine import PatchEngine
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,9 @@ logger = logging.getLogger(__name__)
 # patch_engine._MAX_FILE_CHARS (250_000) so the LLM-edit paths stay
 # consistent — a whole-file rewrite of a huge file must not trigger an
 # unbounded read here just because patch_engine's other gates were bypassed.
-_MAX_SYNTHESIZE_FILE_CHARS = 250_000
+# P9-2: imported directly from PatchEngine (single source of truth) instead of
+# a duplicated value copy to prevent future drift.
+_MAX_SYNTHESIZE_FILE_CHARS = PatchEngine._MAX_FILE_CHARS
 
 
 class PatchSynthesizer:

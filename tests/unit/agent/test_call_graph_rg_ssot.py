@@ -33,13 +33,13 @@ from external_llm.graph.repository_graph import RepositoryGraph
 def isolated_file_cache():
     """Save/restore the process-wide caches and gc rate-limit around every test."""
     saved = dict(_file_cache)
-    saved_deficit = cg_module._file_cache_gc_deficit
+    saved_deficit = _file_cache._gc_deficit
     _file_cache.clear()
-    cg_module._file_cache_gc_deficit = 0
+    _file_cache._gc_deficit = 0
     yield
     _file_cache.clear()
     _file_cache.update(saved)
-    cg_module._file_cache_gc_deficit = saved_deficit
+    _file_cache._gc_deficit = saved_deficit
 
 
 def _make_repo(tmp_path, files: dict) -> str:

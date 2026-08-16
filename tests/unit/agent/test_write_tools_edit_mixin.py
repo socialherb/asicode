@@ -188,6 +188,7 @@ class TestNearMatchHint:
         out = harness._near_match_hint(content, "a = code")
         assert "Markdown decoration differs" in out
 
+    @pytest.mark.slow
     def test_multiline_content_change_ratio_survives_autojunk(self, harness):
         """P24-1: char-level autojunk collapse on multi-line old_strings.
 

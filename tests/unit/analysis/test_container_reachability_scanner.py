@@ -8,6 +8,7 @@ temp files.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import tempfile
 
@@ -23,6 +24,7 @@ from external_llm.analysis.container_reachability_scanner import (
     _collect_dict_literals,
     _collect_read_sites,
     _compute_reachability,
+    _crx_cache_path,
     _domain_of_rhs,
     _extract_string_keys,
     _find_class_node,
@@ -517,3 +519,144 @@ class TestScanContainerReachability:
 
     def test_empty_file(self):
         assert _scan("# nothing\n") == []
+
+
+# ── per-file extraction cache (2026-08-16, commit 786ffcdc pattern) ────────
+
+class TestScanCache:
+    """(mtime_ns, size)-fingerprint disk cache: hit/miss parity, invalidation,
+    fail-open, and cross-file-set independence of the cached superset."""
+
+    def test_cold_equals_hot(self):
+        src = (
+            '_PRIVATE = {"alpha": 1, "beta": 2}\n'
+            'def f():\n'
+            '    return _PRIVATE["alpha"]\n'
+        )
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "m.py")
+            with open(p, "w") as fh:
+                fh.write(src)
+            first = scan_container_reachability(repo_root=d, file_paths=[p])
+            second = scan_container_reachability(repo_root=d, file_paths=[p])  # cache hit
+            assert first and second
+            assert [c.to_dict() for c in first] == [c.to_dict() for c in second]
+            assert first[0].keys_unreachable == ["beta"]
+
+    def test_edit_invalidates_entry(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "m.py")
+            with open(p, "w") as fh:
+                fh.write('_D = {"a": 1, "b": 2}\n\ndef f():\n    return _D["a"]\n')
+            first = scan_container_reachability(repo_root=d, file_paths=[p])
+            assert [c.keys_unreachable for c in first] == [["b"]]
+            # different size → fingerprint mismatch → re-extraction
+            with open(p, "w") as fh:
+                fh.write('_D = {"a": 1, "b": 2, "c": 3}\n\ndef f():\n    return _D["a"]\n')
+            second = scan_container_reachability(repo_root=d, file_paths=[p])
+            assert [c.keys_unreachable for c in second] == [["b", "c"]]
+
+    def test_corrupted_cache_fails_open(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "m.py")
+            with open(p, "w") as fh:
+                fh.write('_D = {"a": 1, "b": 2}\n\ndef f():\n    return _D["a"]\n')
+            os.makedirs(os.path.join(d, ".cache"), exist_ok=True)
+            with open(_crx_cache_path(d), "w") as fh:
+                fh.write("{definitely not json")
+            out = scan_container_reachability(repo_root=d, file_paths=[p])
+            assert len(out) == 1
+            assert out[0].keys_unreachable == ["b"]
+
+    def test_version_mismatch_discards_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "m.py")
+            with open(p, "w") as fh:
+                fh.write('_D = {"a": 1, "b": 2}\n\ndef f():\n    return _D["a"]\n')
+            scan_container_reachability(repo_root=d, file_paths=[p])
+            # rewrite with a future format version → must be discarded
+            with open(_crx_cache_path(d), "w") as fh:
+                json.dump({"format": 999, "files": {}}, fh)
+            out = scan_container_reachability(repo_root=d, file_paths=[p])
+            assert len(out) == 1
+
+    def test_empty_repo_root_bypasses_cache(self, tmp_path, monkeypatch):
+        # repo_root="" (unit-test convention) must not write .cache in CWD
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "m.py").write_text(
+            '_D = {"a": 1, "b": 2}\n\ndef f():\n    return _D["a"]\n'
+        )
+        out = scan_container_reachability(repo_root="", file_paths=["m.py"])
+        assert len(out) == 1
+        assert not (tmp_path / ".cache").exists()
+
+    def test_cache_serves_different_cross_sets(self):
+        # The cached payload is a cross-file-set-independent superset; switching
+        # the graph set between runs (all cache hits after the first) must not
+        # change per-run semantics vs. the unfiltered original.
+        src = (
+            '_PRIVATE = {"a": 1, "x": 2}\n'
+            'PUBLIC = {"b": 1, "y": 2}\n'
+            'def f():\n'
+            '    return _PRIVATE["a"] + PUBLIC["b"]\n'
+        )
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "m.py")
+            with open(p, "w") as fh:
+                fh.write(src)
+            # warm the cache with graph mode; neither name referenced → both allowed
+            r1 = scan_container_reachability(
+                repo_root=d, file_paths=[p], cross_file_referenced_names={"OTHER"})
+            assert len(r1) == 2
+            # both cross-referenced → nothing allowed (cache hit)
+            r2 = scan_container_reachability(
+                repo_root=d, file_paths=[p],
+                cross_file_referenced_names={"PUBLIC", "_PRIVATE"})
+            assert r2 == []
+            # no graph data → private only (cache hit)
+            r3 = scan_container_reachability(repo_root=d, file_paths=[p])
+            assert [c.container_symbol for c in r3] == ["_PRIVATE"]
+            # empty set (graph mode, nothing referenced) → both (cache hit)
+            r4 = scan_container_reachability(
+                repo_root=d, file_paths=[p], cross_file_referenced_names=set())
+            assert len(r4) == 2
+
+    def test_unparseable_file_skip_is_cached(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "bad.py")
+            with open(p, "w") as fh:
+                fh.write("def broken(:\n")
+            assert scan_container_reachability(repo_root=d, file_paths=[p]) == []
+            assert scan_container_reachability(repo_root=d, file_paths=[p]) == []
+
+    def test_cache_key_uses_rel_path_independent_of_repo_root(self):
+        # Same relative file reachable via a different repo_root must not
+        # share cache entries (paths are the key).
+        src = '_D = {"a": 1, "b": 2}\n\ndef f():\n    return _D["a"]\n'
+        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+            p1 = os.path.join(d1, "m.py")
+            with open(p1, "w") as fh:
+                fh.write(src)
+            out1 = scan_container_reachability(repo_root=d1, file_paths=["m.py"])
+            assert len(out1) == 1
+            # different root, relative path key must miss (no shared cache)
+            out2 = scan_container_reachability(repo_root=d2, file_paths=["m.py"])
+            assert out2 == []  # m.py does not exist under d2
+
+
+def test_crx_cache_path_goes_through_path_guard(tmp_path, monkeypatch):
+    """P-1 regression: the cache path must route through the fail-closed guard."""
+    from external_llm.analysis import parse_cache
+    from external_llm.analysis.container_reachability_scanner import (
+        _CRX_CACHE_VERSION,
+        _crx_cache_path,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        parse_cache,
+        "cache_file_path",
+        lambda root, filename: calls.append((root, filename)) or "/guarded",
+    )
+    assert _crx_cache_path(str(tmp_path)) == "/guarded"
+    assert calls == [(str(tmp_path), f"container_reachability_v{_CRX_CACHE_VERSION}.json")]

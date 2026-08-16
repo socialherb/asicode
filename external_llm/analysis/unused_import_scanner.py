@@ -18,12 +18,14 @@ Exclusions (false positive prevention):
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 import re
 from dataclasses import dataclass
 
 from external_llm.agent.config.thresholds import config as _cfg
+from external_llm.common.atomic_io import atomic_write_json
 from external_llm.languages import LanguageId as _LanguageId
 
 from . import parse_cache
@@ -35,15 +37,45 @@ logger = logging.getLogger(__name__)
 # flag these as dead; normalizer handles them deterministically.  Only applies
 # to imports actually coming from the typing family (see scan loop) — a
 # same-named symbol from another module is still a regular candidate.
-_TYPING_MODULE_SYMBOLS: frozenset = frozenset({
-    "Any", "Callable", "ClassVar", "Dict", "Final", "FrozenSet",
-    "Generator", "Generic", "Iterable", "Iterator", "List", "Literal",
-    "Mapping", "MutableMapping", "MutableSequence", "Optional", "Protocol",
-    "Sequence", "Set", "Tuple", "Type", "TypeVar", "Union",
-    "Annotated", "TypedDict", "NamedTuple", "cast", "overload",
-    "runtime_checkable", "TYPE_CHECKING", "get_type_hints",
-    "ParamSpec", "Concatenate", "TypeAlias", "Never",
-})
+_TYPING_MODULE_SYMBOLS: frozenset = frozenset(
+    {
+        "Any",
+        "Callable",
+        "ClassVar",
+        "Dict",
+        "Final",
+        "FrozenSet",
+        "Generator",
+        "Generic",
+        "Iterable",
+        "Iterator",
+        "List",
+        "Literal",
+        "Mapping",
+        "MutableMapping",
+        "MutableSequence",
+        "Optional",
+        "Protocol",
+        "Sequence",
+        "Set",
+        "Tuple",
+        "Type",
+        "TypeVar",
+        "Union",
+        "Annotated",
+        "TypedDict",
+        "NamedTuple",
+        "cast",
+        "overload",
+        "runtime_checkable",
+        "TYPE_CHECKING",
+        "get_type_hints",
+        "ParamSpec",
+        "Concatenate",
+        "TypeAlias",
+        "Never",
+    }
+)
 
 _TYPING_MODULES: frozenset = frozenset({"typing", "typing_extensions"})
 
@@ -86,15 +118,16 @@ def _has_noqa_comment(line_text: str, codes: set[str] | None = None) -> bool:
 @dataclass
 class UnusedImportCandidate:
     """One unused import statement."""
+
     file: str
-    symbol_name: str           # imported name (alias-resolved)
-    lineno: int                # line number of the import statement
-    import_line_text: str      # raw import line for display
+    symbol_name: str  # imported name (alias-resolved)
+    lineno: int  # line number of the import statement
+    import_line_text: str  # raw import line for display
     kind: str = "unused_import"
     is_test_file: bool = False  # True when the import lives in a test file.
-                                # Test fixtures/conftests carry a high false-positive
-                                # rate (magic imports, pytest plugins), so callers can
-                                # down-weight or bucket these separately.
+    # Test fixtures/conftests carry a high false-positive
+    # rate (magic imports, pytest plugins), so callers can
+    # down-weight or bucket these separately.
 
     def to_dict(self) -> dict:
         return {
@@ -266,8 +299,6 @@ def _collect_type_names_from_strings(tree: ast.Module) -> set:
     return names
 
 
-
-
 def _add_identifiers_from_annotation(ann: ast.AST | None, names: set) -> None:
     """Parse identifiers from *ann*, including nested string constants.
 
@@ -319,6 +350,139 @@ def _call_func_name(func: ast.AST) -> str:
     return ""
 
 
+# ── Per-file analysis cache ─────────────────────────────────────────────────
+# The per-file analysis block in ``scan_unused_imports`` (parse + __all__ +
+# TYPE_CHECKING ranges + import info + load names + string-annotation names)
+# is a PURE function of file content, and the structural gate runs the scanner
+# on the whole repo in a FRESH process every time — without a cache it re-walks
+# every AST (measured ~22s on this repo under load, 2026-08-16; ast.walk is the
+# dominant cost).  Results are cached per file under a ``(st_mtime_ns,
+# st_size)`` fingerprint — the same invalidation contract as the vulture scan
+# cache — and persisted to ``.cache`` so a cache-hot run pays only the file
+# reads (parse_cache) and the candidate loop.
+#
+# Cache-file version: bump ``_UIC_CACHE_VERSION`` when the collectors below
+# change semantics (import/load shapes), or a stale cache would silently serve
+# pre-change analysis.  Corruption / version mismatch / read-write errors all
+# fail OPEN to a full re-analysis (never wrong results).  An empty
+# ``repo_root`` (unit-test convention) bypasses the cache entirely.
+_UIC_CACHE_VERSION = 1
+
+
+def _uic_cache_path(repo_root: str) -> str:
+    return parse_cache.cache_file_path(repo_root, f"unused_import_v{_UIC_CACHE_VERSION}.json")
+
+
+def _uic_load(repo_root: str) -> tuple[dict, bool]:
+    """Load the analysis cache for *repo_root*; ``(cache, dirty=False)``.
+
+    Values are ``abs_path -> (fingerprint, payload)`` where ``payload`` is
+    None for a persisted "skip this file" decision and otherwise
+    ``{"import_info": ..., "all": ..., "ranges": ..., "load": ...,
+    "strings": ...}`` (sets restored from lists).
+    """
+    if not repo_root:
+        return {}, False
+    cache_path = _uic_cache_path(repo_root)  # outside try: CachePathError must propagate
+    try:
+        with open(cache_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if payload.get("format") != _UIC_CACHE_VERSION:
+            return {}, False
+        cache: dict = {}
+        for path, entry in (payload.get("files") or {}).items():
+            if not isinstance(entry, dict) or not isinstance(entry.get("fp"), list):
+                continue
+            pl = entry.get("payload")
+            if pl is not None:
+                pl = {
+                    "import_info": pl.get("import_info") or [],
+                    "all": set(pl.get("all") or ()),
+                    "ranges": pl.get("ranges") or [],
+                    "load": set(pl.get("load") or ()),
+                    "strings": set(pl.get("strings") or ()),
+                }
+            cache[path] = (tuple(entry["fp"]), pl)
+    except (OSError, ValueError, TypeError):
+        logger.debug("unused-import analysis cache unreadable — full analysis", exc_info=True)
+        return {}, False
+    return cache, False
+
+
+def _uic_save(repo_root: str, cache: dict) -> None:
+    """Persist *cache* to disk (best-effort; failure costs a re-analysis)."""
+    if not repo_root:
+        return
+    try:
+        cache_path = _uic_cache_path(repo_root)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        files = {}
+        for abs_path, (fp, pl) in cache.items():
+            if pl is None:
+                files[abs_path] = {"fp": list(fp), "payload": None}
+                continue
+            files[abs_path] = {
+                "fp": list(fp),
+                "payload": {
+                    "import_info": pl["import_info"],
+                    "all": sorted(pl["all"]),
+                    "ranges": pl["ranges"],
+                    "load": sorted(pl["load"]),
+                    "strings": sorted(pl["strings"]),
+                },
+            }
+        atomic_write_json(
+            cache_path,
+            {"format": _UIC_CACHE_VERSION, "files": files},
+            indent=None,
+            ensure_ascii=True,
+        )
+    except (OSError, TypeError, ValueError):
+        logger.debug("unused-import analysis cache write failed", exc_info=True)
+
+
+def _uic_stat(abs_path: str) -> tuple[int, int] | None:
+    """(st_mtime_ns, st_size) — delegates to the canonical parse_cache helper
+    (single stat code path; order contract documented there, B1)."""
+    return parse_cache.stat_fingerprint(abs_path)
+
+
+def _uic_extract_file(abs_path: str, rel_path: str):
+    """Per-file analysis — parse + __all__ + ranges + import/load/string names.
+
+    Returns the analysis payload or None when the file must be SKIPPED
+    (unreadable, SyntaxError, dynamic ``__all__``, or no imports at all) —
+    mirroring the scan loop's skip conditions.  Pure function of file
+    content; cached by ``scan_unused_imports``.
+    """
+    source = parse_cache.read_source(abs_path)
+    if source is None:
+        return None
+    tree = parse_cache.parse_ast(abs_path)
+    if tree is None:
+        logger.debug("[UNUSED_IMPORT] SyntaxError in %s — skipping", rel_path)
+        return None
+    all_names = _extract_all_names(tree)
+    if "*__dynamic__*" in all_names:
+        logger.debug("[UNUSED_IMPORT] %s has dynamic __all__ — conservative skip", rel_path)
+        return None
+    type_checking_ranges = _collect_type_checking_ranges(tree)
+    import_info = _collect_import_info(tree, source.splitlines())
+    if not import_info:
+        return None
+    load_names = _collect_load_names(tree)
+    # Lazy string-annotation scan: only run the expensive full-tree walk when
+    # there are imported names NOT already covered by load_names.  In most
+    # files all imports resolve to Name nodes, making this scan pure waste.
+    _import_names = {n for n, *_ in import_info}
+    string_names = _collect_type_names_from_strings(tree) if _import_names - load_names - {"*"} else set()
+    return {
+        "import_info": import_info,
+        "all": all_names,
+        "ranges": type_checking_ranges,
+        "load": load_names,
+        "strings": string_names,
+    }
 
 
 def scan_unused_imports(
@@ -340,6 +504,7 @@ def scan_unused_imports(
     candidates: list[UnusedImportCandidate] = []
     truncated_files: list[str] = []
 
+    _uic_cache, _uic_dirty = _uic_load(repo_root or "")
     for rel_path in file_paths or []:
         abs_path = rel_path if os.path.isabs(rel_path) else os.path.join(repo_root or "", rel_path)
 
@@ -349,34 +514,31 @@ def scan_unused_imports(
         if _lang != "python":
             continue
 
+        _uic_fp = _uic_stat(abs_path)
+        if _uic_fp is None:
+            continue
+        _uic_entry = _uic_cache.get(abs_path)
+        if _uic_entry is None or _uic_entry[0] != _uic_fp:
+            # Miss (or stale fingerprint): analyze and store — the analysis is
+            # a pure per-file function, so a cache-hot run skips every AST
+            # walk (the scanner's dominant cost in the structural gate).
+            _uic_entry = (_uic_fp, _uic_extract_file(abs_path, rel_path))
+            _uic_cache[abs_path] = _uic_entry
+            _uic_dirty = True
+        if _uic_entry[1] is None:
+            continue  # cached skip decision (unreadable / broken / no imports)
+
+        _analysis = _uic_entry[1]
+        import_info = _analysis["import_info"]
+        all_names = _analysis["all"]
+        type_checking_ranges = _analysis["ranges"]
+        used_names = _analysis["load"] | _analysis["strings"]
+        # Cache hits skip the parse but still need the raw lines for the
+        # multi-line noqa(F401) check in the candidate loop below.
         source = parse_cache.read_source(abs_path)
         if source is None:
             continue
-        tree = parse_cache.parse_ast(abs_path)
-        if tree is None:
-            logger.debug("[UNUSED_IMPORT] SyntaxError in %s — skipping", rel_path)
-            continue
         lines = source.splitlines()
-        all_names = _extract_all_names(tree)
-        if "*__dynamic__*" in all_names:
-            logger.debug("[UNUSED_IMPORT] %s has dynamic __all__ — conservative skip", rel_path)
-            continue
-        type_checking_ranges = _collect_type_checking_ranges(tree)
-        import_info = _collect_import_info(tree, lines)
-        if not import_info:
-            continue
-        load_names = _collect_load_names(tree)
-        # Lazy string-annotation scan: only run the expensive full-tree walk when
-        # there are imported names NOT already covered by load_names.  In most
-        # files all imports resolve to Name nodes, making this scan pure waste.
-        _import_names = {n for n, *_ in import_info}
-        if _import_names - load_names - {"*"}:
-            used_names = (
-                load_names
-                | _collect_type_names_from_strings(tree)
-            )
-        else:
-            used_names = load_names
 
         emitted = 0
         for local_name, line_text, lineno, module, end_lineno in import_info:
@@ -398,37 +560,48 @@ def scan_unused_imports(
                 if local_name in _TYPING_MODULE_SYMBOLS and module in _TYPING_MODULES:
                     logger.debug(
                         "[UNUSED_IMPORT] skipping typing symbol '%s' in %s (normalizer domain)",
-                        local_name, rel_path,
+                        local_name,
+                        rel_path,
                     )
                     continue
 
-                candidates.append(UnusedImportCandidate(
-                    file=rel_path,
-                    symbol_name=local_name,
-                    lineno=lineno,
-                    import_line_text=line_text,
-                    is_test_file=_is_test_path(rel_path),
-                ))
+                candidates.append(
+                    UnusedImportCandidate(
+                        file=rel_path,
+                        symbol_name=local_name,
+                        lineno=lineno,
+                        import_line_text=line_text,
+                        is_test_file=_is_test_path(rel_path),
+                    )
+                )
                 emitted += 1
                 if emitted >= max_per_file:
                     # Hitting the configured limit is expected — keep DEBUG-only per file,
                     # then aggregate one line after scan to reduce terminal noise.
                     logger.debug(
                         "[UNUSED_IMPORT] %s: hit max_per_file=%d at name %r, truncating remaining",
-                        rel_path, max_per_file, local_name,
+                        rel_path,
+                        max_per_file,
+                        local_name,
                     )
                     truncated_files.append(rel_path)
                     break
 
+    if _uic_dirty:
+        _uic_save(repo_root or "", _uic_cache)
+
     if truncated_files:
         logger.warning(
             "[UNUSED_IMPORT] truncated %d file(s) at max_per_file=%d (first: %s)",
-            len(truncated_files), max_per_file, truncated_files[0],
+            len(truncated_files),
+            max_per_file,
+            truncated_files[0],
         )
     if candidates:
         logger.info(
             "[UNUSED_IMPORT] %d unused import(s) across %d file(s)",
-            len(candidates), len({c.file for c in candidates}),
+            len(candidates),
+            len({c.file for c in candidates}),
         )
 
     return candidates

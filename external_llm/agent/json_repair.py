@@ -179,7 +179,8 @@ def repair_truncated_json(text: str) -> str | None:
     repaired = _t[:_last_complete_end + 1] + "]}"
 
     # Validate: the result is at least structurally balanced.
-    if not repaired.startswith("{"):
+    # (도달 불가: 107행에서 _t.startswith("{") 보장 → repaired도 항상 "{"로 시작)
+    if not repaired.startswith("{"):  # pragma: no cover
         return None
 
     return repaired

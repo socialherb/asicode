@@ -20,6 +20,7 @@ from .client import (
     LLMAuthenticationError,
     LLMCancelled,
     LLMClient,
+    LLMClientError,
     LLMMessage,
     LLMQuotaExceededError,
     LLMRateLimitError,
@@ -27,10 +28,12 @@ from .client import (
     LLMServerUnavailableError,
     ToolCallRequest,
     ToolCallResponse,
+    guard_sse_iteration,
     interruptible_sleep,
     is_balance_quota_signal,
     iter_sse_data_events,
     parse_retry_after,
+    raise_sse_iteration_failure,
 )
 from .model_registry import text_only_model
 from .output_parser import parse_tool_args
@@ -297,6 +300,14 @@ def _apply_thinking_mode(
     a toggle); a lone ``effort_override`` is left for the caller/subclass to handle.
     """
     if thinking_mode is None:
+        # No toggle requested. Still honor an explicit effort override for
+        # NON-reasoning models: ZAIClient forwards reasoning_effort alone
+        # (GLM-5.2 thinks by default, so callers may pass effort without a
+        # toggle). Previously this early return silently dropped it — the
+        # ZAIClient elif branch was dead code. Reasoning models keep the old
+        # behavior (no dial injected without an explicit toggle).
+        if effort_override and not is_reasoning:
+            payload["reasoning_effort"] = effort_override
         return
     if _is_deepseek_v4(model):
         payload["thinking"] = {"type": "enabled" if thinking_mode else "disabled"}
@@ -341,13 +352,12 @@ class OpenAIClient(LLMClient):
     OpenAI API client for ChatGPT models
 
     Supported models:
-    - gpt-4-turbo-preview
-    - gpt-4
-    - gpt-3.5-turbo
+    - gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna
+    - gpt-4o, gpt-4o-mini, o3/o4-mini
     """
 
     DEFAULT_BASE_URL = "https://api.openai.com/v1"
-    DEFAULT_MODEL = "gpt-4-turbo-preview"
+    DEFAULT_MODEL = "gpt-5.6-sol"
     # ZAI/GLM and OpenAI use automatic prefix matching (no explicit cache_control
     # breakpoints).
 
@@ -575,7 +585,7 @@ class OpenAIClient(LLMClient):
         # summary (plain chat() call, no tools) stream incrementally instead of
         # blocking until the whole response is buffered — which would leave the
         # "thinking" ticker as the only visible UI for the entire call duration.
-        # Mirrors chat_with_tools() L498-499 streaming gate.
+        # Mirrors the `chat_with_tools()` streaming gate.
         if token_callback is not None:
             return self._chat_streaming(url, headers, payload, model, token_callback)
 
@@ -866,7 +876,7 @@ class OpenAIClient(LLMClient):
             cached_tokens = None
             reasoning_content = ""
 
-            for ev in iter_sse_data_events(response):
+            for ev in guard_sse_iteration(iter_sse_data_events(response)):
 
                 # Usage chunk (stream_options)
                 if ev.get("usage"):
@@ -899,6 +909,10 @@ class OpenAIClient(LLMClient):
 
         except requests.RequestException as e:
             raise LLMAPIError(f"OpenAI streaming request failed: {e}") from e
+        except LLMClientError:
+            raise
+        except Exception as e:
+            raise_sse_iteration_failure(e)
         finally:
             response.close()
 
@@ -1013,7 +1027,7 @@ class OpenAIClient(LLMClient):
             # Accumulate tool calls by index
             _tool_acc: dict[int, dict] = {}
 
-            for ev in iter_sse_data_events(response):
+            for ev in guard_sse_iteration(iter_sse_data_events(response)):
 
                 # Usage chunk (stream_options)
                 if ev.get("usage"):
@@ -1054,6 +1068,10 @@ class OpenAIClient(LLMClient):
 
         except requests.RequestException as e:
             raise LLMAPIError(f"OpenAI streaming request failed: {e}") from e
+        except LLMClientError:
+            raise
+        except Exception as e:
+            raise_sse_iteration_failure(e)
         finally:
             response.close()
 
@@ -1156,8 +1174,8 @@ class ZAIClient(OpenAIClient):
     and is NOT covered by the Coding Plan subscription.
 
     Supported models:
-    - glm-5.2
-    - glm-5.1, glm-5, glm-5-turbo
+    - glm-5.3
+    - glm-5.2, glm-5.1, glm-5, glm-5-turbo
     - glm-4.7, glm-4.6, glm-4.5, etc.
 
     Thinking/reasoning mode:
@@ -1167,7 +1185,7 @@ class ZAIClient(OpenAIClient):
     Thinking is ENABLED by default on GLM-5.2+ — send thinking.type="disabled" to turn off.
     """
     DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
-    DEFAULT_MODEL = "glm-5.2"
+    DEFAULT_MODEL = "glm-5.3"
 
     def get_provider_name(self) -> str:
         return "zai"

@@ -385,3 +385,65 @@ class TestIntentResolutionConfig:
         k1 = cfg.get_cache_key("same input")
         k2 = cfg.get_cache_key("same input")
         assert k1 == k2
+
+
+# ── RED→GREEN: guard_spec(GuardIR) 재수화 ────────────────────────────────
+
+
+class TestFromDictGuardSpec:
+    """from_dict의 guard_spec dict → GuardIR 재수화 경로."""
+
+    def _base(self, guard_spec):
+        return {
+            "original_request": "add guard",
+            "normalized_query": "add guard",
+            "guard_spec": guard_spec,
+        }
+
+    def test_guard_spec_dict_rehydrates_full_ir(self):
+        from external_llm.agent.guard_ir import GuardIR
+
+        restored = IntentResult.from_dict(self._base({
+            "compact": "if x is None: return",
+            "condition": {
+                "op": "Is",
+                "operands": ["x", "None"],
+                "attribute_pairs": [],
+            },
+            "control": "return",
+        }))
+        assert isinstance(restored.guard_spec, GuardIR)
+        assert restored.guard_spec.compact == "if x is None: return"
+        assert restored.guard_spec.control == "return"
+        assert restored.guard_spec.condition is not None
+        assert restored.guard_spec.condition.op_class == "Is"
+        assert restored.guard_spec.condition.operands == ["x", "None"]
+
+    def test_guard_spec_without_condition(self):
+        from external_llm.agent.guard_ir import GuardIR
+
+        restored = IntentResult.from_dict(self._base({
+            "compact": "if y: break",
+            "control": "break",
+        }))
+        assert isinstance(restored.guard_spec, GuardIR)
+        assert restored.guard_spec.condition is None
+
+    def test_guard_spec_none_stays_none(self):
+        restored = IntentResult.from_dict(self._base(None))
+        assert restored.guard_spec is None
+
+    def test_round_trip_preserves_guard_spec(self):
+        r = IntentResult(
+            original_request="g",
+            normalized_query="g",
+            guard_spec=IntentResult._guard_spec_from_dict({
+                "compact": "if x: return",
+                "condition": {"op": "Name", "operands": ["x"], "attribute_pairs": []},
+                "control": "return",
+            }),
+        )
+        d = r.to_dict()
+        restored = IntentResult.from_dict(d)
+        assert restored.guard_spec is not None
+        assert restored.guard_spec.compact == "if x: return"

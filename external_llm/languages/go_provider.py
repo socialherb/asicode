@@ -18,8 +18,10 @@ from .base import (
     _filter_genuine_syntax_errors,
     _replace_last_cmd_path,
     _tempfile_for_content,
+    build_line_index,
     detect_project_root,
     find_brace_block_end,
+    line_at_offset,
     resolve_tool_path,
     tree_sitter_syntax_fallback,
 )
@@ -381,14 +383,16 @@ class GoSyntaxProvider(SyntaxProvider):
     _LINE_BASED_KINDS = frozenset({"variable", "constant"})
 
     @staticmethod
-    def _find_block_end(content: str, offset: int) -> int:
+    def _find_block_end(content: str, offset: int, nl: list[int] | None = None) -> int:
         """Heuristic: find the matching closing brace from *offset*.
 
         Delegates to the shared :func:`find_brace_block_end` (C-family SSOT)
         which skips string/char/template literals and ``//`` / ``/* */``
         comments so braces inside them do not corrupt the depth counter.
+        *nl* is an optional precomputed line index (see ``base.build_line_index``)
+        that keeps the internal line queries O(log n) in hot loops.
         """
-        return find_brace_block_end(content, offset)
+        return find_brace_block_end(content, offset, nl)
 
     # ── Definition keywords ───────────────────────────────────────────────
 
@@ -399,32 +403,33 @@ class GoSyntaxProvider(SyntaxProvider):
     ) -> list[tuple[str, str, int, int]]:
         """Regex fallback: find all top-level Go definitions via pattern + brace counting."""
         results: list[tuple[str, str, int, int]] = []
+        nl = build_line_index(content)
         for m in re.finditer(r'^func\s+(\w+)\s*\(', content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "function", start_line, end_line))
         for m in re.finditer(r'^func\s+\([^)]*\)\s+(\w+)\s*\(', content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "method", start_line, end_line))
         for m in re.finditer(r'^type\s+(\w+)\s+(struct|interface)\s*\{', content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), m.group(2), start_line, end_line))
         for m in re.finditer(r'^var\s+(\w+)\b', content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
+            start_line = line_at_offset(nl, m.start())
             # var declarations are single-line or grouped with parens
             end_pos = content.find("\n", m.end())
             if end_pos == -1:
                 end_pos = len(content)
-            end_line = content[:end_pos].count("\n") + 1
+            end_line = line_at_offset(nl, end_pos)
             results.append((m.group(1), "variable", start_line, end_line))
         for m in re.finditer(r'^const\s+(\w+)\b', content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
+            start_line = line_at_offset(nl, m.start())
             end_pos = content.find("\n", m.end())
             if end_pos == -1:
                 end_pos = len(content)
-            end_line = content[:end_pos].count("\n") + 1
+            end_line = line_at_offset(nl, end_pos)
             results.append((m.group(1), "constant", start_line, end_line))
         return results
 
@@ -441,6 +446,7 @@ class GoSyntaxProvider(SyntaxProvider):
         anywhere-in-receiver match.
         """
         grouped: dict[str, list[tuple[str, int, int]]] = {}
+        nl = build_line_index(content)
         for m in re.finditer(
             r'^func\s+\(([^)]*)\)\s+(\w+)\s*\(',
             content, re.MULTILINE,
@@ -451,8 +457,8 @@ class GoSyntaxProvider(SyntaxProvider):
             _recv_type = _recv_type.replace("*", "").strip()
             if not _recv_type:
                 continue
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             grouped.setdefault(_recv_type, []).append(
                 (m.group(2), start_line, end_line)
             )

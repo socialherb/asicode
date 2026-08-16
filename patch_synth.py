@@ -5,7 +5,7 @@ import re
 from difflib import SequenceMatcher
 from typing import Optional
 
-from common import normalize_rel_path_fast
+from common import EDIT_TARGET_MAX_BYTES, normalize_rel_path_fast
 from external_llm.common.indent_utils import detect_indent_char, min_indent, shift_block
 from path_security import resolve_inside_repo
 
@@ -13,8 +13,10 @@ logger = logging.getLogger(__name__)
 
 # P19-4: edit targets larger than this are refused by the file-IO helper
 # (None return → callers treat the file as unreadable → refuse to synthesize).
-# Mirrors llm_execution._REWRITE_FILE_MAX_BYTES.
-_EDIT_TARGET_MAX_BYTES = 64 * 1024 * 1024
+# P9-2: value flows from the shared SSOT (external_llm/common); module-level
+# alias kept so callers/tests that reference ``_EDIT_TARGET_MAX_BYTES`` keep
+# working and stay in lockstep with the webapp rewrite guard.
+_EDIT_TARGET_MAX_BYTES = EDIT_TARGET_MAX_BYTES
 
 
 # ============================================================

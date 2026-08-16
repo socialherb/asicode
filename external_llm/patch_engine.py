@@ -26,8 +26,9 @@ from common import normalize_rel_path_fast
 from path_security import resolve_inside_repo
 
 from .code_structure_utils import extract_symbol_name, is_python_definition
+from .common.atomic_io import atomic_write_text
 from .output_modes import OutputMode
-from .output_parser import parse_file_blocks
+from .output_parser import _fence_tail_is_lang_tag, parse_file_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,8 @@ class PatchEngine:
     _RE_FILE_BLOCK = re.compile(
         r"(?ims)"
         r"(?:^|\n)\s*(?:FILE|Path|Target file)\s*:\s*(?P<path>[^\n\r]+?)\s*\r?\n"
-        r"(?:```[^\n\r]*\r?\n(?P<code1>[\s\S]*?)\r?\n```|"
+        r"(?:```(?P<fencetail1>[^\n\r]+)\r?\n```|"
+        r"```(?P<fencetail2>[^\n\r]*)\r?\n(?P<code1>[\s\S]*?)\r?\n```|"
         r"(?P<code2>(?:(?!^\s*(?:FILE|Path|Target file)\s*:).*\r?\n)+))"
     )
 
@@ -225,6 +227,28 @@ class PatchEngine:
                     break
         if not _patch_is_new_file and _check_target:
             _tf_full = Path(self.repo_root) / _check_target
+            # Path-traversal guard: `../outside.py`-style targets must never
+            # resolve outside the repo, even when such a file happens to exist
+            # (a sibling temp dir or parallel-session artifact would otherwise
+            # let a no-op/context-only patch report success against it).
+            try:
+                _tf_resolved = _tf_full.resolve()
+                _repo_resolved = Path(self.repo_root).resolve()
+                _tf_escapes = not _tf_resolved.is_relative_to(_repo_resolved)
+            except Exception:
+                _tf_escapes = False
+            if _tf_escapes:
+                metadata["reason"] = "path_escapes_repo"
+                metadata["mode"] = "early_exit"
+                return PatchResult(
+                    success=False,
+                    patch_applied=None,
+                    error=(
+                        f"Target file escapes the repository root: {_check_target}. "
+                        f"Refusing to apply a patch outside the repo."
+                    ),
+                    metadata=metadata,
+                )
             if not _tf_full.exists():
                 metadata["reason"] = "file_not_found"
                 metadata["mode"] = "early_exit"
@@ -267,8 +291,40 @@ class PatchEngine:
                 _skip_3way = True
                 metadata["skip_3way_reason"] = "fake_index_sha"
 
+        # Step 1d: No-op detection — hunks with only context lines change
+        # nothing. A context-only patch (e.g. a `diff -u` snapshot) is
+        # trivially "applied": the tree is already in the desired state. This
+        # also sidesteps Apple git 2.39.5's SIGBUS on whitespace near-miss
+        # context under -C0 (see _tolerant_git_apply).
+        if self._patch_is_noop(work_patch):
+            if not _check_target:
+                # Context-only (no-op) patch with NO resolvable target path:
+                # there is nothing to verify the no-op against, and a success
+                # here would make `apply_patch {"patch": "@@...", "path": ""}`
+                # silently succeed. Refuse with a missing-path failure.
+                metadata["reason"] = "noop_missing_path"
+                metadata["mode"] = "noop_rejected"
+                return PatchResult(
+                    success=False,
+                    patch_applied=None,
+                    error=(
+                        "Context-only (no-op) patch carries no target file "
+                        "path; cannot apply. Provide the 'path' argument or "
+                        "a file header."
+                    ),
+                    metadata=metadata,
+                )
+            metadata["reason"] = "noop_success"
+            metadata["mode"] = "noop"
+            return PatchResult(
+                success=True,
+                patch_applied=work_patch,
+                metadata=metadata
+            )
+
         # Step 2: Try git apply (primary path)
         self._add_step(metadata, "git_apply", "Attempting git apply")
+        _primary_broken = False
         if not norm_error and self._diff_apply:
             try:
                 _ga_ok, _ga_msg, _ga_reason, _ga_details = self._diff_apply(
@@ -287,46 +343,55 @@ class PatchEngine:
                 metadata["first_fail_reason"] = _ga_msg or _ga_reason or "git apply failed"
             except Exception as e:
                 metadata["first_fail_reason"] = f"git apply exception: {e}"
+                # The applier itself is broken — do not spend tolerant/reanchor
+                # attempts (they bypass _diff_apply and could mask the failure);
+                # fall straight to the repair ladder.
+                _primary_broken = True
         elif not self._diff_apply:
             metadata["first_fail_reason"] = "diff_apply module not available"
+            _primary_broken = True
 
-        # Step 2b: Tolerant git apply variants (fix hunk counts, whitespace, etc.)
-        self._add_step(metadata, "tolerant_apply", "Trying tolerant git apply variants")
-        tol_ok, _tol_err, tol_mode = self._tolerant_git_apply(work_patch, target_file, allow_3way=not _skip_3way)
-        if tol_ok:
-            metadata["reason"] = f"tolerant_apply_success:{tol_mode}"
-            metadata["mode"] = f"tolerant_{tol_mode}"
-            metadata["fallback_used"] = [tol_mode]
-            return PatchResult(success=True, patch_applied=work_patch, metadata=metadata)
+        # Step 2b/2c: Tolerant git apply variants + line re-anchoring.
+        # Skipped when the primary applier is broken (exception/unavailable) —
+        # the tolerant path bypasses _diff_apply and could mask the failure;
+        # fall straight to the repair ladder instead.
+        if not _primary_broken:
+            self._add_step(metadata, "tolerant_apply", "Trying tolerant git apply variants")
+            tol_ok, _tol_err, tol_mode = self._tolerant_git_apply(work_patch, target_file, allow_3way=not _skip_3way)
+            if tol_ok:
+                metadata["reason"] = f"tolerant_apply_success:{tol_mode}"
+                metadata["mode"] = f"tolerant_{tol_mode}"
+                metadata["fallback_used"] = [tol_mode]
+                return PatchResult(success=True, patch_applied=work_patch, metadata=metadata)
 
-        # Step 2c: Exact-line re-anchoring (search for removed lines in actual file)
-        self._add_step(metadata, "exact_reanchor", "Attempting exact-line re-anchor")
-        reanchored = self._exact_reanchor_patch(work_patch, target_file)
-        if not reanchored:
-            # Fallback to fuzzy SequenceMatcher re-anchoring
-            self._add_step(metadata, "reanchor", "Attempting fuzzy context re-anchor")
-            reanchored = self._reanchor_patch(work_patch, target_file)
-        if reanchored:
-            tol_ok2, _tol_err2, tol_mode2 = self._tolerant_git_apply(reanchored, target_file, allow_3way=not _skip_3way)
-            if tol_ok2:
-                metadata["reason"] = f"reanchor_success:{tol_mode2}"
-                metadata["mode"] = f"reanchor_{tol_mode2}"
-                metadata["fallback_used"] = ["reanchor", tol_mode2]
-                return PatchResult(success=True, patch_applied=reanchored, metadata=metadata)
-            # Also try primary diff_apply on reanchored patch
-            if self._diff_apply:
-                try:
-                    _ra_ok, _ra_msg, _ra_reason, _ra_details = self._diff_apply(
-                        self.repo_root, reanchored,
-                        skip_3way=_skip_3way,
-                    )
-                    if _ra_ok:
-                        metadata["reason"] = "reanchor_git_apply_success"
-                        metadata["mode"] = "reanchor_git_apply"
-                        metadata["fallback_used"] = ["reanchor"]
-                        return PatchResult(success=True, patch_applied=reanchored, metadata=metadata)
-                except Exception as e:
-                    logger.debug("PatchEngine: reanchored patch diff_apply failed: %s", e)
+            # Step 2c: Exact-line re-anchoring (search for removed lines in actual file)
+            self._add_step(metadata, "exact_reanchor", "Attempting exact-line re-anchor")
+            reanchored = self._exact_reanchor_patch(work_patch, target_file)
+            if not reanchored:
+                # Fallback to fuzzy SequenceMatcher re-anchoring
+                self._add_step(metadata, "reanchor", "Attempting fuzzy context re-anchor")
+                reanchored = self._reanchor_patch(work_patch, target_file)
+            if reanchored:
+                tol_ok2, _tol_err2, tol_mode2 = self._tolerant_git_apply(reanchored, target_file, allow_3way=not _skip_3way)
+                if tol_ok2:
+                    metadata["reason"] = f"reanchor_success:{tol_mode2}"
+                    metadata["mode"] = f"reanchor_{tol_mode2}"
+                    metadata["fallback_used"] = ["reanchor", tol_mode2]
+                    return PatchResult(success=True, patch_applied=reanchored, metadata=metadata)
+                # Also try primary diff_apply on reanchored patch
+                if self._diff_apply:
+                    try:
+                        _ra_ok, _ra_msg, _ra_reason, _ra_details = self._diff_apply(
+                            self.repo_root, reanchored,
+                            skip_3way=_skip_3way,
+                        )
+                        if _ra_ok:
+                            metadata["reason"] = "reanchor_git_apply_success"
+                            metadata["mode"] = "reanchor_git_apply"
+                            metadata["fallback_used"] = ["reanchor"]
+                            return PatchResult(success=True, patch_applied=reanchored, metadata=metadata)
+                    except Exception as e:
+                        logger.debug("PatchEngine: reanchored patch diff_apply failed: %s", e)
 
         # Step 3: Fallback ladder (AST / symbol / semantic / file-block)
         self._add_step(metadata, "repair", "Attempting repair ladder")
@@ -352,6 +417,15 @@ class PatchEngine:
 
             # Actually apply the repaired patch
             if repair_result.patch_applied:
+                if merged_metadata.get("applied"):
+                    # repair_patch already applied the repaired patch (direct
+                    # callers observe an applied tree) — skip the re-apply,
+                    # which would fail on the already-consumed pre-image lines.
+                    return PatchResult(
+                        success=True,
+                        patch_applied=repair_result.patch_applied,
+                        metadata=merged_metadata
+                    )
                 apply_ok, apply_err = self._apply_diff_once(repair_result.patch_applied, target_file)
                 if apply_ok:
                     return PatchResult(
@@ -489,6 +563,17 @@ class PatchEngine:
                 missing.append("patch_synthesizer")
             if OutputMode is None:
                 missing.append("output_modes")
+            if missing == ["output_modes"]:
+                # Only the mode enumeration is unavailable (components are
+                # fine) — report the enum specifically so callers can react
+                # to "cannot enumerate output modes" rather than a generic
+                # component failure.
+                metadata["first_fail_reason"] = "output_mode enum not available"
+                return PatchResult(
+                    success=False,
+                    error="Output mode enumeration not available",
+                    metadata=metadata
+                )
             metadata["first_fail_reason"] = f"components not available: {', '.join(missing)}"
             return PatchResult(
                 success=False,
@@ -597,6 +682,12 @@ class PatchEngine:
         except Exception:
             return ("", "read_failed")
 
+        # Multi-file guard: more than one FILE:/Path:/Target file: marker means
+        # the LLM emitted several rewrite blocks — refuse instead of silently
+        # applying the first (the block parsers may surface only one).
+        if len(re.findall(r"(?im)^\s*(?:FILE|Path|Target file)\s*:", llm_text or "")) > 1:
+            return ("", "multi_file_block")
+
         # Parse blocks via the canonical parser
         parsed_blocks: list[dict[str, str]] = []
         try:
@@ -622,6 +713,12 @@ class PatchEngine:
                 code = m.group("code1")
                 if code is None:
                     code = m.group("code2") or ""
+                tail = m.group("fencetail2")
+                if tail is None:
+                    tail = m.group("fencetail1")
+                tail = (tail or "").strip()
+                if tail and not _fence_tail_is_lang_tag(tail):
+                    code = tail + "\n" + str(code)
                 code = self._strip_trailing_fences(str(code))
                 rel = normalize_rel_path_fast(p)
                 if rel:
@@ -654,6 +751,79 @@ class PatchEngine:
         if other_files:
             return ("", "multi_file_block")
 
+        # Shared synthesis tail: valve + diff generation for the chosen block.
+        return self._synthesize_full_file_diff(repo_root, tgt_rel, new_text, old_text=old_text)
+
+    _SYMBOL_HEAD_RE = re.compile(r"^\s*(?:async\s+def|def|class)\s+")
+
+    @staticmethod
+    def _single_symbol_snippet(text: str) -> bool:
+        """True when *text* is a SINGLE top-level def/class block — the
+        function-level snippet case. Multi-symbol text (a full-file rewrite)
+        must not be treated as a snippet."""
+        if not text:
+            return False
+        heads = [
+            ln for ln in text.splitlines()
+            if PatchEngine._SYMBOL_HEAD_RE.match(ln)
+        ]
+        return len(heads) == 1
+
+    @classmethod
+    def _replace_symbol_block(cls, old_text: str, new_text: str) -> Optional[str]:
+        """Replace the single top-level def/class block named by the first line
+        of *new_text* inside *old_text*. Returns the merged text, or None when
+        the symbol's block cannot be located."""
+        new_lines = new_text.splitlines()
+        if not new_lines:
+            return None
+        first = new_lines[0].rstrip()
+        if not cls._SYMBOL_HEAD_RE.match(first):
+            return None
+        old_lines = old_text.splitlines()
+        for i, ln in enumerate(old_lines):
+            if ln.rstrip() != first:
+                continue
+            j = i + 1
+            while j < len(old_lines) and (
+                not old_lines[j].strip() or old_lines[j][:1] in (" ", "\t")
+            ):
+                j += 1
+            merged = old_lines[:i] + new_lines + old_lines[j:]
+            out = "\n".join(merged)
+            if old_text.endswith("\n"):
+                out += "\n"
+            return out
+        return None
+
+    def _synthesize_full_file_diff(self, repo_root: str, target_file: str, new_text: str,
+                                   old_text: Optional[str] = None) -> tuple[str, str]:
+        """Synthesize a unified diff for a full-file rewrite candidate.
+
+        Shared by ``_try_synthesize_diff_from_file_blocks`` and the repair
+        ladder's file-block fallback. Returns ``(patch, reason)``; reason is
+        ``"file_block_synth"`` on success or one of target_missing /
+        read_failed / file_too_large / no_changes / file_rewrite_too_large /
+        patch_too_large.
+        """
+        tgt_rel = normalize_rel_path_fast(str(target_file))
+        try:
+            tgt_path = resolve_inside_repo(repo_root, tgt_rel)
+        except ValueError:
+            return ("", "target_missing")
+        if not tgt_path.exists() or not tgt_path.is_file():
+            return ("", "target_missing")
+        try:
+            if tgt_path.stat().st_size > int(self._MAX_FILE_CHARS):
+                return ("", "file_too_large")
+        except OSError:
+            return ("", "read_failed")
+        if old_text is None:
+            try:
+                old_text = tgt_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return ("", "read_failed")
+
         # Normalize new text to ensure trailing newline (git-style)
         if not new_text.endswith("\n"):
             new_text = new_text + "\n"
@@ -663,6 +833,14 @@ class PatchEngine:
 
         if old_text == new_text:
             return ("", "no_changes")
+
+        # Partial-file python snippet: a single top-level def/class block that
+        # exists in the file is a function-level edit, not a full-file rewrite
+        # (the rewrite valve below would reject it as file_rewrite_too_large).
+        if self._single_symbol_snippet(new_text):
+            replaced = self._replace_symbol_block(old_text, new_text)
+            if replaced is not None and replaced != old_text:
+                new_text = replaced
 
         # Safety valve: reject over-large rewrites.
         # FILE blocks are full rewrites; if the model drifts and rewrites most of the file,
@@ -774,7 +952,7 @@ class PatchEngine:
             # Skip expensive fuzzy-salvage for very large files. Strategy 1/2
             # below use an O(NxMxL) sliding-window SequenceMatcher.ratio() over
             # the WHOLE file with no window limit, unlike _reanchor_patch()
-            # which caps at >2000 lines (see L2658). Salvage is best-effort
+            # which caps at >2000 lines (see `_reanchor_patch`). Salvage is best-effort
             # recovery for malformed small-model output; large files are
             # handled by the tolerant-apply + reanchor ladder, which already
             # degrades gracefully past 2000 lines.
@@ -868,24 +1046,39 @@ class PatchEngine:
 
                     # Require at least 60% line-level match (prevents partial corruption)
                     if best_idx is not None and best_ratio >= 0.6:
-                        new_lines = list(old_lines)
-                        new_lines[best_idx:best_idx + n_removed] = added_lines
+                        # Replacement-consistency guard: refuse to collapse more
+                        # removed lines into fewer added lines (a truncated /
+                        # corrupt output silently deleting code). The exception
+                        # is a match covering the ENTIRE file, which is a full
+                        # rewrite rather than a partial edit.
+                        whole_file_match = (
+                            best_idx == 0 and n_removed == len(old_lines)
+                        )
+                        if len(added_lines) < n_removed and not whole_file_match:
+                            logger.debug(
+                                "salvage_small_model_output: strategy 1 rejected — "
+                                "replacement collapses %d removed lines into %d added",
+                                n_removed, len(added_lines),
+                            )
+                        else:
+                            new_lines = list(old_lines)
+                            new_lines[best_idx:best_idx + n_removed] = added_lines
 
-                        diff_lines = list(difflib.unified_diff(
-                            old_lines,
-                            new_lines,
-                            fromfile=f"a/{rel}",
-                            tofile=f"b/{rel}",
-                            lineterm="",
-                        ))
+                            diff_lines = list(difflib.unified_diff(
+                                old_lines,
+                                new_lines,
+                                fromfile=f"a/{rel}",
+                                tofile=f"b/{rel}",
+                                lineterm="",
+                            ))
 
-                        if diff_lines:
-                            diff_text = "\n".join(diff_lines)
-                            if not diff_text.startswith("diff --git "):
-                                diff_text = f"diff --git a/{rel} b/{rel}\n" + diff_text
-                            if not diff_text.endswith("\n"):
-                                diff_text += "\n"
-                            return diff_text
+                            if diff_lines:
+                                diff_text = "\n".join(diff_lines)
+                                if not diff_text.startswith("diff --git "):
+                                    diff_text = f"diff --git a/{rel} b/{rel}\n" + diff_text
+                                if not diff_text.endswith("\n"):
+                                    diff_text += "\n"
+                                return diff_text
 
             # Strategy 2: Before/after blocks with fuzzy matching (line-level)
             if before_blocks and after_blocks and len(before_blocks) == len(after_blocks):
@@ -944,8 +1137,12 @@ class PatchEngine:
                             diff_text += "\n"
                         return diff_text
 
-            # Strategy 3: Symbol-aware insertion for added lines
-            if added_lines:
+            # Strategy 3: Symbol-aware insertion for added lines.
+            # An output carrying BOTH - and + lines expresses a REPLACEMENT,
+            # not an insertion: once strategy 1 rejected it (e.g. a collapse
+            # into unrelated content), treating the + lines as free insertions
+            # would silently apply the rejected garbage.
+            if added_lines and not removed_lines:
                 # Filter out lines already present
                 old_lines_set = set(old_lines)  # O(n²) → O(n) : set lookup is O(1)
                 insert_lines = [ln for ln in added_lines if ln.strip() and ln not in old_lines_set]
@@ -1220,6 +1417,7 @@ class PatchEngine:
                 metadata["reason"] = "repair_success:auto_repair"
                 metadata["mode"] = "auto_repair"
                 metadata["fallback_used"] = ["auto_repair"]
+                metadata["applied"] = self._apply_repair_patch(auto_fix, target_file)
                 return PatchResult(
                     success=True,
                     patch_applied=auto_fix,
@@ -1244,37 +1442,45 @@ class PatchEngine:
         else:
             logger.warning("parse_file_blocks not available")
 
-        if not parsed_blocks:
+        new_code = ""
+        if parsed_blocks:
+            # Prefer the block that matches target_file; fall back to first block
+            block = parsed_blocks[0]
+            try:
+                normalized_target = normalize_rel_path_fast(str(target_file))
+                for candidate in parsed_blocks:
+                    candidate_path = normalize_rel_path_fast(str(
+                        candidate.get("path")
+                        or candidate.get("file")
+                        or candidate.get("filename")
+                        or ""
+                    ))
+                    if candidate_path and normalized_target and candidate_path == normalized_target:
+                        block = candidate
+                        break
+            except Exception:
+                block = parsed_blocks[0]
+            new_code = block.get("text") or block.get("content") or ""
+
+        if not new_code.strip():
+            # No usable FILE: block — header/fence forms (FUNCTION:/CLASS:/
+            # METHOD: or a bare fenced def) still drive the AST/symbol/semantic
+            # ladder below, so extract the fenced body directly instead of
+            # bailing out (the header dispatch in step 1 needs new_code).
+            new_code = self._extract_code_from_llm_output(llm_output or "") or ""
+
+        if not new_code.strip():
+            if self._llm_output_has_code_shape(llm_output or ""):
+                metadata["reason"] = "empty_new_code"
+                return PatchResult(
+                    success=False,
+                    error="Empty code block in LLM output",
+                    metadata=metadata
+                )
             metadata["reason"] = "no_parsed_blocks"
             return PatchResult(
                 success=False,
                 error="No parseable file blocks found in LLM output",
-                metadata=metadata
-            )
-
-        # Prefer the block that matches target_file; fall back to first block
-        block = parsed_blocks[0]
-        try:
-            normalized_target = normalize_rel_path_fast(str(target_file))
-            for candidate in parsed_blocks:
-                candidate_path = normalize_rel_path_fast(str(
-                    candidate.get("path")
-                    or candidate.get("file")
-                    or candidate.get("filename")
-                    or ""
-                ))
-                if candidate_path and normalized_target and candidate_path == normalized_target:
-                    block = candidate
-                    break
-        except Exception:
-            block = parsed_blocks[0]
-
-        new_code = block.get("text") or block.get("content") or ""
-        if not new_code.strip():
-            metadata["reason"] = "empty_new_code"
-            return PatchResult(
-                success=False,
-                error="Empty code block in LLM output",
                 metadata=metadata
             )
 
@@ -1341,6 +1547,16 @@ class PatchEngine:
             except Exception as e:
                 logger.debug("AST rewrite attempt failed: %s", e)
                 metadata["second_fail_reason"] = f"ast_rewrite_failed: {e}"
+                # A crash inside the header-dispatched AST rewrite is a tooling
+                # failure, not a "symbol not found" — stop the ladder rather
+                # than masking it with a weaker fallback.
+                metadata["reason"] = "all_repair_failed"
+                metadata["fallback_used"] = fallback_attempted
+                return PatchResult(
+                    success=False,
+                    error=f"All repair attempts failed: {failure_reason}",
+                    metadata=metadata
+                )
 
         # 2. Symbol search fallback
         if not fallback_succeeded and self.symbol_searcher and self.ast_rewriter:
@@ -1414,6 +1630,16 @@ class PatchEngine:
                         result_patch = synthesized
                         result_mode = "file_block_synth"
                         fallback_succeeded = True
+                if not fallback_succeeded:
+                    # Bare-fence full-file output (no FILE: block): synthesize
+                    # the diff directly from the extracted code.
+                    synth_patch, synth_reason = self._synthesize_full_file_diff(
+                        self.repo_root, target_file, new_code
+                    )
+                    if synth_reason == "file_block_synth":
+                        result_patch = synth_patch
+                        result_mode = "file_block_synth"
+                        fallback_succeeded = True
             except Exception as e:
                 logger.debug("File-block synthesis failed: %s", e)
                 metadata["second_fail_reason"] = f"file_block_synth_failed: {e}"
@@ -1424,6 +1650,12 @@ class PatchEngine:
             metadata["mode"] = result_mode
             metadata["fallback_used"] = fallback_attempted
             metadata["synth_reason"] = f"repaired via {result_mode}"
+            # Apply the repaired patch immediately so direct callers observe an
+            # applied tree; apply_patch honors the "applied" flag and skips its
+            # own re-apply (the pre-image lines are already gone by then).
+            metadata["applied"] = bool(result_patch) and self._apply_repair_patch(
+                result_patch, target_file
+            )
             return PatchResult(
                 success=True,
                 patch_applied=result_patch,
@@ -1436,6 +1668,51 @@ class PatchEngine:
             success=False,
             error=f"All repair attempts failed: {failure_reason}",
             metadata=metadata
+        )
+
+    def _apply_repair_patch(self, patch_text: str, target_file: str) -> bool:
+        """Apply a successfully repaired patch immediately so direct callers
+        observe an applied tree. Returns whether the apply succeeded;
+        ``apply_patch`` re-applies only when this is False."""
+        try:
+            ok, _err = self._apply_diff_once(patch_text, target_file)
+            return bool(ok)
+        except Exception as e:
+            logger.debug("apply repaired patch failed for %s: %s", target_file, e)
+            return False
+
+    _FENCE_BLOCK_RE = re.compile(r"```(?P<tail>[^\n\r]*)\r?\n(?P<code>[\s\S]*?)\r?\n```")
+
+    @classmethod
+    def _extract_code_from_llm_output(cls, llm_output: str) -> Optional[str]:
+        """First fenced body in header-style LLM output (no FILE: block).
+
+        Handles `````code`` fence-line tails like FILE-block parsing: a plain
+        language tag is dropped, anything else becomes the first code line.
+        Returns the code (possibly empty for an empty fence) or None when the
+        output carries no fenced block.
+        """
+        text = (llm_output or "").strip()
+        if not text:
+            return None
+        m = cls._FENCE_BLOCK_RE.search(text)
+        if not m:
+            return None
+        code = m.group("code")
+        tail = (m.group("tail") or "").strip()
+        if tail and not _fence_tail_is_lang_tag(tail):
+            code = tail + "\n" + code
+        code = code.replace("\r\n", "\n").strip("\n") + "\n"
+        return code if code.strip() else ""
+
+    @staticmethod
+    def _llm_output_has_code_shape(llm_output: str) -> bool:
+        """True when the output looks like a code block/header form even if
+        nothing parseable was extracted (distinguishes "empty_new_code" from
+        "no_parsed_blocks")."""
+        text = (llm_output or "").strip()
+        return "```" in text or bool(
+            re.match(r"^(?:FUNCTION|CLASS|METHOD)\s*:", text)
         )
 
     @staticmethod
@@ -2112,6 +2389,13 @@ class PatchEngine:
         except Exception as e:
             return False, f"diff_apply exception: {e}"
         else:
+            # Tolerant fallback: the strict path rejects zero-context and
+            # trailing-'+' hunks that `git apply --unidiff-zero` accepts (and
+            # content-verifies via its own offset search), so a well-formed
+            # patch that the strict path refuses still applies here.
+            tol_ok, _tol_err, _tol_mode = self._tolerant_git_apply(normalized, target_file)
+            if tol_ok:
+                return True, None
             return False, _ado_msg or _ado_reason or "git apply failed"
 
     # ── Hunk header count fix ─────────────────────────────────────────────────
@@ -2180,7 +2464,8 @@ class PatchEngine:
 
         return "".join(output)
 
-    def _add_diff_headers(self, patch_text: str, target_file: Optional[str]) -> str:
+    @staticmethod
+    def _add_diff_headers(patch_text: str, target_file: Optional[str]) -> str:
         """Add missing diff headers (diff --git, ---, +++) to a patch.
 
         Handles:
@@ -2207,6 +2492,23 @@ class PatchEngine:
             return f"diff --git a/{fp} b/{fp}\n" + text + "\n"
 
         return patch_text
+
+    @staticmethod
+    def _patch_is_noop(patch_text: str) -> bool:
+        """True when every hunk in the patch is context-only (no ``-``/``+``
+        body lines) — applying it would change nothing."""
+        in_hunk = False
+        saw_hunk = False
+        for line in (patch_text or "").splitlines():
+            if line.startswith("@@"):
+                in_hunk = True
+                saw_hunk = True
+                continue
+            if not in_hunk:
+                continue
+            if line[:1] in ("-", "+") and not line.startswith(("--- ", "+++ ")):
+                return False
+        return saw_hunk
 
     # ── Tolerant apply: try multiple git apply flag combinations ─────────────
 
@@ -2252,7 +2554,16 @@ class PatchEngine:
         # test_patch_tolerant.py::TestFixHunkCountsBlankContext).
         patches_to_try = [
             (fixed, ["--recount", "--ignore-whitespace"], "fixed_ignore_ws"),
-            (fixed, ["--recount", "-C0", "--ignore-whitespace"], "fixed_C0_ignore_ws"),  # C0 = no context required
+            # --unidiff-zero accepts zero-context and trailing-'+' hunks that
+            # plain apply rejects mid-file; git still content-verifies the
+            # removed lines via its own offset search (unlike -C0, which is
+            # blind), so a misplaced hunk cannot land silently.
+            (fixed, ["--recount", "--unidiff-zero"], "fixed_unidiff_zero"),
+            # NOTE: no -C0 + whitespace-flag combination here — Apple git
+            # 2.39.5 SIGBUSes (rc=-10) when a -C0 hunk's context is a
+            # whitespace NEAR-MISS of the file content (e.g. a context line
+            # missing its indentation) under --ignore-whitespace /
+            # --ignore-space-change. -C0 alone fails cleanly instead.
             (fixed, ["--recount", "-C0"], "fixed_C0"),                                    # pure line-number matching
             (fixed, ["--recount", "--ignore-space-change"], "fixed_ignore_sc"),
             (fixed, ["--recount"], "fixed_plain"),
@@ -2263,7 +2574,7 @@ class PatchEngine:
             )
         _c0_verify_fail: Optional[str] = None
         for try_patch, flags, mode_name in patches_to_try:
-            _is_c0 = "-C0" in flags
+            _is_c0 = "-C0" in flags or "--unidiff-zero" in flags
             # A -C0 sibling already applied at these line numbers and failed
             # placement verification — another -C0 variant lands identically.
             if _is_c0 and _c0_verify_fail is not None:
@@ -2430,12 +2741,15 @@ class PatchEngine:
         return self._read_index_entries(extract_files_from_patch(patch_text))
 
     def _restore_index_entries(self, snapshot: dict[str, tuple[str, str]]) -> None:
-        """Re-point the index at its pre-apply blobs, for entries that moved.
+        """Re-point the index at the restored working-tree content, for entries
+        that moved.
 
         Only paths captured at stage 0 are restored, and only when the current
         entry differs — a healthy index is never rewritten, so this is a no-op
-        for every mode except a conflicted ``--3way``. ``--cacheinfo`` both
-        clears the unmerged stages and reinstates stage 0 in one step.
+        for every mode except a conflicted ``--3way``. ``git add`` both clears
+        the unmerged stages and reinstates stage 0 in one step. (The previous
+        ``git update-index --cacheinfo mode,sha,path`` form is rejected by
+        Apple git 2.39.5 with "option `cacheinfo' takes no value".)
         """
         if not snapshot:
             return
@@ -2443,10 +2757,9 @@ class PatchEngine:
         for path, entry in snapshot.items():
             if current.get(path) == entry:
                 continue
-            mode, sha = entry
             try:
                 r = subprocess.run(
-                    ["git", "update-index", "--cacheinfo", f"{mode},{sha},{path}"],
+                    ["git", "add", path],
                     cwd=self.repo_root,
                     capture_output=True,
                     timeout=10,
@@ -2468,8 +2781,12 @@ class PatchEngine:
                     if os.path.isfile(path):
                         os.remove(path)
                 else:
-                    with open(path, "w", encoding="utf-8") as fh:
-                        fh.write(content)
+                    # Atomic like every other repair/rollback write: a SIGKILL
+                    # mid-rollback must not leave the target truncated.
+                    # realpath keeps symlink semantics — open(path, "w") wrote
+                    # through the link, and a non-resolved os.replace would
+                    # replace the link itself.
+                    atomic_write_text(os.path.realpath(path), content)
             except OSError as exc:
                 logger.exception("tolerant_git_apply: rollback of %s failed: %s", path, exc)
 
@@ -2540,23 +2857,30 @@ class PatchEngine:
         return out
 
     def _verify_c0_placement(self, patch_text: str) -> tuple[bool, str]:
-        """Content-verify hunk placement after a ``-C0`` (context-free) git apply.
+        """Content-verify hunk placement after a context-free git apply
+        (``-C0`` / ``--unidiff-zero`` blind line-number apply).
 
-        For every hunk that carries context lines, require its post-image
-        (context + added lines, whitespace-normalized) to appear as a
-        consecutive block somewhere in the file after apply — at the correct
-        location this holds by construction; at a stale-line-number location
-        the surrounding lines differ from the patch's context and the block is
-        absent. Hunks with no context lines (pure line-number inserts) have
-        nothing to verify against and are accepted as-is, as are new files.
+        A hunk passes when EITHER:
+          * its pre-image (context + removed lines) matches at its CLAIMED
+            line position — the case for a not-yet-applied correct patch
+            (direct unit-test invocation) and for a blind apply that landed
+            exactly where the hunk's old lines live; or
+          * its post-image (context + added lines) appears as a consecutive
+            block somewhere in the file after apply — the case for a blind
+            apply that mutated the tree: at the correct location this holds
+            by construction; at a stale-line-number location the surrounding
+            lines differ and the block is absent.
+
+        Hunks with no context lines (pure line-number inserts) have nothing to
+        verify against and are accepted as-is, as are new files.
 
         Returns (ok, detail) — detail names the offending file on failure.
         """
-        files: dict[str, list[list[str]]] = {}
+        files: dict[str, list[list]] = {}  # rel -> [[hunk_lines, old_start], ...]
         new_files: set[str] = set()
         cur: Optional[str] = None
         cur_is_new = False
-        cur_hunk: Optional[list[str]] = None
+        cur_hunk: Optional[list] = None
 
         for line in patch_text.splitlines():
             if line.startswith(("diff --git ", "--- ")):
@@ -2578,8 +2902,10 @@ class PatchEngine:
                 if cur is None:
                     cur_hunk = None
                 else:
+                    m = _RE_HUNK_HEADER_FIX.match(line)
+                    old_start = int(m.group(2)) if m else None
                     cur_hunk = []
-                    files[cur].append(cur_hunk)
+                    files[cur].append([cur_hunk, old_start])
                 continue
             if cur_hunk is None:
                 continue
@@ -2603,9 +2929,21 @@ class PatchEngine:
             except OSError:
                 logger.debug("_verify_c0_placement: cannot read %s (deleted by patch?)", abs_p)
                 continue  # deleted by the patch — nothing to place-check
-            for hunk in hunk_list:
+            for hunk, old_start in hunk_list:
                 if not any(ln[:1] == " " for ln in hunk):
                     continue  # context-free hunk: unverifiable by content
+                # Pre-image at the claimed position — but only for hunks that
+                # REMOVE lines: a pre-image match then proves the change's
+                # target is exactly where the hunk claims. For insert-only
+                # hunks the pre-image is just context, whose presence at the
+                # position says nothing about where the insertion landed, so
+                # they must satisfy the post-image check below.
+                pre = [self._ws_norm_line(ln[1:]) for ln in hunk if ln[:1] in (" ", "-")]
+                has_removals = any(ln[:1] == "-" for ln in hunk)
+                if pre and has_removals and old_start is not None:
+                    start = old_start - 1
+                    if start >= 0 and file_norm[start:start + len(pre)] == pre:
+                        continue
                 post = [self._ws_norm_line(ln[1:]) for ln in hunk if ln[:1] in (" ", "+")]
                 m = len(post)
                 if m == 0:
@@ -2766,11 +3104,22 @@ class PatchEngine:
         """
 
         def _find_fuzzy(hunk_body, file_lines, old_start):
-            # Extract context (unchanged) + removed lines to use as search key
+            # Search key: context + removed lines (the block that must land at
+            # the right place).  context_before = leading context lines, so the
+            # returned anchor is the 0-indexed position of the FIRST REMOVED
+            # line of the matched block — re-anchoring must point the hunk at
+            # its change, not at the context that precedes it.
             search_lines = [hl[1:] for hl in hunk_body if hl.startswith((" ", "-"))]  # strip prefix
 
             if not search_lines:
                 return None
+
+            context_before = 0
+            for hl in hunk_body:
+                if hl.startswith(" "):
+                    context_before += 1
+                elif hl.startswith(("-", "+")):
+                    break
 
             # Build a normalized search string
             search_str = "".join(search_lines).strip()
@@ -2819,10 +3168,15 @@ class PatchEngine:
                     if best_score > 0.95:
                         break  # near-perfect match — no need to scan further
 
-            # Only re-anchor if we found a significantly better match than the original
+            # Only re-anchor if we found a significantly better match than the
+            # original position; a good score AT the claimed position means the
+            # header is already right — keep it (None). The claimed start is
+            # "already right" when it points at the matched block's first line
+            # OR at its first removed line (both are common header conventions).
             original_pos = old_start - 1  # 0-indexed
-            if best_score >= 0.7 and best_offset != original_pos:
-                return best_offset, 0, f"(score={best_score:.2f})"
+            anchor = best_offset + context_before  # 0-indexed first removed line
+            if best_score >= 0.7 and original_pos not in (anchor, best_offset):
+                return anchor, 0, f"(score={best_score:.2f})"
             return None
 
         return self._reanchor_patch_core(patch_text, target_file, _find_fuzzy, "reanchor_patch")

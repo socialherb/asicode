@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 import subprocess
 from concurrent.futures import TimeoutError as _FutureTimeoutError
 
+from external_llm.common.atomic_io import atomic_write_text
 from external_llm.common.indent_utils import reindent_text
 from external_llm.common.walk_policy import _walk_should_skip_dir
 
@@ -976,7 +977,7 @@ class ToolRegistry(
         ``performance_metrics.get_summary()`` — see
         ``PerformanceCollector.register_tool_result_cache``.
         """
-        # getattr default matches the dataclass field default (True, L168), NOT
+        # getattr default matches the `tool_result_cache_enabled` field default (True), NOT
         # False: a duck-typed config that omits the attribute must get the
         # DOCUMENTED behavior (cache enabled), not silently fail-closed to
         # disabled. Real AgentConfig instances always carry the field.
@@ -1051,7 +1052,7 @@ class ToolRegistry(
         # base.agent_profile into sub_config, so an unmodified sub_config simply
         # re-copies the parent's — but a subagent-specific profile set on the
         # config was previously SILENTLY IGNORED and the parent's enforced.
-        # `is not None` (not truthiness): matches __init__ L672 fallback rule.
+        # `is not None` (not truthiness): matches the `__init__` `agent_profile` fallback.
         sub_profile = getattr(sub_config, "agent_profile", None)
         clone._agent_profile = (
             sub_profile if sub_profile is not None else getattr(self, "_agent_profile", None)
@@ -2007,8 +2008,7 @@ class ToolRegistry(
                     continue  # Only raw replacements supported for now
 
                 try:
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.write(repaired_code)
+                    atomic_write_text(path, repaired_code)
                 except OSError:
                     logger.debug("write safety: could not write repaired %s", path)
                     continue
@@ -2025,8 +2025,8 @@ class ToolRegistry(
                     # Code is now clean — stop processing this file
                     break
                 # Restore current_code on failure
-                with contextlib.suppress(OSError), open(path, "w", encoding="utf-8") as f:
-                    f.write(current_code)
+                with contextlib.suppress(OSError):
+                    atomic_write_text(path, current_code)
 
         # ── All-files contract gate ───────────────────────────────────────
         # Per-file repair success is necessary but NOT sufficient: a True return
@@ -2572,8 +2572,7 @@ class ToolRegistry(
                             if _repaired is not None:
                                 _repair_path = next(iter(_write_snapshots))
                                 try:
-                                    with open(_repair_path, "w", encoding="utf-8") as _f:
-                                        _f.write(_repaired)
+                                    atomic_write_text(_repair_path, _repaired)
                                 except OSError:
                                     _repaired = None
 

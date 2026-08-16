@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import external_llm.agent.execution_mode_classifier as emc_module
 from external_llm.agent.execution_mode_classifier import (
     _LLM_MODE_ALIASES,
     ExecuteMode,
@@ -123,6 +124,21 @@ class TestHasNumberAfterKeyword:
     def test_various_inputs(self, text, keywords, expected):
         assert _has_number_after_keyword(text, keywords) == expected
 
+    def test_later_occurrence_after_embedded_keyword(self):
+        """Contract (implementation comment): a keyword embedded in a longer word
+        must keep scanning for later occurrences.  The first 'line' sits inside
+        'delineate'; the genuine 'line 42' reference later must still match."""
+        assert _has_number_after_keyword("delineate line 42", ("line",)) is True
+
+    def test_later_hangul_occurrence_after_embedded_keyword(self):
+        """Korean: first '줄' matches inside '줄바꿈' (line break); the later
+        '줄 42' is the real line reference and must still match."""
+        assert _has_number_after_keyword("줄바꿈 제거 후 줄 42 수정", ("줄",)) is True
+
+    def test_no_number_after_any_occurrence(self):
+        """Negative guard: embedded keyword + later bare keyword stays False."""
+        assert _has_number_after_keyword("delineate line", ("line",)) is False
+
 
 # ── _analyze_intent_with_keywords ─────────────────────────────────────────
 
@@ -164,11 +180,56 @@ class TestAnalyzeIntentWithKeywords:
         """'legacy' keyword takes priority over line number."""
         assert _analyze_intent_with_keywords("legacy mode on line 42") == "legacy"
 
+    def test_legacy_in_filename_does_not_trigger_legacy_mode(self):
+        """F6 regression: 'legacy' embedded in a file name is a normal editing
+        request, not an explicit legacy-diff-format request. The old substring
+        check ('legacy' in prompt_lower) misrouted these to "legacy"."""
+        assert _analyze_intent_with_keywords("fix the bug in legacy_parser.py") == "normal"
+
+    def test_legacy_identifier_rename_does_not_trigger_legacy_mode(self):
+        """F6 regression: same substring hazard for identifiers being renamed."""
+        assert _analyze_intent_with_keywords("rename legacy_utils.py to utils.py") == "normal"
+
+    def test_legacy_whole_word_still_selects_legacy(self):
+        """Word-boundary match keeps the explicit-request contract."""
+        assert _analyze_intent_with_keywords("use legacy mode") == "legacy"
+        assert _analyze_intent_with_keywords("please output legacy-format diff") == "legacy"
+
+    def test_position_row_hangul_fast_path_never_builds_semantic_matcher(self):
+        """F7 regression: 'position'/'row'/'위치' are position words known to
+        the semantic backstop examples (_MODE_INTENT_EXAMPLES["line_edit"]) but
+        were missing from _LINE_REFERENCE_KEYWORDS, so digit prompts phrased
+        with them paid an ~8s sentence_transformers import + embedding load on
+        the first backstop hit. They must short-circuit on the fast path."""
+        with patch(
+            "external_llm.agent.execution_mode_classifier._get_mode_matcher",
+            side_effect=AssertionError("semantic matcher must not be built"),
+        ):
+            assert _analyze_intent_with_keywords("position 15") == "strict_json"
+            assert _analyze_intent_with_keywords("edit row 7") == "strict_json"
+            assert _analyze_intent_with_keywords("위치 20 수정") == "strict_json"
+
     def test_default_normal(self):
         assert _analyze_intent_with_keywords("fix the bug in foo()") == "normal"
 
     def test_empty_prompt(self):
         assert _analyze_intent_with_keywords("") == "normal"
+
+
+class TestLineReferenceKeywordCoverage:
+    """F7 contract: every position word the semantic backstop knows
+    (_MODE_INTENT_EXAMPLES["line_edit"]) must appear in _LINE_REFERENCE_KEYWORDS,
+    otherwise a digit prompt phrased with that word pays an ~8s
+    sentence_transformers import + embedding-model load on the first semantic
+    backstop hit. Keep in sync when a position word is added to the examples.
+    """
+
+    @pytest.mark.parametrize(
+        "word",
+        ["line", "position", "row", "라인", "줄", "행", "위치"],
+    )
+    def test_position_word_has_fast_path_keyword(self, word):
+        assert word in emc_module._LINE_REFERENCE_KEYWORDS
 
 
 # ── validate_instruction_target_file ──────────────────────────────────────
@@ -312,3 +373,56 @@ class TestAnalyzeRequestForOptimalMode:
         result = analyze_request_for_optimal_mode("fix bug", None)
         assert result == "normal"
         mock_kw.assert_called_once_with("fix bug")
+
+
+# ── _get_mode_matcher / semantic backstop ─────────────────────────────────
+
+class TestModeMatcherAndSemanticBackstop:
+    """Tests for the lazy _get_mode_matcher singleton and the semantic
+    backstop branch of _analyze_intent_with_keywords.
+
+    The SemanticIntentMatcher constructor is cheap (embeddings are only
+    encoded inside _ensure_built), so the lazy-build path is exercised with
+    the real object; only .matches is faked to avoid model loading.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_mode_matcher(self, monkeypatch):
+        """Start each test from an unbuilt matcher so the lazy path runs."""
+        monkeypatch.setattr(emc_module, "_mode_matcher", None)
+        yield
+
+    def test_lazy_build_returns_real_matcher_and_caches(self):
+        from external_llm.agent.config.thresholds import config as cfg
+        from external_llm.agent.semantic_intent import SemanticIntentMatcher
+
+        first = emc_module._get_mode_matcher()
+        assert isinstance(first, SemanticIntentMatcher)
+        assert first._name == "mode-line-edit"
+        assert first._threshold == cfg.scores.SEMANTIC_INTENT_MIN
+        assert first._margin == cfg.scores.SEMANTIC_INTENT_MARGIN
+        # Singleton: second call must return the cached instance (double-checked
+        # locking fast path) — this also guards the `if _mode_matcher is not None`
+        # early return line.
+        assert emc_module._get_mode_matcher() is first
+
+    def test_semantic_backstop_hit_returns_strict_json(self, monkeypatch):
+        from external_llm.agent.semantic_intent import SemanticIntentMatcher
+
+        monkeypatch.setattr(
+            "external_llm.agent.semantic_intent.SemanticIntentMatcher.matches",
+            lambda self, text, label: True,
+        )
+        # Digit present, no fast-path keyword ("item" is not in
+        # _LINE_REFERENCE_KEYWORDS; "position"/"row"/"위치" were promoted to the
+        # fast path — F7) -> falls through to the semantic backstop.
+        assert emc_module._analyze_intent_with_keywords("please adjust item 20") == "strict_json"
+        # The lazy path must have built the real matcher, not a stub.
+        assert isinstance(emc_module._mode_matcher, SemanticIntentMatcher)
+
+    def test_semantic_backstop_miss_falls_to_normal(self, monkeypatch):
+        monkeypatch.setattr(
+            "external_llm.agent.semantic_intent.SemanticIntentMatcher.matches",
+            lambda self, text, label: False,
+        )
+        assert emc_module._analyze_intent_with_keywords("please adjust item 20") == "normal"

@@ -187,7 +187,7 @@ def resolve_multiline_anchor(
                     ),
                     "failure_class": "multiline_mismatch",
                 }
-            break
+            break  # pragma: no cover — _pat_lines는 비어있지 않은 줄만 남으므로 위 if가 항상 참 (trailing blank 제거됨)
         _pat_stripped = _pat_lines[_pi].strip()
         _file_stripped = lines[_file_lineno].strip()
         if _pat_stripped and _pat_stripped not in _file_stripped:

@@ -146,11 +146,12 @@ class DependencyGraphBuilder:
         for func in analysis.functions:
             func_name = f"{file_str}:{func.name}"
 
-            # We know this function exists in this file
-            # The analysis.calls contains all function calls made in the entire file
-            # We'd need per-function call tracking, which requires more detailed AST walking
-            # For now, associate file-level calls with each function
-            for call in analysis.calls:
+            # DG-B1: use per-function call targets (func.calls, computed by
+            # CodeAnalyzer from THIS function's own AST scope) instead of the
+            # lossy whole-file call set, which previously attributed every
+            # file-level call to every function (false self-loops + unrelated
+            # edges fed to the LLM via super_context_builder).
+            for call in func.calls:
                 if call in defined:
                     # Internal call
                     callee = f"{file_str}:{call}"

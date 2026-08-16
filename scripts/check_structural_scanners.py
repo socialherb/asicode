@@ -5,7 +5,7 @@ The scanner registry (external_llm/agent/scanner_registry.py) powers the MCP
 ``run_structural_scan`` tool.  Most of its scanners are ASSIST tools: they
 emit candidates for human triage (ast_similarity near-duplicates, dead-block
 clusters, vulture low-confidence hints) and are intentionally not gateable.
-Seven scanners, however, are deterministic and currently at ZERO candidates
+Nine scanners, however, are deterministic and currently at ZERO candidates
 repo-wide, so a candidate from them is a regression by construction:
 
   - contradictory_logic_scanner  — contradictory conditions, unreachable
@@ -20,10 +20,17 @@ repo-wide, so a candidate from them is a regression by construction:
                                    (framework-dispatch false positives
                                    suppressed structurally)
   - broken_contract_scanner      — writer/reader pairs split by migration
+  - container_reachability_scanner — containers whose name has no cross-file
+                        reference (graph-injected)
+  - ast_similarity_scanner       — exact duplicates ONLY: pairs with similarity
+                        1.0 (identical normalised structure) in
+                        non-test source
 
-These seven ARE the gate: any candidate fails the build.  No baseline — zero
-is the floor (same contract as scripts/check_lint_full.py).  The remaining
-scanners run in report-only mode (counts printed, never fail).
+  These nine ARE the gate: any candidate fails the build.  No baseline — zero
+  is the floor (same contract as scripts/check_lint_full.py).  ast_similarity is
+  gated at a narrower contract than the others (only exact-1.0 non-test pairs;
+  see GATE_SCANNERS note) — the ranked near-duplicate set is not an enumeration
+  contract and stays report-only.
 
 Why the four graph-dependent scanners were promoted (2026-08-08): the gate
 script previously ran WITHOUT a call graph, so dead_block / public_dead_code
@@ -46,11 +53,20 @@ The ONLY flag is ``--gate-only``; any other ``--*`` argument fails with exit 1
 (no silent ignore — a typo must not degrade into a ~35s full scan).
 
 Explicit file args (pre-commit per-file mode) scan only those files and skip
-report-only scanners (they are whole-repo signals).  No args scans the whole
-repo including report-only counts — the full picture for manual/weekly drift
-checks.  ``--gate-only`` runs the same full-repo scan but ONLY the seven
-gate scanners, skipping the two remaining report-only ones (ast_similarity /
-container_reachability — measured ~35s of wall time 2026-08-07).
+report-only scanners (they are whole-repo signals).  Since 2026-08-16 (P-2)
+per-file mode ALSO unions the git-untracked scannable files: pre-commit passes
+only STAGED paths, so a new file with a violation would otherwise pass the gate
+until its first commit while the full-scan floor (CI) caught it — per-file mode
+must judge the same zero-candidate floor as the full scan.  No args scans the
+whole repo including report-only counts — the full picture for manual/weekly
+drift checks.  ``--gate-only`` runs the same full-repo scan but skips the
+report-only section entirely.  Wall time measured 2026-08-16 (P-I, commit
+35f52561): ~69s COLD (fresh repo/CI checkout — no .cache/, so the graph
+build + every scanner's per-file cache miss) vs 15-18s WARM (local, .cache/
+present).  lint.yml restores .cache/ via actions/cache (P8-1, cb0a7fe3), so
+CI pays the cold price only on a cache miss; a source-touching push still
+misses for the touched files (fingerprint (mtime_ns, size) mismatch) and
+self-heals on the next run.
 Explicit paths that are ALL rejected (out-of-repo or non-scannable extension)
 FAIL with exit 1 — they never silently fall back to a full-repo scan: that
 fallback made a gate test pass /tmp files and burn ~35s per run (120s timeout
@@ -58,6 +74,7 @@ flakes under parallel-suite contention, 2026-08-07).
 """
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -88,6 +105,15 @@ from external_llm.analysis.scan_walk import (  # noqa: E402 — eager by design,
 # scanner structurally skips containers whose name appears in
 # cross_file_referenced_names (cross-file consumption is invisible to its
 # single-file scope), so the gate passes the full cross-file ref set.
+#
+# ast_similarity_scanner is gated at a NARROWER contract than the others:
+# only similarity-1.0 pairs (identical normalised structure) in NON-TEST
+# source fail the build.  The ranked near-duplicate set is not gateable (see
+# REPORT_ONLY_SCANNERS note), but 1.0 is a deterministic statement — two
+# symbols with identical normalised structure are duplicates by construction,
+# and the ranked cap cannot hide them once max_candidates is raised.  Test
+# files are excluded: test methods are idiomatically similar (arrange/act/
+# assert), 994 exact pairs measured 2026-08-16, and they are not regressions.
 GATE_SCANNERS: tuple[str, ...] = (
     "contradictory_logic_scanner",
     "duplicate_definition_scanner",
@@ -97,17 +123,21 @@ GATE_SCANNERS: tuple[str, ...] = (
     "vulture_dead_code_scanner",
     "broken_contract_scanner",
     "container_reachability_scanner",
+    "ast_similarity_scanner",
 )
 
-# Non-deterministic / assist-only scanners — report-only.
+# Non-deterministic / assist-only scanners — report-only.  Currently EMPTY:
+# ast_similarity_scanner was promoted to the gate (2026-08-16, P-3) at the
+# similarity-1.0 non-test contract; container_reachability_scanner is already
+# in GATE_SCANNERS.  The ranked ast_similarity near-duplicate set stays
+# unjudged by design:
 # ast_similarity_scanner is a RANKING scanner: its count is capped by
 # max_candidates (measured: 20 at the default cap, 100 at max_candidates=100),
 # so "0 candidates" is not an enumeration contract — the top-N set churns with
 # every code change.  Candidates are mostly test methods (idiomatic
-# arrange/act/assert similarity) plus intentional mirror pairs
-# (e.g. get_callers/get_callees), which are not regressions.  It stays
-# report-only by design.
-REPORT_ONLY_SCANNERS: tuple[str, ...] = ("ast_similarity_scanner",)
+# arrange/act/assert similarity), which are not regressions.  That ranked set
+# remains report-only; only the exact-1.0 subset is gated.
+REPORT_ONLY_SCANNERS: tuple[str, ...] = ()
 
 # The extension tuple / cap / walk are the scan-walk SINGLE SOURCE
 # (external_llm/analysis/scan_walk.py): the _SCAN_* names below are identity
@@ -212,6 +242,59 @@ def _resolve_scan_paths(args: list[str]) -> list[str] | None:
     return out or None
 
 
+def _untracked_scan_files(root: Path) -> list[str]:
+    """Scannable git-untracked files under *root* (repo-relative paths).
+
+    pre-commit hands the per-file gate only STAGED paths, so a new (untracked)
+    file with a violation passed the gate until its first commit while the
+    full-scan floor (CI) caught it — main() unions this set so per-file mode
+    and full-scan mode judge the same zero-candidate floor (P-2, 2026-08-16).
+
+    Best-effort: any git failure (no git binary, *root* outside a worktree)
+    returns [] — untracked files cannot be enumerated without git, and the
+    only production caller (pre-commit) always runs inside a worktree, so the
+    misscan window does not exist there.  ``--exclude-standard`` respects
+    .gitignore, so ignored scratch files are never scanned.  ``*_probe.py`` is
+    excluded: the gate-mechanics tests write intentional-violation probes
+    inside the repo and unlink them in finally, and a sibling worker's
+    in-flight probe must not trip the zero-candidate floor (mirrors
+    test_full_scan_is_zero_on_gate_scanners).  Entries resolve through the
+    worktree root (``git ls-files`` paths are worktree-root-relative, which
+    may be an ancestor of *root*) and are kept only when inside *root*.
+    """
+    try:
+        top = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if top.returncode != 0 or not top.stdout.strip():
+            return []
+        listing = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if listing.returncode != 0:
+        return []
+    toplevel = Path(top.stdout.strip())
+    out: list[str] = []
+    for raw in listing.stdout.split("\0"):
+        if not raw or not raw.endswith(_SCAN_EXTS) or raw.endswith("_probe.py"):
+            continue
+        rel = os.path.relpath((toplevel / raw).resolve(), root.resolve())
+        if rel.startswith(".."):
+            continue
+        out.append(rel)
+    return sorted(out)
+
+
 def _walk_scan_files(root: Path) -> list[str]:
     """Collect scannable source files under *root* (repo-relative paths).
 
@@ -249,7 +332,7 @@ def _unjudged_languages(file_paths: list[str]) -> list[tuple[str, list[str]]]:
     AST fallback outside Python), so a missing grammar would let that language
     pass the gate UNJUDGED.  ``main()`` fails the gate when this returns
     non-empty (fail-closed, 2026-08-11).  Python is never probed — its floor
-    is the seven AST scanners plus the ast-module fallback, which need no
+    is the eight AST scanners plus the ast-module fallback, which need no
     grammar — and UNKNOWN extensions are never scanned (_SCAN_EXTS bounds
     both the walk and per-file normalization).
 
@@ -290,6 +373,50 @@ def _run_scanner(registry, name: str, file_paths: list[str], **kwargs) -> int:
     if total > 10:
         print(f"      … and {total - 10} more")
     return total
+
+
+def _run_ast_similarity_gate(registry, file_paths: list[str]) -> int:
+    """Run the ast_similarity exact-duplicate gate; return failing pair count.
+
+    The gate contract is NARROWER than the other scanners: only pairs whose
+    similarity is exactly 1.0 (identical normalised structure) in NON-TEST
+    source fail.  The ranked near-duplicate set is not an enumeration contract
+    (see REPORT_ONLY_SCANNERS note) and test methods are idiomatically similar
+    by design — 994 exact pairs live in tests/ (measured 2026-08-16), so test
+    files are excluded wholesale.
+
+    max_candidates is raised far above the default (20) so the 1.0 subset is
+    not truncated by the ranking cap: at max_candidates=10000 a pair hidden by
+    the cap would silently pass the gate, which would make "0 candidates" a
+    lie.  The 1.0 filter is applied AFTER the run because the scanner's
+    ``min_similarity`` gate is a soft ranking cutoff — a pair at 0.9999 must
+    not fail the build, only structural identity does.
+    """
+    src_paths = [p for p in file_paths if not p.startswith("tests/")]
+    if not src_paths:
+        print("  ast_similarity_scanner: 0 candidate(s) (no non-test source files)")
+        return 0
+    try:
+        result = registry.run(
+            "ast_similarity_scanner",
+            repo_root=str(REPO),
+            file_paths=src_paths,
+            min_similarity=0.999,
+            max_candidates=10000,
+        )
+    except Exception as exc:  # fail-closed: a broken scanner is not a pass
+        print(f"❌ ast_similarity_scanner: SCANNER ERROR — {exc!r}")
+        return -1
+    exact = [c for c in result.candidates_raw if c.get("similarity", 0.0) >= 0.9999]
+    print(
+        f"  ast_similarity_scanner: {len(exact)} exact-duplicate pair(s) "
+        f"(similarity 1.0, non-test source) across {len(result.affected_files)} file(s)"
+    )
+    for c in exact[:10]:
+        print(f"      {c.get('symbol_a')} <-> {c.get('symbol_b')} (sim {c.get('similarity')})")
+    if len(exact) > 10:
+        print(f"      … and {len(exact) - 10} more")
+    return len(exact)
 
 
 def _load_registry():
@@ -378,7 +505,19 @@ def main() -> int:
         print("   (paths must resolve inside the repo and end in one of: " + ", ".join(_SCAN_EXTS) + ")")
         return 1
     full_scan = paths is None
-    file_paths = paths if paths is not None else _walk_scan_files(REPO)
+    if full_scan:
+        file_paths = _walk_scan_files(REPO)
+    else:
+        # P-2 (2026-08-16): pre-commit passes only STAGED paths, so a new
+        # (untracked) file with a violation passed the per-file gate until its
+        # first commit while the full-scan floor (CI) caught it.  Union the
+        # git-untracked scannable set: per-file mode and full-scan mode must
+        # judge the same zero-candidate floor.
+        untracked = _untracked_scan_files(REPO)
+        added = sorted(set(untracked) - set(paths))
+        if added:
+            print(f"  [per-file] +{len(added)} untracked file(s) (git ls-files --others --exclude-standard)")
+        file_paths = sorted(set(paths) | set(untracked))
     if not file_paths:
         print("⚠ no scannable source files found")
         return 1
@@ -497,6 +636,19 @@ def main() -> int:
             print(f"❌ {name}: NOT REGISTERED — gate would silently pass")
             failed = True
             continue
+        if name == "ast_similarity_scanner":
+            # Whole-repo pair signal: per-file mode (pre-commit) cannot judge
+            # similarity pairs from a single changed file, so it is skipped
+            # here exactly as the report-only scanners used to be.  The
+            # full-scan floor (CI lint.yml --gate-only, local no-flag runs)
+            # applies the zero-exact-pair contract repo-wide.
+            if not full_scan:
+                print("  ast_similarity_scanner: skipped in per-file mode (whole-repo pair signal)")
+                continue
+            count = _run_ast_similarity_gate(registry, file_paths)
+            if count > 0 or count < 0:
+                failed = True
+            continue
         kwargs: dict = {}
         if cross_refs is not None and "cross_file_referenced_names" in (spec.input_schema or {}):
             kwargs["cross_file_referenced_names"] = cross_refs
@@ -507,7 +659,7 @@ def main() -> int:
             failed = True
 
     if full_scan and not gate_only:
-        print("Report-only scanners (not gated — see docstring):")
+        print("Report-only scanners (currently none — ast_similarity is gated at the exact-1.0 contract):")
         for name in REPORT_ONLY_SCANNERS:
             if registry.get_spec(name) is None:
                 print(f"  {name}: not available")

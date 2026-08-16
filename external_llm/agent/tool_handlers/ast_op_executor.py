@@ -572,7 +572,9 @@ class ASTOpExecutor:
         function, the insertion point is adjusted to after their definitions.
         """
         body = func_node.body  # type: ignore[attr-defined]
-        if not body:
+        # ast.parse rejects empty function bodies, so this branch is structurally
+        # unreachable.
+        if not body:  # pragma: no cover
             if op is not None:
                 op["_error"] = "add_guard: target function has an empty body"
             return "".join(lines), False
@@ -679,7 +681,9 @@ class ASTOpExecutor:
 
         loop_node = candidates[0]
         body = loop_node.body  # type: ignore[attr-defined]
-        if not body:
+        # ast.parse rejects empty loop bodies, so this branch is structurally
+        # unreachable.
+        if not body:  # pragma: no cover
             if op is not None:
                 op["_error"] = "add_guard: matched loop has an empty body"
             return "".join(lines), False
@@ -860,7 +864,10 @@ class ASTOpExecutor:
             if stmt_end >= last_def_line:
                 return stmt_end
 
-        return -1
+        # Every first_def line lies inside the span of some body statement
+        # (ast.walk covers only func_node descendants), so the LAST body
+        # statement always satisfies stmt_end >= last_def_line.
+        return -1  # pragma: no cover
 
     @staticmethod
     def _is_safe_for_loop_body(
@@ -1128,7 +1135,7 @@ class ASTOpExecutor:
             if cls_node.body:
                 first_body_line = lines[cls_node.body[0].lineno - 1]
                 indent_str = first_body_line[:len(first_body_line) - len(first_body_line.lstrip())]
-            else:
+            else:  # pragma: no cover — a class with an empty body cannot be parsed
                 indent_str = "    "
 
             # Build the field line
@@ -1254,7 +1261,9 @@ class ASTOpExecutor:
             # Detect bracket type and closing character
             bracket_close = "]" if isinstance(target_node.value, ast.List) else ")"
             close_idx = end_line.rfind(bracket_close)
-            if close_idx == -1:
+            # node.end_lineno IS the closing-bracket line, so the bracket always
+            # appears on end_line (rfind >= 0).
+            if close_idx == -1:  # pragma: no cover
                 return None
 
             # Detect indentation from existing elements or use list indent + 4

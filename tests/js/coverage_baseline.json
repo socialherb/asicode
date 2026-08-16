@@ -1,0 +1,47 @@
+{
+  "surfaces": {
+    "webapp/ui/static/agent-panel.js": {
+      "kind": "map",
+      "uncovered": [
+        "tool_call_preview",
+        "agent_thinking",
+        "tool_call",
+        "reasoning",
+        "tdd_cycle_start",
+        "tdd_cycle_pass",
+        "tdd_cycle_fail",
+        "user_message_received",
+        "pause_for_approval",
+        "pause_for_user_input",
+        "approval_timeout",
+        "tool_nudge",
+        "context_trimmed",
+        "orchestrator_plan",
+        "orchestrator_done",
+        "route_decision",
+        "route_applied",
+        "cancelled",
+        "error",
+        "token_usage",
+        "rate_limit_retry",
+        "turn_start",
+        "fail_loop_detected",
+        "connection_retry",
+        "auto_observation"
+      ]
+    },
+    "webapp/ui/static/design-chat.js": {
+      "kind": "listener",
+      "uncovered": [
+        "design_tool_call",
+        "design_checkpoint",
+        "design_reasoning",
+        "design_token",
+        "design_token_reset",
+        "design_response",
+        "error",
+        "done"
+      ]
+    }
+  }
+}

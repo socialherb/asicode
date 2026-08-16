@@ -139,6 +139,7 @@ def save(
     faster: 1.87s -> 1.77s).
     """
     path = Path(cache_path)
+    tmp: Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # PID-suffixed tmp: two gate processes (pre-commit + manual) writing
@@ -165,8 +166,17 @@ def save(
                 fh.write("}")  # close section
             fh.write("}")  # close payload
         os.replace(tmp, path)
-    except OSError as exc:
+        tmp = None  # committed — nothing to clean up
+    except (OSError, TypeError, ValueError) as exc:
+        # OSError: filesystem; TypeError/ValueError: an entry that
+        # json.dumps cannot serialize (C4, 2026-08-12) — pre-streaming the
+        # whole payload was dumped BEFORE the tmp existed, so a serialization
+        # failure left nothing behind; entry-wise streaming can raise mid-
+        # file, so both the exception class and the tmp cleanup are new.
         _logger.debug("structural graph cache write failed (%s): %s", cache_path, exc)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def data_to_json(data: dict) -> dict:

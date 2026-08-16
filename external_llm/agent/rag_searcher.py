@@ -624,14 +624,19 @@ class RAGSearcher:
         """Phase 2 of an incremental update. Caller MUST hold ``_index_lock``.
 
         Applies only the parallel-array mutations for ``changed_paths`` using
-        the pre-tokenized ``prepared`` map (locating each existing entry with
-        ``list.index`` under the lock — it races with a concurrent
-        ``_remove_doc_at`` otherwise), subtracts/adds df contributions, and
-        refreshes the shared fingerprint map.  Returns the deferred vector-cache
-        updates for the caller to flush OUTSIDE the lock (embedding I/O must
-        not block concurrent searches).
+        the pre-tokenized ``prepared`` map (locating each existing entry via
+        the ``_rel_path_to_idx`` mirror — rebuilt at the end of every prior
+        mutating call, so it matches the arrays at entry; O(1) per lookup
+        instead of ``list.index``'s O(corpus) string scan under the lock),
+        subtracts/adds df contributions, and refreshes the shared fingerprint
+        map.  Pops are deferred to the end and applied in descending index
+        order so the snapshot stays valid for the whole loop.  Returns the
+        deferred vector-cache updates for the caller to flush OUTSIDE the lock
+        (embedding I/O must not block concurrent searches).
         """
         vc_updates: list[tuple[str, str]] = []
+        removals: list[int] = []
+        _idx_of = self._rel_path_to_idx  # immutable snapshot; valid at entry
         for rel_path in changed_paths:
             norm_path = rel_path.strip().lstrip("/")
             prep = prepared.get(norm_path)
@@ -675,9 +680,9 @@ class RAGSearcher:
                     vc_updates.append((norm_path, text))
                 else:
                     # File deleted / no longer indexable / no tokens — remove.
-                    self._remove_doc_at(existing_idx)
+                    removals.append(existing_idx)
 
-            elif prep is not None and self._n_docs < _MAX_FILES:
+            elif prep is not None and self._n_docs - len(removals) < _MAX_FILES:
                 # NEW file — append to index.
                 text, tokens = prep
                 tc = {}
@@ -706,6 +711,12 @@ class RAGSearcher:
                 self._s.fingerprints[norm_path] = fp_map[norm_path]
             else:
                 self._s.fingerprints.pop(norm_path, None)
+
+        # Deferred pops: apply in DESCENDING index order so each document is
+        # still at its original index when popped — a lower-index removal has
+        # not shifted it yet, and higher-index removals do not affect it.
+        for idx in sorted(removals, reverse=True):
+            self._remove_doc_at(idx)
 
         # Bump the generation so an in-flight searcher that already read the
         # pre-mutation index discards its (now-stale) result rather than

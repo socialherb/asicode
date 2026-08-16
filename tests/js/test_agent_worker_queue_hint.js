@@ -118,6 +118,10 @@ globalThis._agentRenderWorking = (tl) => {
   ind.textContent = "⏳ 처리 중";
   tl.appendChild(ind);
 };
+// Stub of the OUTPUT-tab raw-log writer (not under test here) — the
+// session_start handler under test also records the session id into the
+// raw output log (round-29 audit #1 OUTPUT tab wiring).
+globalThis._agentOutputLogEvent = () => {};
 globalThis.sessionStorage = {
   _s: {},
   setItem(k, v) { this._s[k] = v; },

@@ -5,6 +5,8 @@ import tempfile
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from external_llm.analysis.public_dead_code_scanner import (
     DeadBlockCandidate,
     DeadBlockMember,
@@ -745,3 +747,149 @@ def test_subscript_assignment_rhs_identifier_not_a_def():
     assert "_SCANNER_NAMES" not in dead_names
     assert "_SCHEMA" not in dead_names
     Path(src).unlink()
+
+
+# ── Per-file extraction disk cache (shared with dead_block_scanner) ──────
+
+
+def _dead_sig(candidates):
+    """(file, cluster_start, cluster_end, member names) signature — the cache
+    must reproduce the scan output bit-for-bit, not just the count."""
+    return sorted(
+        (c.file, c.cluster_start, c.cluster_end, tuple(m.name for m in c.members))
+        for c in candidates
+    )
+
+
+def test_extraction_cache_hot_run_matches_cold(tmp_path):
+    """A cache-hot run must produce the same candidates as the cold run while
+    reusing the on-disk extraction (the dead_block / public_dead_code pair
+    share this cache — the second scanner pays ~0s after the first)."""
+    import os
+
+    from external_llm.analysis._dead_block_shared import _dbx_cache_path
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "mod.py").write_text(textwrap.dedent("""\
+        def _dead_one():
+            return 1
+
+        def _dead_two():
+            return 2
+
+        def live():
+            return 3
+    """))
+    cache_path = _dbx_cache_path(str(repo))
+    assert not os.path.exists(cache_path)
+
+    first = scan_public_dead_blocks(repo_root=str(repo), file_paths=["mod.py"])
+    assert os.path.exists(cache_path), "cold run must persist the extraction cache"
+
+    second = scan_public_dead_blocks(repo_root=str(repo), file_paths=["mod.py"])
+    assert _dead_sig(first) == _dead_sig(second)
+    # Both dead members must still be reported (cache served the extraction).
+    dead_names = {m.name for c in second for m in c.members}
+    assert dead_names == {"_dead_one", "_dead_two"}
+
+
+def test_extraction_cache_invalidates_on_edit(tmp_path):
+    """Editing a file (fingerprint change) must re-extract THAT file — a stale
+    cache entry would serve the pre-edit defs and report wrong dead code."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "mod.py"
+    target.write_text("def _gone():\n    return 1\n")
+    scan_public_dead_blocks(repo_root=str(repo), file_paths=["mod.py"])
+
+    # Rewrite: _gone is now referenced by the new live function.
+    target.write_text("def _gone():\n    return 1\n\ndef live():\n    return _gone()\n")
+    candidates = scan_public_dead_blocks(repo_root=str(repo), file_paths=["mod.py"])
+    dead_names = {m.name for c in candidates for m in c.members}
+    assert "_gone" not in dead_names, "stale extraction served after edit"
+
+
+def test_extraction_cache_corrupt_falls_back_to_full_scan(tmp_path):
+    """A corrupt cache file must fail OPEN to a full extraction — never to
+    wrong results (or a crash)."""
+    from external_llm.analysis._dead_block_shared import _dbx_cache_path
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "mod.py").write_text("def _dead():\n    return 1\n")
+    scan_public_dead_blocks(repo_root=str(repo), file_paths=["mod.py"])
+    with open(_dbx_cache_path(str(repo)), "w", encoding="utf-8") as fh:
+        fh.write("{not json!!")
+
+    candidates = scan_public_dead_blocks(repo_root=str(repo), file_paths=["mod.py"])
+    dead_names = {m.name for c in candidates for m in c.members}
+    assert dead_names == {"_dead"}
+
+
+def test_extraction_cache_version_mismatch_discarded(tmp_path):
+    """A cache written by a different collector version must be discarded
+    (bump ``_DBX_CACHE_VERSION`` when def/reference semantics change)."""
+    import json
+
+    from external_llm.analysis._dead_block_shared import _dbx_cache_path
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "mod.py").write_text("def _dead():\n    return 1\n")
+    scan_public_dead_blocks(repo_root=str(repo), file_paths=["mod.py"])
+    path = _dbx_cache_path(str(repo))
+    with open(path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    payload["format"] = payload["format"] + 99
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+
+    candidates = scan_public_dead_blocks(repo_root=str(repo), file_paths=["mod.py"])
+    dead_names = {m.name for c in candidates for m in c.members}
+    assert dead_names == {"_dead"}
+
+
+def test_empty_repo_root_bypasses_cache(tmp_path):
+    """The unit-test convention ``repo_root=""`` must NOT touch the CWD's
+    ``.cache`` (the cache file would otherwise grow with throwaway temp
+    files from every test run).  The P-1 path guard makes the lookup
+    fail-closed: an empty root raises instead of returning a CWD path."""
+    import os
+
+    from external_llm.analysis._dead_block_shared import _dbx_cache_path
+    from external_llm.analysis.parse_cache import CachePathError
+
+    with pytest.raises(CachePathError):
+        _dbx_cache_path("")
+
+    cache_path = os.path.join(".cache", "dead_block_extract_v1.json")
+    before = os.path.getmtime(cache_path) if os.path.exists(cache_path) else None
+    src = _make_py_file("""\
+        def _dead():
+            return 1
+    """)
+    try:
+        scan_public_dead_blocks(repo_root="", file_paths=[src])
+        after = os.path.getmtime(cache_path) if os.path.exists(cache_path) else None
+        assert after == before, "repo_root='' must bypass the extraction cache"
+    finally:
+        Path(src).unlink()
+
+
+def test_dbx_cache_path_goes_through_path_guard(tmp_path, monkeypatch):
+    """P-1 regression: the cache path must route through the fail-closed guard."""
+    from external_llm.analysis import parse_cache
+    from external_llm.analysis._dead_block_shared import (
+        _DBX_CACHE_VERSION,
+        _dbx_cache_path,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        parse_cache,
+        "cache_file_path",
+        lambda root, filename: calls.append((root, filename)) or "/guarded",
+    )
+    assert _dbx_cache_path(str(tmp_path)) == "/guarded"
+    assert calls == [(str(tmp_path), f"dead_block_extract_v{_DBX_CACHE_VERSION}.json")]

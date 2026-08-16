@@ -12,6 +12,7 @@ Architecture:
   Server loads: compressed_summary + recent_turns + RAG + new message
   Result: consistent ~7K token context regardless of conversation length
 """
+
 from __future__ import annotations
 
 import json
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DesignSession:
     """A persistent design chat session."""
+
     session_id: str
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -72,6 +74,7 @@ class DesignSessionManager:
         # _save is called from both the main thread (add_turn) and the background compress thread (persist callback)
         # — atomic protection for archive migration + active file writes
         import threading as _threading
+
         self._save_lock = _threading.Lock()
         # Identifier for this process (terminal) — marks in_progress ownership in multi-terminal shared sessions
         # and distinguishes "my turn / another's turn" during context building
@@ -99,8 +102,7 @@ class DesignSessionManager:
         """
         try:
             candidates = [
-                p for p in self.sessions_dir.glob("*.archive.jsonl")
-                if p.stat().st_size > self._ARCHIVE_MAX_BYTES
+                p for p in self.sessions_dir.glob("*.archive.jsonl") if p.stat().st_size > self._ARCHIVE_MAX_BYTES
             ]
         except OSError as e:
             logger.debug("archive sweep could not stat sessions dir: %s", e)
@@ -190,9 +192,16 @@ class DesignSessionManager:
     def _refresh_if_stale(self, session: DesignSession) -> None:
         """Absorb disk state if disk mtime differs from last sync timestamp."""
         path = self._session_path(session.session_id)
+        # DS-1: mtime must be initialized — a cached-but-never-written session
+        # (get_or_create created it, no add_turn yet) has no disk file, the
+        # suppressed stat failure left mtime unbound, and every subsequent
+        # cache hit crashed with UnboundLocalError on the comparison below.
+        mtime: Optional[float] = None
         with suppress(OSError):
             mtime = path.stat().st_mtime
-        if mtime == self._mtimes.get(session.session_id):
+        if mtime is None or mtime == self._mtimes.get(session.session_id):
+            # No file on disk → nothing to absorb (equivalent to the old
+            # adopt path: _load_raw would return None and adopt no-ops).
             return
         with self._save_lock, self._flock(session.session_id):
             try:
@@ -229,10 +238,7 @@ class DesignSessionManager:
         # appended turn whose save failed, followed by another process's newer
         # write. A threshold would silently drop it (data loss). Turns already in
         # base are skipped, so the common case is byte-identical to before.
-        seen = {
-            (t.get("timestamp"), t.get("role"), t.get("content"))
-            for t in base_turns
-        }
+        seen = {(t.get("timestamp"), t.get("role"), t.get("content")) for t in base_turns}
         merged = list(base_turns)
         merged.extend(t for t in other_turns if (t.get("timestamp"), t.get("role"), t.get("content")) not in seen)
         session.turns[:] = merged
@@ -246,7 +252,18 @@ class DesignSessionManager:
             session.chat_mode = fresh.chat_mode
             session.decisions = fresh.decisions
 
-    def add_turn(self, session_id: str, role: str, content: str, model: str = "", digest: str = "", exclude_from_compression: bool = False, in_progress: bool = False, tool_results: Optional[list] = None, auto: bool = False) -> None:
+    def add_turn(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        model: str = "",
+        digest: str = "",
+        exclude_from_compression: bool = False,
+        in_progress: bool = False,
+        tool_results: Optional[list] = None,
+        auto: bool = False,
+    ) -> None:
         """Add a turn to the session.
 
         digest: deterministic work-state digest of the turn's tool loop
@@ -440,7 +457,9 @@ class DesignSessionManager:
         return self._ctx.load_project_context_md()
 
     def build_context_messages(
-        self, session: DesignSession, current_model: str = "",
+        self,
+        session: DesignSession,
+        current_model: str = "",
         skip_core_prompt: bool = False,
         mode: str = "",
     ) -> list[dict[str, str]]:
@@ -448,8 +467,11 @@ class DesignSessionManager:
         if not mode:
             mode = getattr(session, "chat_mode", "code")
         return self._ctx.build_context_messages(
-            session, current_model, skip_core_prompt=skip_core_prompt,
-            mode=mode, owner=self._owner,
+            session,
+            current_model,
+            skip_core_prompt=skip_core_prompt,
+            mode=mode,
+            owner=self._owner,
         )
 
     # ── Delegated to SessionCompressionContext ─────────────────────────────────
@@ -464,14 +486,21 @@ class DesignSessionManager:
     ) -> None:
         """Delegate to SessionCompressionContext with persist callback."""
         self._ctx.schedule_background_compress(
-            session, model, llm_client, force=force,
+            session,
+            model,
+            llm_client,
+            force=force,
             notify=notify,
             persist=lambda: self._save(session),
         )
 
     def compact_now(
-        self, session: DesignSession, model: str, llm_client,
-        recent_keep: int = 0, notify=None,
+        self,
+        session: DesignSession,
+        model: str,
+        llm_client,
+        recent_keep: int = 0,
+        notify=None,
     ) -> bool:
         """Synchronously compress the recent verbatim window into the summary.
 
@@ -480,8 +509,12 @@ class DesignSessionManager:
         next turn's context is just the (bounded) summary. Used by ``/clear``.
         """
         return self._ctx.compact_now(
-            session, model, llm_client, recent_keep=recent_keep,
-            notify=notify, persist=lambda: self._save(session),
+            session,
+            model,
+            llm_client,
+            recent_keep=recent_keep,
+            notify=notify,
+            persist=lambda: self._save(session),
         )
 
     def list_sessions(self) -> list[dict[str, Any]]:
@@ -511,13 +544,15 @@ class DesignSessionManager:
                         updated = path.stat().st_mtime
                     except OSError:
                         updated = 0
-                sessions.append({
-                    "session_id": data.get("session_id", path.stem),
-                    "created_at": data.get("created_at"),
-                    "updated_at": updated,
-                    "turn_count": len(data.get("turns", [])) + data.get("archived_count", 0),
-                    "has_summary": bool(data.get("compressed_summary")),
-                })
+                sessions.append(
+                    {
+                        "session_id": data.get("session_id", path.stem),
+                        "created_at": data.get("created_at"),
+                        "updated_at": updated,
+                        "turn_count": len(data.get("turns", [])) + data.get("archived_count", 0),
+                        "has_summary": bool(data.get("compressed_summary")),
+                    }
+                )
         # Sort newest-first by updated_at (float), tie-broken by id for stability.
         sessions.sort(key=lambda s: (s.get("updated_at") or 0, s.get("session_id") or ""), reverse=True)
         return sessions[:20]  # last 20
@@ -576,13 +611,12 @@ class DesignSessionManager:
         local_cut = session.compressed_up_to - session.archived_count
         if local_cut <= 0:
             return
-        n = 0
-        for t in session.turns[:local_cut]:
-            if t.get("preserve"):
-                break
-            n += 1
-        if n <= 0:
-            return
+        # NOTE: no legacy "preserve" scan — nothing produces preserve=True
+        # turns any more (add_turn never sets it and _load_raw migrates legacy
+        # disk files at the single read choke point), so every turn below the
+        # cut is archivable and the old n<=0 guard was reachable only via the
+        # removed scan (A262 pattern).
+        n = local_cut
         path = self._archive_path(session.session_id)
         # P28-3: keep the archive bounded — fold the oldest records into
         # summary records before appending (no-op while under the cap).
@@ -600,7 +634,8 @@ class DesignSessionManager:
         except Exception as e:
             logger.warning(
                 "Failed to archive turns for session %s: %s — keeping turns in active file",
-                session.session_id, e,
+                session.session_id,
+                e,
             )
             return
         session.turns = session.turns[n:]
@@ -683,7 +718,9 @@ class DesignSessionManager:
             return False
         logger.info(
             "Compacted design-session archive %s: %d -> %d bytes",
-            session_id, total, len(new_text),
+            session_id,
+            total,
+            len(new_text),
         )
         return True
 

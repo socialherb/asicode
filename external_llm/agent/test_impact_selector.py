@@ -108,6 +108,33 @@ def _iter_top_level_nodes(path: Path) -> Iterator[ast.stmt]:
     yield from ast.iter_child_nodes(tree)
 
 
+def _collect_top_level(path: Path, visit) -> set[str]:
+    """Collect names from top-level statements of *path* through *visit*.
+
+    *visit* is called with ``(out, node)`` for every top-level statement and
+    adds the names it recognizes to ``out``.  Shared by ``_defined_names`` and
+    ``_extract_imports`` so both collectors degrade to empty results through
+    the same tolerance path (``_iter_top_level_nodes`` yields nothing when the
+    file cannot be read or parsed).
+    """
+    out: set[str] = set()
+    for node in _iter_top_level_nodes(path):
+        visit(out, node)
+    return out
+
+
+def _collect_defined_names(out: set[str], node: ast.stmt) -> None:
+    """Add the names defined by one top-level *node* to *out*."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        out.add(node.name)
+    elif isinstance(node, ast.ClassDef):
+        out.add(node.name)
+        for sub in node.body:
+            if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.add(sub.name)
+                out.add(f"{node.name}.{sub.name}")
+
+
 def _defined_names(path: Path) -> set[str]:
     """Top-level defs/classes and methods defined in ``path``.
 
@@ -116,17 +143,7 @@ def _defined_names(path: Path) -> set[str]:
     bare name. Tolerates syntax errors (returns whatever parsed) so a
     half-edited file never breaks selection.
     """
-    names: set[str] = set()
-    for node in _iter_top_level_nodes(path):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            names.add(node.name)
-        elif isinstance(node, ast.ClassDef):
-            names.add(node.name)
-            for sub in node.body:
-                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    names.add(sub.name)
-                    names.add(f"{node.name}.{sub.name}")
-    return names
+    return _collect_top_level(path, _collect_defined_names)
 
 
 def is_test_file(rel_path: str) -> bool:
@@ -198,6 +215,16 @@ def git_status_test_files(repo_root: str | Path) -> list[str]:
 
 # ── import extraction (signal 3) ─────────────────────────────────────────────
 
+def _collect_import_names(out: set[str], node: ast.stmt) -> None:
+    """Add the module names imported by one top-level *node* to *out*."""
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            if alias.name:
+                out.add(alias.name)  # full dotted path
+    elif isinstance(node, ast.ImportFrom) and node.module:
+        out.add(node.module)  # full dotted path
+
+
 def _extract_imports(path: Path) -> set[str]:
     """Return set of full dotted module names imported by ``path``.
 
@@ -209,15 +236,7 @@ def _extract_imports(path: Path) -> set[str]:
     matches ``external_llm.agent.orchestrator``) instead of collapsing
     everything to a single top-level key.
     """
-    imports: set[str] = set()
-    for node in _iter_top_level_nodes(path):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name:
-                    imports.add(alias.name)  # full dotted path
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imports.add(node.module)  # full dotted path
-    return imports
+    return _collect_top_level(path, _collect_import_names)
 
 
 def _is_first_party_module(mod: str, repo_root: Path) -> bool:

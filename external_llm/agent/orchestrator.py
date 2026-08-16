@@ -51,6 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
+from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.common.walk_policy import _walk_dir_sort_key, _walk_should_skip_dir
 from utils.llm_utils import simple_llm_call
 from utils.string_helper import parse_json, utf8_trailing_incomplete_len
@@ -463,6 +464,23 @@ class SubTaskSpec:
     priority: int = 0     # 0=highest (run first), 1=normal, 2=lowest
 
 
+def _resolve_subagent_base_max_turns(
+    orch_config: "OrchestratorConfig", extra_turns: int = 0
+) -> int:
+    """Turn budget for an IPC-dispatched sub-agent.
+
+    Base = the orchestrator's AgentConfig.max_turns when one is configured,
+    else the SSOT ``AGENT_MAX_TURNS_DEFAULT`` (no magic 12 fallback) — plus
+    ``extra_turns`` for revision retries.
+    """
+    base = (
+        orch_config.agent_config.max_turns
+        if orch_config.agent_config
+        else _cfg.counts.AGENT_MAX_TURNS_DEFAULT
+    )
+    return base + extra_turns
+
+
 @dataclass
 class OrchestratorConfig:
     max_subagents: int = 3
@@ -727,6 +745,22 @@ def _expand_directory_assignments(repo_root: Optional[str], files: list[str]) ->
             expanded.append(f)
             continue
         if _is_dir:
+            # The walk-pruning predicate only sees *children* of the walked
+            # directory — a skip dir ASSIGNED DIRECTLY (e.g. ".venv",
+            # "node_modules") would otherwise be expanded wholesale, inflating
+            # the snapshot set with vendored noise and tripping the cap.
+            # Leave it bare (same degraded semantics as a cap-exceeded dir).
+            _base = os.path.basename(_abs.rstrip("/\\")) or os.path.basename(_abs)
+            if _walk_should_skip_dir(_base):
+                logger.warning(
+                    "assigned_files entry %r is a walk-skipped directory; NOT "
+                    "expanding — left as a bare directory path, so its "
+                    "snapshot/revert/scope-matching will be skipped. Assign "
+                    "specific files instead.",
+                    f,
+                )
+                expanded.append(f)
+                continue
             _dir_files: list[str] = []
             _over_cap = False
             for _dirpath, _dirnames, _filenames in os.walk(_abs):
@@ -876,6 +910,14 @@ _SNAPSHOT_AGGREGATE_MAX_BYTES = 64 * 1024 * 1024  # 64 MiB
 # this per file only burns RAM before truncation. 64 KiB comfortably covers
 # the whole prompt budget while bounding the read of a huge generated file.
 _SYNTH_DIFF_FILE_BYTES = 64 * 1024
+
+# Shared-memory injection caps: summaries of every completed sub-agent are
+# recorded, but each subsequent task receives only the most recent few (later
+# batches are more relevant) within a total char budget. This keeps each task's
+# prompt O(1) in the number of sub-agents instead of O(N²) across a large run.
+_SHARED_MEMORY_INJECT_LIMIT = 12        # max summaries injected per task
+_SHARED_MEMORY_INJECT_MAX_CHARS = 6000  # char budget for the injected block
+_SHARED_MEMORY_STORE_LIMIT = 50         # ring cap on the stored list itself
 
 
 def _read_synth_diff_head(abs_path: str, max_bytes: int = _SYNTH_DIFF_FILE_BYTES) -> tuple[str, bool, int]:
@@ -1326,7 +1368,8 @@ class OrchestratorAgent:
         # worker that missed the shutdown.json sentinel (orphan prevention).
         self._ipc_worker_procs: dict[str, Any] = {}
         # Shared memory: compact summaries of completed SubAgents, accumulated
-        # across batches and injected into all subsequent SubAgents' context.
+        # across batches. Each subsequent SubAgent receives only the most recent
+        # few (entry + char capped) so its prompt stays O(1) in sub-agent count.
         self._shared_memory: list[str] = []
         # ── Tool-loop mode state ──────────────────────────────────────────
         # Background sub-agent bookkeeping for tool-loop mode. spawn_subagent
@@ -1727,7 +1770,7 @@ class OrchestratorAgent:
                 if result is not None:
                     summary = self._extract_subagent_summary(task_map[tid], result)
                     if summary:
-                        self._shared_memory.append(summary)
+                        self._record_subagent_summary(summary)
 
         return results
 
@@ -1905,14 +1948,17 @@ class OrchestratorAgent:
                 f"[Current task]\n{task_text}"
             )
 
-        # Inject shared memory: summaries of ALL previously completed SubAgents
-        # (not just direct dependencies). Excludes tasks already covered above.
+        # Inject shared memory: summaries of previously completed SubAgents (not
+        # just direct dependencies). Excludes tasks already covered above, then
+        # caps the block to the most recent entries within a char budget so the
+        # prompt stays O(1) in the number of sub-agents (see _cap_shared_memory_injection).
         dep_ids = set(subtask.dependencies)
         shared = [
             s for s in self._shared_memory
             if not any(s.startswith(f"[{dep_id}:") for dep_id in dep_ids)
         ]
         if shared:
+            shared = self._cap_shared_memory_injection(shared)
             shared_block = "\n".join(shared)
             task_text = (
                 f"[Orchestration progress]\n{shared_block}\n\n"
@@ -1953,6 +1999,36 @@ class OrchestratorAgent:
         files_note = f" | Files: {', '.join(files)}" if files else ""
         msg = (result.final_message or "")[:200].replace("\n", " ")
         return f"[{subtask.task_id}: {subtask.title} → {status_en}{files_note}] {msg}"
+
+    def _record_subagent_summary(self, summary: str) -> None:
+        """Record a completed-subagent summary, keeping ``_shared_memory`` bounded.
+
+        Only the most recent ``_SHARED_MEMORY_STORE_LIMIT`` entries can ever be
+        injected (the inject limit is far smaller), so older entries are dead
+        weight — trimming the ring here bounds memory for very large runs.
+        """
+        self._shared_memory.append(summary)
+        if len(self._shared_memory) > _SHARED_MEMORY_STORE_LIMIT:
+            self._shared_memory = self._shared_memory[-_SHARED_MEMORY_STORE_LIMIT:]
+
+    def _cap_shared_memory_injection(self, shared: list[str]) -> list[str]:
+        """Bound a shared-memory block for injection into one task's prompt.
+
+        Keeps the most recent entries (later batches are more relevant) within
+        ``_SHARED_MEMORY_INJECT_LIMIT`` entries and ``_SHARED_MEMORY_INJECT_MAX_CHARS``
+        total chars, preserving chronological order. At least one entry is always
+        kept — even if it alone exceeds the char budget — so a task never loses
+        all orchestration context.
+        """
+        tail = shared[-_SHARED_MEMORY_INJECT_LIMIT:]
+        selected: list[str] = []
+        used = 0
+        for s in reversed(tail):
+            if selected and used + len(s) > _SHARED_MEMORY_INJECT_MAX_CHARS:
+                break
+            selected.append(s)
+            used += len(s)
+        return list(reversed(selected))
 
     # ── Single subagent runner ─────────────────────────────────────────────
     def _resolve_subagent_model(self, agent_id: str) -> tuple[str, str, str]:
@@ -2036,10 +2112,9 @@ class OrchestratorAgent:
             # orchestrator model (see _resolve_subagent_model).
             _provider, _model, _api_key = self._resolve_subagent_model(agent_id)
 
-            _base_max_turns = (
-                self.orch_config.agent_config.max_turns
-                if self.orch_config.agent_config else 12
-            ) + extra_turns
+            _base_max_turns = _resolve_subagent_base_max_turns(
+                self.orch_config, extra_turns
+            )
             ipc_task = SubagentTask(
                 task_id=subtask.task_id,
                 title=subtask.title,
@@ -3216,9 +3291,14 @@ class OrchestratorAgent:
         out: list = []
         for _e in reported:
             _raw = (_e.get("file") if isinstance(_e, dict) else _e) or ""
+            if not _raw:
+                # Empty file field (malformed report) must not normalize to "."
+                # — normpath("") is ".", which passes every subtraction below
+                # and would surface as a phantom genuine violation.
+                continue
             _f = os.path.normpath(_raw)
             if not _f:
-                continue
+                continue  # pragma: no cover — normpath(non-empty) never yields "" (normpath("") == "." is the empty case, filtered above)
             if _f in _baseline:
                 continue
             # Use prefix-aware matching so unexpanded directory entries (those
@@ -3311,7 +3391,12 @@ class OrchestratorAgent:
         for _e in (unassigned or []):
             _raw = (_e.get("file") if isinstance(_e, dict) else _e) or ""
             _f = os.path.normpath(_raw)
-            if not _f or _is_infra_path(_f):
+            # ``os.path.normpath("")`` returns ".", NOT "" — an empty/None
+            # entry (malformed worker report) would sail past the truthiness
+            # guard below, classify "." as a directory, and rmtree THE REPO
+            # ROOT (ignore_errors=True ⇒ wholesale deletion). Skip raw-empty
+            # entries AND the normpath artifact explicitly.
+            if not _raw or _f in ("", ".", "..") or _is_infra_path(_f):
                 continue
             _abs = os.path.join(repo_root, _f) if repo_root else _f
             if os.path.isdir(_abs):
@@ -4065,7 +4150,7 @@ Approve if the change correctly implements what was asked without breaking exist
             status = ("error" if not result or result.status == "error"
                       else getattr(result, "status", "completed"))
             with self._bg_lock:
-                # Re-check inside the lock: the unlocked guard above (L2317) is a
+                # Re-check inside the lock: the unlocked fast-path guard above is a
                 # fast path, but two callers can both observe result is None,
                 # both see future.done(), and both reach here — a TOCTOU that
                 # would append the SAME result twice into _bg_results (double-
@@ -5111,7 +5196,7 @@ Approve if the change correctly implements what was asked without breaking exist
 
             for w in adj[v]:
                 if w not in task_map:
-                    continue  # Skip dependencies not in current task set
+                    continue  # pragma: no cover — adj is built only from deps present in task_map (see the builder loop above), so this guard is unreachable
                 if w not in visited:
                     dfs(w)
                 elif w in on_stack:

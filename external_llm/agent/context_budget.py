@@ -59,6 +59,9 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "claude-sonnet-5":           200_000,
     "claude-haiku-4-5":          200_000,
     "claude-haiku-4-5-20251001": 200_000,
+    # OpenRouter serves this model under the dot spelling ``claude-sonnet-4.6``
+    # (same pinned snapshot as the hyphen form below); both resolve to 200K.
+    "claude-sonnet-4.6":         200_000,
     "claude-sonnet-4-6":         200_000,
     "claude-sonnet-4-5":         200_000,
     "claude-opus-4-8":           200_000,
@@ -73,10 +76,11 @@ _CONTEXT_LIMITS: dict[str, int] = {
     # DeepSeek — original deepseek-r1 (64K context); deepseek-chat/reasoner are
     # deprecated aliases for deepseek-v4-flash thinking/non-thinking → 1M fallback.
     "deepseek-r1":       64_000,
-    # Zhipu GLM (zai + opencode). glm-5.2 is the DEFAULT_MODEL and 1M is verified
+    # Zhipu GLM (zai + opencode). glm-5.3 is the DEFAULT_MODEL and 1M is verified
     # (Z.ai docs: "Context Length: 1M" — generational leap from the 200K family).
     # Listed EXPLICITLY (not via _DEFAULT fallback) so the default model's window
     # cannot silently drift if _DEFAULT_CONTEXT_LIMIT changes. glm-5/5.1/5-turbo 200K; glm-4.7 128K.
+    "glm-5.3":          1_000_000,
     "glm-5.2":          1_000_000,
     "glm-5.1":          200_000,
     "glm-5-turbo":      200_000,
@@ -121,6 +125,15 @@ _CONTEXT_LIMITS: dict[str, int] = {
 _FAMILY_PREFIX_LIMITS: tuple[tuple[str, int], ...] = (
     ("claude-", 200_000),   # every claude-* entry above is 200K — shared by pinned dates
     ("grok-4.5", 500_000),  # grok-4.5 variants share the 500K window
+    # Qwen2.5-Coder series (local Ollama: qwen2.5-coder:0.5b/1.5b/3b/7b/14b/32b).
+    # The MODEL supports 128K tokens (Qwen2.5-Coder technical report); Ollama
+    # serves a smaller num_ctx by default (4096) but _num_ctx_for_model raises it
+    # to at least 8192. The dynamic /api/show query (priority 0) reads the user's
+    # Modelfile value when one is set; this entry is the static fallback so a
+    # server that is unreachable or lacks num_ctx uses 128K instead of the 1M
+    # fallback (which is 122x the actual server window and made the pre-flight
+    # cap inert). qwen2.5-coder is the OllamaClient.DEFAULT_MODEL.
+    ("qwen2.5-coder", 128_000),
 )
 
 
@@ -650,7 +663,7 @@ class ContextBudgetManager:
         from ``_record_context_overflow`` (and their TTL expiry) are reflected
         immediately instead of a construction-time snapshot.
 
-        The guard paths (agent_loop preemptive_trim, ``_resolve_context_limit``)
+        The guard paths (agent_loop pre-flight guard, ``_resolve_context_limit``)
         all use the live value; the old snapshot made the __init__ log and
         ``fit_messages`` warnings report a cap that could be several 25%-steps
         stale after a 400-driven override — misleading when debugging with logs.

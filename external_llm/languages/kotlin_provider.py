@@ -19,9 +19,11 @@ from .base import (
     _filter_genuine_syntax_errors,
     _replace_last_cmd_path,
     _tempfile_for_content,
+    build_line_index,
     detect_project_root,
     find_brace_block_end,
     find_brace_block_end_offset,
+    line_at_offset,
     tree_sitter_syntax_fallback,
 )
 from .models import (
@@ -368,14 +370,16 @@ class KotlinSyntaxProvider(SyntaxProvider):
         return self._find_symbol_regex(symbol_name, content)
 
     @staticmethod
-    def _find_block_end(content: str, offset: int) -> int:
+    def _find_block_end(content: str, offset: int, nl: list[int] | None = None) -> int:
         """Heuristic: find the matching closing brace from *offset*.
 
         Delegates to the shared :func:`find_brace_block_end` (C-family SSOT)
         which skips string/char/template literals and ``//`` / ``/* */``
         comments so braces inside them do not corrupt the depth counter.
+        *nl* is an optional precomputed line index (see ``base.build_line_index``)
+        that keeps the internal line queries O(log n) in hot loops.
         """
-        return find_brace_block_end(content, offset)
+        return find_brace_block_end(content, offset, nl)
 
     # ── Definition keywords ───────────────────────────────────────────────
 
@@ -386,33 +390,34 @@ class KotlinSyntaxProvider(SyntaxProvider):
     ) -> list[tuple[str, str, int, int]]:
         """Regex fallback: find all top-level Kotlin definitions via pattern + brace counting."""
         results: list[tuple[str, str, int, int]] = []
+        nl = build_line_index(content)
         # Top-level functions: fun Name()  (not indented)
         for m in re.finditer(r'^fun\s+(\w+)\s*[\(<]', content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "function", start_line, end_line))
         # Classes: (modifiers) class Name
         for m in re.finditer(
             r'^(?:(?:data|sealed|abstract|open|inner|public|private|protected|internal)\s+)*'
             r'class\s+(\w+)', content, re.MULTILINE,
         ):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "class", start_line, end_line))
         # Interfaces
         for m in re.finditer(r'^interface\s+(\w+)', content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "interface", start_line, end_line))
         # Objects: object Name
         for m in re.finditer(r'^object\s+(\w+)\s*(?::|\{|$)', content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "object", start_line, end_line))
         # Enum classes
         for m in re.finditer(r'^enum\s+class\s+(\w+)', content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "enum", start_line, end_line))
         return results
 
@@ -421,6 +426,7 @@ class KotlinSyntaxProvider(SyntaxProvider):
     ) -> list[tuple[str, int, int]]:
         """Regex fallback: find methods inside a Kotlin class body."""
         results: list[tuple[str, int, int]] = []
+        nl = build_line_index(content)
         esc = re.escape(class_name)
         # Find class definition: class Name ... {
         pat = (
@@ -440,8 +446,8 @@ class KotlinSyntaxProvider(SyntaxProvider):
                 class_body,
             ):
                 method_start = class_body_start + mm.start()
-                method_line = content[:method_start].count("\n") + 1
-                method_end = self._find_block_end(content, method_start)
+                method_line = line_at_offset(nl, method_start)
+                method_end = self._find_block_end(content, method_start, nl)
                 results.append((mm.group(1), method_line, method_end))
         return results
 

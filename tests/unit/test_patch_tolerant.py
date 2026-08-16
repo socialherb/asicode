@@ -814,6 +814,22 @@ class TestC0PlacementVerification:
         )
         assert "rolled back" in (err or ""), f"error should explain the rollback: {err}"
 
+    def test_rollback_routes_through_atomic_write_text(self, engine, kt_repo, monkeypatch):
+        """Rollback must restore via atomic_write_text, never open(path, "w")."""
+        from external_llm import patch_engine as pe_mod
+        calls = []
+        real = pe_mod.atomic_write_text
+
+        def _spy(path, content, **kw):
+            calls.append((str(path), content))
+            return real(path, content, **kw)
+        monkeypatch.setattr(pe_mod, "atomic_write_text", _spy)
+        ok, _err, mode = engine._tolerant_git_apply(self.STALE_INSERT_PATCH, "code.kt")
+        assert not ok, f"unverifiable -C0 apply must not report success (mode={mode})"
+        assert calls, "rollback must write through atomic_write_text"
+        assert calls[-1][1] == self.KT_CONTENT, "rollback must restore pre-patch content"
+        assert (kt_repo / "code.kt").read_text() == self.KT_CONTENT
+
     def test_full_pipeline_never_misplaces(self, engine, kt_repo):
         """apply_patch end-to-end on the drifted patch: either a repair path
         places the hunk correctly, or the whole apply fails and the file is

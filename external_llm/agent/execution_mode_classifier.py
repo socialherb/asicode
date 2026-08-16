@@ -118,8 +118,9 @@ _mode_matcher_lock = threading.Lock()
 # knows (_MODE_INTENT_EXAMPLES["line_edit"]) must appear here, otherwise a
 # digit prompt phrased with that word pays an ~8s sentence_transformers import
 # + embedding-model load on the first semantic backstop hit. Keep in sync with
-# the Hangul examples ("라인", "줄", "행") in _MODE_INTENT_EXAMPLES above.
-_LINE_REFERENCE_KEYWORDS: tuple[str, ...] = ("line", "라인", "줄", "행")
+# the English/Hangul examples ("line", "position", "row", "라인", "줄",
+# "행", "위치") in _MODE_INTENT_EXAMPLES above.
+_LINE_REFERENCE_KEYWORDS: tuple[str, ...] = ("line", "position", "row", "라인", "줄", "행", "위치")
 
 
 def _get_mode_matcher():
@@ -148,19 +149,25 @@ def _has_number_after_keyword(text: str, keywords: tuple[str, ...]) -> bool:
     """Check if any keyword in *keywords* is immediately followed by a number.
 
     Handles both ``"line 42"`` and ``"line42"`` forms.  No regex needed.
+
+    Scans *every* occurrence of each keyword: a keyword embedded in a longer
+    word ("delineate", "줄바꿈") must not shadow a genuine later reference
+    ("line 42", "줄 42").  The first space-delimited neighbor after an
+    occurrence must be a digit.
     """
     for kw in keywords:
-        idx = text.find(kw)
-        if idx < 0:
-            continue
-        # Scan the remainder after the keyword — first non-space char must be a digit.
-        rest = text[idx + len(kw):].lstrip()
-        if rest and rest[0].isdigit():
-            return True
-        # The keyword may be embedded in a longer word; keep scanning.
-        # Fall through to check for later occurrences (handles "online 42")
-        # — the prefix check above ensures the first space-delimited neighbor
-        # is a number. That's good enough for our use case.
+        start = 0
+        while True:
+            idx = text.find(kw, start)
+            if idx < 0:
+                break
+            # Scan the remainder after the keyword — first non-space char must be a digit.
+            rest = text[idx + len(kw):].lstrip()
+            if rest and rest[0].isdigit():
+                return True
+            # The keyword may be embedded in a longer word; skip past this
+            # occurrence and keep scanning for later ones.
+            start = idx + len(kw)
     return False
 
 
@@ -189,8 +196,10 @@ def _analyze_intent_with_keywords(prompt: str) -> str:
     """
     prompt_lower = prompt.lower()
 
-    # Legacy mode: only when explicitly requested
-    if "legacy" in prompt_lower:
+    # Legacy mode: only when explicitly requested. Whole-word match (\b) so a
+    # file/identifier named "legacy_*" (e.g. "fix legacy_parser.py") doesn't
+    # misroute an ordinary edit request to the legacy diff format.
+    if re.search(r"\blegacy\b", prompt_lower):
         return "legacy"
 
     # Check for keyword followed by digits (the number is the actual cue, not the keyword).

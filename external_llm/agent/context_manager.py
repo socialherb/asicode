@@ -905,7 +905,7 @@ class SessionCompressionContext(ContextManager):
             # window itself keeps occupancy high, every turn would trigger an LLM
             # summarize call for a single turn (the compress-lock blocks concurrency,
             # not re-firing). Fewer than FORCE_COMPRESS_MIN_TURNS → skip; the
-            # hard-cap front-trim (_apply_context_hard_cap) still bounds the window.
+            # provider's context limit still bounds the window (400 → overflow override).
             if not self.needs_compression(
                 session, batch_min=self._cfg.compression.FORCE_COMPRESS_MIN_TURNS
             ):

@@ -5,6 +5,7 @@ import textwrap
 
 from external_llm.editor._editor_core.common.import_normalizer import (
     _collect_f821_protected_from_source,
+    _f821_protected,
     collect_typing_usage,
     mark_f821_protected,
     normalize_typing_imports,
@@ -278,5 +279,176 @@ def test_normalize_preserves_f821_protected_unused_import():
             "recreates the F821 the repair just fixed (oscillation)."
         )
         assert "# f821-protected" in result
+    finally:
+        os.unlink(path)
+
+
+# ── RED→GREEN: uncovered branches ────────────────────────────────────────────
+
+
+def test_collect_usage_vararg_kwarg_string_annotations():
+    """*args/**kwargs string annotations are collected (L174/L176)."""
+    src = textwrap.dedent("""
+        def foo(*args: "Dict[str, int]", **kwargs: "List[int]") -> None:
+            pass
+    """)
+    used = collect_typing_usage(src)
+    assert "Dict" in used
+    assert "List" in used
+
+
+def test_collect_usage_annassign_string_annotation():
+    """x: "Optional[int]" = None collects Optional (L182-183)."""
+    src = 'x: "Optional[int]" = None\n'
+    used = collect_typing_usage(src)
+    assert "Optional" in used
+
+
+def test_collect_usage_string_annotation_boundary_rescan():
+    """A non-boundary match ("MyDict" contains "Dict") rescans and misses
+    instead of false-positiving (L216)."""
+    src = 'x: "MyDict" = None\n'
+    used = collect_typing_usage(src)
+    assert "Dict" not in used
+
+
+def test_collect_f821_protected_ignores_other_comments():
+    """Non-f821 markers on typing imports are skipped, not treated as
+    protection (L60)."""
+    src = "from typing import Optional  # noqa: F401\nx = 1\n"
+    assert _collect_f821_protected_from_source(src) == set()
+
+
+def test_mark_f821_protected_missing_file_is_noop():
+    """mark_f821_protected on a missing file is a no-op: in-memory cache is
+    still updated, nothing raises (L91-93)."""
+    path = os.path.join(tempfile.mkdtemp(), "does_not_exist.py")
+    mark_f821_protected(path, "Optional")
+    assert "Optional" in _f821_protected.get(os.path.abspath(path), set())
+
+
+def test_mark_f821_protected_write_failure_logs(monkeypatch, caplog):
+    """Persistence failure is logged and the in-memory cache still wins
+    (L107-108)."""
+    import logging
+
+    def _boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "external_llm.editor._editor_core.common.import_normalizer.atomic_write_text",
+        _boom,
+    )
+    src = "from typing import Optional\nx = Optional[int]\n"
+    path = _write_temp(src)
+    try:
+        with caplog.at_level(
+            logging.WARNING,
+            logger="external_llm.editor._editor_core.common.import_normalizer",
+        ):
+            mark_f821_protected(path, "Optional")
+        assert any("failed to persist marker" in r.message for r in caplog.records)
+    finally:
+        os.unlink(path)
+
+
+def test_normalize_missing_file_returns_false():
+    """A missing file is not an error, just a no-op (L237-238)."""
+    path = os.path.join(tempfile.mkdtemp(), "missing.py")
+    assert normalize_typing_imports(path) is False
+
+
+def test_normalize_syntax_error_returns_false():
+    """An unparseable file is skipped (L242-243)."""
+    path = _write_temp("def foo(: int:")
+    try:
+        assert normalize_typing_imports(path) is False
+    finally:
+        os.unlink(path)
+
+
+def test_normalize_non_typing_import_satisfies_usage():
+    """Symbols already imported from a non-typing source (collections) are
+    not re-added to the typing import (L261-262)."""
+    src = textwrap.dedent("""\
+        from collections import Mapping
+
+        def f(x: Mapping[str, int]) -> None:
+            pass
+    """)
+    path = _write_temp(src)
+    try:
+        assert normalize_typing_imports(path) is False
+        with open(path) as fh:
+            assert "from typing import" not in fh.read()
+    finally:
+        os.unlink(path)
+
+
+def test_normalize_rewrite_parse_failure_skips_write(monkeypatch):
+    """Post-rewrite validation failure (ast.parse #3) skips the write and
+    returns False (L344-349)."""
+    import ast as _ast
+
+    real_parse = _ast.parse
+    calls = {"n": 0}
+
+    def _flaky_parse(source, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 3:  # normalize → collect_usage → rewrite validation
+            raise SyntaxError("boom")
+        return real_parse(source, *a, **k)
+
+    monkeypatch.setattr(
+        "external_llm.editor._editor_core.common.import_normalizer.ast.parse",
+        _flaky_parse,
+    )
+    src = textwrap.dedent("""\
+        from typing import Optional
+
+        def f(x: int) -> int:
+            return x
+    """)
+    path = _write_temp(src)
+    try:
+        assert normalize_typing_imports(path) is False
+    finally:
+        os.unlink(path)
+
+
+def test_normalize_write_failure_returns_false(monkeypatch):
+    """A failed atomic write returns False and keeps the original file
+    (L360-362)."""
+    def _boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "external_llm.editor._editor_core.common.import_normalizer.atomic_write_text",
+        _boom,
+    )
+    src = textwrap.dedent("""\
+        def f(x: Dict[str, int]) -> None:
+            pass
+    """)
+    path = _write_temp(src)
+    try:
+        assert normalize_typing_imports(path) is False
+    finally:
+        os.unlink(path)
+
+
+def test_normalize_inserts_import_in_import_free_file():
+    """A typing-using file with NO imports at all gets the import inserted at
+    line 0 (_find_first_import_line's fallback, L372)."""
+    src = textwrap.dedent("""\
+        def f(x: Dict[str, int]) -> None:
+            pass
+    """)
+    path = _write_temp(src)
+    try:
+        assert normalize_typing_imports(path) is True
+        with open(path) as fh:
+            result = fh.read()
+        assert result.startswith("from typing import Dict")
     finally:
         os.unlink(path)

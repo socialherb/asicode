@@ -18,6 +18,12 @@ from .verdict import CollaborationVerdict
 
 logger = logging.getLogger(__name__)
 
+# Retained event log cap: SessionResult.events carries only the most recent
+# events. Streamed text deltas can emit hundreds of events per query and no
+# production consumer reads the full log, so the list is a ring buffer. The
+# event_callback still receives EVERY event regardless of this cap.
+_MAX_RETAINED_EVENTS = 200
+
 
 @dataclass
 class SessionEvent:
@@ -32,6 +38,7 @@ class SessionEvent:
 class SessionResult:
     """Complete result of a Claude Code Agent session."""
     verdict: CollaborationVerdict
+    # Ring-capped at _MAX_RETAINED_EVENTS (most recent events only).
     events: list[SessionEvent] = field(default_factory=list)
     tool_calls_count: int = 0
     total_tokens: int = 0
@@ -120,7 +127,8 @@ class ClaudeSession:
             prompt: The prompt to send to Claude Code Agent.
 
         Returns:
-            SessionResult containing the verdict and all session events.
+            SessionResult containing the verdict and the most recent session
+            events (ring-capped at ``_MAX_RETAINED_EVENTS``).
         """
         if self._client is None:
             raise RuntimeError("ClaudeSession not connected; use async with")
@@ -527,8 +535,15 @@ class ClaudeSession:
             self._emit_event(SessionEvent(type="status", content="INTERRUPTED"))
 
     def _emit_event(self, event: SessionEvent) -> None:
-        """Emit an event to internal list and optional callback."""
+        """Emit an event to internal list and optional callback.
+
+        The internal list is a ring buffer capped at ``_MAX_RETAINED_EVENTS``
+        (most recent only) so a long partial stream cannot grow it without
+        bound; the callback still receives every event regardless of the cap.
+        """
         self._events.append(event)
+        if len(self._events) > _MAX_RETAINED_EVENTS:
+            del self._events[: len(self._events) - _MAX_RETAINED_EVENTS]
         if self._event_callback:
             try:
                 self._event_callback(event)

@@ -5,6 +5,14 @@ Eliminates duplicated utility functions across modules.
 """
 from __future__ import annotations
 
+# P9-2: single source of truth for the edit-target size cap (64 MiB). All
+# rewrite/edit paths (webapp rewrite guard, patch synthesis, AST rewrite
+# fallback) refuse targets larger than this before the full read — a
+# multi-hundred-MB file would otherwise be loaded entirely into memory and
+# produce an unbounded diff. Keeping the value here unifies the 3 independent
+# ``64 * 1024 * 1024`` constants that used to drift apart.
+EDIT_TARGET_MAX_BYTES = 64 * 1024 * 1024
+
 
 def unique_keep_order(items: list) -> list:
     """Deduplicate items while preserving insertion order.

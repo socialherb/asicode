@@ -13,6 +13,7 @@ before killing a running one, the kill still happens outside the manager
 lock, and the public API (get_info / list_jobs / kill / cleanup) is intact.
 """
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -34,24 +35,45 @@ class _FakeProc:
 
     _next_pid = 2_000_000
 
-    def __init__(self, *, done: bool = False, kill_delay: float = 0.0):
+    def __init__(self, *, done: bool = False, kill_delay: float = 0.0,
+                 returncode: int = 0, wait_returncode: int | None = None,
+                 stuck: bool = False):
         _FakeProc._next_pid += 1
         self.pid = _FakeProc._next_pid
         self.stdout = None
         self.stderr = None
         self._done = done
         self._kill_delay = kill_delay
+        self._returncode = returncode
+        # Simulates a leader that ALREADY exited (its real rc) before the
+        # kill attempt — the F1/R2 TOCTOU window.  wait() must then report
+        # the real exit code and kill() must NOT overwrite it.  None → the
+        # process dies FROM our SIGKILL (real signal death, rc = -9).
+        self._wait_returncode = wait_returncode
+        # Simulates a process that SURVIVES SIGKILL (uninterruptible D-state):
+        # kill() is a no-op and wait() raises TimeoutExpired forever — the R3
+        # sticky-"killing" window.  Tests flip this off to let the process
+        # finally die (with a chosen rc) so the reaper can converge.
+        self._stuck = stuck
 
     def poll(self):
-        return 0 if self._done else None
+        return self._returncode if self._done else None
 
     def kill(self):
+        if self._stuck:
+            return  # SIGKILL delivered but the process is in D-state — survives
         self._done = True
+        if self._wait_returncode is None:
+            self._returncode = -9  # killed by our SIGKILL
+        else:
+            self._returncode = self._wait_returncode  # already dead — rc preserved
 
     def wait(self, timeout=None):
+        if self._stuck:
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
         if self._kill_delay:
             time.sleep(self._kill_delay)
-        return 0
+        return self._returncode
 
 
 @pytest.fixture(autouse=True)
@@ -243,14 +265,25 @@ def test_pre_timeout_output_rides_the_handover_into_the_job_buffer():
         mgr.shutdown()
 
 
-def test_output_buffer_tail_cap():
-    """The accumulated buffer keeps the most recent output under the cap."""
-    old = "A" * bjm._OUTPUT_BUF_CAP
-    grown = old + "TAIL_END"
-    capped = bjm._cap_tail(grown)
-    assert capped.endswith("TAIL_END")
-    assert capped.startswith(bjm._TRUNCATION_MARKER)
-    assert len(capped) <= bjm._OUTPUT_BUF_CAP + len(bjm._TRUNCATION_MARKER)
+def test_output_buffer_head_and_tail_under_cap():
+    """The accumulated buffer (a _BoundedCapture) keeps head AND tail under
+    the cap: the stream START survives a >cap stream, not just the tail —
+    _truncate_bash_output's leading half (pytest's failing command) is only
+    as good as what the buffer retained.  RED before F5: the old tail-only
+    _cap_tail string dropped the head entirely."""
+    mgr = BackgroundJobManager(max_jobs=5, reap_interval=9999.0)
+    try:
+        jid = mgr.start("big", _FakeProc())
+        job = mgr._jobs[jid]  # get() removed — internal job reached directly
+        job._stdout_buf.feed(
+            "HEAD_MARKER\n" + "A" * (bjm._OUTPUT_BUF_CAP * 2) + "\nTAIL_MARKER"
+        )
+        info = mgr.get_info(jid)
+        assert info.stdout.startswith("HEAD_MARKER\n"), "stream head lost"
+        assert info.stdout.endswith("TAIL_MARKER")
+        assert "chars dropped" in info.stdout, "elision not announced"
+    finally:
+        mgr.shutdown()
 
 
 def _noisy_proc(script: str):
@@ -287,7 +320,7 @@ def test_malloc_noise_stripped_from_background_job_output():
             time.sleep(0.05)
 
         # The raw buffer must actually contain noise, else the test is vacuous.
-        assert "MallocStackLogging" in mgr.get(jid)._stderr_buf, (
+        assert "MallocStackLogging" in mgr._jobs[jid]._stderr_buf.text(), (
             "no libmalloc noise produced — test would pass vacuously"
         )
 
@@ -347,7 +380,7 @@ def _real_job(mgr, script: str, drain: bool = False) -> str:
 
     proc = _sp.Popen(["bash", "-c", script], stdout=_sp.PIPE, stderr=_sp.PIPE, text=True)
     job_id = mgr.start(script, proc)
-    job = mgr.get(job_id)
+    job = mgr._jobs[job_id]  # get() removed — white-box tests reach the internal job directly
     deadline = time.monotonic() + 30
     while proc.poll() is None and time.monotonic() < deadline:
         if drain:
@@ -504,7 +537,7 @@ def test_read_output_tolerates_a_missing_recovery_attribute():
             del job.proc._recovered_stderr
         out, _err = job.read_output()
         assert "SALVAGED" in out, "a missing stderr attribute discarded stdout"
-        assert "SALVAGED" in job._stdout_buf
+        assert "SALVAGED" in job._stdout_buf.text()
     finally:
         proc.kill()
         proc.wait()
@@ -540,3 +573,455 @@ def test_empty_nonblocking_pipe_reads_as_empty_not_typeerror():
     finally:
         os.close(r_fd)
         os.close(w_fd)
+
+
+# ── F1: kill() must preserve the real exit status of an already-exited job ──
+
+
+def test_kill_preserves_real_exit_status_of_finished_job():
+    """kill() on a job whose process already exited must report the real
+    outcome (completed/failed), not overwrite it with "killed".
+
+    status is only refreshed by poll_status() (reaper tick = 30s), so a
+    finished-but-unpolled job still reads "running".  Before the fix, kill()
+    took the ProcessLookupError fallback (no-op on the dead leader) and
+    forced status="killed", destroying rc=0 vs rc=7 — permanently, because
+    poll_status() early-returns on terminal states.
+    """
+    mgr = BackgroundJobManager(max_jobs=4, reap_interval=9999.0)
+    try:
+        ok_id = mgr.start("ok", _FakeProc(done=True, returncode=0))
+        bad_id = mgr.start("bad", _FakeProc(done=True, returncode=7))
+
+        # Neither job was ever polled — both still read "running" internally
+        # (get_info() would poll and flip them, so inspect the raw state).
+        assert mgr._jobs[ok_id].status == "running"
+        assert mgr._jobs[bad_id].status == "running"
+
+        assert mgr.kill(ok_id) == "completed"
+        assert mgr.kill(bad_id) == "failed"
+    finally:
+        mgr.shutdown()
+
+
+# ── R2: the kill() fallback must preserve the real rc (TOCTOU residual) ──
+
+
+def test_kill_fallback_preserves_real_exit_code_in_toctou_window():
+    """R2 hardening: F1's pre-poll closes the wide window, but the leader can
+    still exit BETWEEN poll() and killpg().  The fallback wait() then returns
+    the REAL exit code — it must be preserved (rc=7 -> "failed"), not
+    overwritten with "killed", or the rc distinction F1 protects is destroyed
+    again in the narrow window.
+    """
+    mgr = BackgroundJobManager(max_jobs=4, reap_interval=9999.0)
+    try:
+        # wait_returncode=7 simulates the leader exiting with rc=7 after the
+        # pre-poll saw it "running" but before killpg() failed with ESRCH.
+        jid = mgr.start("j", _FakeProc(wait_returncode=7))
+
+        # Job still reads "running" — the pre-poll (poll() -> None) does not
+        # catch it; the fallback must.
+        assert mgr._jobs[jid].status == "running"
+
+        assert mgr.kill(jid) == "failed", "TOCTOU rc=7 must survive as 'failed'"
+        assert mgr._jobs[jid].status == "failed"
+    finally:
+        mgr.shutdown()
+
+
+def test_kill_fallback_signal_death_stays_killed():
+    """A process we actually SIGKILL in the fallback (rc = -9, signal death)
+    must still read "killed", not "failed" — rc<0 maps to the killed label,
+    mirroring the main-path semantics."""
+    mgr = BackgroundJobManager(max_jobs=4, reap_interval=9999.0)
+    try:
+        jid = mgr.start("j", _FakeProc())
+        assert mgr.kill(jid) == "killed"
+        assert mgr._jobs[jid].status == "killed"
+    finally:
+        mgr.shutdown()
+
+
+# ── R3: the "killing" placeholder must never become a terminal state ──
+
+
+def test_stuck_eviction_victim_does_not_freeze_as_killing():
+    """R3: an eviction victim whose process survives SIGKILL (D-state) must
+    not freeze in the ring as "killing" forever.  kill() settles to the
+    honest status, start() re-tracks the victim, and the reaper converges
+    the ring to the real outcome when the process finally dies."""
+    mgr = BackgroundJobManager(max_jobs=1, reap_interval=9999.0)
+    try:
+        proc = _FakeProc(stuck=True)
+        victim_id = mgr.start("victim", proc)
+        mgr.start("new", _FakeProc())  # evicts the victim — the kill cannot finish
+
+        assert victim_id not in mgr._jobs, "victim should have been evicted"
+        assert victim_id in mgr._stale_jobs, "stuck victim was not re-tracked"
+        info = mgr.get_info(victim_id)
+        assert info is not None and info.status == "running", (
+            f"victim frozen as {info.status if info else None!r}"
+        )
+
+        # The process finally dies from the SIGKILL that was delivered while
+        # it was stuck — the reaper must converge the ring to the REAL
+        # outcome instead of serving the placeholder forever.
+        proc._stuck = False
+        proc._done = True
+        proc._returncode = -9
+        mgr._reap_stale()
+
+        assert victim_id not in mgr._stale_jobs, "victim never converged"
+        final = mgr.get_info(victim_id)
+        assert final is not None and final.status == "killed", (
+            f"expected killed, got {final.status if final else None!r}"
+        )
+        waited = mgr.wait_for_completion(victim_id, timeout=2.0, poll_interval=0.01)
+        assert waited is not None and waited.status == "killed"
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.parametrize("rc,expected", [(-9, "killed"), (0, "completed"), (7, "failed")])
+def test_stale_victim_converges_to_real_exit_code(rc, expected):
+    """R3: the reaper's convergence classifies the victim's REAL exit code —
+    signal death -> killed, 0 -> completed, positive -> failed."""
+    mgr = BackgroundJobManager(max_jobs=1, reap_interval=9999.0)
+    try:
+        proc = _FakeProc(stuck=True)
+        victim_id = mgr.start("victim", proc)
+        mgr.start("new", _FakeProc())
+        assert victim_id in mgr._stale_jobs
+
+        proc._stuck = False
+        proc._done = True
+        proc._returncode = rc
+        mgr._reap_stale()
+
+        final = mgr.get_info(victim_id)
+        assert final is not None and final.status == expected, (
+            f"rc={rc}: expected {expected}, got {final.status if final else None!r}"
+        )
+    finally:
+        mgr.shutdown()
+
+
+# ── F4: _stale_jobs must be bounded like every other registry ───────────────
+
+
+def test_stale_jobs_capped_at_max_jobs_fifo():
+    """F4: a SIGKILL-surviving victim (D-state) can outlive the whole session,
+    and without a cap every over-capacity start piles up one Popen + two pipes
+    + buffers forever.  FIFO: the oldest un-converged victim is dropped first,
+    and the ring still serves its placeholder (visibility is not lost)."""
+    mgr = BackgroundJobManager(max_jobs=1, reap_interval=9999.0)
+    try:
+        j1 = mgr.start("v1", _FakeProc(stuck=True))
+        j2 = mgr.start("v2", _FakeProc(stuck=True))
+        mgr.start("v3", _FakeProc(stuck=True))  # evicts j2; its kill also sticks
+        with mgr._lock:
+            assert len(mgr._stale_jobs) == 1, (
+                f"_stale_jobs grew past max_jobs: {list(mgr._stale_jobs)}"
+            )
+            assert list(mgr._stale_jobs) == [j2], "FIFO: oldest (j1) must drop, j2 kept"
+        # The dropped victim's last snapshot stays retrievable via the ring.
+        info = mgr.get_info(j1)
+        assert info is not None and info.status == "running"
+    finally:
+        mgr.shutdown()
+
+
+def test_shutdown_clears_stale_jobs():
+    """F4: shutdown stops the reaper that would converge stale victims — the
+    dict must not keep pinning Popen + pipes after the manager is gone."""
+    mgr = BackgroundJobManager(max_jobs=1, reap_interval=9999.0)
+    mgr.start("v1", _FakeProc(stuck=True))
+    mgr.start("v2", _FakeProc(stuck=True))
+    assert len(mgr._stale_jobs) == 1
+    mgr.shutdown()
+    assert mgr._stale_jobs == {}, "stale tracking survived shutdown"
+def test_direct_kill_of_stuck_job_stays_running_not_killing():
+    """R3: a DIRECT kill of a process that survives SIGKILL must keep the job
+    honest — "running", still tracked in _jobs, reaped when it finally dies.
+    It must never read "killing" (an eviction-only placeholder) or a bogus
+    "killed"."""
+    mgr = BackgroundJobManager(max_jobs=2, reap_interval=9999.0)
+    try:
+        jid = mgr.start("stuck", _FakeProc(stuck=True))
+        assert mgr.kill(jid) == "running", "stuck job must stay 'running'"
+        assert jid in mgr._jobs, "stuck job must remain tracked"
+        assert mgr._jobs[jid].status == "running"
+        assert jid not in mgr._stale_jobs, "direct kill must not stale-track"
+    finally:
+        mgr.shutdown()
+
+
+# ── F3: poll_status() must not block behind kill()'s job-lock hold ──
+
+
+def test_poll_status_does_not_block_when_job_lock_is_held():
+    """poll_status() must return the cached status immediately when kill()
+    holds the job lock (up to ~6 s), instead of blocking the caller.
+
+    cleanup()/list_jobs()/get_info() call poll_status(); a blocking acquire
+    would freeze the whole manager behind one mid-teardown job.
+    """
+    mgr = BackgroundJobManager(max_jobs=2, reap_interval=9999.0)
+    try:
+        job_id = mgr.start("j", _FakeProc())
+        job = mgr._jobs[job_id]  # get() removed — internal job reached directly
+
+        job._lock.acquire()  # simulate kill() mid-teardown
+        try:
+            box: list = []
+            t = threading.Thread(target=lambda: box.append(job.poll_status()))
+            t.daemon = True
+            t.start()
+            t.join(timeout=0.5)
+            assert not t.is_alive(), "poll_status blocked on the job lock"
+            assert box == ["running"]  # cached status returned
+        finally:
+            job._lock.release()
+    finally:
+        mgr.shutdown()
+
+
+# ── F2: an eviction victim stays visible (get_info/wait) during the kill ──
+
+
+def test_eviction_victim_stays_visible_during_kill():
+    """An over-capacity victim is pre-snapshotted (status="killing") before
+    its ~seconds-long kill runs outside the lock — get_info() and
+    wait_for_completion() must never report "not found" for it.
+    """
+    mgr = BackgroundJobManager(max_jobs=1, reap_interval=9999.0)
+    try:
+        victim_id = mgr.start("victim", _FakeProc(kill_delay=0.5))
+        # Second start evicts the victim; the kill takes 0.5 s (kill_delay).
+        start_box: list = []
+
+        def _second_start():
+            start_box.append(mgr.start("new", _FakeProc()))
+
+        t = threading.Thread(target=_second_start)
+        t.daemon = True
+        t.start()
+
+        # Wait until the victim has been popped from _jobs but the kill is
+        # still in flight (kill_delay=0.5 widens the window).
+        deadline = time.monotonic() + 3.0
+        while victim_id in mgr._jobs and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert victim_id not in mgr._jobs, "victim should have been evicted"
+
+        info = mgr.get_info(victim_id)
+        assert info is not None, "victim invisible during eviction kill"
+        assert info.status == "killing", f"expected killing, got {info.status}"
+
+        # wait_for_completion must tolerate the transient state and resolve
+        # to the final "killed" status rather than bailing with None.
+        final = mgr.wait_for_completion(victim_id, timeout=5.0, poll_interval=0.02)
+        assert final is not None, "wait_for_completion saw 'not found' mid-kill"
+        assert final.status == "killed"
+
+        t.join(timeout=3.0)
+        assert not t.is_alive()
+    finally:
+        mgr.shutdown()
+
+
+def test_wait_for_completion_nonexistent_job_respects_timeout():
+    """R1 regression: the transient-None grace in wait_for_completion() must
+    never outlive the caller's timeout budget.  Before the fix, a nonexistent
+    job id always waited the full 3 s grace — a short timeout=0.2 was
+    silently stretched to ~3 s, stalling the serial job tool mid-turn.
+    """
+    mgr = BackgroundJobManager(max_jobs=2, reap_interval=9999.0)
+    try:
+        start = time.monotonic()
+        info = mgr.wait_for_completion("nonexistent", timeout=0.2, poll_interval=0.02)
+        elapsed = time.monotonic() - start
+        assert info is None
+        assert elapsed < 1.0, f"grace outlived timeout: {elapsed:.2f}s"
+    finally:
+        mgr.shutdown()
+
+
+def test_wait_for_completion_nonexistent_job_grace_is_capped():
+    """Complementary guard: with a generous timeout the not-found grace is
+    still capped at 3 s — a genuinely absent job must not block a long-waiting
+    caller beyond the cap, and must not loop until the full timeout."""
+    mgr = BackgroundJobManager(max_jobs=2, reap_interval=9999.0)
+    try:
+        start = time.monotonic()
+        info = mgr.wait_for_completion("nonexistent", timeout=10.0, poll_interval=0.02)
+        elapsed = time.monotonic() - start
+        assert info is None
+        assert 2.5 <= elapsed < 4.0, f"grace cap broken: {elapsed:.2f}s"
+    finally:
+        mgr.shutdown()
+
+
+# ── F4: list_jobs() preview shows the TAIL of the output ──
+
+
+def test_list_jobs_preview_is_tail_not_head():
+    """list_jobs() preview must show the END of the output (where a long
+    command's verdict — build result, test summary — lands), not the head.
+    A head slice freezes the preview on boilerplate while the job runs.
+    """
+    mgr = BackgroundJobManager(max_jobs=2, reap_interval=9999.0)
+    try:
+        job_id = mgr.start("j", _FakeProc())
+        job = mgr._jobs[job_id]  # get() removed — internal job reached directly
+        job._stdout_buf.feed("P" * 500 + "\nBUILD-SUCCEEDED\n")
+
+        infos = mgr.list_jobs()
+        assert len(infos) == 1
+        assert "BUILD-SUCCEEDED" in infos[0].stdout, "preview dropped the tail"
+        assert not infos[0].stdout.startswith("P" * 200), "preview kept the head"
+    finally:
+        mgr.shutdown()
+
+
+# ── F5-followup: info carries the captures' TRUE totals ──
+
+
+def test_info_reports_true_output_totals_beyond_cap():
+    """BackgroundJobInfo must report how many characters the streams ACTUALLY
+    produced (capture ``total``), not how many survived the bounded capture —
+    the render-time truncation notice names this number, and a job that wrote
+    more than _OUTPUT_BUF_CAP would otherwise be described by the size of the
+    elided remainder."""
+    mgr = BackgroundJobManager(max_jobs=2, reap_interval=9999.0)
+    try:
+        job_id = mgr.start("j", _FakeProc())
+        job = mgr._jobs[job_id]
+        job._stdout_buf.feed("P" * (bjm._OUTPUT_BUF_CAP * 2 + 100_000))
+
+        info = mgr.get_info(job_id)
+        assert info.stdout_total == bjm._OUTPUT_BUF_CAP * 2 + 100_000
+        assert len(info.stdout) < info.stdout_total, (
+            "capped text must not be mistaken for the true output size"
+        )
+
+        listed = mgr.list_jobs()
+        assert listed[0].stdout_total == bjm._OUTPUT_BUF_CAP * 2 + 100_000
+    finally:
+        mgr.shutdown()
+
+
+# ── C1: list_jobs() merges the reaped-results ring ──
+
+
+def test_list_jobs_includes_reaped_jobs_after_cleanup():
+    """A finished job moved to the reaped-results ring by cleanup() must
+    still appear in list_jobs() — get_info() answers it by id, so dropping
+    it from the list breaks the 'list all tracked jobs' contract."""
+    mgr = BackgroundJobManager(max_jobs=5, reap_interval=9999.0)
+    try:
+        done_id = mgr.start("done", _FakeProc(done=True, returncode=0))
+        run_id = mgr.start("run", _FakeProc(done=False))
+
+        removed = mgr.cleanup()
+        assert removed == 1
+        assert done_id not in mgr._jobs
+        assert done_id in mgr._reaped_results  # sanity: ring holds the final state
+
+        listed = mgr.list_jobs()  # include_completed=True is the default
+        by_id = {j.job_id: j for j in listed}
+        assert done_id in by_id, "reaped job missing from list_jobs()"
+        assert by_id[done_id].status == "completed"
+        assert run_id in by_id
+    finally:
+        mgr.shutdown()
+
+
+def test_list_jobs_includes_evicted_jobs_after_capacity_eviction():
+    """Capacity eviction also moves finished jobs to the ring; the list
+    must keep showing them."""
+    mgr = BackgroundJobManager(max_jobs=2, reap_interval=9999.0)
+    try:
+        done_id = mgr.start("done", _FakeProc(done=True))
+        mgr.start("run", _FakeProc(done=False))
+        mgr.start("new", _FakeProc(done=False))  # evicts "done" over capacity
+
+        assert done_id not in mgr._jobs
+        assert done_id in mgr._reaped_results
+
+        listed = mgr.list_jobs()
+        assert done_id in {j.job_id for j in listed}
+    finally:
+        mgr.shutdown()
+
+
+def test_list_jobs_include_completed_false_excludes_reaped_terminal():
+    """include_completed=False must also filter terminal entries coming from
+    the reaped ring, not just the active registry."""
+    mgr = BackgroundJobManager(max_jobs=2, reap_interval=9999.0)
+    try:
+        done_id = mgr.start("done", _FakeProc(done=True))
+        run_id = mgr.start("run", _FakeProc(done=False))
+        mgr.start("new", _FakeProc(done=False))  # evicts "done"
+
+        listed = mgr.list_jobs(include_completed=False)
+        ids = {j.job_id for j in listed}
+        assert done_id not in ids, "terminal reaped job must be filtered out"
+        assert run_id in ids
+        assert len(listed) == 2  # run + new (both running)
+    finally:
+        mgr.shutdown()
+
+
+def test_list_jobs_include_completed_false_keeps_stale_running_placeholder():
+    """A stuck evicted victim is re-tracked in the ring as a 'running'
+    placeholder (R3) — it is NOT terminal, so include_completed=False must
+    still list it."""
+    proc = _FakeProc(stuck=True)
+    mgr = BackgroundJobManager(max_jobs=1, reap_interval=9999.0)
+    try:
+        victim_id = mgr.start("victim", proc)
+        mgr.start("new", _FakeProc())  # evicts the victim — kill cannot finish
+
+        assert victim_id in mgr._reaped_results
+        listed = mgr.list_jobs(include_completed=False)
+        assert victim_id in {j.job_id for j in listed}
+    finally:
+        proc._stuck = False
+        mgr.shutdown()
+
+
+def test_list_jobs_deduplicates_active_and_reaped_overlap():
+    """Defensive: if a job_id somehow exists in BOTH registries, the list
+    must not show it twice (no current path creates the overlap, but a
+    duplicate entry is a silent correctness trap for callers)."""
+    mgr = BackgroundJobManager(max_jobs=2, reap_interval=9999.0)
+    try:
+        jid = mgr.start("j", _FakeProc(done=False))
+        with mgr._lock:
+            mgr._store_reaped_locked(jid, mgr._snapshot_job_locked(jid, mgr._jobs[jid]))
+
+        listed = mgr.list_jobs()
+        assert [j.job_id for j in listed].count(jid) == 1
+    finally:
+        mgr.shutdown()
+
+
+# ── misc: get_global_background_job_manager warns on max_jobs mismatch ──
+
+
+def test_global_manager_max_jobs_mismatch_warns(monkeypatch):
+    """A later get_global_background_job_manager(max_jobs=...) call with a
+    different value is silently ignored today (singleton); it must at least
+    log a warning instead of hiding the caller's intent."""
+    monkeypatch.setattr(bjm, "_global_bg_manager", None)
+    warnings: list = []
+    monkeypatch.setattr(bjm.logger, "warning", lambda *a, **k: warnings.append(a))
+
+    m1 = bjm.get_global_background_job_manager(max_jobs=2)
+    m2 = bjm.get_global_background_job_manager(max_jobs=8)
+
+    assert m2 is m1  # singleton preserved
+    assert m1.max_jobs == 2  # first call's value wins
+    assert warnings, "max_jobs mismatch must be logged"

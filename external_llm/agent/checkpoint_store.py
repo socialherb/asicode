@@ -7,7 +7,7 @@ import time
 import uuid
 from pathlib import Path
 
-from external_llm.common.atomic_io import atomic_write_json
+from external_llm.common.atomic_io import atomic_write_bytes, atomic_write_json
 from external_llm.common.file_lock import cross_process_flock
 
 logger = logging.getLogger(__name__)
@@ -245,7 +245,7 @@ class CheckpointStore:
             # (tmp + os.replace) forgot the fsync: a crash/power-loss could
             # leave a 0-byte index, and _load_checkpoints() would then silently
             # reset self.checkpoints to [] — losing the whole index even though
-            # each payload was fsync'd (line 288). atomic_write_json is already
+            # each payload was fsync'd (via `atomic_write_json`). atomic_write_json is already
             # imported above and used for the payloads.
             try:
                 atomic_write_json(
@@ -867,8 +867,13 @@ class CheckpointStore:
             # Ensure parent directory exists
             file_path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                with open(file_path, 'wb') as f:
-                    f.write(raw)
+                # Atomic restore (sibling tmp + fsync + os.replace), mirroring
+                # the blob staging above and the atomic_io contract for
+                # repair/restore paths: a SIGKILL mid-restore must not leave
+                # the target truncated. file_path is already resolved (see the
+                # defense-in-depth check above), so symlink semantics match the
+                # old open("wb") write-through.
+                atomic_write_bytes(file_path, raw)
                 logger.debug("Restored file %s", relative_path_str)
             except OSError as e:
                 logger.exception("Failed to restore file %s: %s", relative_path_str, e)

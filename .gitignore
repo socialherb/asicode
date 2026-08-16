@@ -3,6 +3,7 @@
 .env.*
 # Coverage artifacts
 .coverage
+.coverage.*
 *.cover
 
 # Python

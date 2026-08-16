@@ -10,11 +10,13 @@ Also re-used by ``duplicate_definition_scanner`` for
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+from ..common.atomic_io import atomic_write_json
 from ..languages.tree_sitter_utils import (
     get_node_text as _ts_get_text,
 )
@@ -92,7 +94,11 @@ _LANG_DEF_NODES: dict[str, dict[str, tuple]] = {
         "companion_object": ("class", True, True),
         "interface_declaration": ("class", True, True),
         "enum_declaration": ("class", True, True),
-        "function_declaration": ("function", False, True),  # fwcd kotlin grammar (language-pack AND standalone) — "fun_declaration" was a stale fork variant
+        "function_declaration": (
+            "function",
+            False,
+            True,
+        ),  # fwcd kotlin grammar (language-pack AND standalone) — "fun_declaration" was a stale fork variant
         "property_declaration": ("assignment", False, False),
     },
 }
@@ -102,9 +108,7 @@ _LANG_DEF_NODES: dict[str, dict[str, tuple]] = {
 # so its SHAPE is validated at import: a typo'd kind or a missing flag would
 # silently change dead-block reachability semantics.  The kind vocabulary is
 # the one documented in the map's comment above.
-_DEF_NODE_KINDS = frozenset(
-    {"function", "class", "assignment", "interface", "type_alias", "enum"}
-)
+_DEF_NODE_KINDS = frozenset({"function", "class", "assignment", "interface", "type_alias", "enum"})
 
 
 def _validate_lang_def_nodes() -> None:
@@ -144,34 +148,80 @@ _LANG_ASSIGN_WRAPPERS: dict[str, set] = {
     "kotlin": {"property_declaration"},
 }
 _LANG_DEF_PARENT_TYPES: dict[str, set] = {
-    "python": {"function_definition", "async_function_definition", "class_definition",
-               "assignment", "annotated_assignment", "parameters", "lambda_parameters",
-               "for_statement", "with_item", "import_statement", "import_from_statement",
-               "alias", "typed_parameter", "default_parameter"},
-    "typescript": {"function_declaration", "class_declaration", "method_definition",
-                   "required_parameter", "optional_parameter", "variable_declarator",
-                   "lexical_declaration", "for_in_statement", "catch_clause",
-                   "arrow_function", "assignment",
-                   # interface/type-alias/enum names are blanket-name-field
-                   # handled (probe-verified on the ACTIVE tree-sitter-typescript
-                   # grammar: interface_declaration/type_alias_declaration name =
-                   # type_identifier, enum_declaration name = identifier) — they
-                   # are listed so the reverse validator sees the vocabulary as
-                   # live: the reference walk visits none of these name nodes for
-                   # TS (type_identifier is collected for go/kotlin only), so
-                   # listing them is behavior-neutral but keeps the branch
-                   # vocabulary honest.
-                   "interface_declaration", "type_alias_declaration",
-                   "enum_declaration"},
-    "javascript": {"function_declaration", "class_declaration", "variable_declarator",
-                   "lexical_declaration", "for_in_statement", "catch_clause",
-                   "arrow_function", "assignment"},
-    "go": {"function_declaration", "method_declaration",
-           "type_spec", "parameter_declaration", "var_declaration", "short_var_declaration",
-           "field_declaration", "receiver", "const_declaration", "const_spec", "var_spec"},
-    "java": {"class_declaration", "interface_declaration", "enum_declaration",
-             "method_declaration", "formal_parameter", "variable_declarator",
-             "field_declaration", "constructor_declaration"},
+    "python": {
+        "function_definition",
+        "async_function_definition",
+        "class_definition",
+        "assignment",
+        "annotated_assignment",
+        "parameters",
+        "lambda_parameters",
+        "for_statement",
+        "with_item",
+        "import_statement",
+        "import_from_statement",
+        "alias",
+        "typed_parameter",
+        "default_parameter",
+    },
+    "typescript": {
+        "function_declaration",
+        "class_declaration",
+        "method_definition",
+        "required_parameter",
+        "optional_parameter",
+        "variable_declarator",
+        "lexical_declaration",
+        "for_in_statement",
+        "catch_clause",
+        "arrow_function",
+        "assignment",
+        # interface/type-alias/enum names are blanket-name-field
+        # handled (probe-verified on the ACTIVE tree-sitter-typescript
+        # grammar: interface_declaration/type_alias_declaration name =
+        # type_identifier, enum_declaration name = identifier) — they
+        # are listed so the reverse validator sees the vocabulary as
+        # live: the reference walk visits none of these name nodes for
+        # TS (type_identifier is collected for go/kotlin only), so
+        # listing them is behavior-neutral but keeps the branch
+        # vocabulary honest.
+        "interface_declaration",
+        "type_alias_declaration",
+        "enum_declaration",
+    },
+    "javascript": {
+        "function_declaration",
+        "class_declaration",
+        "variable_declarator",
+        "lexical_declaration",
+        "for_in_statement",
+        "catch_clause",
+        "arrow_function",
+        "assignment",
+    },
+    "go": {
+        "function_declaration",
+        "method_declaration",
+        "type_spec",
+        "parameter_declaration",
+        "var_declaration",
+        "short_var_declaration",
+        "field_declaration",
+        "receiver",
+        "const_declaration",
+        "const_spec",
+        "var_spec",
+    },
+    "java": {
+        "class_declaration",
+        "interface_declaration",
+        "enum_declaration",
+        "method_declaration",
+        "formal_parameter",
+        "variable_declarator",
+        "field_declaration",
+        "constructor_declaration",
+    },
     # kotlin: the fwcd grammar (language-pack AND standalone) names bindings via
     # unnamed children (simple_identifier / type_identifier), never a `name`
     # field — object/companion/parameter/property names have no handling shape
@@ -191,47 +241,84 @@ _LANG_DEF_PARENT_TYPES: dict[str, set] = {
 # covered by a branch — an uncovered parent type silently counts its bindings
 # as references and dead-block under-reports (never flags a symbol that looks
 # referenced).
-_DEF_PARENT_NAME_FIELD_TYPES = frozenset({
-    # parent.child_by_field_name("name") == n (also subsumed by the blanket
-    # name-field check at the top of _is_def_position)
-    "function_definition", "async_function_definition", "class_definition",
-    "function_declaration", "class_declaration", "method_definition",
-    "method_declaration", "variable_declarator",
-})
-_DEF_PARENT_LEFT_FIELD_TYPES = frozenset({
-    # parent.child_by_field_name("left") == n — only the binding side is a
-    # definition; the value/iterable side is a USE and must count as a
-    # reference.
-    "assignment", "annotated_assignment", "for_statement", "for_in_statement",
-})
-_DEF_PARENT_BINDING_TYPES = frozenset({
-    # BINDING-aware branch: name field, else first/last identifier child.
-    # NB: reachable only for types listed in some language's
-    # _LANG_DEF_PARENT_TYPES (the `pt in lang_def_parents` gate) —
-    # value_parameter / destructured_parameter were removed with their last
-    # (kotlin) map reference: the fwcd grammar emits "parameter", never them.
-    "parameters", "lambda_parameters", "import_statement", "import_from_statement",
-    "alias", "typed_parameter", "default_parameter", "required_parameter",
-    "optional_parameter", "lexical_declaration", "catch_clause", "arrow_function",
-    "parameter_declaration", "var_declaration", "short_var_declaration",
-    "field_declaration", "receiver", "const_declaration", "formal_parameter",
-    "constructor_declaration", "variable_declaration",
-})
-_DEF_PARENT_SPECIAL_TYPES = frozenset({
-    # with_item → always a use (`with lock:`; aliases live in as_pattern).
-    # "expression_statement" was removed with its _is_def_position branch: no
-    # language map lists it as a def-PARENT (python's map has it as a def-NODE
-    # wrapper only), so the branch was globally unreachable — the reverse
-    # validator below fails at import if such dead vocabulary reappears.
-    "with_item",
-})
-_DEF_PARENT_GRAMMAR_NAME_FIELD = frozenset({
-    # No explicit branch — covered by the blanket child_by_field_name("name")
-    # check (name field probe-verified on the ACTIVE grammars:
-    # tree-sitter-typescript / tree-sitter-go).
-    "interface_declaration", "type_alias_declaration", "enum_declaration",
-    "type_spec", "const_spec", "var_spec",
-})
+_DEF_PARENT_NAME_FIELD_TYPES = frozenset(
+    {
+        # parent.child_by_field_name("name") == n (also subsumed by the blanket
+        # name-field check at the top of _is_def_position)
+        "function_definition",
+        "async_function_definition",
+        "class_definition",
+        "function_declaration",
+        "class_declaration",
+        "method_definition",
+        "method_declaration",
+        "variable_declarator",
+    }
+)
+_DEF_PARENT_LEFT_FIELD_TYPES = frozenset(
+    {
+        # parent.child_by_field_name("left") == n — only the binding side is a
+        # definition; the value/iterable side is a USE and must count as a
+        # reference.
+        "assignment",
+        "annotated_assignment",
+        "for_statement",
+        "for_in_statement",
+    }
+)
+_DEF_PARENT_BINDING_TYPES = frozenset(
+    {
+        # BINDING-aware branch: name field, else first/last identifier child.
+        # NB: reachable only for types listed in some language's
+        # _LANG_DEF_PARENT_TYPES (the `pt in lang_def_parents` gate) —
+        # value_parameter / destructured_parameter were removed with their last
+        # (kotlin) map reference: the fwcd grammar emits "parameter", never them.
+        "parameters",
+        "lambda_parameters",
+        "import_statement",
+        "import_from_statement",
+        "alias",
+        "typed_parameter",
+        "default_parameter",
+        "required_parameter",
+        "optional_parameter",
+        "lexical_declaration",
+        "catch_clause",
+        "arrow_function",
+        "parameter_declaration",
+        "var_declaration",
+        "short_var_declaration",
+        "field_declaration",
+        "receiver",
+        "const_declaration",
+        "formal_parameter",
+        "constructor_declaration",
+        "variable_declaration",
+    }
+)
+_DEF_PARENT_SPECIAL_TYPES = frozenset(
+    {
+        # with_item → always a use (`with lock:`; aliases live in as_pattern).
+        # "expression_statement" was removed with its _is_def_position branch: no
+        # language map lists it as a def-PARENT (python's map has it as a def-NODE
+        # wrapper only), so the branch was globally unreachable — the reverse
+        # validator below fails at import if such dead vocabulary reappears.
+        "with_item",
+    }
+)
+_DEF_PARENT_GRAMMAR_NAME_FIELD = frozenset(
+    {
+        # No explicit branch — covered by the blanket child_by_field_name("name")
+        # check (name field probe-verified on the ACTIVE grammars:
+        # tree-sitter-typescript / tree-sitter-go).
+        "interface_declaration",
+        "type_alias_declaration",
+        "enum_declaration",
+        "type_spec",
+        "const_spec",
+        "var_spec",
+    }
+)
 _DEF_PARENT_COVERED = (
     _DEF_PARENT_NAME_FIELD_TYPES
     | _DEF_PARENT_LEFT_FIELD_TYPES
@@ -254,16 +341,12 @@ def _validate_lang_assign_wrappers() -> None:
     wrapper_keys = set(_LANG_ASSIGN_WRAPPERS)
     if wrapper_keys != def_keys:
         raise ValueError(
-            f"_LANG_ASSIGN_WRAPPERS languages {sorted(wrapper_keys)} != "
-            f"_LANG_DEF_NODES languages {sorted(def_keys)}"
+            f"_LANG_ASSIGN_WRAPPERS languages {sorted(wrapper_keys)} != _LANG_DEF_NODES languages {sorted(def_keys)}"
         )
     for lang, wrappers in _LANG_ASSIGN_WRAPPERS.items():
-        if not isinstance(wrappers, set) or not wrappers or not all(
-            isinstance(w, str) and w for w in wrappers
-        ):
+        if not isinstance(wrappers, set) or not wrappers or not all(isinstance(w, str) and w for w in wrappers):
             raise ValueError(
-                f"_LANG_ASSIGN_WRAPPERS[{lang!r}] must be a non-empty set of "
-                f"non-empty strings, got {wrappers!r}"
+                f"_LANG_ASSIGN_WRAPPERS[{lang!r}] must be a non-empty set of non-empty strings, got {wrappers!r}"
             )
         unknown = wrappers - set(_LANG_DEF_NODES[lang])
         if unknown:
@@ -297,16 +380,12 @@ def _validate_lang_def_parent_types() -> None:
     parent_keys = set(_LANG_DEF_PARENT_TYPES)
     if parent_keys != def_keys:
         raise ValueError(
-            f"_LANG_DEF_PARENT_TYPES languages {sorted(parent_keys)} != "
-            f"_LANG_DEF_NODES languages {sorted(def_keys)}"
+            f"_LANG_DEF_PARENT_TYPES languages {sorted(parent_keys)} != _LANG_DEF_NODES languages {sorted(def_keys)}"
         )
     for lang, parents in _LANG_DEF_PARENT_TYPES.items():
-        if not isinstance(parents, set) or not parents or not all(
-            isinstance(p, str) and p for p in parents
-        ):
+        if not isinstance(parents, set) or not parents or not all(isinstance(p, str) and p for p in parents):
             raise ValueError(
-                f"_LANG_DEF_PARENT_TYPES[{lang!r}] must be a non-empty set of "
-                f"non-empty strings, got {parents!r}"
+                f"_LANG_DEF_PARENT_TYPES[{lang!r}] must be a non-empty set of non-empty strings, got {parents!r}"
             )
         unknown = parents - _DEF_PARENT_COVERED
         if unknown:
@@ -351,6 +430,7 @@ class DeadBlockMember:
 @dataclass
 class DeadBlockCandidate:
     """A contiguous group of unused module-level definitions in one file."""
+
     file: str
     members: list[DeadBlockMember] = field(default_factory=list)
     cluster_start: int = 0
@@ -484,7 +564,7 @@ def _ts_collect_all_defs(
                 # (5 real cases across the repo, 2026-08).
                 in_wrappers = language in _LANG_ASSIGN_WRAPPERS and node_type in _LANG_ASSIGN_WRAPPERS[language]
                 if in_wrappers:
-                    for child in (node.children or []):
+                    for child in node.children or []:
                         name_node = _ts_def_name_node(child, fields_only=True)
                         if name_node is None and child.type in _NAME_HOLDER_CHILD_TYPES:
                             # kotlin fwcd: name nested in variable_declaration
@@ -504,14 +584,14 @@ def _ts_collect_all_defs(
                 start = decorator_node.start_point[0] + 1
             out.append((name, kind, start, end, enclosing_class))
             if is_container:
-                for child in (node.children or []):
+                for child in node.children or []:
                     _walk(child, enclosing_class=name)
 
         elif language == "python" and node_type == "decorated_definition":
             if _ts_has_overload_or_framework(node, source):
                 return
         else:
-            for child in (node.children or []):
+            for child in node.children or []:
                 _walk(child, enclosing_class)
 
     _walk(root)
@@ -520,7 +600,7 @@ def _ts_collect_all_defs(
 
 def _ts_child_by_type(node, type_names: tuple[str, ...]) -> Optional[object]:
     """Find first child with one of *type_names* (tree-sitter node helper)."""
-    for child in (node.children or []):
+    for child in node.children or []:
         if child.type in type_names:
             return child
     return None
@@ -532,15 +612,21 @@ def _ts_child_by_type(node, type_names: tuple[str, ...]) -> Optional[object]:
 # call ``_init()`` registers the callee as an assignment def, and ``x.y = z``
 # registers the RHS identifier ``z``.  The resulting fake def's only reference
 # is its own line, so it is reported dead (5 real false positives, 2026-08).
-_ASSIGNMENT_LIKE_DEF_NODES = frozenset({
-    "assignment", "annotated_assignment",          # python
-    "variable_declarator", "lexical_declaration",
-    "variable_declaration",                        # typescript / javascript
-    "var_spec", "const_spec", "var_declaration",
-    "const_declaration",                           # go
-    "field_declaration",                           # java
-    "property_declaration",                        # kotlin
-})
+_ASSIGNMENT_LIKE_DEF_NODES = frozenset(
+    {
+        "assignment",
+        "annotated_assignment",  # python
+        "variable_declarator",
+        "lexical_declaration",
+        "variable_declaration",  # typescript / javascript
+        "var_spec",
+        "const_spec",
+        "var_declaration",
+        "const_declaration",  # go
+        "field_declaration",  # java
+        "property_declaration",  # kotlin
+    }
+)
 
 
 # Identifier-like node types that can carry a binding name across the
@@ -562,7 +648,7 @@ _NAME_HOLDER_CHILD_TYPES = frozenset({"variable_declaration", "binding_pattern_k
 
 def _ts_name_inside(node) -> Optional[object]:
     """First identifier-like child of a kotlin name-holder node (fwcd grammar)."""
-    for child in (node.children or []):
+    for child in node.children or []:
         if child.type in _NAME_NODE_TYPES:
             return child
         if child.type in _NAME_HOLDER_CHILD_TYPES:
@@ -596,7 +682,7 @@ def _ts_def_name_node(node, fields_only: bool = False) -> Optional[object]:
 def _ts_has_overload_or_framework(node, source: str) -> bool:
     """Check if node has @overload or @fixture/@hookimpl/@hookspec decorator."""
     _FRAMEWORK_NAMES = {"fixture", "hookimpl", "hookspec"}
-    for child in (node.children or []):
+    for child in node.children or []:
         if child.type != "decorator":
             continue
         # Walk decorator child for identifier
@@ -712,7 +798,7 @@ def _ts_collect_name_references(source: str, language: str = "python") -> dict:
                 if obj_name in ("self", "cls"):
                     attr_name = _ts_get_text(source_bytes, attr)
                     refs.setdefault(f"clsattr:{attr_name}", []).append(n.start_point[0] + 1)
-        for child in (n.children or []):
+        for child in n.children or []:
             _walk(child)
 
     _walk(root)
@@ -734,11 +820,13 @@ def _has_overload(func: ast.AST) -> bool:
 
 
 # Decorator attribute names that indicate framework-managed discovery/injection.
-_FRAMEWORK_INJECTION_DECORATOR_NAMES: frozenset = frozenset({
-    "fixture",
-    "hookimpl",
-    "hookspec",
-})
+_FRAMEWORK_INJECTION_DECORATOR_NAMES: frozenset = frozenset(
+    {
+        "fixture",
+        "hookimpl",
+        "hookspec",
+    }
+)
 
 
 def _has_framework_injection_decorator(node: ast.AST) -> bool:
@@ -919,9 +1007,7 @@ def _collect_name_references(tree: ast.Module) -> dict:
                 refs.setdefault(base.id, []).append(getattr(node, "lineno", 0))
                 # self.attr / cls.attr -> also register as clsattr:attr_name
                 if base.id in ("self", "cls"):
-                    refs.setdefault(
-                        f"clsattr:{node.attr}", []
-                    ).append(getattr(node, "lineno", 0))
+                    refs.setdefault(f"clsattr:{node.attr}", []).append(getattr(node, "lineno", 0))
     return refs
 
 
@@ -976,7 +1062,163 @@ def _cluster_dead_members(
     return clusters, clustered_members
 
 
+# ── Per-file extraction cache (dead_block / public_dead_code share it) ──────
+# The extraction block inside ``scan_dead_block_core`` (parse + ``__all__`` +
+# defs + references) is a PURE function of file content and is IDENTICAL for
+# dead_block_scanner and public_dead_code_scanner — they share the core and
+# differ only in the confidence/visibility FILTERING applied afterwards.  Each
+# scanner previously re-parsed every file with tree-sitter (~3.2s) and
+# re-walked every tree for name references (~4.3s); the pair paid 2x per gate
+# run.  The extraction is therefore cached per file under a
+# ``(st_mtime_ns, st_size)`` fingerprint — the same invalidation contract as
+# the vulture scan cache — and persisted to ``.cache`` so a cache-hot run
+# skips BOTH scanners' extraction (~12s → ~2s on this repo, 2026-08-16).
+#
+# Cache-file version: bump ``_DBX_CACHE_VERSION`` when the collectors'
+# semantics change (def/reference shapes), or a stale cache would silently
+# serve pre-change extraction results.  Corruption / version mismatch /
+# read-write errors all fail OPEN to a full extraction (never wrong results).
+_DBX_CACHE_VERSION = 1
+
+
+def _dbx_cache_path(repo_root: str) -> str:
+    from . import parse_cache as _pc
+
+    return _pc.cache_file_path(repo_root, f"dead_block_extract_v{_DBX_CACHE_VERSION}.json")
+
+
+def _dbx_load(repo_root: str) -> tuple[dict, bool]:
+    """Load the extraction cache for *repo_root*; returns ``(cache, dirty=False)``.
+
+    Fail-open: any read/parse error or version mismatch returns an empty
+    cache — the caller recomputes everything and rewrites the file.  Values
+    are ``abs_path -> (fingerprint, payload)`` where ``payload`` is None for
+    a persisted "skip this file" decision and otherwise the serialized
+    ``(lang, all_names, defs, references)`` extraction (all_names restored
+    to a set so membership checks stay O(1)).
+
+    An empty *repo_root* (unit-test convention) bypasses the cache entirely —
+    the cache file would otherwise land in the CWD and grow with throwaway
+    temp files.
+    """
+    if not repo_root:
+        return {}, False
+    cache_path = _dbx_cache_path(repo_root)  # outside try: CachePathError must propagate
+    try:
+        with open(cache_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if payload.get("format") != _DBX_CACHE_VERSION:
+            return {}, False
+        cache: dict = {}
+        for path, entry in (payload.get("files") or {}).items():
+            if not isinstance(entry, dict) or not isinstance(entry.get("fp"), list):
+                continue
+            pl = entry.get("payload")
+            if pl is not None:
+                pl = (pl.get("lang"), set(pl.get("all") or ()), pl.get("defs") or (), pl.get("refs") or {})
+            cache[path] = (tuple(entry["fp"]), pl)
+    except (OSError, ValueError, TypeError):
+        logger.debug("dead-block extraction cache unreadable — full extraction", exc_info=True)
+        return {}, False
+    return cache, False
+
+
+def _dbx_save(repo_root: str, cache: dict) -> None:
+    """Persist *cache* to disk atomically (best-effort; failure costs a re-extraction).
+
+    Whole-file replace via the canonical :func:`atomic_write_json` (B2): a
+    crash mid-save — or another process saving the same file concurrently —
+    can never leave a truncated cache; the previous one stays loadable.  See
+    the disk-cache concurrency policy in ``parse_cache`` (lock-free,
+    last-writer-wins).
+
+    Empty *repo_root* skips the write (see ``_dbx_load`` — unit tests run
+    with ``repo_root=""`` and must not pollute the CWD's ``.cache``).
+    """
+    if not repo_root:
+        return
+    try:
+        cache_path = _dbx_cache_path(repo_root)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        files = {}
+        for abs_path, (fp, pl) in cache.items():
+            if pl is None:
+                files[abs_path] = {"fp": list(fp), "payload": None}
+                continue
+            _lang, all_names, defs, references = pl
+            files[abs_path] = {
+                "fp": list(fp),
+                "payload": {
+                    "lang": _lang,
+                    "all": sorted(all_names),
+                    "defs": defs,
+                    "refs": references,
+                },
+            }
+        atomic_write_json(
+            cache_path,
+            {"format": _DBX_CACHE_VERSION, "files": files},
+            indent=None,
+            ensure_ascii=True,
+        )
+    except (OSError, TypeError, ValueError):
+        logger.debug("dead-block extraction cache write failed", exc_info=True)
+
+
+def _dbx_stat(abs_path: str) -> Optional[tuple[int, int]]:
+    """(st_mtime_ns, st_size) — delegates to the canonical parse_cache helper
+    (single stat code path; order contract documented there, B1)."""
+    from . import parse_cache as _pc
+
+    return _pc.stat_fingerprint(abs_path)
+
+
+def _extract_dead_block_file(abs_path: str, rel_path: str):
+    """Per-file extraction — parse + ``__all__`` + defs + references (pure).
+
+    Returns ``(lang, all_names, defs, references)`` or None when the file must
+    be SKIPPED (unreadable, unparseable tree, dynamic ``__all__``, or
+    non-Python without tree-sitter).  Pure function of file content — the
+    cache above makes the two dead-block scanners pay it once, not twice.
+    """
+    from ..languages import LanguageId as _LanguageId
+    from . import parse_cache as _pc
+
+    src = _pc.read_source(abs_path)
+    if src is None:
+        return None
+    _lang_id = _LanguageId.from_path(rel_path)
+    _lang = _lang_id.value if _lang_id is not None else "python"
+
+    # ── Primary: tree-sitter (language-agnostic) ──
+    if _HAS_TS:
+        # tree-sitter is error-tolerant; a partial tree from broken source
+        # would under-count references and produce false positives.
+        _pre_tree = _ts_parse_to_tree(src, _lang)
+        if _pre_tree is None or _pre_tree.root_node.has_error:
+            return None
+        all_names = _ts_extract_all_list(src, language=_lang)
+        if "*__dynamic__*" in all_names:
+            return None
+        defs = _ts_collect_all_defs(src, language=_lang)
+        references = _ts_collect_name_references(src, language=_lang)
+    else:
+        # ── Fallback: AST (Python only) ──
+        if _lang != "python":
+            return None
+        tree = _pc.parse_ast(abs_path)
+        if tree is None:
+            return None
+        all_names = _extract_all_list(tree)
+        if "*__dynamic__*" in all_names:
+            return None
+        defs = _collect_all_defs(tree)
+        references = _collect_name_references(tree)
+    return _lang, all_names, defs, references
+
+
 # ── Shared scan core ─────────────────────────────────────────────────────────
+
 
 def scan_dead_block_core(
     *,
@@ -1004,9 +1246,6 @@ def scan_dead_block_core(
 
     Returns ``(candidates, truncated_cluster_count)``.
     """
-    from ..languages import LanguageId as _LanguageId
-    from . import parse_cache as _pc
-
     gap_tol = cluster_gap_tolerance if cluster_gap_tolerance is not None else CLUSTER_GAP_TOLERANCE
     candidates: list[DeadBlockCandidate] = []
     truncated_total = 0
@@ -1016,41 +1255,24 @@ def scan_dead_block_core(
             return False
         return any(not m.name.startswith("_") for m in members)
 
-
+    _dbx_cache, _dbx_dirty = _dbx_load(repo_root or "")
     for rel_path in file_paths or []:
         abs_path = rel_path if os.path.isabs(rel_path) else os.path.join(repo_root or "", rel_path)
-        src = _pc.read_source(abs_path)
-        if src is None:
+        _dbx_fp = _dbx_stat(abs_path)
+        if _dbx_fp is None:
             continue
+        _dbx_entry = _dbx_cache.get(abs_path)
+        if _dbx_entry is None or _dbx_entry[0] != _dbx_fp:
+            # Miss (or stale fingerprint): extract and store — the extraction
+            # is shared verbatim by dead_block_scanner and public_dead_code_
+            # scanner, so the second scanner over the same files hits here.
+            _dbx_entry = (_dbx_fp, _extract_dead_block_file(abs_path, rel_path))
+            _dbx_cache[abs_path] = _dbx_entry
+            _dbx_dirty = True
+        if _dbx_entry[1] is None:
+            continue  # cached skip decision (unreadable / broken / dynamic __all__)
 
-        _lang_id = _LanguageId.from_path(rel_path)
-        _lang = _lang_id.value if _lang_id is not None else "python"
-
-        # ── Primary: tree-sitter (language-agnostic) ──
-        if _HAS_TS:
-            # tree-sitter is error-tolerant; a partial tree from broken source
-            # would under-count references and produce false positives.
-            _pre_tree = _ts_parse_to_tree(src, _lang)
-            if _pre_tree is None or _pre_tree.root_node.has_error:
-                continue
-            all_names = _ts_extract_all_list(src, language=_lang)
-            if "*__dynamic__*" in all_names:
-                continue
-            defs = _ts_collect_all_defs(src, language=_lang)
-            references = _ts_collect_name_references(src, language=_lang)
-        else:
-            # ── Fallback: AST (Python only) ──
-            if _lang != "python":
-                continue
-            tree = _pc.parse_ast(abs_path)
-            if tree is None:
-                continue
-            all_names = _extract_all_list(tree)
-            if "*__dynamic__*" in all_names:
-                continue
-            defs = _collect_all_defs(tree)
-            references = _collect_name_references(tree)
-
+        _lang, all_names, defs, references = _dbx_entry[1]
         _dynamic_invocation = _is_dynamic_invocation_file(rel_path)
 
         _effective_cross = cross_file_referenced_names
@@ -1069,55 +1291,71 @@ def scan_dead_block_core(
             if _dynamic_invocation and not name.startswith("_"):
                 continue
             if not _is_dead_candidate(
-                name, all_names, _effective_cross,
+                name,
+                all_names,
+                _effective_cross,
                 include_public=include_public,
             ):
                 continue
             if _is_externally_referenced(
-                name, lineno, end_lineno, references,
+                name,
+                lineno,
+                end_lineno,
+                references,
                 cross_file_referenced_names=_effective_cross,
                 is_class_attr=(kind == "class_assignment"),
             ):
                 continue
-            dead_members.append(DeadBlockMember(
-                name=name, symbol_kind=kind,
-                lineno=lineno, end_lineno=end_lineno,
-                enclosing_class=enclosing_class,
-            ))
+            dead_members.append(
+                DeadBlockMember(
+                    name=name,
+                    symbol_kind=kind,
+                    lineno=lineno,
+                    end_lineno=end_lineno,
+                    enclosing_class=enclosing_class,
+                )
+            )
 
         if len(dead_members) < 2:
             if len(dead_members) == 1:
                 m = dead_members[0]
-                candidates.append(DeadBlockCandidate(
-                    file=rel_path,
-                    members=[m],
-                    cluster_start=m.lineno,
-                    cluster_end=m.end_lineno,
-                    confidence=singleton_confidence,
-                    is_singleton=True,
-                    includes_public=_pub([m]),
-                ))
+                candidates.append(
+                    DeadBlockCandidate(
+                        file=rel_path,
+                        members=[m],
+                        cluster_start=m.lineno,
+                        cluster_end=m.end_lineno,
+                        confidence=singleton_confidence,
+                        is_singleton=True,
+                        includes_public=_pub([m]),
+                    )
+                )
             continue
 
         clusters, clustered_members = _cluster_dead_members(dead_members, gap_tol)
 
         emitted = 0
         for cluster in clusters:
-            candidates.append(DeadBlockCandidate(
-                file=rel_path,
-                members=list(cluster),
-                cluster_start=cluster[0].lineno,
-                cluster_end=cluster[-1].end_lineno,
-                confidence=1.0,
-                includes_public=_pub(cluster),
-            ))
+            candidates.append(
+                DeadBlockCandidate(
+                    file=rel_path,
+                    members=list(cluster),
+                    cluster_start=cluster[0].lineno,
+                    cluster_end=cluster[-1].end_lineno,
+                    confidence=1.0,
+                    includes_public=_pub(cluster),
+                )
+            )
             emitted += 1
             if emitted >= max_per_file:
                 _remaining = len(clusters) - emitted
                 truncated_total += _remaining
                 logger.warning(
                     "[%s] %s: hit max_per_file=%d, truncating %d remaining cluster(s)",
-                    log_tag, rel_path, max_per_file, _remaining,
+                    log_tag,
+                    rel_path,
+                    max_per_file,
+                    _remaining,
                 )
                 break
 
@@ -1126,23 +1364,30 @@ def scan_dead_block_core(
         for m in dead_members:
             if (m.lineno, m.name) in clustered_members:
                 continue
-            candidates.append(DeadBlockCandidate(
-                file=rel_path,
-                members=[m],
-                cluster_start=m.lineno,
-                cluster_end=m.end_lineno,
-                confidence=singleton_confidence,
-                is_singleton=True,
-                includes_public=_pub([m]),
-            ))
+            candidates.append(
+                DeadBlockCandidate(
+                    file=rel_path,
+                    members=[m],
+                    cluster_start=m.lineno,
+                    cluster_end=m.end_lineno,
+                    confidence=singleton_confidence,
+                    is_singleton=True,
+                    includes_public=_pub([m]),
+                )
+            )
             _singleton_emitted += 1
             if emitted + _singleton_emitted >= max_per_file:
                 break
 
+    if _dbx_dirty:
+        _dbx_save(repo_root or "", _dbx_cache)
+
     if candidates:
         logger.info(
             "[%s] %d cluster(s) across %d file(s); total dead symbols=%d (public=%s)",
-            log_tag, len(candidates), len({c.file for c in candidates}),
+            log_tag,
+            len(candidates),
+            len({c.file for c in candidates}),
             sum(len(c.members) for c in candidates),
             any(c.includes_public for c in candidates),
         )

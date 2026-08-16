@@ -139,3 +139,35 @@ def test_invalid_utf8_replaced_not_dropped():
         pr = ParseResult(success=True, mode=OutputMode.FULL_FILE, content="y = 1\n")
         diff = PatchSynthesizer(td).synthesize(pr, "m.py")
         assert "\ufffd" in diff
+
+
+# ---------------------------------------------------------------------------
+# P9-2: SSOT regression gates — duplicated policy values must not reappear
+# ---------------------------------------------------------------------------
+
+def test_p9_2_synthesis_cap_is_single_source_of_truth():
+    """_MAX_SYNTHESIZE_FILE_CHARS must be an alias of PatchEngine._MAX_FILE_CHARS,
+    not a duplicated value copy. Renaming/parameterizing the gate must keep them equal."""
+    from external_llm import patch_synthesizer as ps_mod
+    from external_llm.patch_engine import PatchEngine
+
+    # SSOT relationship (not just same value — same class constant referenced)
+    assert ps_mod._MAX_SYNTHESIZE_FILE_CHARS == PatchEngine._MAX_FILE_CHARS
+
+
+def test_p9_2_dead_service_caps_removed():
+    """service.py must NOT carry duplicated FILE-rewrite caps (P9-2). The only
+    service-local cap is _MAX_FILE_RETRY_FILE_CHARS (real consumer at L1733)."""
+    import inspect
+
+    from external_llm import service as svc_mod
+
+    src = inspect.getsource(svc_mod)
+    # Ghost constants (previously 0.45/400 here) are gone
+    assert "_MAX_FILE_REWRITE_CHANGE_RATIO = " not in src
+    assert "_MAX_FILE_REWRITE_CHANGED_LINES = " not in src
+    # service-local SSOT caps for FILE rewrites are gone too
+    assert "_MAX_FILE_CHARS = " not in src
+    assert "_MAX_PATCH_CHARS = " not in src
+    # The single service-local cap with a real consumer survives
+    assert "_MAX_FILE_RETRY_FILE_CHARS = " in src

@@ -439,6 +439,58 @@ P3-1 적용 후에도 남는 genuine false positive 4건 (`operation_executor.py
 
 ---
 
+## 🟠 P8 — 2026-08-16 CI 게이트 콜드 부트 개선 라운드
+
+> 컨텍스트: P-I 재측정(`35f52561`, 2026-08-16)에서 게이트 실측 — **웜 15-18s / 콜드 ~69.3s** (`scripts/check_structural_scanners.py --gate-only`). 열거→읽기 통합(B1, `bb641142`)과 원자 쓰기(B2, `73baaf43`)가 캐시 신뢰성을 확보했으나, CI는 캐시가 **아예 없다** — 아래 제안은 그 CI 콜드 부트 비용을 다룬다.
+
+### P8-1. [제안: 채택 검토] `lint.yml` structural-scanner 스텝 `actions/cache`로 `.cache/` 재사용
+
+**파일**: `.github/workflows/lint.yml` — "Check ZERO deterministic structural scanner candidates" 스텝(`run: python scripts/check_structural_scanners.py --gate-only`)
+
+**현황**: `.cache/`는 gitignore(`.gitignore:26`)라 CI checkout에 존재하지 않음 → **매 push마다 콜드 부트**. 실측: 웜 15-18s → 콜드 ~69.3s (**3.9-4.6배**, 게이트 全 스텝 중 최대 단일 비용). `--gate-only`는 8개 스캐너 + 그래프 빌드 전부를 요구하므로 캐시 히트 시 실질 절감은 50s+.
+
+**타당성 (코드로 검증됨)**:
+- 캐시 fingerprint는 `(path, mtime_ns, size)` — `actions/cache`(gzip 압축 tar)로 복원하면 mtime/size가 **원본 그대로 보존**되어 스탬프 일치 → 히트.
+- 파이썬 파일이 **변경된 경우 mtime_ns/size가 바뀌어 미스** → 그 파일만 재분석(self-heal, 변경 후 첫 실행이 콜드 부트와 동일 결과).
+- B2(`73baaf43`) 원자 쓰기 계약: 캐시는 완전 payload 1개 (`atomic_write_json`/streaming temp+replace) — CI 복원 파일이 손상/절단돼도 **fail-open**으로 풀 재분석 (정확성 무영향).
+- `CACHE_VERSION`/`_DBX_CACHE_VERSION`/`_CRX_CACHE_VERSION` 등 버전 키가 payload에 내장 — 스캐너 로직 변경 시 자동 무효화 (수동 버전 범프 불필요).
+
+**리스크: 하** | **노력: 0.25d** | **절감: push당 ~50s** (콜드 69s → 웜 ~18s)
+
+**구현안**: `unit-tests` 잡과 별개로, 같은 스텝 앞에
+
+```yaml
+- name: Cache gate analyzer results (.cache/)
+  id: gate-cache
+  uses: actions/cache@v4
+  with:
+    path: .cache
+    key: gate-scanners-${{ runner.os }}-${{ hashFiles('external_llm/**/*.py', 'scripts/*.py') }}
+    restore-keys: |
+      gate-scanners-${{ runner.os }}-
+```
+
+**주의사항**:
+1. **`hashFiles`는 파이썬 소스만 키** — 소스 무변경 + 의존성만 바뀐 push도 웜 유지 (의도).
+2. **key에 개별 캐시 버전(`CACHE_VERSION` 등)을 넣지 말 것** — 버전은 payload 내장이라 이미 자동 무효화되며, key에 넣으면 불필요한 캐시 분열.
+3. **`--gate-only` 스텝은 `python -m pip install -e .` 직후** — 캐시 restore는 그 **앞**에 배치 (별도 스텝).
+4. 그래프 캐시가 복원되면 `graph.cache_stats` 로그가 **`hit/total`**으로 찍힘 — CI 로그에서 히트율 확인 가능 (검증 지표).
+5. **콜드 ↔ 웜 결과가 같음은 B1 계약상 보장** — 웜 빌드는 캐시-served여도 bit-for-bit 동일 (그래프 walk 순서가 단일 주입 순서, `check_structural_scanners.py:451-454`).
+
+**대안 (기각)**: ① `.cache/` 커밋 — gitignore 계약 위반 + 매 push 100MB 업로드, 기각. ② `--gate-only` 스텝을 release.yml로 이동 — 이 잡이 유일한 push 게이트라 무의미, 기각. ③ pre-commit 훅에 캐시 워밍 — 로컬은 이미 웜이라 무의미, 기각.
+
+### P8-2. [문서: 반영] `check_structural_scanners.py` 게이트 타이밍 주석 갱신
+
+**파일**: `tests/unit/test_check_structural_scanners.py:714-715` (`~21s warm` 주석 → P-I 실측 반영)
+
+**현황**: 웜/콜드 실측값이 문서화된 곳이 없어 CI 캐시 설계자가 기대값을 알 수 없음. P-I(`35f52561`)가 2파일 갱신하며 `tests/unit/test_check_structural_scanners.py:714-715`에 `15-18s warm / 69s cold --gate-only`를 남겼으나, `check_structural_scanners.py` 헤더/도움말에는 콜드 부트 언급이 없음.
+
+**제안**: `scripts/check_structural_scanners.py` docstring/`--help`에 실측 추가 — `--gate-only` 콜드 ~69s (fresh repo/CI, 캐시 부재 시) / 웜 15-18s. "CI 캐시 도입 시 웜에 근접" 기대값 명시.
+
+**리스크: 없음** | **노력: 0.1d**
+
+---
+
 ## 📊 전체 15항목 요약 테이블
 
 | # | 항목 | 카테고리 | 파일/범위 | 노력 | 리스크 | **검증 상태** |
@@ -569,3 +621,4 @@ for f in ['change_spec_assertions.py', 'symbol_handlers.py', 'intent_verifier.py
 | 2026-08-02 | R1+R2+R3 MCP Streamable-HTTP 하드닝 (`5512d50c`) · R4 git-context SSOT 위임 (`20c9da68`) | AI agent |
 | 2026-08-02 | P6-2 REPL 블록 모듈화 (`c52891fd`, P1-1 종결) · R5 pytest-xdist 기본 병렬화 (`922e0920`) | AI agent |
 | 2026-08-02 | P6-3 write_task 하드닝 (`6ee43ed6`, P6 라운드 종결) · C1 문서 스테일 갱신 | AI agent |
+| 2026-08-16 | P8 라운드 신설 — P8-1: lint.yml structural-scanner 스텝 `.cache/` actions/cache 재사용 제안 (타당성: mtime_ns fingerprint 보존 + fail-open + 버전 내장 무효화; 리스크 하, push당 ~50s 절감) · P8-2: 게이트 콜드 부트 타이밍 문서화 제안 (근거: P-I 실측 웜 15-18s / 콜드 ~69s) | AI agent |

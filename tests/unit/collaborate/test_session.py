@@ -10,6 +10,7 @@ import pytest
 
 from external_llm.repl.collaborate import CollaborationVerdict
 from external_llm.repl.collaborate.claude_session import (
+    _MAX_RETAINED_EVENTS,
     ClaudeSession,
     SessionEvent,
     SessionResult,
@@ -263,3 +264,43 @@ class TestQueryTimeout:
         """query_timeout defaults to None → wait_for not applied."""
         s = ClaudeSession()
         assert s._query_timeout is None
+
+
+class TestEventRetentionCap:
+    """SessionResult.events must be a bounded ring (most recent), not an
+    unbounded accumulation — streamed text deltas can emit hundreds of events
+    per single query, and no production consumer reads the full log."""
+
+    def test_retained_events_ring_capped_but_callback_sees_all(self):
+        seen: list[SessionEvent] = []
+        s = ClaudeSession(event_callback=seen.append)
+        total = _MAX_RETAINED_EVENTS + 50
+        for i in range(total):
+            s._emit_event(SessionEvent(type="text", content=f"chunk-{i}"))
+        # Ring cap: only the most recent events are retained, in order.
+        assert len(s._events) == _MAX_RETAINED_EVENTS
+        assert s._events[0].content == "chunk-50"  # oldest dropped
+        assert s._events[-1].content == f"chunk-{total - 1}"  # newest kept
+        # The live callback is NOT capped — every event still reaches it.
+        assert len(seen) == total
+        assert seen[0].content == "chunk-0"
+        assert seen[-1].content == f"chunk-{total - 1}"
+
+    def test_under_cap_keeps_all_in_order(self):
+        s = ClaudeSession()
+        for i in range(5):
+            s._emit_event(SessionEvent(type="text", content=f"c{i}"))
+        assert [e.content for e in s._events] == ["c0", "c1", "c2", "c3", "c4"]
+
+    def test_stream_deltas_stay_bounded(self):
+        """The real emission path (_handle_stream_event → _emit_event) must
+        keep the retained list within the cap for a long partial stream."""
+        s = ClaudeSession()
+        s._events = []
+        for i in range(_MAX_RETAINED_EVENTS + 30):
+            s._handle_stream_event({
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": f"t{i}"},
+            })
+        assert len(s._events) == _MAX_RETAINED_EVENTS
+        assert s._events[-1].content == f"t{_MAX_RETAINED_EVENTS + 29}"

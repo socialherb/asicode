@@ -1241,10 +1241,14 @@ def symbol_defined_anywhere(source: str, symbol: str, file_path: Optional[str] =
     if _HAS_TS:
         try:
             ts_defs = _walk_definitions_py(source)
-            found = any(d.name == symbol for d in ts_defs)
-            if found or lang_id in (None, _LanguageId.PYTHON):
-                return found
-            # Non-Python source with empty tree-sitter → inconclusive, fall through
+            if any(d.name == symbol for d in ts_defs):
+                return True
+            # Tree-sitter collects only function/class/decorated nodes, so a
+            # miss is NOT definitive: module-level or nested assignments
+            # (``X = 1`` / ``X: int = 2``) are invisible to it. Fall through
+            # to the AST walk — the reference implementation — which treats
+            # Assign/AnnAssign as definitions (and, for unknown non-Python
+            # languages, degrades to the conservative True on SyntaxError).
         except Exception:
             logger.debug('symbol_defined_anywhere: tree-sitter failed, falling back to AST', exc_info=True)
 
@@ -1355,7 +1359,11 @@ def collect_defined_names(source: str, file_path: Optional[str] = None) -> set:
                                 for alias in _node.names:
                                     names.add(alias.asname if alias.asname else alias.name.split(".")[0])
                     return names
-                return names
+                # Nothing collected — e.g. an imports-only source: ``import os``
+                # is not a symbol node, so returning the empty set here would
+                # LOSE the imported names the contract promises (``import X``
+                # → ``{X}``). Fall through to the AST fallback — the reference
+                # implementation — instead of returning the empty set early.
         except Exception:
             logger.debug('collect_defined_names: tree-sitter failed, falling back to AST', exc_info=True)
 
@@ -1435,8 +1443,17 @@ def extract_function_signature_detailed(source: str, symbol_name: str) -> Option
                     + node.args.args
                     + node.args.kwonlyargs
                 )
-                for arg in all_args:
+                # Index at which keyword-only args begin (after posonly + args).
+                kwonly_start = len(node.args.posonlyargs) + len(node.args.args)
+                for i, arg in enumerate(all_args):
                     ann = ast.unparse(arg.annotation) if arg.annotation else ""
+                    # A bare '*' separator marks the start of keyword-only args.
+                    # Omitting it collapses ``def f(a, *, b)`` and ``def f(a, b)``
+                    # into the same signature, hiding API-changing edits.  When a
+                    # ``*vararg`` is present its leading '*' already serves as the
+                    # separator, so the bare marker is only needed otherwise.
+                    if i == kwonly_start and node.args.kwonlyargs and not node.args.vararg:
+                        parts.append("*")
                     parts.append(f"{arg.arg}:{ann}")
                 if node.args.vararg:
                     ann = ast.unparse(node.args.vararg.annotation) if node.args.vararg.annotation else ""

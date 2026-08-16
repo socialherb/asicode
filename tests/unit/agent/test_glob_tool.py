@@ -88,6 +88,34 @@ class TestGlobToRegex:
         assert _glob_to_regex("[[:alpha:]]").match("a]")
         assert not _glob_to_regex("[[:alpha:]]").match("b]")
 
+    def test_leading_bracket_in_class_is_literal_member(self):
+        """`[[]` is the class {`[`} in glob terms — a leading `[[` must not be
+        reinterpreted as a Python 3.13+ nested set (FutureWarning today, silent
+        semantics change in a future Python)."""
+        import warnings
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            rx = _glob_to_regex("[[]")
+        assert not any("nested set" in str(w.message) for w in rec), rec
+        assert rx.match("[")
+        assert not rx.match("a")
+        # `[` anywhere in the body is a literal member, not a nested-set opener
+        assert _glob_to_regex("[a[b]").match("[")
+        assert _glob_to_regex("[a[b]").match("b")
+
+    def test_ampersand_pair_in_class_is_literal(self):
+        """`[a&&b]` is the class {a, &, b} in glob terms — the `&&` must not be
+        reinterpreted as the Python 3.13+ set-intersection operator."""
+        import warnings
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            rx = _glob_to_regex("[a&&b]")
+        assert not any("intersection" in str(w.message) for w in rec), rec
+        assert rx.match("&")
+        assert rx.match("a")
+        assert rx.match("b")
+        assert not rx.match("c")
+
 
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:

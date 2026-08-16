@@ -30,6 +30,11 @@ class _FakeJobInfo:
         self.elapsed = 1.0
         self.stdout = "out"
         self.stderr = "err"
+        self.command = "pytest -q"
+        # Capture totals — default to the text lengths; the bounded tests
+        # override them to simulate a capture that elided the middle.
+        self.stdout_total = len(self.stdout)
+        self.stderr_total = len(self.stderr)
 
 
 class _StubBgManager:
@@ -48,6 +53,9 @@ class _StubBgManager:
     def get_info(self, job_id):
         self.get_calls += 1
         return self.info
+
+    def list_jobs(self, include_completed=True):
+        return [self.info]
 
 
 class _Handler(ShellToolsMixin):
@@ -128,6 +136,65 @@ class TestWaitCancellation:
         assert res.ok
 
 
+class TestJobOutputBounded:
+    """F1: ``job(action=output)`` must not push the raw accumulated buffer
+    into the LLM context.  The live buffer grows to ``_OUTPUT_BUF_CAP``
+    (2 MiB/stream — 35x the bash budget) and even the reaped ring's 32 KiB
+    tail is far past it; every other tool result is bounded at
+    ``BASH_OUTPUT_MAX_CHARS``, so a 2 MiB payload would blow the turn's
+    context budget the same way bash used to before ``_truncate_bash_output``.
+    """
+
+    @staticmethod
+    def _cap() -> int:
+        from external_llm.agent.config.thresholds import config as _thresholds
+        return _thresholds.tokens.BASH_OUTPUT_MAX_CHARS
+
+    def test_live_job_output_capped_at_bash_budget(self):
+        big = "x" * (self._cap() * 5)  # 300 KB — 5x the budget, small vs the 2 MiB buffer
+        info = _FakeJobInfo(status="running")
+        info.stdout = big
+        info.stderr = ""
+        h = _handler(_StubBgManager(info))
+        res = h._tool_job({"action": "output", "job_id": "j1"})
+        assert res.ok
+        assert len(res.content) <= self._cap() + 500, (  # +500 = truncation notice
+            f"job output rendered {len(res.content):,} chars against a "
+            f"{self._cap():,}-char cap"
+        )
+        assert "... [truncated" in res.content, "elision not announced"
+        assert res.content.endswith("x" * 100), "the tail (latest output) was dropped"
+
+    def test_truncation_notice_names_the_true_total(self):
+        """F5-followup: the notice must name what the process ACTUALLY printed
+        (the capture total), not the size of the capped text that survived —
+        a job that wrote 108 MB must not be reported as 300 KB."""
+        cap = self._cap()
+        info = _FakeJobInfo(status="completed")
+        info.stdout = "x" * (cap * 5)  # what the bounded capture retained
+        info.stdout_total = 108_000_000  # what the process really printed
+        h = _handler(_StubBgManager(info))
+        res = h._tool_job({"action": "output", "job_id": "j1"})
+        assert res.ok
+        # The notice names the TRUE total (what the process printed), unformatted
+        # — e.g. "107940003", not the ~300K that survived the capture.
+        expected = info.stdout_total + info.stderr_total - cap
+        assert f"{expected}" in res.content, (
+            "notice reported the surviving length instead of the true total"
+        )
+        assert f"{cap * 5}" not in res.content, (
+            "the surviving (capped) size leaked into the notice"
+        )
+
+    def test_small_job_output_untouched(self):
+        info = _FakeJobInfo(status="completed")
+        h = _handler(_StubBgManager(info))
+        res = h._tool_job({"action": "output", "job_id": "j1"})
+        assert res.ok
+        assert "Job ID: j1" in res.content
+        assert "out" in res.content and "err" in res.content
+
+
 class _FakeProc:
     """Minimal subprocess.Popen stand-in (same shape as
     test_background_job_manager.py): poll() returning None keeps it "running"."""
@@ -197,3 +264,55 @@ class TestWaitForCompletionIntegration:
             assert time.monotonic() - t0 < 5.0
         finally:
             mgr.shutdown()
+
+
+class TestJobListPreview:
+    """C2: job(action=list) preview must merge BOTH streams.
+
+    The old pick ``(j.stdout or j.stderr)`` preferred stdout whenever it was
+    non-empty — a toolchain that writes its verdict only to stderr (test
+    failure summaries, linter diagnostics) had its cause hidden behind
+    stdout boilerplate.  Both streams now contribute a tail slice, so
+    neither can swallow the other within the one-line preview budget.
+    """
+
+    def test_stderr_only_verdict_shown(self):
+        info = _FakeJobInfo(status="failed")
+        info.stdout = ""
+        info.stderr = "FAILED test_x — AssertionError: boom"
+        res = _handler(_StubBgManager(info))._tool_job({"action": "list"})
+        assert res.ok
+        assert "FAILED test_x" in res.content
+
+    def test_stdout_boilerplate_does_not_hide_stderr_verdict(self):
+        info = _FakeJobInfo(status="failed")
+        info.stdout = "collecting ... done"  # boilerplate — no verdict
+        info.stderr = "FAILED test_x — AssertionError: boom"
+        res = _handler(_StubBgManager(info))._tool_job({"action": "list"})
+        assert res.ok
+        assert "boom" in res.content, "stderr verdict hidden behind stdout pick"
+
+    def test_both_streams_keep_a_tail_slice_when_long(self):
+        info = _FakeJobInfo(status="running")
+        info.stdout = "A" * 300
+        info.stderr = "B" * 300
+        res = _handler(_StubBgManager(info))._tool_job({"action": "list"})
+        assert res.ok
+        assert "AAA" in res.content, "stdout tail swallowed by stderr"
+        assert "BBB" in res.content, "stderr tail swallowed by stdout"
+
+    def test_stdout_only_preview_unchanged(self):
+        info = _FakeJobInfo(status="completed")
+        info.stdout = "All tests passed"
+        info.stderr = ""
+        res = _handler(_StubBgManager(info))._tool_job({"action": "list"})
+        assert res.ok
+        assert "All tests passed" in res.content
+
+    def test_no_output_omits_preview_line(self):
+        info = _FakeJobInfo(status="running")
+        info.stdout = ""
+        info.stderr = ""
+        res = _handler(_StubBgManager(info))._tool_job({"action": "list"})
+        assert res.ok
+        assert "│" not in res.content

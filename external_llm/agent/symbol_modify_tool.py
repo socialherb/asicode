@@ -926,9 +926,14 @@ def _apply_surgical_edit(
         return None
 
     # Strategy 2: fuzzy match with uniqueness guard
-    search_stripped = [ln.strip() for ln in search_text.splitlines() if ln.strip()]
-    replace_stripped_lines = replace_text.splitlines(keepends=True)
-    if search_stripped:
+    # DEAD BY CONSTRUCTION (kept defensively): search_text is always a
+    # contiguous slice of sym_text — for a full block it IS sym_text, and for
+    # a body-only edit it is lines[body_start:sym_end] with body_start >=
+    # sym_start_line — so the exact find() above always succeeds and this
+    # block is unreachable (round 32-7 coverage audit).
+    search_stripped = [ln.strip() for ln in search_text.splitlines() if ln.strip()]  # pragma: no cover
+    replace_stripped_lines = replace_text.splitlines(keepends=True)  # pragma: no cover
+    if search_stripped:  # pragma: no cover
         fuzzy_candidates = []
         for si in range(sym_start_line, min(sym_end_line, len(lines))):
             matched = True
@@ -991,7 +996,7 @@ def _apply_surgical_edit(
             )
             if new_content != source:
                 return _create_unified_diff(file_path, source, new_content)
-    return None
+    return None  # pragma: no cover — unreachable: exact match always succeeds (see dead-block note above)
 
 
 def _find_symbol_def_line(
@@ -1079,6 +1084,217 @@ def _find_symbol_range_via_treesitter(
     return None
 
 
+def _py_code_part(line: str) -> str:
+    """The code portion of a single Python line, minus any trailing ``#`` comment.
+
+    Single-line scope only (the callers below feed it one physical line), so a
+    triple-quote reads as an ordinary quote — good enough to keep a ``#`` inside
+    a string from being mistaken for a comment marker.
+    """
+    quote = ""
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch == "#":
+            return line[:i]
+        i += 1
+    return line
+
+
+def _py_brackets_balanced(text: str) -> bool:
+    """Whether ``()``/``[]``/``{}`` balance in *text*, ignoring strings and comments.
+
+    Deliberately small: the decorator and signature scans below only need to ask
+    "is this chunk of lines a complete expression yet", so an unterminated
+    triple-quote or a stray closer simply reads as unbalanced.
+    """
+    depth = 0
+    quote = ""
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\" and len(quote) == 1:
+                i += 2
+                continue
+            if text.startswith(quote, i):
+                i += len(quote)
+                quote = ""
+                continue
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch * 3 if text.startswith(ch * 3, i) else ch
+            i += len(quote)
+            continue
+        if ch == "#":
+            nl = text.find("\n", i)
+            if nl == -1:
+                break
+            i = nl + 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return False
+        i += 1
+    return depth == 0 and not quote
+
+
+def _python_class_block(lines: list[str], name: str) -> Optional[tuple[int, int]]:
+    """0-indexed ``(body_start, body_end)`` of ``class <name>``'s body, else ``None``.
+
+    Used to VERIFY a ``Class.method`` qualifier on the non-AST path. Returning
+    ``None`` for an absent class is the whole point: without it the fallback
+    matched the bare method name anywhere in the file, so a wrong qualifier
+    silently edited a same-named method of a different class.
+    """
+    rx = re.compile(rf"^(\s*)class\s+{re.escape(name)}\b")
+    for i, line in enumerate(lines):
+        m = rx.match(line)
+        if m is None:
+            continue
+        cls_indent = len(m.group(1))
+        end = i + 1
+        for k in range(i + 1, len(lines)):
+            stripped = lines[k].strip()
+            if not stripped:
+                continue
+            if len(lines[k]) - len(lines[k].lstrip()) <= cls_indent:
+                break
+            end = k + 1
+        return (i + 1, end)
+    return None
+
+
+def _find_python_symbol_line_range(source: str, symbol: str) -> Optional[tuple[int, int]]:
+    """Python-aware fallback for when the ``ast`` path cannot answer.
+
+    Reached only when :func:`_find_symbol_ast_node` misses — in practice when the
+    file does not parse (the agent is repairing it), which is exactly when
+    modify_symbol gets used. It must never hand Python off to the brace/indent
+    heuristic below, which is written for C-family syntax and mis-ranges Python
+    three ways: it stops at the ``) -> T:`` continuation of a multi-line
+    signature (truncated range → orphaned body), it skips comment lines as
+    boundary candidates (absorbs the NEXT symbol's leading comments → silent
+    deletion), and it has no notion of decorators (start lands below ``@foo`` →
+    duplicated decorator on replace).
+
+    Returns 0-indexed ``(start, exclusive_end)``, matching the ``ast`` path
+    exactly: decorators included, trailing blank/comment lines excluded.
+    """
+    lines = source.splitlines()
+    class_name: Optional[str] = None
+    bare = symbol
+    if "." in symbol:
+        class_name, bare = symbol.split(".", 1)
+        if "." in bare:
+            return None  # A.B.c — unsupported, same as the ast path
+    if not bare.isidentifier():
+        return None
+
+    lo, hi = 0, len(lines)
+    if class_name is not None:
+        block = _python_class_block(lines, class_name)
+        if block is None:
+            return None  # qualifier names a class this file does not define
+        lo, hi = block
+
+    def_rx = re.compile(rf"^\s*(?:async\s+def|def|class)\s+{re.escape(bare)}\b")
+    i = next((k for k in range(lo, hi) if def_rx.match(lines[k])), None)
+    if i is None:
+        return None
+    def_indent = len(lines[i]) - len(lines[i].lstrip())
+
+    # ── Start: walk up over the decorator run (``ast`` uses decorator_list[0]) ──
+    start = i
+    pending: list[str] = []
+    j = i - 1
+    while j >= 0:
+        line = lines[j]
+        stripped = line.strip()
+        if not stripped:
+            break  # a blank line ends the decorator run
+        pending.insert(0, line)
+        chunk = "\n".join(pending)
+        is_deco_head = (
+            stripped.startswith("@")
+            and len(line) - len(line.lstrip()) == def_indent
+            and _py_brackets_balanced(chunk)
+        )
+        if is_deco_head:
+            start = j
+            pending = []
+        elif _py_brackets_balanced(chunk):
+            break  # ordinary code, and nothing left open above it
+        j -= 1
+
+    # ── Header end: the signature may span lines (``def f(\n  x,\n) -> T:``) ──
+    sig_end = i
+    for k in range(i, min(len(lines), i + 200)):
+        chunk = "\n".join(lines[i:k + 1])
+        if _py_brackets_balanced(chunk) and ":" in _py_code_part(lines[k]):
+            sig_end = k
+            break
+
+    # ── End: last real body line. A line at or below the def's own indent is a
+    # boundary EVEN IF it is a comment — that comment introduces the next
+    # sibling. Body comments/blank lines do not extend the range, mirroring
+    # ``ast.end_lineno``, so a replace never eats a trailing separator.
+    last = sig_end
+    for k in range(sig_end + 1, len(lines)):
+        stripped = lines[k].strip()
+        if not stripped:
+            continue
+        if len(lines[k]) - len(lines[k].lstrip()) <= def_indent:
+            break
+        if not stripped.startswith("#"):
+            last = k
+    return (start, last + 1)
+
+
+def _python_symbol_miss_reason(source: str, symbol: str) -> str:
+    """Why a Python symbol could not be located — phrased so the agent can act."""
+    lines = source.splitlines()
+    if "." in symbol:
+        cls = symbol.split(".", 1)[0]
+        if _python_class_block(lines, cls) is None:
+            defined = re.findall(r"^\s*class\s+(\w+)", source, re.MULTILINE)
+            near = difflib.get_close_matches(cls, defined, n=3, cutoff=0.4)
+            hint = ""
+            if near:
+                hint = f" Did you mean '{near[0]}'?"
+            elif defined:
+                hint = f" Classes defined here: {', '.join(defined[:6])}."
+            return f"this file defines no class named '{cls}'.{hint}"
+    try:
+        compile_quiet(source, "<check>", "exec")
+    except SyntaxError as e:
+        return (
+            f"the file does not currently parse (line {e.lineno}: {e.msg}), so the "
+            "symbol index is unavailable — repair the syntax error first, or use "
+            "edit_text to fix it by exact string match"
+        )
+    except (ValueError, TypeError, RecursionError) as e:
+        # diagnosis only — lone surrogates/oversized source make compile()
+        # raise these instead of SyntaxError; never let a diagnosis path
+        # mask the real modify error.
+        logger.debug("_python_symbol_miss_reason: compile failed: %r", e)
+    return "no such symbol in this file"
+
+
 def _find_symbol_line_range(source: str, symbol: str, file_path: str) -> Optional[tuple[int, int]]:
     """Find the line range (start_line, end_line) for a symbol.
 
@@ -1092,6 +1308,11 @@ def _find_symbol_line_range(source: str, symbol: str, file_path: str) -> Optiona
                 deco_list = getattr(node, "decorator_list", [])
                 start = deco_list[0].lineno - 1 if deco_list else node.lineno - 1
                 return (start, end_lineno)
+        # ast missed: the file does not parse, or the symbol/qualifier is absent.
+        # Answer with the Python-aware fallback and RETURN — falling through to
+        # the C-family brace/indent heuristic below produced wrong-but-plausible
+        # ranges (see _find_python_symbol_line_range for the three failure modes).
+        return _find_python_symbol_line_range(source, symbol)
 
     # Non-Python: prefer the tree-sitter AST for an accurate (start, end) taken
     # straight from the parse — no brace-balancing. Falls back to the typed
@@ -1547,6 +1768,18 @@ def modify_symbol(
             ), ""
         return False, (
             f"modify_symbol could not produce syntactically valid code for '{symbol}' "
-            "(re-indentation/splice would break Python syntax). Use apply_patch instead."
+            "(re-indentation/splice would break Python syntax). Retry with edit_text "
+            "(exact string match, always available), or apply_patch if this file has "
+            "not been edited this session — apply_patch refuses files already touched "
+            "by a text-editing tool, so naming it as the only alternative dead-ends."
         ), ""
-    return False, "All strategies failed - could not locate or replace symbol", ""
+    # Locate failure. For Python, say WHY — a bad Class. qualifier and an
+    # unparseable file are both common and need opposite next actions, and the
+    # generic message previously sent the agent looking for a splice problem
+    # that did not exist.
+    detail = ""
+    if LanguageId.from_path(rel_path) is LanguageId.PYTHON:
+        detail = f": {_python_symbol_miss_reason(source, symbol)}"
+    return False, (
+        f"modify_symbol could not locate symbol '{symbol}' in {rel_path}{detail}"
+    ), ""

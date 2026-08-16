@@ -905,6 +905,17 @@ class WriteToolsPatchMixin:
                         ),
                     )
 
+        # F1 cross-process edit-lease guard: refuse when a parallel session
+        # holds a live lease on any op target (pre-check before compile/apply).
+        _lease_paths = [
+            str(op.get("path") or "")
+            for op in (ops or [])
+            if isinstance(op, dict) and op.get("path")
+        ]
+        _lease_refused = self._refuse_foreign_leased(_lease_paths)
+        if _lease_refused is not None:
+            return _lease_refused
+
         # plan_compiler is a first-party root module — import cannot fail.
         from plan_compiler import compile_plan_to_unified_diff
 
@@ -953,7 +964,7 @@ class WriteToolsPatchMixin:
             added_lines = removed_lines = 0
             try:
                 for line in patch.split("\n"):
-                    if line.startswith(("+++", "---")):
+                    if line.startswith(("+++ ", "--- ")):
                         continue
                     if line.startswith("+"):
                         added_lines += 1
@@ -1069,8 +1080,10 @@ class WriteToolsPatchMixin:
                 cur_file["hunks"].append(cur_hunk)
                 continue
             if cur_hunk is not None and (raw_line.startswith(('+', '-', ' '))):
-                # Context/added/removed line. Skip bare '---'/'+++' file headers.
-                if raw_line.startswith(('---', '+++')):
+                # Context/added/removed line. Skip '--- '/'+++ ' file headers
+                # (marker + space); content lines like '---x'/'+++x' (no space)
+                # are real body lines and must NOT be dropped (WP-B1).
+                if raw_line.startswith(('--- ', '+++ ')):
                     continue
                 cur_hunk["lines"].append((raw_line[0], raw_line[1:]))
                 continue
@@ -1121,7 +1134,9 @@ class WriteToolsPatchMixin:
         content_lines: list[str] = []
         in_hunk = False
         for raw in lines:
-            if raw.startswith(('+++', '---')):
+            # Skip '+++ '/'--- ' file headers only; '+++x' (content starting
+            # with '++') is a real added line and must survive (WP-B1).
+            if raw.startswith(('+++ ', '--- ')):
                 continue
             if self._FALLBACK_PATCH_HUNK_RE.match(raw):
                 in_hunk = True
@@ -1727,7 +1742,9 @@ class WriteToolsPatchMixin:
                     "live in the working tree but apply_patch would revert to HEAD on "
                     "conflict (silently losing them): "
                     + ", ".join(_session)
-                    + ". Continue editing these files with the same text-editing tool instead."
+                    + ". Continue editing these files with a text-editing tool instead"
+                    " — edit_text (exact string match) always works here, and is the"
+                    " right retry when modify_symbol has just failed on the same file."
                 ),
                 execution_time=_time.monotonic() - start_time,
                 metadata={
@@ -1735,6 +1752,94 @@ class WriteToolsPatchMixin:
                     "reason": "session_text_edit_overwrite_risk",
                 },
             )
+    def _acquire_edit_leases(self, paths) -> None:
+        """F1: stake this session's cross-process edit lease on ``paths``.
+
+        Called after a successful write so parallel asicode sessions (other
+        terminals / subagent workers) see these files as actively WIP before
+        their own write tools touch them — see
+        :mod:`external_llm.common.edit_lease`. Never raises, never blocks: a
+        lease guards visibility, not availability (the acquire is fail-open
+        and a no-op without a repo_root).
+        """
+        rr = str(getattr(self, "repo_root", "") or "")
+        if not rr or not paths:
+            return
+        try:
+            from external_llm.common.edit_lease import acquire_edit_lease
+
+            for p in paths:
+                acquire_edit_lease(rr, p)
+        except Exception:
+            logger.debug(
+                "<module>::WriteToolsPatchMixin::_acquire_edit_leases suppressed",
+                exc_info=True,
+            )
+
+    def _refuse_foreign_leased(self, touched, start_time: "Optional[float]" = None) -> "Optional[ToolResult]":
+        """F1 cross-process edit-lease guard — sibling of _refuse_session_edited.
+
+        Returns a refusal ToolResult (ok=False) when at least one path in
+        ``touched`` carries a LIVE edit lease owned by a DIFFERENT asicode
+        process (parallel terminal session or subagent worker) — i.e. that
+        session has recent uncommitted WIP on the file. Documented failure
+        modes this prevents: apply_patch's HEAD-context revert silently
+        deleting the other session's edits, AUTO-REPAIR re-attaching code it
+        deleted, ruff/AUTO-fix reformatting a mid-edit file.
+
+        Returns None when nothing conflicts so the caller proceeds. Fail-open:
+        any lease read/parse failure, empty repo_root, or
+        ``ASICODE_EDIT_LEASES=0`` means "no conflict". The escape hatch is
+        deliberate and stated in the error: delete the lease file (path in
+        metadata.foreign_lease_conflicts[].lease_file) once the other session
+        is confirmed done, or disable the guard via the env var.
+        """
+        import time as _time
+        rr = str(getattr(self, "repo_root", "") or "")
+        if not rr:
+            return None
+        try:
+            from external_llm.common.edit_lease import find_live_foreign_leases
+
+            conflicts = find_live_foreign_leases(rr, touched)
+        except Exception:
+            logger.debug(
+                "<module>::WriteToolsPatchMixin::_refuse_foreign_leased suppressed",
+                exc_info=True,
+            )
+            return None
+        if not conflicts:
+            return None
+        _files = ", ".join(str(c.get("path", "?")) for c in conflicts)
+        _owners = "; ".join(
+            "pid {pid} on {host} (last edit {age:.0f}s ago)".format(
+                pid=c.get("pid", "?"), host=c.get("host", "?"), age=c.get("age_s", 0.0)
+            )
+            for c in conflicts
+        )
+        return self._make_result(
+            ok=False,
+            content="",
+            error=(
+                "Write refused: live edit lease from another asicode session on: "
+                + _files
+                + ". Owner: "
+                + _owners
+                + ". That session likely has uncommitted WIP on these files; writing "
+                "now risks silently clobbering its edits (HEAD-context revert, "
+                "AUTO-REPAIR resurrecting deleted code, mid-edit reformatting). Let "
+                "the other session commit or finish first. If you have CONFIRMED it "
+                "is done with these files, remove the lease file(s) listed in "
+                "metadata.foreign_lease_conflicts[].lease_file, or disable the guard "
+                "with ASICODE_EDIT_LEASES=0."
+            ),
+            execution_time=(_time.monotonic() - start_time) if start_time else 0.0,
+            metadata={
+                "foreign_lease_conflicts": conflicts,
+                "reason": "foreign_edit_lease",
+            },
+        )
+
     def _append_applied_patch(self, record: str) -> None:
         """Guarded append to ``self._applied_patches`` — shared by ALL write entry points.
 
@@ -1809,6 +1914,11 @@ class WriteToolsPatchMixin:
         _refused = self._refuse_session_edited(_mp_touched, start_time)
         if _refused is not None:
             return _refused
+        # F1 cross-process edit-lease guard: a parallel session's live lease on
+        # any touched file means uncommitted WIP we must not clobber.
+        _lease_refused = self._refuse_foreign_leased(_mp_touched, start_time)
+        if _lease_refused is not None:
+            return _lease_refused
 
         try:
             engine = PatchEngine(self._effective_repo_root)
@@ -1838,14 +1948,30 @@ class WriteToolsPatchMixin:
                     patch_record = (patch_result.metadata or {}).get("patch") or patch_text
                     if patch_record:
                         self._append_applied_patch(str(patch_record))
+                    # F1: stake our lease on the synthesized-patch target so
+                    # parallel sessions see it as actively WIP.
+                    self._acquire_edit_leases(
+                        list(_mp_touched) + ([str(path)] if path else [])
+                    )
 
                     _meta = dict(patch_result.metadata) if patch_result.metadata else {}
+                    # P26-1: content-loss guard on the LIVE synthesize path —
+                    # score the APPLIED patch (patch_record), not the raw
+                    # non-diff input: the input has no hunks, so scoring it
+                    # would always pass silently.
+                    _applied_text = str(patch_record) if patch_record else patch_text
+                    _ratio_warn = self._check_patch_content_ratio(_applied_text)
+                    if _ratio_warn:
+                        _meta["content_ratio_warning"] = _ratio_warn
+                    _content = patch_result.patch_applied or "Patch applied successfully"
+                    if _ratio_warn:
+                        _content += f"\n{_ratio_warn}"
                     _syn = self._run_syntax_check_for_file(path)
                     if not _syn.get("skipped"):
                         _meta["syntax_check"] = _syn
                     return self._make_result(
                         ok=True,
-                        content=patch_result.patch_applied or "Patch applied successfully",
+                        content=_content,
                         execution_time=execution_time,
                         metadata=_meta
                     )
@@ -1876,6 +2002,11 @@ class WriteToolsPatchMixin:
                 patch_record = (patch_result.metadata or {}).get("patch") or patch_text
                 if patch_record:
                     self._append_applied_patch(str(patch_record))
+                # F1: stake our lease on every file this patch touched so
+                # parallel sessions see them as actively WIP.
+                self._acquire_edit_leases(
+                    list(_mp_touched) + ([str(path)] if path else [])
+                )
 
                 _meta2 = dict(patch_result.metadata) if patch_result.metadata else {}
                 # P26-1: content-loss guard on the MAIN PatchEngine branch —
@@ -1969,6 +2100,10 @@ class WriteToolsPatchMixin:
         _refused = self._refuse_session_edited(_pre_touched_files, start_time)
         if _refused is not None:
             return _refused
+        # F1 cross-process edit-lease guard (mirrors the main entry guard).
+        _lease_refused = self._refuse_foreign_leased(_pre_touched_files, start_time)
+        if _lease_refused is not None:
+            return _lease_refused
 
         # diff_apply is a first-party root module — the import cannot fail.
         # The None guard stays: tests patch diff_apply.apply_patch to None to
@@ -1981,6 +2116,8 @@ class WriteToolsPatchMixin:
                 # Track applied patch so agent_loop can detect successful writes
                 # (applied_patches non-empty = "real edit happened", avoids false-success nudge)
                 self._append_applied_patch(str(patch_text))
+                # F1: stake our lease on every file this diff_apply touched.
+                self._acquire_edit_leases(_pre_touched_files)
                 # P26-1: content-loss guard on the diff_apply fast path too —
                 # the legacy git-apply fallback below had the guard, but this
                 # earlier return bypassed it entirely.
@@ -2184,6 +2321,10 @@ class WriteToolsPatchMixin:
             _refused = self._refuse_session_edited(_pre_touched, start_time)
             if _refused is not None:
                 return _refused
+            # F1 cross-process edit-lease guard (mirrors the main entry guard).
+            _lease_refused = self._refuse_foreign_leased(_pre_touched, start_time)
+            if _lease_refused is not None:
+                return _lease_refused
 
             apply_cmd = list(_apply_base)
             if use_ignore_ws:
@@ -2279,6 +2420,8 @@ class WriteToolsPatchMixin:
                 )
 
             self._append_applied_patch(patch_clean)
+            # F1: stake our lease on every file the pure git-apply path touched.
+            self._acquire_edit_leases(_pre_touched)
             if touched:
                 self._invalidate_cache_after_write(touched)
             content_msg = f"Patch applied successfully. Touched files: {', '.join(touched) or 'unknown'}"
@@ -2637,6 +2780,10 @@ class WriteToolsPatchMixin:
                 ok=False, content="",
                 error=f"Path blocked (outside repo): {file_path}", execution_time=0,
             )
+        # F1 cross-process edit-lease guard.
+        _lease_refused = self._refuse_foreign_leased([file_path])
+        if _lease_refused is not None:
+            return _lease_refused
         # anchor_pattern OR anchor_ast_lineno — exactly one locating strategy required.
         if not anchor_pattern and anchor_ast_lineno is None:
             return self._make_result(
@@ -2691,7 +2838,7 @@ class WriteToolsPatchMixin:
         from external_llm.agent.operation_models import FailureClass as _FC  # noqa: N814 — private lazy-import alias
 
         # ── anchor_ast_lineno: direct line bypasses string search ──────────
-        # Mirrors the editor path's 2a strategy (symbol_handlers_anchor.py:452).
+        # Mirrors the editor path's direct-line anchor strategy.
         # When the caller supplies an exact 1-indexed line (e.g. right after a
         # read_file/read_symbol), skip the string/regex/fuzzy search entirely —
         # eliminates anchor_miss and anchor_not_unique failures. Falls back to
@@ -3046,7 +3193,7 @@ class WriteToolsPatchMixin:
                 lines[anchor_lineno:_anchor_end + 1] = [_block_text]
             else:
                 _old_line = lines[anchor_lineno]
-                # Indent bare snippet to anchor depth — strip() at L3125 already
+                # Indent bare snippet to anchor depth — the earlier `.strip()` already
                 # removed all leading whitespace, so snippet is always "bare".
                 _replace_lines = new_code.splitlines(True)
                 if _replace_lines:

@@ -139,3 +139,117 @@ def test_ruff_findings_bad_json_returns_empty(monkeypatch):
         subprocess, "run", lambda cmd, **kw: _proc(returncode=0, stdout="not json")
     )
     assert semantic_lint.ruff_findings("x = 1\n") == []
+
+
+# ── RED→GREEN: 캐시 히트 / 빈 출력 / many 배치 / LRU 제거 ────────────────
+
+
+class TestRuffFindingsCacheAndBatch:
+    def test_cached_findings_returned_without_respawn(self, monkeypatch):
+        """비어있지 않은 결과는 LRU 캐시에 저장되어 재실행 없이 반환된다."""
+        from external_llm.agent import semantic_lint
+
+        monkeypatch.setattr(semantic_lint, "_RUFF_AVAILABLE", True)
+        key = ("", "F401,F811,F821,F841", "content x")
+        semantic_lint._FINDINGS_CACHE[key] = [{"code": "F401", "line": 1, "message": "unused"}]
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return _proc(returncode=0, stdout="[]")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        out = semantic_lint.ruff_findings("content x")
+        assert out == [{"code": "F401", "line": 1, "message": "unused"}]
+        assert calls == []  # 캐시 히트 — ruff 재기동 없음
+
+    def test_empty_stdout_returns_empty_list(self, monkeypatch):
+        from external_llm.agent import semantic_lint
+
+        monkeypatch.setattr(semantic_lint, "_RUFF_AVAILABLE", True)
+        monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _proc(returncode=0, stdout=""))
+        assert semantic_lint.ruff_findings("x = 1") == []
+
+    def test_many_unavailable_returns_empty(self, monkeypatch):
+        from external_llm.agent import semantic_lint
+
+        monkeypatch.setattr(semantic_lint, "_check_ruff_available", lambda: False)
+        assert semantic_lint.ruff_findings_many(["a.py"]) == {}
+
+    def test_many_no_py_paths_returns_empty(self, monkeypatch):
+        from external_llm.agent import semantic_lint
+
+        monkeypatch.setattr(semantic_lint, "_RUFF_AVAILABLE", True)
+        assert semantic_lint.ruff_findings_many(["a.txt"]) == {}
+        assert semantic_lint.ruff_findings_many(["missing.py"]) == {}
+
+    def test_many_nonzero_rc_returns_empty(self, monkeypatch, tmp_path):
+        from external_llm.agent import semantic_lint
+
+        f = tmp_path / "a.py"
+        f.write_text("x = 1")
+        monkeypatch.setattr(semantic_lint, "_RUFF_AVAILABLE", True)
+        monkeypatch.setattr(subprocess, "run",
+                            lambda cmd, **kw: _proc(returncode=2, stdout="", stderr="boom"))
+        assert semantic_lint.ruff_findings_many([str(f)]) == {}
+
+    def test_many_empty_stdout_returns_all_empty(self, monkeypatch, tmp_path):
+        from external_llm.agent import semantic_lint
+
+        f = tmp_path / "a.py"
+        f.write_text("x = 1")
+        monkeypatch.setattr(semantic_lint, "_RUFF_AVAILABLE", True)
+        monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _proc(returncode=0, stdout=""))
+        assert semantic_lint.ruff_findings_many([str(f)]) == {str(f): []}
+
+    def test_many_subprocess_error_returns_empty(self, monkeypatch, tmp_path):
+        from external_llm.agent import semantic_lint
+
+        f = tmp_path / "a.py"
+        f.write_text("x = 1")
+
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, timeout=15)
+
+        monkeypatch.setattr(semantic_lint, "_RUFF_AVAILABLE", True)
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert semantic_lint.ruff_findings_many([str(f)]) == {}
+
+    def test_cache_lookup_moves_to_end_and_copies(self):
+        from external_llm.agent import semantic_lint
+
+        key = ("k",)
+        semantic_lint._FINDINGS_CACHE[key] = [{"code": "F401"}]
+        semantic_lint._FINDINGS_CACHE[("other",)] = [{"code": "F821"}]
+        out = semantic_lint._findings_cache_lookup(key)
+        assert out == [{"code": "F401"}]
+        assert out is not semantic_lint._FINDINGS_CACHE[key]  # 복사본
+        # move_to_end로 key가 최근 항목이 됨
+        assert list(semantic_lint._FINDINGS_CACHE)[-1] == key
+
+    def test_cache_store_evicts_lru_at_cap(self):
+        from external_llm.agent import semantic_lint
+
+        semantic_lint._FINDINGS_CACHE.clear()
+        for i in range(semantic_lint._FINDINGS_CACHE_MAX + 5):
+            semantic_lint._findings_cache_store((f"m{i}",), [{"code": "F401"}])
+        assert len(semantic_lint._FINDINGS_CACHE) == semantic_lint._FINDINGS_CACHE_MAX
+        assert (f"m{0}",) not in semantic_lint._FINDINGS_CACHE  # 가장 오래된 항목 제거
+        assert (f"m{semantic_lint._FINDINGS_CACHE_MAX + 4}",) in semantic_lint._FINDINGS_CACHE
+        semantic_lint._FINDINGS_CACHE.clear()
+
+
+class TestRuffFindingsManyParseLoop:
+    def test_findings_parsed_into_by_path(self, monkeypatch, tmp_path):
+        from external_llm.agent import semantic_lint
+
+        f = tmp_path / "a.py"
+        f.write_text("import os\n")
+        payload = json.dumps([
+            {"filename": str(f), "location": {"row": 2}, "code": "F401",
+             "message": "unused import", "severity": "warning"},
+        ])
+        monkeypatch.setattr(semantic_lint, "_check_ruff_available", lambda: True)
+        monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _proc(returncode=1, stdout=payload))
+        out = semantic_lint.ruff_findings_many([str(f)])
+        assert out[str(f)] == [{"code": "F401", "line": 2, "message": "unused import"}]

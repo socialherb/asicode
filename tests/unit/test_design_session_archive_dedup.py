@@ -177,9 +177,20 @@ class TestArchiveCompressedTurnsDedup:
 
         assert s.archived_count == 1
 
-    def test_preserve_turn_stops_archiving(self, mgr):
+    def test_legacy_preserve_turns_migrate_and_archive(self, mgr):
+
+        """The stop-at-preserve scan was removed as unreachable: nothing
+
+        produces preserve=True any more (add_turn never sets it and _load_raw
+
+        migrates legacy disk files to exclude_from_compression at the single
+
+        read choke point).  Every turn below the cut archives — including
+
+        migrated exclude turns, which are ephemeral by contract."""
 
         p = _write(mgr, "s1", [])
+
 
         s = _session(
 
@@ -189,10 +200,16 @@ class TestArchiveCompressedTurnsDedup:
 
         )
 
+        # Simulate what _load_raw does to a legacy disk file:
+
+        s.turns[1].pop("preserve")
+
+        s.turns[1]["exclude_from_compression"] = True
+
         mgr._archive_compressed_turns(s)
 
-        assert len(p.read_text(encoding="utf-8").splitlines()) == 1
+        assert len(p.read_text(encoding="utf-8").splitlines()) == 3
 
-        assert s.archived_count == 1
+        assert s.archived_count == 3
 
-        assert len(s.turns) == 2
+        assert len(s.turns) == 0

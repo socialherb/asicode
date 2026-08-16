@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 from abc import ABC, abstractmethod
+from bisect import bisect_left
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from typing import Optional
@@ -669,7 +670,39 @@ def net_brace_count(content: str, *, js_lexing: bool = False) -> int:
     return depth
 
 
-def find_brace_block_end(content: str, offset: int) -> int:
+def build_line_index(content: str) -> list[int]:
+    """All ``\n`` offsets in *content*, ascending.
+
+    Build once per content string, then answer any number of
+    "what line is this offset on?" queries in O(log n) via
+    :func:`line_at_offset` / :func:`line_index_at_offset` instead of the
+    O(n) ``content[:offset].count("\\n")`` idiom.  The regex-fallback
+    definition scans call this per match today — Σ m.start() ≈ N·M/2
+    copies per scan.
+    """
+    out: list[int] = []
+    p = content.find("\n")
+    while p != -1:
+        out.append(p)
+        p = content.find("\n", p + 1)
+    return out
+
+
+def line_index_at_offset(nl: list[int], offset: int) -> int:
+    """0-based line index of *offset* — equivalent to ``content[:offset].count("\\n")``.
+
+    ``bisect_left`` (NOT ``bisect_right``): an offset sitting exactly on a
+    newline belongs to the line *after* it, matching ``count`` semantics.
+    """
+    return bisect_left(nl, offset)
+
+
+def line_at_offset(nl: list[int], offset: int) -> int:
+    """1-based line number of *offset* — ``content[:offset].count("\\n") + 1``, O(log n)."""
+    return line_index_at_offset(nl, offset) + 1
+
+
+def find_brace_block_end(content: str, offset: int, nl: list[int] | None = None) -> int:
     """Heuristic: 1-based line of the matching ``}`` starting from *offset*.
 
     Derives from the core :func:`_find_closing_brace` scanner — every newline
@@ -680,12 +713,17 @@ def find_brace_block_end(content: str, offset: int) -> int:
     Shared by all brace-delimited C-family languages (C/C++/Go/Java/Kotlin/
     TypeScript/JavaScript).  Conservative fallback is the start line when
     no matching brace is found.
+
+    *nl* is an optional precomputed :func:`build_line_index` — pass it when
+    calling in a loop to keep the two line queries O(log n) instead of O(n).
     """
-    start_line = content[:offset].count("\n") + 1
+    start_line = content[:offset].count("\n") + 1 if nl is None else line_at_offset(nl, offset)
     end = _find_closing_brace(content, offset)
     if end == -1:
         return start_line
-    return content[:end].count("\n") + 1
+    if nl is None:
+        return content[:end].count("\n") + 1
+    return line_at_offset(nl, end)
 
 
 def find_brace_block_end_offset(content: str, offset: int) -> int:

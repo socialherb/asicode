@@ -8,7 +8,12 @@ from typing import ClassVar
 
 import pytest
 
-from external_llm.languages.base import tree_sitter_syntax_fallback
+from external_llm.languages.base import (
+    build_line_index,
+    line_at_offset,
+    line_index_at_offset,
+    tree_sitter_syntax_fallback,
+)
 from external_llm.languages.bash_provider import BashSyntaxProvider
 from external_llm.languages.go_provider import GoSyntaxProvider
 from external_llm.languages.java_provider import JavaSyntaxProvider
@@ -1054,3 +1059,59 @@ class TestIterSymbolMatches:
         # Unescaped, "Foo+" would match the "Foo" prefix of FooPlus.
         content = "package main\n\nvar FooPlus = 1\n"
         assert list(provider._iter_symbol_matches(content, "Foo+")) == []
+
+
+# ── Line-index SSOT: build_line_index / line_at_offset / line_index_at_offset ─
+
+class TestLineIndexHelpers:
+    """P1: the regex fallbacks replaced per-match ``content[:off].count("\\n")``
+    (O(n) each) with a precomputed newline-offset index + bisect (O(log n)).
+
+    Pins the exact equivalence with the old ``count`` idiom, including the
+    boundary the analysis flagged: an offset sitting exactly ON a newline
+    belongs to the line that newline terminates (``bisect_left``, not right).
+    """
+
+    def test_matches_count_idiom_on_random_offsets(self):
+        import random
+
+        rng = random.Random(7)
+        for _ in range(50):
+            lines = [
+                "".join(rng.choice("abc def{}()") for _ in range(rng.randint(0, 30)))
+                for _ in range(rng.randint(1, 40))
+            ]
+            content = "\n".join(lines)
+            nl = build_line_index(content)
+            for _ in range(30):
+                off = rng.randint(0, len(content))
+                assert line_at_offset(nl, off) == content[:off].count("\n") + 1
+                assert line_index_at_offset(nl, off) == content[:off].count("\n")
+
+    def test_offset_exactly_on_newline_belongs_to_terminated_line(self):
+        content = "aaa\nbbb\nccc\n"
+        nl = build_line_index(content)
+        first_nl = content.index("\n")
+        # The first newline ends line 1 — not line 2 (bisect_right would say 2).
+        assert content[:first_nl].count("\n") + 1 == 1
+        assert line_at_offset(nl, first_nl) == 1
+
+    def test_empty_and_trailing_newline_content(self):
+        assert build_line_index("") == []
+        assert line_at_offset([], 0) == 1
+        content = "only-one-line"
+        assert line_at_offset(build_line_index(content), 5) == 1
+        assert line_index_at_offset(build_line_index(content), 5) == 0
+
+    def test_line_index_offsets_are_ascending_newline_positions(self):
+        content = "a\nbb\nccc\n\ndddd\n"
+        assert build_line_index(content) == [1, 4, 8, 9, 14]
+
+    def test_find_brace_block_end_accepts_precomputed_index(self):
+        from external_llm.languages.base import find_brace_block_end
+
+        content = "func A() {\n    return 1\n}\nfunc B() {\n}\n"
+        nl = build_line_index(content)
+        off = content.index("{")
+        # Same result with and without the precomputed index.
+        assert find_brace_block_end(content, off, nl) == find_brace_block_end(content, off) == 3

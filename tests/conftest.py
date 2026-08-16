@@ -214,11 +214,18 @@ def temp_repo_root() -> Generator[str, None, None]:
     """Create a temporary directory as a fake repository root."""
     tmpdir = tempfile.mkdtemp(prefix="asr-test-")
     try:
-        # Initialize as a git repo for git operations
+        # Initialize as a git repo for git operations. Five subprocess spawns
+        # per test used to cost ~150ms each under 8-way parallelism; the user
+        # identity is written straight into .git/config (git init always
+        # creates that file) instead of two `git config` subprocesses.
         import subprocess
-        subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=False)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmpdir, capture_output=True, check=False)
-        subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmpdir, capture_output=True, check=False)
+        subprocess.run(["git", "init", "-q"], cwd=tmpdir, capture_output=True, check=False)
+        with (Path(tmpdir) / ".git" / "config").open("a") as cfg:
+            cfg.write(
+                "[user]\n"
+                "\temail = test@example.com\n"
+                "\tname = Test User\n"
+            )
 
         # Create a sample Python file for testing
         sample_file = Path(tmpdir) / "sample.py"
@@ -234,7 +241,7 @@ def temp_repo_root() -> Generator[str, None, None]:
 
         # Commit the file
         subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=False)
-        subprocess.run(["git", "commit", "-m", "initial"], cwd=tmpdir, capture_output=True, check=False)
+        subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=tmpdir, capture_output=True, check=False)
 
         yield tmpdir
     finally:

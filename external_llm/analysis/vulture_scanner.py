@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import ast
 import datetime as _dt
+import json
 import logging
 import os
 import sys
@@ -37,7 +38,9 @@ from dataclasses import dataclass, field
 from typing import Any, Generic, Optional, TypeVar
 
 from external_llm.agent.config.thresholds import config as _cfg
+from external_llm.analysis import parse_cache
 from external_llm.analysis.unused_import_scanner import _has_noqa_comment
+from external_llm.common.atomic_io import atomic_write_json
 from external_llm.common.cache_utils import _capped_put
 
 logger = logging.getLogger(__name__)
@@ -93,15 +96,34 @@ _VANISHED_RETRIES = 3
 # framework with no static caller (vulture cannot see polymorphic dispatch):
 #   _missing_         — Enum metaclass fallback (value lookup)
 #   handle_*          — html.parser.HTMLParser streaming callbacks
-_ALWAYS_LIVE: frozenset[str] = frozenset({
-    "__init__", "__new__", "__str__", "__repr__", "__call__",
-    "__enter__", "__exit__", "__iter__", "__next__", "__len__",
-    "__getitem__", "__setitem__", "__contains__",
-    "__post_init__", "__hash__", "__eq__", "__ne__", "__lt__", "__gt__",
-    # Non-dunder framework protocols (no static caller by design):
-    "_missing_",
-    "handle_starttag", "handle_endtag", "handle_data",
-})
+_ALWAYS_LIVE: frozenset[str] = frozenset(
+    {
+        "__init__",
+        "__new__",
+        "__str__",
+        "__repr__",
+        "__call__",
+        "__enter__",
+        "__exit__",
+        "__iter__",
+        "__next__",
+        "__len__",
+        "__getitem__",
+        "__setitem__",
+        "__contains__",
+        "__post_init__",
+        "__hash__",
+        "__eq__",
+        "__ne__",
+        "__lt__",
+        "__gt__",
+        # Non-dunder framework protocols (no static caller by design):
+        "_missing_",
+        "handle_starttag",
+        "handle_endtag",
+        "handle_data",
+    }
+)
 
 # libcst/ast visitor base classes. Subclasses define per-node-type dispatch
 # hooks — ``visit_<Node>``, ``leave_<Node>`` — and lifecycle methods
@@ -110,10 +132,14 @@ _ALWAYS_LIVE: frozenset[str] = frozenset({
 # inheritance (see ``_collect_visitor_hook_linenos``), NOT by name alone, so a
 # coincidentally named business method (e.g. ``visit_url`` in a non-visitor
 # class) is never over-suppressed.
-_VISITOR_BASE_NAMES: frozenset[str] = frozenset({
-    "CSTVisitor", "CSTTransformer",     # libcst
-    "NodeVisitor", "NodeTransformer",   # ast
-})
+_VISITOR_BASE_NAMES: frozenset[str] = frozenset(
+    {
+        "CSTVisitor",
+        "CSTTransformer",  # libcst
+        "NodeVisitor",
+        "NodeTransformer",  # ast
+    }
+)
 _VISITOR_HOOK_PREFIXES: tuple[str, ...] = ("visit_", "leave_")
 _VISITOR_HOOK_EXACT: frozenset[str] = frozenset({"on_visit", "on_leave", "generic_visit"})
 
@@ -128,21 +154,46 @@ _VISITOR_HOOK_EXACT: frozenset[str] = frozenset({"on_visit", "on_leave", "generi
 #                                      ``close_connection`` (http.server protocol)
 # A coincidentally named business attribute in a non-framework class is never
 # suppressed (see ``_framework_live_for_file``).
-_ENUM_BASE_NAMES: frozenset[str] = frozenset({
-    "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
-})
-_PYDANTIC_BASE_NAMES: frozenset[str] = frozenset({
-    "BaseModel", "BaseSettings", "RootModel",
-})
-_PYDANTIC_FIELD_DECORATORS: frozenset[str] = frozenset({
-    "model_validator", "field_validator", "computed_field", "serializer", "validator",
-})
-_HTTP_BASE_NAMES: frozenset[str] = frozenset({
-    "BaseHTTPRequestHandler", "StreamingHTTPRequestHandler", "SimpleHTTPRequestHandler",
-})
-_HTTP_PROTOCOL_ATTRS: frozenset[str] = frozenset({
-    "server_version", "protocol_version", "log_message", "close_connection",
-})
+_ENUM_BASE_NAMES: frozenset[str] = frozenset(
+    {
+        "Enum",
+        "IntEnum",
+        "StrEnum",
+        "Flag",
+        "IntFlag",
+    }
+)
+_PYDANTIC_BASE_NAMES: frozenset[str] = frozenset(
+    {
+        "BaseModel",
+        "BaseSettings",
+        "RootModel",
+    }
+)
+_PYDANTIC_FIELD_DECORATORS: frozenset[str] = frozenset(
+    {
+        "model_validator",
+        "field_validator",
+        "computed_field",
+        "serializer",
+        "validator",
+    }
+)
+_HTTP_BASE_NAMES: frozenset[str] = frozenset(
+    {
+        "BaseHTTPRequestHandler",
+        "StreamingHTTPRequestHandler",
+        "SimpleHTTPRequestHandler",
+    }
+)
+_HTTP_PROTOCOL_ATTRS: frozenset[str] = frozenset(
+    {
+        "server_version",
+        "protocol_version",
+        "log_message",
+        "close_connection",
+    }
+)
 
 
 # ── noqa suppression ──────────────────────────────────────────────────────────
@@ -158,6 +209,7 @@ _HTTP_PROTOCOL_ATTRS: frozenset[str] = frozenset({
 # files, avg ~28KB → cap 256 ≈ ~7MB worst-typical).
 _SOURCE_LINES_CACHE_MAX_ENTRIES: int = 256
 _source_lines_cache: dict[str, tuple[float, list[str]]] = {}
+
 
 def _source_line_has_noqa(abs_path: str, lineno: int, codes: set[str] | None = None) -> bool:
     """Check if the source line at *lineno* (1-indexed) has a # noqa comment."""
@@ -181,6 +233,7 @@ def _source_line_has_noqa(abs_path: str, lineno: int, codes: set[str] | None = N
 
 # ── Test-path & string-dispatch suppression ───────────────────────────────────
 
+
 def _is_test_path(rel_file: str) -> bool:
     """True if *rel_file* is a test file (pytest fixtures/parametrize noise).
 
@@ -194,11 +247,7 @@ def _is_test_path(rel_file: str) -> bool:
     if any(seg == "tests" for seg in parts):
         return True
     base = parts[-1]
-    return (
-        base == "conftest.py"
-        or base.startswith("test_")
-        or base.endswith("_test.py")
-    )
+    return base == "conftest.py" or base.startswith("test_") or base.endswith("_test.py")
 
 
 def _is_cancelled(cancel_event: Any) -> bool:
@@ -242,8 +291,7 @@ def _scavenge_tolerant(
             if len(kept) == len(pending):
                 raise  # no listed path vanished — unexpected SystemExit
             logger.warning(
-                "[VULTURE_SCANNER] %d path(s) vanished mid-scan — retrying "
-                "without them",
+                "[VULTURE_SCANNER] %d path(s) vanished mid-scan — retrying without them",
                 len(pending) - len(kept),
             )
             pending = kept
@@ -252,9 +300,7 @@ def _scavenge_tolerant(
     # Bounded retries exhausted with a live vanished path each time — the
     # environment is churning too hard to scan; fail loudly rather than
     # silently skipping candidates.
-    raise SystemExit(
-        f"vulture: {len(pending)} path(s) kept vanishing during scan"
-    )
+    raise SystemExit(f"vulture: {len(pending)} path(s) kept vanishing during scan")
 
 
 def _scavenge_with_cancel(
@@ -316,6 +362,260 @@ def _scavenge_with_cancel(
     return True
 
 
+# ── Per-file scan cache ───────────────────────────────────────────────────────
+# vulture's ``scan()`` is per-file (``scan(code, filename=path)`` appends the
+# file's defined items to ``v.defined_*`` / ``v.unreachable_code`` and its
+# referenced names to the GLOBAL ``v.used_names``), and ``get_unused_code()``
+# matches items against that global used-names set — cross-file references
+# are the point: a use in b.py keeps a.py's definition alive.  Per-file scan
+# results are therefore cacheable independently under the same
+# ``(st_mtime_ns, st_size)`` fingerprint the in-memory caches use, and a
+# cache-hit run re-parses only the changed files while reproducing the SAME
+# ``defined_*`` / ``used_names`` / ``unreachable_code`` state as a full
+# scavenge — hence the same ``get_unused_code()`` output.  Round 32-P-F:
+# full-project scans went from ~940 ast.parse / ~15s on asicode to
+# cache-hot ~0.5s (this repo's structural gate runs the scanner on every
+# pre-commit / lint.yml step, so the cache pays off within a single push).
+# vulture typ → Vulture attribute that collects that kind's items (the plural
+# forms are irregular: class→classes, property→props, variable→vars — never
+# derive them with a blind ``+ "s"``).
+_VULTURE_TYP_TO_ATTR = {
+    "attribute": "defined_attrs",
+    "class": "defined_classes",
+    "function": "defined_funcs",
+    "import": "defined_imports",
+    "method": "defined_methods",
+    "property": "defined_props",
+    "variable": "defined_vars",
+}
+_VULTURE_DEFINED_ATTRS = (*_VULTURE_TYP_TO_ATTR.values(), "unreachable_code")
+
+# Bumped 1 → 2 (2026-08-16): the per-file "used" payload changed semantics
+# from a scan-ORDER-DEPENDENT delta (``set(used_names) - used_before``, which
+# silently dropped names first used by earlier-scanned files — a full-repo
+# entry restored in per-file mode falsely flagged ``logger``/``ast``/etc. as
+# unused) to the file's ABSOLUTE used-name set (fresh-instance scan, valid
+# under any restore subset/order).
+# Bumped 2 → 3 (round 32-F2): the per-item "filename" key was hoisted to a
+# single entry-level "fn" — every item of an entry shares the entry file's
+# path, so repeating it 109K times wasted ~4.4MB (19% of the 22MB payload).
+_VULTURE_CACHE_VERSION = 3
+
+
+def _vulture_cache_path(repo_root: str) -> str:
+    from . import parse_cache as _pc
+
+    return _pc.cache_file_path(repo_root, f"vulture_scan_v{_VULTURE_CACHE_VERSION}.json")
+
+
+def _load_vulture_scan_cache(repo_root: str, vulture_version: str) -> dict[str, dict]:
+    """Per-file scan results keyed by repo-relative path — fail-open.
+
+    Any read error / format mismatch / vulture-version mismatch returns {} —
+    a stale cache must never change scan results, only cost a full re-scan.
+    An empty *repo_root* (unit-test convention) bypasses the cache entirely,
+    mirroring the other scanners' disk caches.
+    """
+    if not repo_root:
+        return {}
+    cache_path = _vulture_cache_path(repo_root)  # outside try: CachePathError must propagate
+    try:
+        with open(cache_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if (
+        payload.get("format") != _VULTURE_CACHE_VERSION
+        or payload.get("vulture") != vulture_version
+        or not isinstance(payload.get("files"), dict)
+    ):
+        return {}
+    return payload["files"]
+
+
+def _save_vulture_scan_cache(repo_root: str, files: dict[str, dict], vulture_version: str) -> None:
+    """Atomic replace via the canonical writer; failures logged (fail-open).
+
+    Delegates to :func:`atomic_write_json` (B2) — same rename atomicity the
+    hand-rolled pid-tmp+``os.replace`` here provided, plus fsync, failure-path
+    temp cleanup and the stale-temp sweep.  Lock-free last-writer-wins; see
+    the disk-cache concurrency policy in ``parse_cache``.
+    """
+    if not repo_root:
+        return
+    payload = {
+        "format": _VULTURE_CACHE_VERSION,
+        "vulture": vulture_version,
+        "files": files,
+    }
+    path = _vulture_cache_path(repo_root)
+    try:
+        atomic_write_json(path, payload, indent=None, ensure_ascii=True)
+    except (OSError, TypeError, ValueError):
+        logger.debug("[VULTURE_SCANNER] scan cache write failed", exc_info=True)
+
+
+def _serialize_vulture_item(item) -> dict:
+    """One vulture Item → JSON-safe dict (fields of vulture.core.Item).
+
+    The filename is NOT repeated per item: it is hoisted to the entry's
+    "fn" key (all items of an entry belong to that one file — round 32-F2,
+    ~19% payload reduction)."""
+    return {
+        "name": item.name,
+        "typ": item.typ,
+        "first_lineno": item.first_lineno,
+        "last_lineno": item.last_lineno,
+        "message": item.message,
+        "confidence": item.confidence,
+    }
+
+
+def _restore_vulture_entry(v: Any, entry: dict) -> None:
+    """Rehydrate one cached per-file scan into *v* (defined items + used names)."""
+    from pathlib import Path
+
+    import vulture.core
+
+    for d in entry.get("items", []):
+        item = vulture.core.Item(
+            name=d["name"],
+            typ=d["typ"],
+            filename=Path(entry.get("fn") or ""),
+            first_lineno=d["first_lineno"],
+            last_lineno=d["last_lineno"],
+            message=d.get("message", ""),
+            confidence=d.get("confidence", 0),
+        )
+        if d["typ"] == "unreachable_code":
+            v.unreachable_code.append(item)
+        else:
+            getattr(v, _VULTURE_TYP_TO_ATTR[d["typ"]]).append(item)
+    used = entry.get("used")
+    if used:
+        v.used_names.update(used)
+
+
+def _prepare_vulture_exclude_patterns(exclude_patterns: list[str]) -> list[str]:
+    """scavenge()'s exclude normalization: bare patterns become ``*pat*``."""
+
+    def prepare_pattern(pattern: str) -> str:
+        if not any(char in pattern for char in "*?["):
+            return f"*{pattern}*"
+        return pattern
+
+    return [prepare_pattern(p) for p in (exclude_patterns or [])]
+
+
+def _scan_vulture_files_with_cache(
+    v: Any,
+    scan_paths: list[str],
+    exclude_patterns: list[str],
+    repo_root: str,
+    cancel_event: Any = None,
+    files_cache: Optional[dict] = None,
+    save_state: Optional[dict] = None,
+) -> bool:
+    """Per-file vulture scan with a (mtime_ns, size)-keyed disk cache.
+
+    Returns True when the scan completed; False when cancelled (or never
+    started).  Replaces the whole-set ``v.scavenge()`` with a per-file
+    ``v.scan(code, filename=path)`` loop whose results are cached, so a
+    cache-hot run re-parses only the changed files while producing the SAME
+    ``defined_*`` / ``used_names`` / ``unreachable_code`` state — and thus the
+    same ``get_unused_code()`` output (cross-file matching is preserved: used
+    names are rehydrated into the global ``used_names`` set before matching).
+
+    Persistence (round 32-F2): when *save_state* is None the function persists
+    via ``parse_cache.should_persist_partial_update`` — a partial update of a
+    large corpus is SKIPPED (serialising ~22MB to persist a 1-3-file edit
+    costs 4.6s while re-scanning those files costs ~0.1s each).  When the
+    caller supplies *save_state* (``{"dirty": int}``), counting is delegated:
+    the caller decides once, after its own pre-processing sync, so a cold run
+    writes the payload exactly once instead of twice.
+
+    Files that vanish between enumeration and read are skipped with a debug
+    log — per-file granularity makes the whole-set SystemExit retry loop
+    (``_scavenge_tolerant``) unnecessary: one missing file no longer aborts
+    the scan.
+
+    Exclude patterns use scavenge semantics (``*pat*`` fnmatch wrapping,
+    case-insensitive).  Cancellation is checked between files — per-file
+    granularity makes the scan interruptible at file boundaries without the
+    daemon-thread machinery ``_scavenge_with_cancel`` needs for the opaque
+    whole-set call.
+    """
+    import vulture
+    import vulture.core
+
+    if _is_cancelled(cancel_event):
+        return False
+
+    patterns = _prepare_vulture_exclude_patterns(exclude_patterns)
+    if files_cache is None:
+        files_cache = _load_vulture_scan_cache(repo_root, vulture.__version__)
+    dirty = 0
+    for abs_path in scan_paths:
+        if _is_cancelled(cancel_event):
+            return False
+        rel = os.path.relpath(abs_path, repo_root)
+        if patterns and vulture.core._match(rel, patterns, case=False):
+            continue
+        fp = _stat_fingerprint(abs_path)
+        if fp is None:
+            continue  # vanished between enumeration and read
+        entry = files_cache.get(rel)
+        if entry is not None and tuple(entry.get("fp") or ()) == fp:
+            _restore_vulture_entry(v, entry)
+            continue
+        pair = parse_cache.read_with_fingerprint(abs_path)
+        if pair is None:
+            logger.debug("[VULTURE_SCANNER] %s vanished before read", abs_path)
+            continue
+        # Fused pair: the entry is keyed by the stamp taken with THIS read,
+        # never a post-write stamp with pre-write content (B1 order contract).
+        code, fp = pair
+        marks = {attr: len(getattr(v, attr)) for attr in _VULTURE_DEFINED_ATTRS}
+        # Capture THIS file's used names in isolation: vulture's scan only
+        # WRITES ``used_names`` (never reads it — verified against vulture
+        # 2.16 core.py), so clearing the shared set before the scan and
+        # merging the additions back afterwards yields the file's ABSOLUTE
+        # used-name set.  The old delta (``set(v.used_names) - used_before``)
+        # was order/scope-dependent: an entry written by a full-repo run and
+        # restored in per-file mode lost every name first used by an
+        # earlier-scanned file, falsely flagging ``logger``/``ast``/etc. as
+        # unused (2026-08-16 container_reachability gate run).
+        _saved_used = set(v.used_names)
+        v.used_names.clear()
+        try:
+            v.scan(code, filename=abs_path)
+        except Exception:
+            v.used_names.clear()
+            v.used_names.update(_saved_used)
+            logger.debug("[VULTURE_SCANNER] scan failed for %s", abs_path, exc_info=True)
+            continue
+        file_used = set(v.used_names)
+        v.used_names.clear()
+        v.used_names.update(_saved_used)
+        v.used_names.update(file_used)
+        files_cache[rel] = {
+            "fp": list(fp),
+            "fn": abs_path,
+            "items": [
+                _serialize_vulture_item(item)
+                for attr in _VULTURE_DEFINED_ATTRS
+                for item in getattr(v, attr)[marks[attr] :]
+            ],
+            "used": sorted(file_used),
+        }
+        dirty += 1
+    if save_state is not None:
+        save_state["dirty"] = save_state.get("dirty", 0) + dirty
+    elif dirty and parse_cache.should_persist_partial_update(dirty, len(files_cache)):
+        _save_vulture_scan_cache(repo_root, files_cache, vulture.__version__)
+    return True
+
+
 # ── Pre-processing fingerprint caches ─────────────────────────────────────────
 # The two pre-processing passes below (_dispatch_names_for_file /
 # _visitor_hooks_for_file) are pure functions of file content, and the scanner
@@ -355,22 +655,14 @@ class _FingerprintCache(Generic[_T]):
 
 
 def _stat_fingerprint(path: str) -> tuple[int, int] | None:
-    """(st_mtime_ns, st_size) of *path*, or None if it cannot be stat'ed."""
-    try:
-        st = os.stat(path)
-    except OSError:
-        logger.debug("cannot stat %s", path)
-        return None
-    return (st.st_mtime_ns, st.st_size)
+    """(st_mtime_ns, st_size) — delegates to the canonical parse_cache helper
+    (single stat code path; order contract documented there, B1)."""
+    return parse_cache.stat_fingerprint(path)
 
 
 _dispatch_names_cache: _FingerprintCache[frozenset[str]] = _FingerprintCache()
-_visitor_hooks_cache: _FingerprintCache[frozenset[tuple[str, int]]] = (
-    _FingerprintCache()
-)
-_framework_live_cache: _FingerprintCache[frozenset[tuple[int, str]]] = (
-    _FingerprintCache()
-)
+_visitor_hooks_cache: _FingerprintCache[frozenset[tuple[str, int]]] = _FingerprintCache()
+_framework_live_cache: _FingerprintCache[frozenset[tuple[int, str]]] = _FingerprintCache()
 
 
 def _dispatch_names_for_file(path: str) -> frozenset[str]:
@@ -386,6 +678,9 @@ def _dispatch_names_for_file(path: str) -> frozenset[str]:
     import tokenize
 
     names: set[str] = set()
+    # Raw-bytes stream on purpose: tokenize.tokenize honours encoding
+    # cookies / BOM; re-reading as str would mojibake non-UTF-8 sources.  The
+    # stat→read order above already satisfies the B1 contract.
     try:
         with open(path, "rb") as fh:
             for tok in tokenize.tokenize(fh.readline):
@@ -417,10 +712,12 @@ def _visitor_hooks_for_file(path: str) -> frozenset[tuple[str, int]]:
     import ast
 
     hooks: set[tuple[str, int]] = set()
+    pair = parse_cache.read_with_fingerprint(path)
+    if pair is None:
+        return frozenset()
     try:
-        with open(path, encoding="utf-8") as _f:
-            tree = ast.parse(_f.read())
-    except (OSError, SyntaxError):
+        tree = ast.parse(pair[0])
+    except SyntaxError:
         return frozenset()
 
     class_bases: dict[str, list[str]] = {}
@@ -433,8 +730,7 @@ def _visitor_hooks_for_file(path: str) -> frozenset[tuple[str, int]]:
         def visit_ClassDef(self, node):
             self.stack.append(node.name)
             class_bases[node.name] = [
-                b.id if isinstance(b, ast.Name)
-                else (b.attr if isinstance(b, ast.Attribute) else None)
+                b.id if isinstance(b, ast.Name) else (b.attr if isinstance(b, ast.Attribute) else None)
                 for b in node.bases
             ]
             self.generic_visit(node)
@@ -457,17 +753,12 @@ def _visitor_hooks_for_file(path: str) -> frozenset[tuple[str, int]]:
                 return False
             _seen.add(cn)
             return any(
-                b in _VISITOR_BASE_NAMES
-                or (b in class_bases and _is_visitor(b, _seen))
-                for b in class_bases[cn]
+                b in _VISITOR_BASE_NAMES or (b in class_bases and _is_visitor(b, _seen)) for b in class_bases[cn]
             )
 
         abs_path = os.path.abspath(path)
         for lineno, name, cn in methods:
-            if (
-                name in _VISITOR_HOOK_EXACT
-                or name.startswith(_VISITOR_HOOK_PREFIXES)
-            ) and _is_visitor(cn):
+            if (name in _VISITOR_HOOK_EXACT or name.startswith(_VISITOR_HOOK_PREFIXES)) and _is_visitor(cn):
                 hooks.add((abs_path, lineno))
     result = frozenset(hooks)
     _visitor_hooks_cache.put(path, fp, result)
@@ -513,9 +804,11 @@ def _framework_live_for_file(path: str) -> frozenset[tuple[int, str]]:
     import ast
 
     live: set[tuple[int, str]] = set()
+    pair = parse_cache.read_with_fingerprint(path)
+    if pair is None:
+        return frozenset()
     try:
-        with open(path, encoding="utf-8") as _f:
-            tree = ast.parse(_f.read())
+        tree = ast.parse(pair[0])
     except (OSError, SyntaxError):
         return frozenset()
 
@@ -542,12 +835,9 @@ def _framework_live_for_file(path: str) -> frozenset[tuple[int, str]]:
     _class_bases: dict[str, set[str]] = {}
     for _node in ast.walk(tree):
         if isinstance(_node, ast.ClassDef):
-            _class_bases[_node.name] = {
-                _base_name(b) for b in _node.bases
-            }
+            _class_bases[_node.name] = {_base_name(b) for b in _node.bases}
 
-    def _inherits_from(cls_name: str, candidates: frozenset[str],
-                       _seen: set[str] | None = None) -> bool:
+    def _inherits_from(cls_name: str, candidates: frozenset[str], _seen: set[str] | None = None) -> bool:
         """True when *cls_name* (or a same-file ancestor) inherits a candidate."""
         if _seen is None:
             _seen = set()
@@ -555,10 +845,7 @@ def _framework_live_for_file(path: str) -> frozenset[tuple[int, str]]:
             return False
         _seen.add(cls_name)
         bases = _class_bases[cls_name]
-        return bool(bases & candidates) or any(
-            _inherits_from(b, candidates, _seen)
-            for b in bases if b in _class_bases
-        )
+        return bool(bases & candidates) or any(_inherits_from(b, candidates, _seen) for b in bases if b in _class_bases)
 
     class _Mapper(ast.NodeVisitor):
         def __init__(self) -> None:
@@ -578,35 +865,23 @@ def _framework_live_for_file(path: str) -> frozenset[tuple[int, str]]:
             # Class-body members the framework consumes directly.
             for stmt in node.body:
                 if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
-                    targets = (
-                        stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-                    )
+                    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
                     for t in targets:
                         if not isinstance(t, ast.Name):
                             continue
                         if (
                             (is_enum or is_pydantic or is_dataclass)
                             or (is_http and t.id in _HTTP_PROTOCOL_ATTRS)
-                            or (
-                                is_visitor and (
-                                    t.id.startswith("visit_")
-                                    or t.id.startswith("leave_")
-                                )
-                            )
+                            or (is_visitor and (t.id.startswith("visit_") or t.id.startswith("leave_")))
                         ):
                             # Enum member / pydantic or dataclass field / HTTP
                             # protocol attr / visitor method alias — all
                             # consumed by the framework, never dead code.
                             live.add((stmt.lineno, t.id))
                 elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if is_http and (
-                        stmt.name.startswith("do_") or stmt.name == "log_message"
-                    ):
+                    if is_http and (stmt.name.startswith("do_") or stmt.name == "log_message"):
                         live.add((stmt.lineno, stmt.name))
-                    if is_pydantic and any(
-                        _deco_name(d) in _PYDANTIC_FIELD_DECORATORS
-                        for d in stmt.decorator_list
-                    ):
+                    if is_pydantic and any(_deco_name(d) in _PYDANTIC_FIELD_DECORATORS for d in stmt.decorator_list):
                         live.add((stmt.lineno, stmt.name))
                         # vulture reports the DECORATOR line as first_lineno
                         # for decorated defs, not the ``def`` line — record
@@ -625,9 +900,7 @@ def _framework_live_for_file(path: str) -> frozenset[tuple[int, str]]:
             for t in targets:
                 if not isinstance(t, ast.Attribute):
                     continue
-                is_bare_self = (
-                    isinstance(t.value, ast.Name) and t.value.id == "self"
-                )
+                is_bare_self = isinstance(t.value, ast.Name) and t.value.id == "self"
                 in_http = bool(self._http_stack) and self._http_stack[-1]
                 if (not is_bare_self) or (in_http and t.attr in _HTTP_PROTOCOL_ATTRS):
                     live.add((node.lineno, t.attr))
@@ -640,6 +913,91 @@ def _framework_live_for_file(path: str) -> frozenset[tuple[int, str]]:
     result = frozenset(live)
     _framework_live_cache.put(path, fp, result)
     return result
+
+
+# ── Pre-processing disk cache (dispatch / visitor-hook / framework-live) ────
+# The three pre-processing passes above are PURE per-file functions, but their
+# in-memory fingerprint caches die with the process — a gate run re-tokenized
+# every file for dispatch names (~2.5s) and re-parsed every file for visitor
+# hooks + framework-live (~4s) on top of the v.scan disk cache, which covers
+# only the vulture scan itself.  The v.scan cache entry is therefore extended
+# with a "pre" section holding the three results under the same fingerprint:
+# ``_warm_preprocess_caches`` rehydrates the in-memory caches from disk before
+# the collections run, and ``_sync_preprocess_cache`` writes any newly
+# computed results back into the entry so the next save persists them.  A
+# cache-hot run then pays ~0.5s total for all pre-processing (measured
+# 2026-08-16: 6.8s → 0.8s for vulture_dead_code_scanner in the gate).
+#
+# The visitor-hook results store ABSOLUTE paths; the per-file cache key is the
+# repo-relative path, so only the linenos are persisted and the path is
+# re-derived from the key on warm-up (they are always the same file).
+
+
+def _warm_preprocess_caches(files_cache: dict, repo_root: str) -> None:
+    """Rehydrate the in-memory pre-processing caches from *files_cache*.
+
+    Entries whose fingerprint is stale are ignored — the caller's
+    ``_stat_fingerprint`` check in each ``*_for_file`` function then misses and
+    recomputes (the disk fingerprint is deliberately NOT verified here: the
+    function-level check is the single invalidation point).
+    """
+    for rel, entry in files_cache.items():
+        fp = tuple(entry.get("fp") or ())
+        pre = entry.get("pre")
+        if not fp or not isinstance(pre, dict):
+            continue
+        # abspath, NOT normpath: the fresh-computation path
+        # (``_visitor_hooks_for_file``) keys its VALUE tuples by
+        # ``os.path.abspath(path)``, and the candidate check matches
+        # ``(abspath, lineno)``.  With a RELATIVE repo_root, normpath keeps
+        # these tuples relative and every rehydrated visitor hook silently
+        # stops matching — visit_* methods leaked as false dead code
+        # (round 32-F2 regression, caught by cold-vs-warm parity).
+        abs_path = os.path.abspath(os.path.join(repo_root, rel))
+        dispatch = pre.get("dispatch")
+        if isinstance(dispatch, list):
+            _dispatch_names_cache.put(abs_path, fp, frozenset(dispatch))
+        vhooks = pre.get("vhooks")
+        if isinstance(vhooks, list):
+            _visitor_hooks_cache.put(abs_path, fp, frozenset((abs_path, ln) for ln in vhooks))
+        framework = pre.get("framework")
+        if isinstance(framework, list):
+            _framework_live_cache.put(abs_path, fp, frozenset((ln, name) for ln, name in framework))
+
+
+def _sync_preprocess_cache(files_cache: dict, repo_root: str) -> int:
+    """Write newly computed pre-processing results into *files_cache*.
+
+    Returns the number of changed (entry, key) pairs — 0 means nothing
+    changed (caller need not persist).  Only entries that already exist
+    with a matching fingerprint are updated — a file outside the scan set
+    (or invalidated meanwhile) is left alone.
+    """
+    dirty = 0
+    for cache, key, convert in (
+        (_dispatch_names_cache, "dispatch", lambda r: sorted(r)),
+        (_visitor_hooks_cache, "vhooks", lambda r: sorted(ln for _, ln in r)),
+        (_framework_live_cache, "framework", lambda r: sorted((ln, name) for ln, name in r)),
+    ):
+        for abs_path, (fp, result) in list(cache._data.items()):
+            try:
+                rel = os.path.relpath(abs_path, repo_root)
+            except ValueError:
+                logger.debug("[VULTURE_SCANNER] preprocess sync: relpath failed for %s", abs_path)
+                continue
+            if rel.startswith("..") or os.path.isabs(rel):
+                continue  # outside the repo — not part of the cache domain
+            entry = files_cache.get(rel)
+            if entry is None or tuple(entry.get("fp") or ()) != fp:
+                continue
+            pre = entry.setdefault("pre", {})
+            val = convert(result)
+            if pre.get(key) != val:
+                pre[key] = val
+                dirty += 1
+    return dirty
+
+
 def _collect_dispatch_live_names(scan_paths: list[str], cancel_event: Any = None) -> frozenset[str]:
     """Identifier-shaped string literals found across *scan_paths*.
 
@@ -691,6 +1049,7 @@ def _collect_visitor_hook_linenos(scan_paths: list[str], cancel_event: Any = Non
 
 # ── Candidate model ────────────────────────────────────────────────────────────
 
+
 @dataclass
 class VultureCandidate:
     """One unused code item found by Vulture, normalized to asicode format."""
@@ -721,6 +1080,7 @@ class VultureCandidate:
 
 # ── Confidence normalization ───────────────────────────────────────────────────
 
+
 def _compute_normalized_confidence(
     vulture_confidence: int,
     name: str,
@@ -750,6 +1110,7 @@ def _compute_normalized_confidence(
 
 
 # ── Internal dedup ─────────────────────────────────────────────────────────────
+
 
 def _dedup_candidates(candidates: list[VultureCandidate]) -> list[VultureCandidate]:
     """Merge candidates that refer to the same (file, name, kind) with nearby lines.
@@ -800,22 +1161,25 @@ def _dedup_candidates(candidates: list[VultureCandidate]) -> list[VultureCandida
             min_lineno = min(c.lineno for c in cluster)
             max_end = max(c.end_lineno for c in cluster)
 
-            merged.append(VultureCandidate(
-                file=base.file,
-                name=base.name,
-                kind="|".join(kinds),
-                lineno=min_lineno,
-                end_lineno=max_end,
-                vulture_confidence=base.vulture_confidence,
-                message=base.message,
-                normalized_confidence=max(c.normalized_confidence for c in cluster),
-                evidence_sources=sources,
-            ))
+            merged.append(
+                VultureCandidate(
+                    file=base.file,
+                    name=base.name,
+                    kind="|".join(kinds),
+                    lineno=min_lineno,
+                    end_lineno=max_end,
+                    vulture_confidence=base.vulture_confidence,
+                    message=base.message,
+                    normalized_confidence=max(c.normalized_confidence for c in cluster),
+                    evidence_sources=sources,
+                )
+            )
 
     return merged
 
 
 # ── Scan scope decision ───────────────────────────────────────────────────────
+
 
 def decide_vulture_scan_scope(
     graph: object,
@@ -840,7 +1204,8 @@ def decide_vulture_scan_scope(
             if len(graph.get_importers(fp) or []) >= threshold:
                 logger.debug(
                     "[VULTURE_SCOPE] %s has >= %d importer(s) — full_project scan",
-                    fp, threshold,
+                    fp,
+                    threshold,
                 )
                 return "full_project"
         except Exception:
@@ -862,10 +1227,12 @@ def _collect_project_py_files(repo_root: str) -> list[str]:
     from pathlib import Path
 
     from external_llm.agent._shared_utils import _walk_py_files
+
     return [str(p) for p in _walk_py_files(Path(repo_root), max_files=4000)]
 
 
 # ── Main scanner entry point ───────────────────────────────────────────────────
+
 
 def scan_vulture_dead_code(
     *,
@@ -913,10 +1280,7 @@ def scan_vulture_dead_code(
     try:
         import vulture.core
     except ImportError:
-        logger.warning(
-            "[VULTURE_SCANNER] vulture package not installed — "
-            "install with: pip install 'asicode[vulture]'"
-        )
+        logger.warning("[VULTURE_SCANNER] vulture package not installed — install with: pip install 'asicode[vulture]'")
         return []
 
     file_paths = file_paths or []
@@ -926,10 +1290,7 @@ def scan_vulture_dead_code(
     # Resolve excluded kinds. By default drop module-level function/class —
     # they overlap with (and are inferior to) public_dead_code_scanner's
     # cross-file reachability. exclude_kinds=() keeps everything.
-    _skip_kinds = (
-        frozenset(exclude_kinds) if exclude_kinds is not None
-        else _PUBLIC_DEAD_CODE_OVERLAP_KINDS
-    )
+    _skip_kinds = frozenset(exclude_kinds) if exclude_kinds is not None else _PUBLIC_DEAD_CODE_OVERLAP_KINDS
 
     # ── Decide scan scope: full_project (accurate) vs file-only (fast) ──────────
     # Leaf-only targets skip the project-wide enumeration. Either way vulture
@@ -943,10 +1304,7 @@ def scan_vulture_dead_code(
         _cfg.counts.VULTURE_HUB_IMPORTER_THRESHOLD,
     )
     if scope == "file_paths_only" and file_paths:
-        scan_paths = [
-            p if os.path.isabs(p) else os.path.join(repo_root, p)
-            for p in file_paths
-        ]
+        scan_paths = [p if os.path.isabs(p) else os.path.join(repo_root, p) for p in file_paths]
         # String-based dispatch (handler maps resolved via getattr) is a
         # CROSS-FILE mechanism: the map usually lives in a registry file
         # OUTSIDE the leaf-scanned targets. file_paths_only must therefore
@@ -974,6 +1332,18 @@ def scan_vulture_dead_code(
         logger.debug("[VULTURE_SCANNER] cancelled before pre-processing")
         return []
 
+    # Pre-processing disk cache (see the section above _collect_dispatch_live_
+    # names): load the per-file cache ONCE and rehydrate the in-memory dispatch
+    # / visitor-hook / framework-live caches from it, so a cache-hot run skips
+    # the tokenize/parse passes entirely (measured ~6s in the structural gate).
+    files_cache = _load_vulture_scan_cache(repo_root, vulture.__version__)
+    _warm_preprocess_caches(files_cache, repo_root)
+    # Single persistence decision point (round 32-F2): the scan and the
+    # pre-processing sync both accumulate into save_state, and the finally
+    # block applies should_persist_partial_update ONCE — a cold run writes
+    # the ~22MB payload exactly once instead of twice.
+    save_state = {"dirty": 0}
+
     _dispatch_live = _collect_dispatch_live_names(dispatch_scan_paths, cancel_event=cancel_event)
 
     # In ``file_paths_only`` scope vulture parses ONLY the target files, so its
@@ -990,11 +1360,7 @@ def scan_vulture_dead_code(
     #      the import itself may be consumed only via string annotations
     #      (``-> "ToolResult"``), which vulture cannot see either way.
     _caller_live: set[str] = set()
-    if (
-        scope == "file_paths_only"
-        and repo_graph is not None
-        and hasattr(repo_graph, "get_callers")
-    ):
+    if scope == "file_paths_only" and repo_graph is not None and hasattr(repo_graph, "get_callers"):
         try:
             for p in file_paths:
                 abs_p = p if os.path.isabs(p) else os.path.join(repo_root, p)
@@ -1040,16 +1406,25 @@ def scan_vulture_dead_code(
 
     try:
         v = vulture.core.Vulture(verbose=False)
-        # Run scavenge with cooperative cancel (see _scavenge_with_cancel).
-        # Returns False if cancelled mid-parse — ESC / Ctrl-C during the opaque
-        # ast.parse now aborts promptly instead of blocking until it completes.
-        # Returning inside this try lets the ``finally`` restore the recursion
-        # limit, fixing a latent leak where the old standalone pre-scavenge
-        # cancel-check returned before the finally ran.
-        if not _scavenge_with_cancel(
-            v, scan_paths, exclude_patterns or [], cancel_event=cancel_event,
+        # Per-file scan with a fingerprint-keyed disk cache (see
+        # _scan_vulture_files_with_cache): cache-hot runs re-parse only the
+        # changed files while reproducing the same defined_*/used_names state
+        # as a full scavenge — and therefore the same get_unused_code() output.
+        # Returns False if cancelled — ESC / Ctrl-C is honored between files
+        # instead of mid-opaque-call.  Returning inside this try lets the
+        # ``finally`` restore the recursion limit, fixing a latent leak where
+        # the old standalone pre-scavenge cancel-check returned before the
+        # finally ran.
+        if not _scan_vulture_files_with_cache(
+            v,
+            scan_paths,
+            exclude_patterns or [],
+            repo_root,
+            cancel_event=cancel_event,
+            files_cache=files_cache,
+            save_state=save_state,
         ):
-            logger.debug("[VULTURE_SCANNER] cancelled before/during scavenge")
+            logger.debug("[VULTURE_SCANNER] cancelled before/during scan")
             return []
 
         per_file_counts: dict[str, int] = {}
@@ -1088,10 +1463,7 @@ def scan_vulture_dead_code(
                 continue
 
             # file_paths whitelist filter
-            if file_paths and not any(
-                rel_file == fp or abs_file == os.path.abspath(fp)
-                for fp in file_paths
-            ):
+            if file_paths and not any(rel_file == fp or abs_file == os.path.abspath(fp) for fp in file_paths):
                 continue
 
             # Filter dunder protocol names (always-live, regardless of kind)
@@ -1156,17 +1528,19 @@ def scan_vulture_dead_code(
 
             norm_conf = _compute_normalized_confidence(confidence, name, kind)
 
-            candidates.append(VultureCandidate(
-                file=rel_file,
-                name=name,
-                kind=kind,
-                lineno=first_lineno,
-                end_lineno=max(first_lineno, last_lineno),
-                vulture_confidence=confidence,
-                message=message,
-                normalized_confidence=norm_conf,
-                evidence_sources=["vulture_dead_code_scanner"],
-            ))
+            candidates.append(
+                VultureCandidate(
+                    file=rel_file,
+                    name=name,
+                    kind=kind,
+                    lineno=first_lineno,
+                    end_lineno=max(first_lineno, last_lineno),
+                    vulture_confidence=confidence,
+                    message=message,
+                    normalized_confidence=norm_conf,
+                    evidence_sources=["vulture_dead_code_scanner"],
+                )
+            )
 
     except Exception:
         logger.exception("[VULTURE_SCANNER] scan failed")
@@ -1175,6 +1549,16 @@ def scan_vulture_dead_code(
         # Restore recursion limit if we raised it
         if _raised_rec_limit:
             sys.setrecursionlimit(_prev_rec_limit)
+        # Persist any newly computed pre-processing results (dispatch /
+        # visitor-hook / framework-live) into the v.scan cache entry — runs on
+        # every exit path so a cancelled/errored scan still saves the work it
+        # did complete.  No-op when nothing changed.  Partial updates of a
+        # large corpus are deliberately SKIPPED (round 32-F2): the next
+        # process re-scans the stale files for far less than a full-payload
+        # serialisation costs.
+        save_state["dirty"] += _sync_preprocess_cache(files_cache, repo_root)
+        if parse_cache.should_persist_partial_update(save_state["dirty"], len(files_cache)):
+            _save_vulture_scan_cache(repo_root, files_cache, vulture.__version__)
 
     # Internal dedup
     merged = _dedup_candidates(candidates)
@@ -1187,14 +1571,18 @@ def scan_vulture_dead_code(
 
     if merged:
         logger.info(
-            "[VULTURE_SCANNER] %d candidate(s) in %d ms "
-            "(scope=%s, min_confidence=%d, dedup applied)",
-            len(merged), elapsed_ms, scope, min_confidence,
+            "[VULTURE_SCANNER] %d candidate(s) in %d ms (scope=%s, min_confidence=%d, dedup applied)",
+            len(merged),
+            elapsed_ms,
+            scope,
+            min_confidence,
         )
     else:
         logger.info(
             "[VULTURE_SCANNER] no candidates found (scope=%s, min_confidence=%d, %d ms)",
-            scope, min_confidence, elapsed_ms,
+            scope,
+            min_confidence,
+            elapsed_ms,
         )
 
     return merged

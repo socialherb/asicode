@@ -826,3 +826,204 @@ class TestAnchorEditLanguageNeutralGate:
         assert result.ok is False
         with open(path) as f:
             assert f.read() == original
+
+
+# ── Crash-safe repair writes: atomic_write_text, never open(path,'w') ─────────
+# A truncating open(path, 'w') clears the file before the new bytes land, so a
+# crash between open and write-completion leaves a torn source file on disk.
+# atomic_write_text writes a sibling temp + fsync + rename, closing that window.
+# Verified two ways: (1) behaviorally by spying on builtins.open during the
+# repair (atomic_write_text uses os.fdopen, so the spy stays empty); (2)
+# structurally via an AST invariant over the whole repair-method set.
+
+import builtins as _builtins
+
+
+def _spy_write_opens(monkeypatch, target):
+    """Record any builtins.open(file, mode='w...') hitting `target`."""
+    real_open = _builtins.open
+    target_abs = os.path.abspath(target)
+    writes: list = []
+
+    def _spy(file, mode="r", *args, **kwargs):
+        if "w" in mode and os.path.abspath(str(file)) == target_abs:
+            writes.append(str(file))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(_builtins, "open", _spy)
+    return writes
+
+
+class TestRepairUsesAtomicWrite:
+    """_repair_verify_failure's repair-write and rollback-restore must both be
+    crash-safe (atomic_write_text), never a truncating open(path, 'w')."""
+
+    @staticmethod
+    def _install_repair_stubs(tool_registry, temp_repo_root, monkeypatch, repaired_code):
+        """One .py file whose verify-failure classifies as ARGUMENT_MISMATCH and
+        whose repair strategy yields `repaired_code`. Returns (file_path,
+        snapshots). When `repaired_code` is valid → success write path; when
+        invalid → re-verify fails → rollback restore path."""
+        file_a = os.path.join(temp_repo_root, "ra.py")
+        orig_a = "# original a\n"
+        with open(file_a, "w") as f:
+            f.write(orig_a)
+        # Simulate the write having broken the file on disk.
+        with open(file_a, "w") as f:
+            f.write("def a(\n    pass\n")
+        snapshots = {file_a: orig_a}
+
+        def _real_verify(snaps):
+            import ast as _ast
+            for p in snaps:
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    src = fh.read()
+                try:
+                    _ast.parse(src, filename=p)
+                except SyntaxError as exc:
+                    return False, f"{p}:{exc.lineno or 1}:{exc.offset or 1}: {exc.msg}"
+            return True, ""
+
+        monkeypatch.setattr(tool_registry, "_verify_after_write", _real_verify)
+
+        from external_llm.editor._editor_core.vm.failure_classifier import (
+            FailureType,
+        )
+
+        class _FC:
+            def classify(self, verrs):
+                return FailureType.ARGUMENT_MISMATCH
+
+        class _Prov:
+            def language_id(self):
+                class _L:
+                    value = "python"
+                return _L()
+
+            def capabilities(self):
+                class _C:
+                    has_syntax_validator = True
+                return _C()
+
+            def validate_syntax(self, path, content):
+                import ast as _ast
+
+                from external_llm.languages.models import SyntaxError_ as _SE
+                try:
+                    _ast.parse(content, filename=path)
+                    compile(content, path, "exec")
+                except SyntaxError as _e:
+                    return _SyntaxRes(ok=False, errors=[_SE(
+                        file=path, line=_e.lineno or 1, col=_e.offset or 1,
+                        message="missing 1 required positional argument",
+                    )])
+                return _SyntaxRes(ok=True, errors=[])
+
+        class _FLR:
+            @staticmethod
+            def instance():
+                return _FLR()
+
+            def get(self, path):
+                return _Prov()
+
+        import external_llm.agent.tool_safety as _ts
+        import external_llm.languages as _langpkg
+        monkeypatch.setattr(_ts, "LanguageRegistry", _FLR, raising=False)
+        monkeypatch.setattr(_langpkg, "LanguageRegistry", _FLR, raising=False)
+        monkeypatch.setattr(
+            "external_llm.languages.LanguageRegistry", _FLR, raising=False,
+        )
+
+        import external_llm.editor._editor_core.vm.failure_classifier as _fc
+        import external_llm.editor._editor_core.vm.repair_registry as _rr
+        monkeypatch.setattr(_fc, "create_failure_classifier", lambda lang: _FC())
+
+        class _Op:
+            def __init__(self, payload):
+                self.payload = payload
+                self.kind = type("K", (), {"value": "RAW_REPLACE"})
+
+        class _Reg:
+            def __init__(self, lang):
+                pass
+
+            def get(self, ftype):
+                if ftype == FailureType.ARGUMENT_MISMATCH:
+                    return lambda code, verr, clf: [_Op(
+                        {"__raw_code__": repaired_code}
+                    )]
+                return None
+
+        monkeypatch.setattr(_rr, "RepairRegistry", _Reg)
+        return file_a, snapshots
+
+    def test_repair_write_uses_atomic_write(
+        self, tool_registry: ToolRegistry, temp_repo_root: str, monkeypatch,
+    ):
+        # Valid repaired code → re-verify ok → success write path.
+        file_a, snapshots = self._install_repair_stubs(
+            tool_registry, temp_repo_root, monkeypatch, "def a():\n    return 1\n",
+        )
+        writes = _spy_write_opens(monkeypatch, file_a)
+        tool_registry._repair_verify_failure(snapshots)
+        assert writes == [], (
+            "verify-repair write used a truncating open(path,'w'); must route "
+            "through atomic_write_text so a crash never tears the source file"
+        )
+
+    def test_repair_rollback_uses_atomic_write(
+        self, tool_registry: ToolRegistry, temp_repo_root: str, monkeypatch,
+    ):
+        # Invalid repaired code → re-verify fails → rollback restore path. Both
+        # the repair write and the rollback restore must be atomic.
+        file_a, snapshots = self._install_repair_stubs(
+            tool_registry, temp_repo_root, monkeypatch, "def a(\n",
+        )
+        writes = _spy_write_opens(monkeypatch, file_a)
+        tool_registry._repair_verify_failure(snapshots)
+        assert writes == [], (
+            "verify-repair rollback restore used a truncating open(path,'w'); "
+            "must route through atomic_write_text"
+        )
+
+
+def test_repair_methods_have_no_truncating_open_w():
+    """Structural invariant: every source-file write in the repair/recovery
+    paths of tool_registry.py and tool_safety.py must go through
+    atomic_write_text (crash-safe rename), never a truncating open(path,'w').
+    Covers all six sites including the indent auto-repair (_dispatch_impl) and
+    Phase-3 decl-loss restore (auto_repair_semantic) that are impractical to
+    trigger behaviorally in isolation."""
+    import ast
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repair_methods = {
+        os.path.join(here, "external_llm", "agent", "tool_registry.py"): {
+            "_repair_verify_failure", "_dispatch_impl",
+        },
+        os.path.join(here, "external_llm", "agent", "tool_safety.py"): {
+            "auto_repair_semantic",
+        },
+    }
+    for path, methods in repair_methods.items():
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=path)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in methods:
+                for call in ast.walk(node):
+                    if not (isinstance(call, ast.Call)
+                            and isinstance(call.func, ast.Name)
+                            and call.func.id == "open"
+                            and len(call.args) >= 2):
+                        continue
+                    mode_arg = call.args[1]
+                    if isinstance(mode_arg, ast.Constant):
+                        modeval = mode_arg.value
+                    else:
+                        continue
+                    assert "w" not in (modeval or ""), (
+                        f"{os.path.basename(path)}::{node.name} still uses "
+                        f"open(path, {modeval!r}) — repair writes must route "
+                        f"through atomic_write_text to avoid torn writes on crash"
+                    )

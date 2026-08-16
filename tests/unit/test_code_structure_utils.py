@@ -950,6 +950,82 @@ class TestExtractFunctionSignatureDetailed:
         assert "*args:" in sig.param_sig
         assert "**kwargs:" in sig.param_sig
 
+    # ── CS-B1: bare '*' separator must distinguish keyword-only boundaries ──
+
+    def test_bare_star_distinguishes_kwonly_from_positional(self):
+        """CS-B1: ``def f(a, *, b)`` and ``def f(a, b)`` must NOT collide.
+
+        The bare ``*`` separator marks the keyword-only boundary; omitting it
+        collapses both signatures to ``a:,b:``, hiding an API-changing edit
+        (positional ↔ keyword-only) from change-detection consumers.
+        """
+        from external_llm.code_structure_utils import extract_function_signature_detailed
+        sig_plain = extract_function_signature_detailed("def f(a, b): pass\n", "f")
+        sig_kwonly = extract_function_signature_detailed("def f(a, *, b): pass\n", "f")
+        assert sig_plain is not None and sig_kwonly is not None
+        assert sig_plain.param_sig != sig_kwonly.param_sig
+        assert sig_kwonly.param_sig == "a:,*,b:"
+        assert sig_plain.param_sig == "a:,b:"
+
+    def test_kwonly_bare_star_present(self):
+        """A keyword-only boundary (no vararg) renders the bare ``*`` marker."""
+        from external_llm.code_structure_utils import extract_function_signature_detailed
+        sig = extract_function_signature_detailed("def f(a, *, b, c): pass\n", "f")
+        assert sig is not None
+        assert sig.param_sig == "a:,*,b:,c:"
+        assert "*,b:" in sig.param_sig  # marker immediately precedes first kwonly
+
+    def test_vararg_suppresses_bare_star(self):
+        """When ``*vararg`` is present its leading '*' already separates, so no
+        bare marker is added (avoids ``**`` doubling)."""
+        from external_llm.code_structure_utils import extract_function_signature_detailed
+        sig = extract_function_signature_detailed("def f(a, *args, b): pass\n", "f")
+        assert sig is not None
+        assert "*args:" in sig.param_sig
+        assert "*" not in sig.param_sig.replace("*args:", "")  # no stray bare '*'
+
+    def test_positional_only_then_kwonly_boundary(self):
+        """``def f(a, /, b, *, c)`` — bare '*' appears before the kwonly block,
+        after the positional-or-keyword args (posonly boundary itself is out of
+        scope for CS-B1 and preserved as-is)."""
+        from external_llm.code_structure_utils import extract_function_signature_detailed
+        sig = extract_function_signature_detailed("def f(a, /, b, *, c): pass\n", "f")
+        assert sig is not None
+        assert sig.param_sig == "a:,b:,*,c:"
+
+    def test_plain_signature_has_no_bare_star(self):
+        """A plain positional signature must not gain a stray bare '*' marker."""
+        from external_llm.code_structure_utils import extract_function_signature_detailed
+        sig = extract_function_signature_detailed("def f(a, b, c): pass\n", "f")
+        assert sig is not None
+        assert sig.param_sig == "a:,b:,c:"
+        assert "*" not in sig.param_sig
+
+    def test_async_kwonly_separator(self):
+        """Async functions render the bare '*' separator identically."""
+        from external_llm.code_structure_utils import extract_function_signature_detailed
+        sig = extract_function_signature_detailed("async def g(a, *, b): pass\n", "g")
+        assert sig is not None
+        assert sig.param_sig == "a:,*,b:"
+
+    def test_api_change_detection_positional_to_kwonly(self):
+        """End-to-end change detection: promoting ``b`` to keyword-only is now
+        visible as a signature difference (the CS-B1 false-negative scenario)."""
+        from external_llm.code_structure_utils import extract_function_signature_detailed
+        before = extract_function_signature_detailed("def f(a, b): pass\n", "f")
+        after = extract_function_signature_detailed("def f(a, *, b): pass\n", "f")
+        assert before is not None and after is not None
+        assert before != after
+
+    def test_legacy_canonical_preserves_separator(self):
+        """``extract_function_signature`` (legacy wrapper) must surface the bare
+        '*' so change-detection through the canonical form also works."""
+        from external_llm.code_structure_utils import extract_function_signature
+        legacy_plain = extract_function_signature("def f(a, b): pass\n", "f")
+        legacy_kwonly = extract_function_signature("def f(a, *, b): pass\n", "f")
+        assert legacy_plain is not None and legacy_kwonly is not None
+        assert legacy_plain != legacy_kwonly
+
 
 # ── is_module_level_import_present (alias-aware availability) ───────────────
 
@@ -1075,3 +1151,70 @@ class TestTsRegexFallbackClassScopeIsLiteralAware:
             "}\n"
         )
         assert symbol_defined_anywhere(src, "A.real", "app.ts") is True
+
+
+# ── TS-primary contract parity (assignments / imports must not be lost) ──
+
+
+class TestSymbolDefinedAnywhereContractParity:
+    """The tree-sitter primary path collects only function/class/decorated
+    nodes. A miss must therefore NOT be definitive for Python — the AST
+    fallback (reference implementation) also treats Assign/AnnAssign as
+    definitions. These tests pin parity between the two paths."""
+
+    def test_module_level_assignment(self):
+        src = "X = 1\n"
+        assert symbol_defined_anywhere(src, "X")
+
+    def test_annotated_assignment(self):
+        src = "Y: int = 2\n"
+        assert symbol_defined_anywhere(src, "Y")
+
+    def test_nested_assignment(self):
+        src = textwrap.dedent("""
+            def outer():
+                x = 1
+                return x
+        """).lstrip()
+        assert symbol_defined_anywhere(src, "x")
+
+    def test_missing_symbol_still_false(self):
+        assert not symbol_defined_anywhere("X = 1\n", "Z")
+
+
+class TestCollectDefinedNamesImportParity:
+    """Imports-only sources must report imported names — the tree-sitter
+    path sees no symbol nodes for ``import os``, so it must defer to the
+    AST fallback instead of returning the empty set."""
+
+    def test_import_only(self):
+        assert collect_defined_names("import os\n") == {"os"}
+
+    def test_from_import_only(self):
+        assert collect_defined_names("from typing import TYPE_CHECKING\n") == {"TYPE_CHECKING"}
+
+    def test_multi_import_only(self):
+        assert collect_defined_names("import os\nfrom pathlib import Path\n") == {"os", "Path"}
+
+    def test_import_alias(self):
+        assert collect_defined_names("import numpy as np\n") == {"np"}
+
+    def test_empty_source_still_empty(self):
+        assert collect_defined_names("") == set()
+
+
+class TestSymbolDefinedAnywhereSyntaxErrorParity:
+    """Unparseable source must take the conservative path (True) regardless
+    of tree-sitter availability — the reference AST fallback cannot verify
+    absence and deliberately avoids false-positive blocking."""
+
+    def test_syntax_error_is_conservative(self):
+        assert symbol_defined_anywhere("def broken(:\n", "anything")
+
+    def test_syntax_error_parity_without_ts(self):
+        orig = symbol_defined_anywhere.__globals__["_HAS_TS"]
+        symbol_defined_anywhere.__globals__["_HAS_TS"] = False
+        try:
+            assert symbol_defined_anywhere("def broken(:\n", "anything")
+        finally:
+            symbol_defined_anywhere.__globals__["_HAS_TS"] = orig

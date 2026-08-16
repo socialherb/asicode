@@ -255,6 +255,24 @@ class TestRestore:
         assert store.restore(cid) is True
         assert repo_root.joinpath("file_a.py").read_text() == "modified"
 
+    def test_restore_routes_through_atomic_write_bytes(self, store, repo_root, monkeypatch):
+        """Restore writes must go through atomic_write_bytes (crash-safe), never open('wb')."""
+        cid = store.create("atomic_restore")
+        (repo_root / "file_a.py").write_text("modified")
+        from external_llm.agent import checkpoint_store as cs_mod
+        calls = []
+        real = cs_mod.atomic_write_bytes
+
+        def _spy(path, data, **kw):
+            calls.append((str(path), data))
+            return real(path, data, **kw)
+        monkeypatch.setattr(cs_mod, "atomic_write_bytes", _spy)
+        assert store.restore(cid) is True
+        assert calls, "restore must write through atomic_write_bytes"
+        restored = {str(p) for p, _ in calls}
+        assert str((repo_root / "file_a.py").resolve()) in restored
+        assert repo_root.joinpath("file_a.py").read_text() == "x = 1"
+
     def test_nonexistent_id(self, store):
         assert store.restore("nonexistent") is False
 
@@ -388,36 +406,44 @@ class TestCreateErrorPaths:
 
 
 class TestRestoreErrorPaths:
-    """Coverage for restore() error paths: IOError writing file (225-227), partial restore (232)."""
+    """Coverage for restore() error paths: IOError writing a restored file, partial restore."""
 
-    def test_ioerror_writing_restored_file(self, store, repo_root):
-        """Lines 225-227: IOError when writing a restored file marks failure."""
+    def test_ioerror_writing_restored_file(self, store, repo_root, monkeypatch):
+        """IOError when writing a restored file marks failure.
+
+        Restore writes are atomic (atomic_write_bytes) — a read-only target is
+        replaced via rename instead of failing, so the failure is injected at
+        the atomic writer rather than via chmod.
+        """
         cid = store.create("restore_io")
-        # Make file_a.py read-only so restore fails on it
-        f = repo_root / "file_a.py"
-        f.write_text("modified")
-        f.chmod(0o444)
-        try:
-            result = store.restore(cid)
-            assert result is False
-        finally:
-            f.chmod(0o644)
+        (repo_root / "file_a.py").write_text("modified")
+        from external_llm.agent import checkpoint_store as cs_mod
+        real = cs_mod.atomic_write_bytes
 
-    def test_partial_restore_logs_warning(self, store, repo_root):
-        """Line 232: one file fails but others succeed → partial restore."""
+        def _fake(path, data, **kw):
+            if str(path).endswith("file_a.py"):
+                raise OSError("denied")
+            return real(path, data, **kw)
+        monkeypatch.setattr(cs_mod, "atomic_write_bytes", _fake)
+        assert store.restore(cid) is False
+
+    def test_partial_restore_logs_warning(self, store, repo_root, monkeypatch):
+        """One file fails but others succeed → partial restore."""
         (repo_root / "extra.py").write_text("extra content")
         cid = store.create("partial")
-        # Make extra.py read-only
-        extra = repo_root / "extra.py"
-        extra.write_text("modified extra")
-        extra.chmod(0o444)
-        try:
-            result = store.restore(cid)
-            assert result is False
-            # file_a.py should still be restored
-            assert repo_root.joinpath("file_a.py").read_text() == "x = 1"
-        finally:
-            extra.chmod(0o644)
+        (repo_root / "extra.py").write_text("modified extra")
+        from external_llm.agent import checkpoint_store as cs_mod
+        real = cs_mod.atomic_write_bytes
+
+        def _fake(path, data, **kw):
+            if str(path).endswith("extra.py"):
+                raise OSError("denied")
+            return real(path, data, **kw)
+        monkeypatch.setattr(cs_mod, "atomic_write_bytes", _fake)
+        result = store.restore(cid)
+        assert result is False
+        # file_a.py should still be restored
+        assert repo_root.joinpath("file_a.py").read_text() == "x = 1"
 
 
 class TestDeleteErrorPaths:

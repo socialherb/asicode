@@ -102,21 +102,39 @@ class TestSizeCompactBudget:
         assert _size_compact_budget("a" * 100) == 8192  # 100 bytes → 50 + 2048 < 8192
 
     def test_large_ascii(self):
-        """Large ASCII → bytes/2 + 2048."""
-        # 14000 ASCII bytes → 7000 tokens + 2048 = 9048
-        assert _size_compact_budget("a" * 14000) == 9048
+        """Large ASCII → bytes/2 + 2048 via canonical estimator."""
+        # 14000 ASCII bytes → 7001 tokens (canonical +1) + 2048 = 9049
+        assert _size_compact_budget("a" * 14000) == 9049
 
     def test_cjk_content(self):
-        """CJK (3 bytes/char) → properly scaled."""
-        # 2000 CJK chars = 6000 bytes → 3000 tokens + 2048 = 5048 (< 8192, floor)
+        """CJK (3 bytes/char) → properly scaled through canonical estimator."""
+        # 2000 CJK chars = 6000 bytes → 3001 tokens + 2048 = 5049 (< 8192, floor)
         assert _size_compact_budget("안" * 2000) == 8192  # floor
-        # 6000 CJK chars = 18000 bytes → 9000 tokens + 2048 = 11048
-        assert _size_compact_budget("안" * 6000) == 11048
+        # 6000 CJK chars = 18000 bytes → 9001 tokens + 2048 = 11049
+        assert _size_compact_budget("안" * 6000) == 11049
 
     def test_mixed_content(self):
-        """Mixed ASCII + CJK → aggregate byte-based."""
+        """Mixed ASCII + CJK → aggregate byte-based through canonical estimator."""
         s = "hello world" + "안녕하세요" * 1000  # ~11 + 15000 = ~15011 bytes
-        assert _size_compact_budget(s) == 9553  # 15011//2 + 2048
+        assert _size_compact_budget(s) == 9554  # 15011//2 + 1 + 2048
+
+    def test_matches_canonical_estimator_exactly(self):
+        """SSOT delegation — _size_compact_budget must equal canonical + slack forall inputs."""
+        from external_llm.agent._shared_utils import _cjk_aware_tokens as _canonical
+
+        cases = [
+            "",
+            "hello world",
+            "a" * 100,
+            "a" * 14000,
+            "안" * 2000,
+            "안" * 6000,
+            "hello world" + "안녕하세요" * 1000,
+            "가" * 20000,
+        ]
+        for c in cases:
+            expected = max(8192, _canonical(c) + 2048)
+            assert _size_compact_budget(c) == expected, f"{c[:20]!r} → {_size_compact_budget(c)} != {expected}"
 
 
 # ═══════════════════════════════════════════════════════════════

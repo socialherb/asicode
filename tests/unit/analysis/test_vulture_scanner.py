@@ -926,3 +926,486 @@ def test_scavenge_tolerant_reraises_unexpected_system_exit(tmp_path):
 
     with pytest.raises(SystemExit):
         _scavenge_tolerant(_BoomVulture(), ["x.py"], [])
+
+
+# ── Per-file scan disk cache (round 32-P-F) ──────────────────────────────────
+
+
+class _CountingVulture:
+    """Real vulture.core.Vulture that records per-file scan() calls."""
+
+    def __init__(self):
+        self.scans: list[str] = []
+        self._inner = vulture.Vulture()
+
+    def scan(self, code, filename=""):
+        self.scans.append(filename)
+        return self._inner.scan(code, filename)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _vulture_files(tmp_path):
+    """Minimal 3-file repo: cross-file live ref + dead code + enum member."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("")
+    (tmp_path / "pkg" / "mod.py").write_text(
+        "def live_fn():\n    return 1\n\n"
+        "def dead_fn():\n    return 2\n\n"
+        "class C:\n"
+        "    def dead_m(self):\n        return 4\n"
+    )
+    (tmp_path / "main.py").write_text(
+        "from pkg.mod import live_fn\nlive_fn()\n"
+    )
+    (tmp_path / "enumfile.py").write_text(
+        "import enum\n\nclass E(enum.Enum):\n    A = 1\n"
+    )
+    return [
+        str(tmp_path / "pkg" / "mod.py"),
+        str(tmp_path / "main.py"),
+        str(tmp_path / "enumfile.py"),
+    ]
+
+
+def _scan_unused(tmp_path, paths, **kw):
+    from external_llm.analysis.vulture_scanner import (
+        _scan_vulture_files_with_cache,
+    )
+
+    v = _CountingVulture()
+    ok = _scan_vulture_files_with_cache(v, paths, [], str(tmp_path), **kw)
+    assert ok
+    return v
+
+
+def _unused_names(v):
+    return sorted(
+        (i.name, i.typ, i.first_lineno)
+        for i in v.get_unused_code(min_confidence=0)
+    )
+
+
+def test_scan_cache_hot_run_matches_cold_and_reuses_all_entries(tmp_path):
+    """A cache-hot run must re-parse NOTHING while producing the same
+    get_unused_code() output as the cold full scan — cross-file reachability
+    is preserved because used names are rehydrated into the global set."""
+    from external_llm.analysis.vulture_scanner import _vulture_cache_path
+
+    paths = _vulture_files(tmp_path)
+
+    cold = _scan_unused(tmp_path, paths)
+    cold_results = _unused_names(cold)
+    assert len(cold.scans) == len(paths), "cold run must scan every file"
+    assert os.path.exists(_vulture_cache_path(str(tmp_path)))
+
+    hot = _scan_unused(tmp_path, paths)
+    assert hot.scans == [], "hot run must re-parse nothing"
+    assert _unused_names(hot) == cold_results, (
+        "cache-rehydrated run must match the full scan"
+    )
+
+
+def test_scan_cache_reparses_only_edited_file(tmp_path):
+    """Editing one file invalidates exactly that file's entry — the other
+    entries are rehydrated and the edit's new dead code is detected."""
+    paths = _vulture_files(tmp_path)
+    _scan_unused(tmp_path, paths)
+
+    (tmp_path / "pkg" / "mod.py").write_text(
+        "def live_fn():\n    return 1\n\n"
+        "def dead_fn():\n    return 2\n\n"
+        "def newly_dead():\n    return 9\n"
+    )
+    v = _scan_unused(tmp_path, paths)
+    assert v.scans == [str(tmp_path / "pkg" / "mod.py")], (
+        "only the edited file must be re-scanned"
+    )
+    names = {i.name for i in v.get_unused_code(min_confidence=0)}
+    assert "newly_dead" in names
+
+
+def test_scan_cache_corrupt_file_falls_back_to_full_scan(tmp_path):
+    """A corrupt cache file must never change results — fail-open to a full
+    re-scan (same contract as the structural graph cache)."""
+    from pathlib import Path
+
+    from external_llm.analysis.vulture_scanner import _vulture_cache_path
+
+    paths = _vulture_files(tmp_path)
+    cold = _scan_unused(tmp_path, paths)
+    cold_results = _unused_names(cold)
+
+    Path(_vulture_cache_path(str(tmp_path))).write_text("{not json")
+    v = _scan_unused(tmp_path, paths)
+    assert len(v.scans) == len(paths), "corrupt cache must trigger a full scan"
+    assert _unused_names(v) == cold_results
+
+
+def test_scan_cache_vulture_version_mismatch_discarded(tmp_path):
+    """A cache written by a different vulture version must be discarded —
+    its item shape is not guaranteed compatible."""
+    import json
+    from pathlib import Path
+
+    from external_llm.analysis.vulture_scanner import _vulture_cache_path
+
+    paths = _vulture_files(tmp_path)
+    _scan_unused(tmp_path, paths)
+
+    p = Path(_vulture_cache_path(str(tmp_path)))
+    payload = json.loads(p.read_text())
+    payload["vulture"] = "0.0.0-other"
+    p.write_text(json.dumps(payload))
+
+    v = _scan_unused(tmp_path, paths)
+    assert len(v.scans) == len(paths), (
+        "a vulture-version mismatch must discard the cache"
+    )
+
+
+def test_scan_cache_skips_vanished_file(tmp_path):
+    """A path that vanishes between enumeration and read must be skipped —
+    per-file granularity makes one missing file harmless (the whole-set
+    SystemExit retry loop only existed for scavenge())."""
+    paths = _vulture_files(tmp_path)
+    v = _scan_unused(tmp_path, paths)
+    results_before = _unused_names(v)
+
+    # Second run with an extra path that does not exist — the vanished file
+    # must be skipped while every cached file is rehydrated and results stay
+    # identical (the whole-set SystemExit abort cannot happen per-file).
+    v2 = _scan_unused(tmp_path, [*paths, str(tmp_path / "gone.py")])
+    assert "gone.py" not in [os.path.basename(s) for s in v2.scans]
+    assert _unused_names(v2) == results_before, (
+        "a vanished file must be skipped, not abort the scan"
+    )
+
+
+def test_scan_cache_used_set_is_order_independent(tmp_path):
+    """The cached per-file "used" set must be ABSOLUTE (pure function of file
+    content), not a scan-order delta: an entry written while other files were
+    scanned first, restored ALONE in per-file mode, must not flag names that
+    were pre-used by those other files.  Regression 2026-08-16: full-repo
+    entries restored in per-file mode falsely flagged ``logger``/``ast``
+    as unused imports (format bumped 1 → 2).
+    """
+    from external_llm.analysis.vulture_scanner import (
+        _load_vulture_scan_cache,
+        _scan_vulture_files_with_cache,
+    )
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("")
+    (tmp_path / "pkg" / "a.py").write_text(
+        "import logging\nlogging.getLogger(__name__)\n"
+    )
+    (tmp_path / "pkg" / "b.py").write_text(
+        "import ast\nimport logging\n\n"
+        "def f():\n    return ast.parse('x'), logging.getLogger(__name__)\n"
+    )
+    a = str(tmp_path / "pkg" / "a.py")
+    b = str(tmp_path / "pkg" / "b.py")
+
+    # Cold scan in [a, b] order — with the old delta format, b's "used" would
+    # miss logging/ast because a first-used them.
+    v = _CountingVulture()
+    assert _scan_vulture_files_with_cache(v, [a, b], [], str(tmp_path))
+    rel_b = os.path.relpath(b, str(tmp_path))
+    import vulture as _vulture_pkg
+
+    b_used = set(
+        _load_vulture_scan_cache(str(tmp_path), _vulture_pkg.__version__)[rel_b]["used"]
+    )
+    assert {"logging", "ast"} <= b_used, (
+        "b's cached used set must be absolute, not a scan-order delta"
+    )
+
+    # Restore ONLY b (per-file mode) — no false unused-import verdicts.
+    v2 = _CountingVulture()
+    assert _scan_vulture_files_with_cache(v2, [b], [], str(tmp_path))
+    assert v2.scans == [], "b must be served from the cache"
+    unused = {(i.name, i.typ) for i in v2.get_unused_code(min_confidence=0)}
+    assert not any(typ == "import" for _name, typ in unused), (
+        "restoring b alone must not flag its imports as unused"
+    )
+
+
+def test_scan_cache_exclude_pattern_skips_matching_files(tmp_path):
+    """Exclude patterns must keep scavenge() semantics: bare patterns are
+    wrapped as ``*pat*`` and matched case-insensitively."""
+    from external_llm.analysis.vulture_scanner import (
+        _scan_vulture_files_with_cache,
+    )
+
+    paths = _vulture_files(tmp_path)
+    v = _CountingVulture()
+    ok = _scan_vulture_files_with_cache(v, paths, ["main"], str(tmp_path))
+    assert ok
+    assert v.scans == [
+        str(tmp_path / "pkg" / "mod.py"),
+        str(tmp_path / "enumfile.py"),
+    ], "exclude patterns must use scavenge semantics (*pat* wrapping)"
+
+
+def test_scan_cache_pre_set_cancel_returns_false(tmp_path):
+    """A pre-set cancel_event returns False without scanning any file."""
+    import threading
+
+    from external_llm.analysis.vulture_scanner import (
+        _scan_vulture_files_with_cache,
+    )
+
+    paths = _vulture_files(tmp_path)
+    ev = threading.Event()
+    ev.set()
+    v = _CountingVulture()
+    ok = _scan_vulture_files_with_cache(
+        v, paths, [], str(tmp_path), cancel_event=ev
+    )
+    assert ok is False
+    assert v.scans == []
+
+
+# ── Pre-processing disk cache (dispatch / visitor-hook / framework-live) ──
+
+
+def test_preprocess_cache_skips_recomputation_on_second_scan(tmp_path, monkeypatch):
+    """The dispatch / visitor-hook / framework-live passes are pure per-file
+    functions whose in-memory caches die with the process; the v.scan disk
+    cache must rehydrate them so a second scan in a fresh call recomputes
+    NOTHING (measured ~6s saved in the structural gate)."""
+    from external_llm.analysis.vulture_scanner import (
+        _dispatch_names_cache,
+        _dispatch_names_for_file,
+        _framework_live_cache,
+        _framework_live_for_file,
+        _stat_fingerprint,
+        _visitor_hooks_cache,
+        _visitor_hooks_for_file,
+        scan_vulture_dead_code,
+    )
+
+    paths = _vulture_files(tmp_path)
+    # Count CACHE MISSES (the collection loop always CALLS the per-file
+    # function; only a miss reaches the tokenize/parse body).
+    misses = {"dispatch": 0, "vhooks": 0, "framework": 0}
+
+    def counting(cache, key, fn):
+        def wrapper(path):
+            fp = _stat_fingerprint(path)
+            if fp is None or cache.get(path, fp) is None:
+                misses[key] = misses.get(key, 0) + 1
+            return fn(path)
+        return wrapper
+
+    monkeypatch.setattr(
+        "external_llm.analysis.vulture_scanner._dispatch_names_for_file",
+        counting(_dispatch_names_cache, "dispatch", _dispatch_names_for_file),
+    )
+    monkeypatch.setattr(
+        "external_llm.analysis.vulture_scanner._visitor_hooks_for_file",
+        counting(_visitor_hooks_cache, "vhooks", _visitor_hooks_for_file),
+    )
+    monkeypatch.setattr(
+        "external_llm.analysis.vulture_scanner._framework_live_for_file",
+        counting(_framework_live_cache, "framework", _framework_live_for_file),
+    )
+
+    first = scan_vulture_dead_code(repo_root=str(tmp_path), file_paths=paths)
+    assert misses["dispatch"] > 0, "cold run must compute dispatch names"
+    assert misses["vhooks"] > 0, "cold run must compute visitor hooks"
+    assert misses["framework"] > 0, "cold run must compute framework-live"
+
+    misses.clear()
+    second = scan_vulture_dead_code(repo_root=str(tmp_path), file_paths=paths)
+    assert misses.get("dispatch", 0) == 0, (
+        f"dispatch recomputed on warm scan ({misses.get('dispatch', 0)} misses)"
+    )
+    assert misses.get("vhooks", 0) == 0, (
+        f"visitor hooks recomputed on warm scan ({misses.get('vhooks', 0)} misses)"
+    )
+    assert misses.get("framework", 0) == 0, (
+        f"framework-live recomputed on warm scan ({misses.get('framework', 0)} misses)"
+    )
+    assert [c.name for c in first] == [c.name for c in second], (
+        "warm scan must reproduce the cold candidate set"
+    )
+
+
+def test_preprocess_cache_invalidates_only_edited_file(tmp_path, monkeypatch):
+    """Editing one file invalidates ITS pre-processing results; the others
+    stay cache-served (fingerprint-keyed invalidation, same contract as the
+    v.scan cache)."""
+    import time
+
+    from external_llm.analysis.vulture_scanner import (
+        _dispatch_names_cache,
+        _dispatch_names_for_file,
+        _stat_fingerprint,
+        scan_vulture_dead_code,
+    )
+
+    paths = _vulture_files(tmp_path)
+    scan_vulture_dead_code(repo_root=str(tmp_path), file_paths=paths)
+
+    # Edit ONE file (new string literal) — ensure mtime/size both change.
+    target = tmp_path / "main.py"
+    before = target.read_text()
+    target.write_text(before + "\n# touch\n")
+    time.sleep(0.01)
+
+    misses = {"dispatch": 0}
+    real = _dispatch_names_for_file
+
+    def counting(path):
+        fp = _stat_fingerprint(path)
+        if fp is None or _dispatch_names_cache.get(path, fp) is None:
+            misses["dispatch"] = misses.get("dispatch", 0) + 1
+        return real(path)
+
+    monkeypatch.setattr(
+        "external_llm.analysis.vulture_scanner._dispatch_names_for_file", counting
+    )
+    scan_vulture_dead_code(repo_root=str(tmp_path), file_paths=paths)
+    assert misses["dispatch"] == 1, (
+        f"expected exactly the edited file to be recomputed, got {misses['dispatch']}"
+    )
+
+
+def test_vulture_cache_path_goes_through_path_guard(tmp_path, monkeypatch):
+    """P-1 regression: the cache path must route through the fail-closed guard."""
+    from external_llm.analysis import parse_cache
+    from external_llm.analysis.vulture_scanner import (
+        _VULTURE_CACHE_VERSION,
+        _vulture_cache_path,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        parse_cache,
+        "cache_file_path",
+        lambda root, filename: calls.append((root, filename)) or "/guarded",
+    )
+    assert _vulture_cache_path(str(tmp_path)) == "/guarded"
+    assert calls == [(str(tmp_path), f"vulture_scan_v{_VULTURE_CACHE_VERSION}.json")]
+
+
+# ── Save-skip policy + v3 entry format (round 32-F2) ───────────────────────
+
+
+def test_scan_cache_v3_entry_hoists_filename(tmp_path):
+    """v3 entries store the file path ONCE ("fn"); items never repeat it —
+    the repeated key was ~19% of the payload (109K absolute paths)."""
+    import json
+    from pathlib import Path
+
+    from external_llm.analysis.vulture_scanner import _vulture_cache_path
+
+    paths = _vulture_files(tmp_path)
+    _scan_unused(tmp_path, paths)
+
+    payload = json.loads(Path(_vulture_cache_path(str(tmp_path))).read_text())
+    assert payload["format"] == 3
+    entries = payload["files"]
+    assert entries, "cold run must persist (small corpus always saves)"
+    for rel, entry in entries.items():
+        assert entry.get("fn"), f"{rel}: entry-level fn missing"
+        for item in entry.get("items", []):
+            assert "filename" not in item, f"{rel}: items must not repeat filename"
+
+
+def test_scan_cache_partial_update_of_large_corpus_skips_save(tmp_path, monkeypatch):
+    """A 1-file edit of a large corpus must NOT pay a full-payload
+    serialisation: the save is skipped and the next run rescans that file
+    (recompute ≈ 0.1s ≪ serialise ≈ 4.6s on asicode)."""
+    import os
+    from pathlib import Path
+
+    from external_llm.analysis import parse_cache as pc
+    from external_llm.analysis.vulture_scanner import _vulture_cache_path
+
+    # Shrink the policy so a 3-file repo counts as "large": 1/3 ≤ 50% skips.
+    monkeypatch.setattr(pc, "SAVE_SKIP_MIN_ENTRIES", 2)
+    monkeypatch.setattr(pc, "SAVE_SKIP_MAX_FRACTION", 0.5)
+
+    paths = _vulture_files(tmp_path)
+    _scan_unused(tmp_path, paths)
+    cache_file = Path(_vulture_cache_path(str(tmp_path)))
+    saved_mtime = os.stat(cache_file).st_mtime_ns
+
+    (tmp_path / "pkg" / "mod.py").write_text(
+        "def live_fn():\n    return 1\n\n"
+        "def dead_fn():\n    return 2\n\n"
+        "def newly_dead():\n    return 9\n"
+    )
+    v = _scan_unused(tmp_path, paths)
+    assert os.stat(cache_file).st_mtime_ns == saved_mtime, (
+        "a partial update of a large corpus must skip the save"
+    )
+    assert v.scans == [str(tmp_path / "pkg" / "mod.py")], (
+        "the edited file was still rescanned in-memory"
+    )
+
+    # The skip costs one bounded rescan on the NEXT run — fail-open.
+    v2 = _scan_unused(tmp_path, paths)
+    assert v2.scans == [str(tmp_path / "pkg" / "mod.py")], (
+        "next process must recompute the skipped entry"
+    )
+
+
+def test_cold_full_scan_writes_payload_exactly_once(tmp_path, monkeypatch):
+    """Cold full flow (scan + preprocess sync) must serialise the payload
+    exactly ONCE — the scan defers its persistence to the caller's single
+    decision point instead of saving at both the scan site and the finally."""
+    from external_llm.analysis import vulture_scanner as vs
+
+    saves: list[int] = []
+    real = vs._save_vulture_scan_cache
+
+    def spy(root, files, version):
+        saves.append(len(files))
+        return real(root, files, version)
+
+    monkeypatch.setattr(vs, "_save_vulture_scan_cache", spy)
+
+    _vulture_files(tmp_path)
+    vs.scan_vulture_dead_code(repo_root=str(tmp_path))
+    assert len(saves) == 1, "cold run must write the payload exactly once"
+
+
+def test_preprocess_warm_rehydrate_keeps_visitor_hooks_with_relative_repo_root(
+    tmp_path, monkeypatch
+):
+    """Regression (round 32-F2): ``_warm_preprocess_caches`` built vhook
+    tuples from ``normpath(join(repo_root, rel))`` — RELATIVE when repo_root
+    is relative — while the fresh path (``_visitor_hooks_for_file``) and the
+    candidate check key by ``abspath``.  Visitor hooks rehydrated from disk
+    silently stopped matching, leaking visit_* methods as false dead code.
+    The gate always passes an absolute repo_root (which is why CI stayed
+    green); any relative-root caller hit the leak on its second scan."""
+    from external_llm.analysis import vulture_scanner as vs
+
+    (tmp_path / "visitor_mod.py").write_text(
+        "import ast\n\n"
+        "class V(ast.NodeVisitor):\n"
+        "    def visit_ClassDef(self, node):\n"
+        "        return self.generic_visit(node)\n"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    cold = vs.scan_vulture_dead_code(repo_root=".")
+    assert all(c.name != "visit_ClassDef" for c in cold), (
+        "cold run must suppress the visitor hook"
+    )
+
+    # Emulate a fresh process: the module-level in-memory fingerprint caches
+    # are what a new interpreter would NOT have — only the DISK cache remains.
+    vs._dispatch_names_cache._data.clear()
+    vs._visitor_hooks_cache._data.clear()
+    vs._framework_live_cache._data.clear()
+
+    warm = vs.scan_vulture_dead_code(repo_root=".")
+    leaked = [c for c in warm if c.name == "visit_ClassDef"]
+    assert not leaked, "rehydrated visitor hooks must still suppress visit_*"

@@ -41,7 +41,6 @@ from ._shared_utils import (
     coerce_token_count,
     context_message_cap,
     estimate_tokens_from_msgs,
-    preemptive_trim,
 )
 from .agent_loop_types import AgentCancelled
 from .agent_turn_pipeline import _cache_hit_ratio, _evict_for_loop
@@ -50,7 +49,6 @@ from .context_budget import (
     _is_context_length_error,
     _record_context_overflow,
     _resolve_context_limit,
-    repair_tool_message_sequence,
 )
 from .insights_manager import (
     _active_invalidate,
@@ -163,12 +161,18 @@ def _apply_context_hard_cap(
     base_url: Optional[str] = None,
 ) -> list[LLMMessage]:
     """
-    Context hard cap guard: trim messages if they exceed the model's context limit.
+    Context hard cap guard: raise a clear error when the window is structurally
+    too small for the tool schemas + output reserve (the call would 400 even
+    with zero chat history).
 
-    Pre-allocates room for output tokens (and tool schemas if provided) to prevent
-    HTTP 400 errors on small-window models.
+    ``preemptive_trim`` was REMOVED (2026-08): the count-based front-trim could
+    not reduce the tool-loop conversation (its tail anchor was pinned to the
+    sole user message) and only spammed log noise; oversized prompts are now
+    enforced by the provider's own limit, with the 400 →
+    ``_record_context_overflow`` override backstop lowering the effective limit
+    for subsequent calls.
 
-    Returns the (possibly trimmed) message list.
+    Returns the message list unchanged.
     """
     _ctx_limit = _resolve_context_limit(model, base_url=base_url)
     _safety_margin = _cfg.tokens.CONTEXT_HARD_CAP_SAFETY_MARGIN
@@ -183,23 +187,6 @@ def _apply_context_hard_cap(
             f"schemas + output reserve: only {_cap} tokens remain for "
             f"messages (minimum {MIN_USABLE_MESSAGE_BUDGET}). Reduce the "
             f"toolset or raise the model's context window (e.g. num_ctx)."
-        )
-    _est = estimate_tokens_from_msgs(messages)
-    if _est > _cap:
-        _before = len(messages)
-        messages = preemptive_trim(messages, max_tokens=_cap, preserve_last=2, tag="DESIGN_CHAT_PREEMPTIVE_TRIM")
-        # preemptive_trim is a count-based slice and can split an
-        # assistant(tool_calls) ↔ role="tool" pair, leaving orphaned tool messages
-        # whose preceding assistant was trimmed. Such orphans cause HTTP 400
-        # ("orphaned tool_result" / "messages must alternate") on OpenAI/DeepSeek.
-        # Repair the sequence — mirrors the guard AgentLoop applies after its trim.
-        messages = repair_tool_message_sequence(messages)
-        _after = len(messages)
-        logger.warning(
-            "[DESIGN_CHAT_CONTEXT_HARD_CAP] estimated %d tokens > cap %d "
-            "(limit=%d, reserved %d for output/tool-schemas); preemptive_trim: %d->%d messages",
-            _est, _cap, _ctx_limit, _ctx_limit - _cap,
-            _before, _after,
         )
     return messages
 
@@ -700,8 +687,13 @@ def _edit_insight(
         old_header = entry.header_line
 
         if new_category:
-            # Rebuild the header line with the new category
-            timestamp_part = old_header.split("] ", 1)[-1] if "] " in old_header else ""
+            # Rebuild the header line with the new category, preserving the
+            # timestamp. Hand-written headers may have no "[category] " bracket
+            # (e.g. "### 2026-08-14 18:47 +0900") — for those the timestamp is
+            # everything after the "### " prefix; treating it as "" would drop
+            # the timestamp permanently (B1).
+            _rest = old_header.split("### ", 1)[-1]
+            timestamp_part = _rest.split("] ", 1)[-1] if "] " in _rest else _rest
             new_header = f"### [{new_category}] {timestamp_part}"
         else:
             new_header = old_header
@@ -1661,37 +1653,6 @@ class DesignChatLoop:
             # Pre-call token estimate for fast context-override convergence.
             _est_tokens = estimate_tokens_from_msgs(_llm_msgs)
 
-            def _re_trim_design_context_overflow() -> int | None:
-                """Re-trim _llm_msgs after a context-override reduction (in-turn recovery).
-
-                Returns the POST-trim estimated token count when trim actually reduced
-                the estimate (caller should retry and record the next 400 against this
-                accurate size), or None if no progress was made (caller should raise
-                the original 400 error).
-                """
-                nonlocal _llm_msgs
-                _before_est = estimate_tokens_from_msgs(_llm_msgs)
-                _before_count = len(_llm_msgs)
-                _new_limit = _resolve_context_limit(self.model, base_url=getattr(self.llm_client, "base_url", None))
-                _new_cap = context_message_cap(_new_limit, _cfg.tokens.CONTEXT_HARD_CAP_SAFETY_MARGIN, tool_schemas)
-                if _new_cap < MIN_USABLE_MESSAGE_BUDGET:
-                    # Structural collapse (reserve + schemas exceed the window):
-                    # re-trimming cannot create budget that never existed. Skip
-                    # the trim and return None so the caller propagates the
-                    # original 400 immediately instead of more doomed attempts.
-                    return None
-                _llm_msgs = preemptive_trim(_llm_msgs, max_tokens=_new_cap, preserve_last=2, tag="DESIGN_CHAT_PREEMPTIVE_TRIM")
-                _llm_msgs = repair_tool_message_sequence(_llm_msgs)
-                _after_est = estimate_tokens_from_msgs(_llm_msgs)
-                _reduced = _after_est < _before_est
-                logger.info(
-                    "[DESIGN_CHAT_OVERFLOW_RETRY] %s — re-trimmed %d→%d messages "
-                    "(new cap=%d, before_est=%s, after_est=%s, reduced=%s)",
-                    self.model, _before_count, len(_llm_msgs),
-                    _new_cap, _before_est, _after_est, _reduced,
-                )
-                return _after_est if _reduced else None
-
             try:
                 _call_start = time.monotonic()
                 if stream_callback:
@@ -1713,10 +1674,9 @@ class DesignChatLoop:
                 _attempt = 0
                 while True:
                     # B023: _ladder_tokens is early-bound via _lt below (stable for the
-                    # whole call); _llm_msgs must STAY late-bound — the overflow-retry
-                    # callback _re_trim_design_context_overflow rebinds it (nonlocal)
-                    # and re-invokes this callable, so freezing the value would retry
-                    # with the oversized pre-trim messages.
+                    # whole call); _llm_msgs stays late-bound. (The re-trim callback
+                    # that used to rebind it via nonlocal was REMOVED 2026-08 — no
+                    # rebinding happens now; late-binding retained as harmless.)
                     response: ToolCallResponse = self._call_llm_with_retry(
                         lambda _lt=_ladder_tokens: self.llm_client.chat_with_tools(
                             messages=_llm_msgs,  # noqa: B023 — _llm_msgs deliberately late-bound (comment above)
@@ -1729,7 +1689,6 @@ class DesignChatLoop:
                             **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
                         ),
                         _estimated_prompt_tokens=_est_tokens,
-                        overflow_retry_cb=_re_trim_design_context_overflow,
                     )
                     _finish_reason = getattr(response, "finish_reason", None)
                     if _finish_reason in _TRUNCATION_REASONS and _attempt < 2:
@@ -1833,8 +1792,8 @@ class DesignChatLoop:
                 # Mirror the split-token accumulation of the normal/final-summary
                 # paths — the fallback performs a real LLM call that consumes
                 # prompt/completion budget, so it must be reflected in the
-                # per-bucket counters (defense-depth parity with L1186-1198 and
-                # L1645-1661). Without this, fallback-path tokens were silently
+                # per-bucket counters (defense-depth parity with the normal-path
+                # and final-summary-path accumulations). Without this, fallback-path tokens were silently
                 # dropped from cost/token accounting.
                 result.tokens_used += _fb.get("tokens_used", 0) or 0
                 result.prompt_tokens += _fb.get("prompt_tokens", 0) or 0
@@ -1847,7 +1806,7 @@ class DesignChatLoop:
                 result.last_call_cache_creation_tokens = _fb.get("cache_creation_tokens", 0) or 0
                 # Record the fallback LLM call to the global collector too, so
                 # design-chat fallback-path token consumption is not invisible
-                # on the dashboard (parallel with L1598-1606).
+                # on the dashboard (parallel with the normal-path record_llm_call).
                 get_global_collector().record_llm_call(
                     provider=self.llm_client.get_provider_name(),
                     prompt_tokens=_fb.get("prompt_tokens", 0) or 0,
@@ -1913,7 +1872,7 @@ class DesignChatLoop:
                 result.content = response.content or ""
                 # GLM-5.2 (thinking ON) / DeepSeek Reasoner may emit the final
                 # answer in reasoning_content with an empty content field. The
-                # intermediate path (L1400) and max-iterations path (L1651) already
+                # intermediate path and max-iterations path already
                 # fall back to reasoning_content; the normal termination path must
                 # too, else the closing summary is silently swallowed and the REPL
                 # returns to prompt with no answer. Without this, the once-retry
@@ -2042,13 +2001,13 @@ class DesignChatLoop:
             # Notify UI of the token usage for the most recent LLM call — CLI displays
             # it as "the actual context size injected into the LLM this call" on the tool
             # completion (✓) line. last_call_* fields are overwritten with the latest
-            # response value on each call (see :973-975 above), so this sends the single
+            # response value on each call (see the normal-path last_call_* assignment), so this sends the single
             # call value, not accumulated result.prompt_tokens. Accumulated billing totals
             # are NOT sent via events — CLI reads chat_result (result.prompt_tokens etc.)
             # directly after the loop returns and displays them in one line
-            # (asi.py ~L7092-L7137).
+            # (repl_impl.py — the cache_cost_summary display of chat_result).
             # Note: design_llm_call is only emitted on tool-call paths — the final answer
-            # (no tool call) returns at L1266 and never reaches here; that call's cache
+            # (no tool call) returns early and never reaches here; that call's cache
             # efficiency is observed via the cumulative summary line
             # (cache {hit_pct}% → ${actual}) above.
             if stream_callback:
@@ -2334,7 +2293,7 @@ class DesignChatLoop:
             )
             _final_content = final_response.content or ""
             # Record the final-response LLM call to global collector for
-            # dashboard visibility (parallel with tool-loop L1598-1606).
+            # dashboard visibility (parallel with the tool-loop record_llm_call).
             get_global_collector().record_llm_call(
                 provider=self.llm_client.get_provider_name(),
                 prompt_tokens=getattr(final_response, "prompt_tokens", None) or (final_response.tokens_used or 0),
@@ -2417,7 +2376,7 @@ class DesignChatLoop:
                         getattr(retry_response, "cache_creation_input_tokens", None))
                     _retry_superseded = True
                     # Record the retry-response LLM call to global collector
-                    # (parallel with final_response recording at L2059-2066).
+                    # (parallel with the final_response last_call_* recording).
                     get_global_collector().record_llm_call(
                         provider=self.llm_client.get_provider_name(),
                         prompt_tokens=getattr(retry_response, "prompt_tokens", None) or (retry_response.tokens_used or 0),
@@ -2427,7 +2386,7 @@ class DesignChatLoop:
                     )
                 except Exception as retry_e:
                     # Record the failed retry first — before propagating
-                    # service-side errors (parallel with tool-loop L1612-1626).
+                    # service-side errors (parallel with the tool-loop failed-call recording).
                     # The original final_response was already recorded above,
                     # and the retry is an additional failed LLM call.
                     get_global_collector().record_llm_call(
@@ -2438,7 +2397,7 @@ class DesignChatLoop:
                         failed=True,
                     )
                     # Propagate service-side LLM errors and user cancellation —
-                    # never catch-and-swallow them (parallel with tool-loop L1626).
+                    # never catch-and-swallow them (parallel with the tool-loop error-propagation guard).
                     from external_llm.client import LLMClientError
                     if isinstance(retry_e, (LLMClientError, AgentCancelled)):
                         raise
@@ -2470,7 +2429,7 @@ class DesignChatLoop:
                 result.provider = getattr(final_response, "provider", "") or ""
         except Exception as e:
             # Record the failed final-response LLM call first — before
-            # propagating service-side errors (parallel with tool-loop L1612-1626).
+            # propagating service-side errors (parallel with the tool-loop failed-call recording).
             # Only when no successful recording was already made (the
             # success-path record_llm_call may have fired before a subsequent
             # statement in the try block raised).
@@ -2483,7 +2442,7 @@ class DesignChatLoop:
                     failed=True,
                 )
             # Propagate service-side LLM errors and user cancellation —
-            # never catch-and-swallow them (parallel with tool-loop L1626).
+            # never catch-and-swallow them (parallel with the tool-loop error-propagation guard).
             from external_llm.client import LLMClientError
             if isinstance(e, (LLMClientError, AgentCancelled)):
                 raise
@@ -2856,7 +2815,7 @@ class DesignChatLoop:
                     result.tool_results.append({"tool": tc.name, "args": tc.args, "content": "", "ok": False})
                 return "Error: 'insight' is required and must not be empty."
             # Emit "running" for CLI in-flight tracking/spinner parity with the
-            # generic-tool path (L1425-1433). save_insight writes to disk, which
+            # generic-tool path (the "Execute tool" running-event emission). save_insight writes to disk, which
             # can briefly block under heavy I/O.
             if stream_callback:
                 try:
@@ -3004,7 +2963,7 @@ class DesignChatLoop:
                 return "Error: 'query' is required."
             # Emit "running" so the CLI registers an in-flight entry and shows a
             # live spinner (search_design_history runs BM25 + vector re-ranking,
-            # which can take >1s). Mirrors the generic-tool path at L1425-1433.
+            # which can take >1s). Mirrors the generic-tool path's running-event emission.
             if stream_callback:
                 try:
                     stream_callback("design_tool_call", {
@@ -3105,6 +3064,13 @@ class DesignChatLoop:
         # Success of a complete write tool is a no-op inside the helper; the
         # call also settles/fires the suggestion-hit tracker on every
         # write-tool result (success settles a pending marker as "helped").
+        # Per-turn key (same identity the recall settle/arm below uses,
+        # stamped once per respond() via new_session_key()): retries
+        # within one turn share the key, a new turn re-arms. Defined OUTSIDE
+        # the write-tool branch — the failure-recall hooks below run for ALL
+        # tools (read tools fail too), and a read-only tool failure would
+        # otherwise hit UnboundLocalError here and silently kill the recall.
+        _session_key = result.recall_session_key
         if tc.name in self.registry._WRITE_TOOLS:
             try:
                 from .tool_failure_log import (
@@ -3112,10 +3078,6 @@ class DesignChatLoop:
                     record_write_tool_failure_from_tr,
                 )
                 _repo_root = getattr(self.registry, "repo_root", None)
-                # Per-turn key (same identity the recall settle/arm below uses,
-                # stamped once per respond() via new_session_key()): retries
-                # within one turn share the key, a new turn re-arms.
-                _session_key = result.recall_session_key
                 if tr is not None:
                     record_write_tool_failure_from_tr(
                         tool=tc.name, tr=tr, args=tc.args,

@@ -40,7 +40,7 @@ _ROUTING_INTENT_NORMALIZE: dict = {
     "create": "explore_and_edit",
     # IntentResult default / classification-failure sentinel (IntentResolver emits
     # intent_type="unknown" on every failure path: LLM-unavailable, parse failure,
-    # empty request — intent_models.py:41). NOT label drift: it is an internal
+    # empty request — the `IntentResult` default in intent_models.py). NOT label drift: it is an internal
     # first-class sentinel, not an LLM-output spelling variation. All failure paths
     # also set lane_hint ∈ {"planner","main_agent"} → routing already resolves to
     # explore_and_edit, so this entry changes ONLY the drift-warning noise, not behavior.
@@ -79,7 +79,7 @@ def is_non_edit_intent(intent: RoutingIntent) -> bool:
 # ``IntentResolver`` metadata sources that mean "classification never happened".
 # All three are failure paths, not classifications: minimal_fallback (LLM call
 # raised / no client), llm_parse_failed (response was not parseable JSON),
-# empty_request (nothing to classify). See intent_resolver.py:791-830.
+# empty_request (nothing to classify). See intent_resolver.py (`_create_empty_result` + the `_resolve_with_llm` failure paths).
 _UNDETERMINED_INTENT_SOURCES = frozenset({
     "minimal_fallback", "llm_parse_failed", "empty_request",
 })

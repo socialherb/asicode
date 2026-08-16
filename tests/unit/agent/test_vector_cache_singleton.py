@@ -20,6 +20,7 @@ from external_llm.agent.vector_cache import (
 EXPECTED_MODEL = get_configured_embedding_model_name()
 
 
+@pytest.mark.slow
 def test_global_embedding_model_singleton():
     """Test that get_global_embedding_model() returns the same instance."""
     # Mock SentenceTransformer to avoid actual model loading

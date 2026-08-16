@@ -72,6 +72,15 @@ _NO_TOOL_NUDGE_MAX: int = config.counts.AGENT_NO_TOOL_NUDGE_MAX
 _NO_PROGRESS_THRESHOLD: int = config.counts.AGENT_NO_PROGRESS_THRESHOLD
 _TOOL_RETRY_LIMIT: int = config.counts.AGENT_TOOL_RETRY_LIMIT
 
+# Stream-display content budgets (UI callback only — the LLM context budget
+# lives elsewhere).  Module-level SSOT: the inline sets at the two call sites
+# had already drifted once (write_plan appeared in one, not the other), and
+# the tool loop would re-create them on every tool call.  `job` joins the
+# verbose tier with `bash`: both surface command output, so both get the same
+# 6000-char display budget instead of the 2000-char default.
+_STREAM_LARGE_TOOLS = frozenset({"apply_patch", "write_plan"})
+_STREAM_VERBOSE_TOOLS = frozenset({"run_tests", "run_lint", "bash", "job"})
+
 
 def _write_touched_test_file(tool_name: str, tool_args: dict) -> bool:
     """Check if a write tool wrote to a test file.
@@ -408,7 +417,7 @@ class TurnPipelineMixin:
                         ctx.no_tool_nudge_count = _fa.nudge_count
                         ctx.messages.append(_fa.nudge_message)
                         # Reset any_tool_called so post-nudge text-only
-                        # responses hit the text_reply path (line 585)
+                        # responses hit the text_reply path (the no-tool-call text_reply outcome)
                         # instead of false-success re-nudge death loop.
                         ctx.any_tool_called = False
                         continue
@@ -527,13 +536,17 @@ class TurnPipelineMixin:
                         logger.debug("<module>::TurnPipelineMixin::_handle_max_turns_reached::_rget:0 suppressed (AttributeError, TypeError, KeyError)", exc_info=True)
                 return getattr(response, key, default)
 
-            _pt = coerce_token_count(_rget("prompt_tokens", 0))
-            if not _pt:
-                _pt = coerce_token_count(_rget("tokens_used", 0))  # fallback: total when split unavailable
+            _pt = _rget("prompt_tokens", 0)
+            if _pt is None:
+                _pt = _rget("tokens_used", 0)  # fallback: total when split unavailable
+            _pt = coerce_token_count(_pt)
             _ct = coerce_token_count(_rget("completion_tokens", 0))
-            # Defense-depth parity with main turn loop (L228-239): accumulate
+            # Defense-depth parity with main turn loop (_run_llm_loop): accumulate
             # cache tokens here too — the max_turns final call consumes cache
             # budget and must be reflected in the per-bucket counters.
+            # Fallback semantics match the main loop's documented contract: a
+            # REAL 0 is a valid split value and must not trigger the fallback
+            # (only an explicit None — provider omitted the split — may).
             _crt = coerce_token_count(_rget("cache_read_input_tokens", 0))
             _cct = coerce_token_count(_rget("cache_creation_input_tokens", 0))
             ctx.total_prompt_tokens += _pt
@@ -559,11 +572,12 @@ class TurnPipelineMixin:
                 # NOTE: _rget closes over `response` *by reference*, so after the
                 # reassignment above it already reads the new response — a second
                 # identical closure (_rget2) was redundant and has been removed.
-                _pt = coerce_token_count(_rget("prompt_tokens", 0))
-                if not _pt:
-                    _pt = coerce_token_count(_rget("tokens_used", 0))  # fallback: total when split unavailable
+                _pt = _rget("prompt_tokens", 0)
+                if _pt is None:
+                    _pt = _rget("tokens_used", 0)  # fallback: total when split unavailable
+                _pt = coerce_token_count(_pt)
                 _ct = coerce_token_count(_rget("completion_tokens", 0))
-                # Defense-depth parity with main turn loop (L228-239): accumulate
+                # Defense-depth parity with main turn loop (_run_llm_loop): accumulate
                 # cache tokens for the wrap-up retry call too.
                 _crt = coerce_token_count(_rget("cache_read_input_tokens", 0))
                 _cct = coerce_token_count(_rget("cache_creation_input_tokens", 0))
@@ -1349,6 +1363,7 @@ class TurnPipelineMixin:
                         "turn": turn_num,
                         "tool": _pc["tool"],
                         "args": self.registry.normalize_args_for_display(_pc["args"]),
+                        "agent_id": self.config.agent_id,
                     })
                 except (AttributeError, TypeError):
                     logger.debug("<module>::TurnPipelineMixin::_build_and_filter_prepared_calls:4 suppressed (AttributeError, TypeError)", exc_info=True)
@@ -1425,9 +1440,7 @@ class TurnPipelineMixin:
                 )
                 if early_result is not None:
                     if self.config.stream_callback:
-                        _LARGE_TOOLS = {"apply_patch", "write_plan"}
-                        _VERBOSE_TOOLS = {"run_tests", "run_lint", "bash"}
-                        content_limit = 8000 if tool_name in _LARGE_TOOLS else (6000 if tool_name in _VERBOSE_TOOLS else 2000)
+                        content_limit = 8000 if tool_name in _STREAM_LARGE_TOOLS else (6000 if tool_name in _STREAM_VERBOSE_TOOLS else 2000)
                         try:
                             self._cb("tool_call", {
                                 "turn": turn_num,
@@ -1438,6 +1451,7 @@ class TurnPipelineMixin:
                                     "content": result.content[:content_limit],
                                     "error": result.error,
                                 },
+                                "agent_id": self.config.agent_id,
                             })
                         except Exception:
                             logger.debug("<module>::TurnPipelineMixin::_process_tool_results:0 suppressed Exception", exc_info=True)
@@ -1595,9 +1609,7 @@ class TurnPipelineMixin:
                     logger.info("No-op confirmed via %s empty/no-change error", tool_name)
 
             if self.config.stream_callback:
-                _LARGE_TOOLS = {"apply_patch", "write_plan"}
-                _VERBOSE_TOOLS = {"run_tests", "run_lint", "bash"}
-                content_limit = 8000 if tool_name in _LARGE_TOOLS else (6000 if tool_name in _VERBOSE_TOOLS else 2000)
+                content_limit = 8000 if tool_name in _STREAM_LARGE_TOOLS else (6000 if tool_name in _STREAM_VERBOSE_TOOLS else 2000)
                 try:
                     self._cb("tool_call", {
                         "turn": turn_num,
@@ -1608,6 +1620,7 @@ class TurnPipelineMixin:
                             "content": result.content[:content_limit],
                             "error": result.error,
                         },
+                        "agent_id": self.config.agent_id,
                     })
                 except (AttributeError, TypeError):
                     logger.debug("<module>::TurnPipelineMixin::_process_tool_results:4 suppressed (AttributeError, TypeError)", exc_info=True)
@@ -2272,17 +2285,17 @@ _EVICT_MIN_CONTENT_LEN = 200
 # verbatim and the prefix cache stays warm (cheap reads, no spikes).
 #
 # ``_EVICTION_OCCUPANCY_TRIGGER``: fire once estimated tokens exceed this
-# fraction of ``context_message_cap`` (the SAME accounting the hard-cap
-# front-trim uses). Sitting below the cap means the gentle stub-based bound here
-# preempts the cruder count-based front-trim (design_chat_loop ~L141), which
-# would invalidate the ENTIRE prefix. 0.75 leaves headroom for the current turn
-# to grow before the hard cap becomes necessary.
+# fraction of ``context_message_cap`` (the SAME accounting the pre-flight
+# guards use). Sitting below the cap means the gentle stub-based bound here
+# preempts the provider's context-length 400 (preemptive_trim removed — an
+# over-cap turn now surfaces as a provider error), which would invalidate the
+# ENTIRE prefix. 0.75 leaves headroom for the current turn to grow.
 #
 # Prefix-stability invariant (CRITICAL, independent of the trigger mechanism).
 # For the prefix cache to stay warm between turns, eviction must be the ONLY
 # thing that rewrites the early prefix. It holds today because the design-chat
-# loop (a) removed per-iteration re-injection (design_chat_loop.py ~L1098) and
-# (b) injects turn-volatile L3 promoted-insights at a LATE position (~L661),
+# loop (a) removed per-iteration re-injection (design_chat_loop.py) and
+# (b) injects turn-volatile L3 promoted-insights at a LATE position (`load_promoted_insights`),
 # keeping the cached system/insights prefix byte-stable across turns. If a
 # future change re-introduces a per-turn-mutated banner/timestamp/state into the
 # system prompt or early messages, EVERY turn becomes a full cache miss and the
@@ -2296,9 +2309,8 @@ _EVICTION_OCCUPANCY_TRIGGER = 0.75
 # occupancy crosses ``_EVICTION_OCCUPANCY_TRIGGER``, stubbing older tool_results
 # rewrites the cached prefix and the whole tail is re-billed as a cache-WRITE —
 # the very cost the gate was meant to save. With the gate off the ONLY context
-# bound is the hard-cap front-trim (``_apply_context_hard_cap``), which fires far
-# later (only on a genuinely oversized prompt) and acts purely as the HTTP-400
-# backstop — so a routine loop never pays a prefix rewrite.
+# bound is the provider's own context limit (``_apply_context_hard_cap`` only
+# raises on structural collapse), so a routine loop never pays a prefix rewrite.
 #
 # The occupancy gate, keep_recent floor and ``_evict_consumed_tool_results``
 # primitive are all kept intact and unit-tested, so re-enabling eviction for a
@@ -2319,8 +2331,8 @@ def _evict_for_loop(messages, model: str = "", tool_schemas=None, base_url: Opti
 
     DISABLED by default (``_EVICTION_ENABLED is False``): returns ``messages``
     unchanged for every model, so no prefix is ever rewritten by the gentle stub
-    bound — only the hard-cap front-trim (``_apply_context_hard_cap``) bounds the
-    window, as an overflow-only HTTP-400 backstop. When enabled, it fires
+    bound — only the provider's context limit (via the 400 → overflow-override
+    backstop) bounds the window. When enabled, it fires
     ``_evict_consumed_tool_results`` (stub every tool result beyond the
     most-recent ``_EVICTION_KEEP_RECENT``) ONLY when the estimated prompt exceeds
     ``_EVICTION_OCCUPANCY_TRIGGER x context_message_cap(model)``. Below that it
@@ -2467,7 +2479,8 @@ def _is_stubbed_tool_result(m) -> bool:
                     return True
             # Gemini: {"functionResponse": {"response": {"content": "[EVICTED..."}}}
             if "functionResponse" in block:
-                inner = (block["functionResponse"] or {}).get("response", {})
+                fr = block["functionResponse"]
+                inner = fr.get("response", {}) if isinstance(fr, dict) else {}
                 inner = inner.get("content", "") if isinstance(inner, dict) else ""
                 if isinstance(inner, str) and inner.startswith(_EVICTED_MARKER):
                     return True
@@ -2480,6 +2493,20 @@ def _eviction_stub(label: str, size: int) -> str:
         f"{_EVICTED_MARKER}: {label} — {size} chars "
         f"evicted to save context; re-read if still needed.]"
     )
+
+
+def _payload_size(content) -> int:
+    """Size of a tool-result payload (str, or JSON-serializable dict/list).
+
+    Shared by the provider-specific block stubbing helpers: both measure the
+    *payload of one block* (str length, or ``json.dumps`` of structured
+    content) so the eviction stub names a real per-block size.
+    """
+    if isinstance(content, str):
+        return len(content)
+    if content is not None:
+        return len(json.dumps(content, ensure_ascii=False))
+    return 0
 
 
 def _stub_tool_result_blocks(m, stub: str, replace_block) -> Any:
@@ -2519,9 +2546,7 @@ def _stub_anthropic_tool_result(m, stub: str, name_map: dict | None = None):
         bname = name_map.get(tid, "") if name_map and tid else ""
         # Size of THIS block's payload only (not the aggregated message size).
         inner = block.get("content", "")
-        bsize = len(inner) if isinstance(inner, str) else (
-            len(json.dumps(inner, ensure_ascii=False)) if inner is not None else 0
-        )
+        bsize = _payload_size(inner)
         label = f"{bname} ({tid})" if bname and tid else (bname or tid or "tool")
         return {**block, "content": _eviction_stub(label, bsize)}
     return _stub_tool_result_blocks(m, stub, replace_block)
@@ -2542,7 +2567,9 @@ def _stub_gemini_tool_result(m, stub: str, name_map: dict | None = None):
             return block
         fr = block["functionResponse"] or {}
         gname = fr.get("name", "") or "tool"
-        # Size of THIS part's payload only.
+        # Size of THIS part's payload only.  NOTE: when the response content is
+        # not a string, the WHOLE response object is measured (not just the
+        # content field) — the response dict is the serializable unit here.
         resp = fr.get("response", {})
         rcontent = resp.get("content", "") if isinstance(resp, dict) else ""
         psize = len(rcontent) if isinstance(rcontent, str) else (
@@ -2654,7 +2681,7 @@ def _evict_consumed_tool_results(messages, keep_recent: int = 6, batch_evict_thr
     # NOTE (counting caveat, BUG-2): ``keep_recent`` / ``pending_count`` count
     # MESSAGE objects. Standard format is one result == one message, but
     # Anthropic (and Gemini) batch N parallel results into ONE user message,
-    # so a batch counts as 1. The break-even cost model (~L2028) is calibrated
+    # so a batch counts as 1. The break-even cost model (eviction costs ~1.25x a cached read) is calibrated
     # in result-units, so on Anthropic/Gemini parallel calls eviction fires one
     # batch later than the model assumes. Impact is small (the first eviction
     # dominates the cost) and bounded, hence tolerated.
@@ -2683,7 +2710,7 @@ def _evict_consumed_tool_results(messages, keep_recent: int = 6, batch_evict_thr
         # Observability: the one-time prefix rewrite this eviction causes shows
         # up as a cache_creation spike on the NEXT LLM call. This log lets an
         # operator correlate that spike with the eviction event — it is the
-        # "1.25x rewrite" the break-even cost model (~L2028) prices. Fires at
+        # "1.25x rewrite" the break-even cost model prices. Fires at
         # most every ``batch_evict_threshold`` turns (the hysteresis gate above).
         logger.debug(
             "evict_tool_results: stubbed %d new tool result(s) "

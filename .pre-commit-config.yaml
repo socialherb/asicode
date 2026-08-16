@@ -170,10 +170,12 @@ repos:
       # that kept them out (dead_block 43, public_dead_code 43, vulture 35) were
       # cross-file false positives, and broken_contract always skipped without a
       # graph; vulture's framework-dispatch FPs are suppressed structurally in
-      # vulture_scanner._framework_live_for_file). Remaining report-only:
-      # ast_similarity / container. See scripts/check_structural_scanners.py.
-      # Per-file mode here (changed files only); lint.yml runs the same script with
-      # NO args = full-repo scan including report-only counts.
+      # vulture_scanner._framework_live_for_file). ast_similarity is gated at
+      # the exact-duplicate (similarity 1.0, non-test source) contract only —
+      # the ranked near-duplicate set is not an enumeration contract. See
+      # scripts/check_structural_scanners.py.
+      # Per-file mode here (changed files + git-untracked union, see P-2); lint.yml
+      # runs the same script with NO args = full-repo scan including report-only counts.
       - id: structural-scan
         name: deterministic structural scanners zero-tolerance
         language: system

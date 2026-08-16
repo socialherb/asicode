@@ -7,7 +7,7 @@ A single :func:`_query_ollama_show` performs ONE ``/api/show`` POST per
 extractors over that one shared cached payload, so a cold start issues a single
 POST instead of two (or three, when the agent tools path also runs).  This
 module is what keeps providers.py (num_ctx enforcement) and context_budget.py
-(preemptive_trim guard) in sync without duplicated heuristics.
+(context-limit resolution) in sync without duplicated heuristics.
 """
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ _SHOW_CACHE_TTL_SECONDS = 300  # 5 minutes
 
 # Negative cache: collapses per-request retry storms when the Ollama server is
 # unreachable or slow.  _query_ollama_show is reached on every LLM generation
-# (providers.py) and on every preemptive_trim / context-limit resolution
+# (providers.py) and on every context-limit resolution
 # (context_budget.py), so a dead or hung server would otherwise add a
 # ``timeout=5`` HTTP POST to every single call — catastrophic in a long
 # autonomous run.  A short TTL (_SHOW_NEGATIVE_CACHE_TTL_SECONDS) preserves the

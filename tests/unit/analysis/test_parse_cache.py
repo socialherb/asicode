@@ -168,3 +168,150 @@ def test_read_and_parse_none_on_syntax_error():
         src, tree = parse_cache.read_and_parse(path)
         assert src is not None
         assert tree is None
+
+
+# ── Disk-cache path guard (P-1, 2026-08-16) ─────────────────────────────────
+
+
+def test_cache_file_path_returns_guarded_path(tmp_path):
+    path = parse_cache.cache_file_path(str(tmp_path), "x_v1.json")
+    assert path == str(Path(tmp_path) / ".cache" / "x_v1.json")
+
+
+def test_cache_file_path_rejects_empty_repo_root():
+    with pytest.raises(parse_cache.CachePathError):
+        parse_cache.cache_file_path("", "x.json")
+
+
+def test_cache_file_path_rejects_empty_filename(tmp_path):
+    with pytest.raises(parse_cache.CachePathError):
+        parse_cache.cache_file_path(str(tmp_path), "")
+
+
+def test_cache_file_path_rejects_directory_components(tmp_path):
+    for bad in ("sub/x.json", "../x.json", "a/../x.json", "/abs/x.json"):
+        with pytest.raises(parse_cache.CachePathError):
+            parse_cache.cache_file_path(str(tmp_path), bad)
+
+
+def test_cache_file_path_rejects_non_json_name(tmp_path):
+    for bad in ("x.txt", "x", "x.json.bak"):
+        with pytest.raises(parse_cache.CachePathError):
+            parse_cache.cache_file_path(str(tmp_path), bad)
+
+
+def test_cache_file_path_rejects_file_as_repo_root(tmp_path):
+    f = tmp_path / "not_a_dir"
+    f.write_text("x", encoding="utf-8")
+    with pytest.raises(parse_cache.CachePathError):
+        parse_cache.cache_file_path(str(f), "x.json")
+
+
+def test_cache_file_path_rejects_escaping_symlink(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (tmp_path / ".cache").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink not permitted on this platform")
+    with pytest.raises(parse_cache.CachePathError):
+        parse_cache.cache_file_path(str(tmp_path), "x.json")
+
+
+# ── Partial-update persistence policy (round 32-F2) ─────────────────────────
+
+
+def test_should_persist_partial_update_thresholds():
+    """Persist when dirty>0 AND (small corpus OR fraction exceeds 5%)."""
+    from external_llm.analysis import parse_cache as pc
+
+    sp = pc.should_persist_partial_update
+    assert sp(0, 0) is False, "nothing dirty — never save"
+    assert sp(1, 3) is True, "small corpus always persists (test fixtures)"
+    assert sp(49, 49) is True, "corpus below SAVE_SKIP_MIN_ENTRIES persists"
+    assert sp(1, 100) is False, "1% of a large corpus — recompute is cheaper"
+    assert sp(5, 100) is False, "exactly 5% still skips (must EXCEED the fraction)"
+    assert sp(6, 100) is True, "6% of a large corpus persists"
+    assert sp(100, 100) is True, "cold scan (100% dirty) persists"
+
+
+# ── Fingerprint order contract (B1) ──────────────────────────────────────────
+
+
+def test_stat_fingerprint_missing_returns_none(tmp_path):
+    assert parse_cache.stat_fingerprint(str(tmp_path / "nope.py")) is None
+
+
+def test_stat_fingerprint_matches_os_stat(tmp_path):
+    import os
+
+    p = _make_py(str(tmp_path), "a.py", "x = 1\n")
+    st = os.stat(p)
+    assert parse_cache.stat_fingerprint(p) == (st.st_mtime_ns, st.st_size)
+
+
+def test_read_with_fingerprint_consistent_pair(tmp_path):
+    p = _make_py(str(tmp_path), "a.py", "x = 1\n")
+    pair = parse_cache.read_with_fingerprint(p)
+    assert pair is not None
+    src, fp = pair
+    assert src == "x = 1\n"
+    assert fp == parse_cache.stat_fingerprint(p)
+
+
+def test_read_with_fingerprint_missing_returns_none(tmp_path):
+    assert parse_cache.read_with_fingerprint(str(tmp_path / "nope.py")) is None
+
+
+def test_read_with_fingerprint_stamp_never_newer_than_content(tmp_path, monkeypatch):
+    """B1 order contract: an interleaved write must leave the returned stamp
+    describing the PRE-read state, so a torn cache entry is unreachable.
+
+    The write is injected into ``_read_impl`` — i.e. it lands between the
+    helper's stat and its read.  If the order were flipped (read, then stat),
+    the returned fingerprint would equal the file's post-write stat and a
+    cache entry keyed by it would HIT on every future run while holding
+    pre-write analysis — this test fails on that regression.
+    """
+    import os
+
+    p = _make_py(str(tmp_path), "a.py", "x = 1\n")
+    real_read = parse_cache._read_impl
+
+    def interleaving_write(abs_path, mtime_ns, size):
+        with open(abs_path, "a", encoding="utf-8") as fh:
+            fh.write("# concurrent write\n")
+        return real_read(abs_path, mtime_ns, size)
+
+    monkeypatch.setattr(parse_cache, "_read_impl", interleaving_write)
+    pair = parse_cache.read_with_fingerprint(p)
+    monkeypatch.undo()
+    assert pair is not None
+    src, fp = pair
+    assert "# concurrent write" in src, "read must observe the post-write content"
+    st = os.stat(p)
+    assert fp != (st.st_mtime_ns, st.st_size), (
+        "stamp must describe the PRE-read state — a post-write stamp paired "
+        "with this content would silently serve stale cache entries"
+    )
+
+
+@pytest.mark.parametrize(
+    "module_name,helper",
+    [
+        ("external_llm.analysis.vulture_scanner", "_stat_fingerprint"),
+        ("external_llm.analysis.unused_import_scanner", "_uic_stat"),
+        ("external_llm.analysis._dead_block_shared", "_dbx_stat"),
+        ("external_llm.analysis.container_reachability_scanner", "_crx_stat"),
+        ("external_llm.analysis.cross_file_refs", "_ie_stat"),
+    ],
+)
+def test_scanner_stat_helpers_delegate_to_canonical(module_name, helper, tmp_path):
+    """Every per-file disk cache stats through the ONE canonical helper."""
+    import importlib
+
+    mod = importlib.import_module(module_name)
+    fn = getattr(mod, helper)
+    assert fn(str(tmp_path / "nope.py")) is None
+    p = _make_py(str(tmp_path), "a.py", "x = 1\n")
+    assert fn(p) == parse_cache.stat_fingerprint(p)

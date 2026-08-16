@@ -1,9 +1,16 @@
 """Tests for TS/JS Semantic Tracer — Core IR."""
 from __future__ import annotations
 
+import textwrap
+
 import pytest
 
-from external_llm.editor.semantic.ts_semantic_tracer import TSSemanticTracer
+from external_llm.editor.semantic import ts_semantic_tracer as ts_mod
+from external_llm.editor.semantic.ts_semantic_tracer import (
+    TSSemanticTracer,
+    _build_jsx_parser,
+    _build_tsx_parser,
+)
 from external_llm.languages.tree_sitter_utils import is_available
 
 pytestmark = pytest.mark.skipif(
@@ -757,3 +764,242 @@ def test_execution_ir_e2e(ts_tracer):
     # 6. Data flow queries
     assert "validate" in m.data_sources_of("validated")
     assert "insert" in m.data_sources_of("user")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IR convenience lookups  (RED→GREEN: get_function/get_class/get_symbol)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_ir_module_lookup_conveniences():
+    """TSModule lookup helpers resolve dotted/bare names, classes, symbols.
+
+    Covers the dotted-name path (L347-353), bare-name class-method path
+    (L361-365), get_class miss (L371) and get_symbol miss (L386).
+    """
+    from external_llm.editor.semantic.ts_ir_models import (
+        IRClass,
+        IRFunction,
+        IRMethod,
+        IRSymbol,
+        SymbolKind,
+        TSModule,
+    )
+
+    mod = TSModule(
+        file_path="game.ts",
+        functions=[IRFunction(name="greet")],
+        classes=[
+            IRClass(
+                name="Game",
+                methods=[
+                    IRMethod(name="lockPiece"),
+                    IRMethod(name="move"),
+                ],
+            )
+        ],
+        symbols=[
+            IRSymbol(name="score", kind=SymbolKind.VARIABLE),
+            IRSymbol(name="state", kind=SymbolKind.VARIABLE, scope="Game"),
+        ],
+    )
+
+    # Dotted name: ClassName.methodName (hit + miss)
+    assert mod.get_function("Game.lockPiece").name == "lockPiece"
+    assert mod.get_function("Game.nope") is None
+    assert mod.get_function("Missing.method") is None
+    # Bare name: top-level function, then class method, then miss
+    assert mod.get_function("greet").name == "greet"
+    assert mod.get_function("move").name == "move"
+    assert mod.get_function("absent") is None
+    # get_class hit + miss
+    assert mod.get_class("Game").name == "Game"
+    assert mod.get_class("Nope") is None
+    # get_symbol hit + miss
+    assert mod.get_symbol("score").kind == SymbolKind.VARIABLE
+    assert mod.get_symbol("absent") is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RED→GREEN: uncovered branches
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_parser_degradation_paths(monkeypatch):
+    """Parser unavailable/failure paths degrade to None/empty (L83-99,
+    L151-163, L202)."""
+    # Grammar loader failure → builders return None.
+    def _boom(*_a, **_k):
+        raise ImportError("grammar missing")
+
+    monkeypatch.setattr("external_llm.languages.tree_sitter_utils.get_parser", _boom)
+    assert _build_tsx_parser() is None
+    assert _build_jsx_parser() is None
+
+    # tree-sitter not available → analyze_core returns an empty module.
+    tracer = TSSemanticTracer(language="typescript")
+    monkeypatch.setattr(ts_mod, "is_available", lambda: False)
+    m = tracer.analyze_core("const x = 1;", "x.ts")
+    assert m.imports == [] and m.functions == []
+
+    # Parser resolved but None → _parse returns None.
+    tracer2 = TSSemanticTracer(language="javascript")
+    monkeypatch.setattr(ts_mod, "is_available", lambda: True)
+    monkeypatch.setattr(tracer2, "_get_parser", lambda: None)
+    assert tracer2._parse("const x = 1;", "x.ts") is None
+
+    # Parser raises → _parse returns None.
+    class _BoomParser:
+        def parse(self, code):
+            raise RuntimeError("parse boom")
+
+    monkeypatch.setattr(tracer2, "_get_parser", lambda: _BoomParser())
+    assert tracer2._parse("const x = 1;", "x.ts") is None
+
+
+def test_export_clause_and_default(ts_tracer):
+    """export { X, Y as Z } and export default expr (L246-247, L339-354)."""
+    m = ts_tracer.analyze_core(
+        "export { foo, bar as baz };\nexport default myThing;\n", "mod.ts"
+    )
+    names = {(e.name, e.kind.value) for e in m.exports}
+    assert ("foo", "named") in names
+    assert ("baz", "named") in names
+    assert ("myThing", "default") in names
+
+
+def test_import_type_only(ts_tracer):
+    """import type marks is_type_only (L311)."""
+    m = ts_tracer.analyze_core('import type { Foo } from "m";\n', "t.ts")
+    assert len(m.imports) == 1
+    assert m.imports[0].is_type_only is True
+
+
+def test_variable_initializer_classification(ts_tracer):
+    """Initializer classification: identifier → variable, unknown node
+    (ternary) → None (L481, L523)."""
+    m = ts_tracer.analyze_core(
+        "const a = b;\nconst f = () => 1;\nconst t = a ? b : c;\n", "v.ts"
+    )
+    assert {"a", "t"} <= {v.name for v in m.variables}
+    assert "f" in {fn.name for fn in m.functions}
+    # The ternary initializer is an unclassified node → source_type None.
+    ta = next(ass for ass in m.assignments if ass.target == "t")
+    assert ta.source_type is None
+
+
+def test_classify_arrow(ts_tracer):
+    """_classify_initializer maps function-like nodes to 'arrow' (L514)."""
+    root = ts_tracer._parse("const f = () => 1;", "a.ts")
+    assert root is not None
+    arrow = None
+
+    def find(node):
+        nonlocal arrow
+        if arrow is not None:
+            return
+        if node.type == "arrow_function":
+            arrow = node
+            return
+        for c in node.children:
+            find(c)
+
+    find(root)
+    assert arrow is not None
+    assert ts_tracer._classify_initializer(arrow) == "arrow"
+
+
+def test_class_implements_and_accessors(ts_tracer):
+    """implements clause + get/set accessors (L546-547, L594-596)."""
+    code = textwrap.dedent("""\
+        class A implements B, C {
+            get value() { return this._v; }
+            set value(v: number) { this._v = v; }
+        }
+    """)
+    m = ts_tracer.analyze_core(code, "svc.ts")
+    assert m.classes and m.classes[0].name == "A"
+    assert m.classes[0].implements == ["B", "C"]
+    getters = [mm for mm in m.classes[0].methods if mm.is_getter]
+    setters = [mm for mm in m.classes[0].methods if mm.is_setter]
+    assert len(getters) == 1
+    assert len(setters) == 1
+
+
+def test_interface_extends(ts_tracer):
+    """interface extends clause (L631)."""
+    m = ts_tracer.analyze_core("interface A extends B {}\n", "t.ts")
+    assert m.interfaces and m.interfaces[0].extends == ["B"]
+
+
+def test_assignment_new_expression(ts_tracer):
+    """new-expression initializer records its class as source inside a
+    function body (L806-809)."""
+    m = ts_tracer.analyze_core(
+        "const f = () => { const a = new Foo(); };\n", "n.ts"
+    )
+    assert any(ass.target == "a" and ass.source == "Foo" for ass in m.assignments)
+
+
+def test_usage_skip_import_specifier_and_member_property(ts_tracer):
+    """Usage collection skips import specifiers and member properties
+    (L767, L772)."""
+    m = ts_tracer.analyze_core(
+        'import { helper } from "m";\nfunction f() { obj.prop; helper(); }\n', "u.ts"
+    )
+    assert all(u.symbol != "prop" for u in m.usages)
+    assert any(u.symbol == "obj" for u in m.usages)
+
+
+def test_assignment_skips_without_value_and_array_pattern(ts_tracer):
+    """Assignments skip value-less declarators (L792) and array patterns
+    (L795); top-level destructuring registers variables (L410-432)."""
+    m = ts_tracer.analyze_core(
+        "const [a, b] = pair;\nconst f = () => {\n  const x;\n  const [c, d] = pair2;\n};\n",
+        "as.ts",
+    )
+    assert {"a", "b"} <= {v.name for v in m.variables}
+    assert not any(ass.target == "x" for ass in m.assignments)
+
+
+def test_function_symbol_loop_skips_unrelated(ts_tracer):
+    """The function-symbol loop skips unrelated symbols (L449)."""
+    m = ts_tracer.analyze_core("const other = 1;\nconst f = () => 1;\n", "p.ts")
+    assert "f" in {fn.name for fn in m.functions}
+
+
+def test_params_forms_js(js_tracer):
+    """JS param forms: rest_pattern, object_pattern, array_pattern directly
+    under formal_parameters (L857, L860, L862)."""
+    m = js_tracer.analyze_core(
+        "function f(...args) {}\nfunction g({x}, [y]) {}\n", "f.js"
+    )
+    by_name = {fn.name: fn for fn in m.functions}
+    assert by_name["f"].params[0].is_rest is True
+    assert by_name["g"].params[0].name == "{...}"
+    assert by_name["g"].params[1].name == "[...]"
+
+
+def test_typed_params_ts(ts_tracer):
+    """TS typed/optional params still extract plain names (L845)."""
+    m = ts_tracer.analyze_core(
+        "function typed(a: number, b?: string) {}\n", "p.ts"
+    )
+    params = m.functions[0].params
+    assert [p.name for p in params] == ["a", "b"]
+
+
+def test_callee_name_and_walk_leaf(ts_tracer):
+    """_walk's leaf exit path (L893)."""
+    root = ts_tracer._parse("", "empty.ts")
+    assert root is not None
+    assert list(ts_tracer._walk(root)) == [root]
+
+
+def test_syntax_error_tolerance(ts_tracer):
+    """Broken constructs degrade without crashing (L301, L406, L707, L826,
+    L832, L839)."""
+    m = ts_tracer.analyze_core(
+        "import {\nconst = 5;\nfunction nope\nfoo(\nconst z = obj.;\n", "bad.ts"
+    )
+    assert isinstance(m, ts_mod.TSModule)

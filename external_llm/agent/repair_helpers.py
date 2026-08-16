@@ -156,7 +156,13 @@ def _strip_redundant_dataclass_decorator(new_body: str, file_source: str, _src_t
         # Check if this class in new_body has @dataclass decorator
         _has_dataclass = False
         for _dec in _node.decorator_list:
-            if isinstance(_dec, (_ast.Name, _ast.Attribute)) and _dec.id == "dataclass":
+            # RH-B1: ast.Attribute nodes (dotted decorators like
+            # @pydantic.dataclasses.dataclass) have no `.id` attribute — the
+            # previous `(_ast.Name, _ast.Attribute)` tuple crashed with
+            # AttributeError. Only bare `@dataclass` counts here: the removal
+            # loop below (and the file-side collector) never strip Attribute
+            # decorators either, so counting them would be dead intent.
+            if isinstance(_dec, _ast.Name) and _dec.id == "dataclass":
                 _has_dataclass = True
                 break
             if isinstance(_dec, _ast.Call):

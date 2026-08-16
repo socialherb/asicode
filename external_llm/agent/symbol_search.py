@@ -1800,7 +1800,7 @@ class SymbolSearcher:
                 # --with-filename is mandatory: with a single FILE argument, rg omits
                 # the path prefix and emits "lineno:content", which would collapse the
                 # 3-part split below (path:lineno:content) and silently drop every
-                # match — see _index_via_treesitter (L1967) which uses the same flag.
+                # match — see `_index_via_treesitter` which uses the same flag.
                 proc = subprocess.run(
                     ["rg", "--no-heading", "--with-filename", "--line-number", "-m", "50", pat, str(file_path)],
                     capture_output=True, text=True, timeout=5,
@@ -2261,7 +2261,7 @@ class SymbolSearcher:
         return results
 
     # ── TS/JS rich symbol search via TSSemanticTracer ──────────────────────
-    # _MAX_TS_FILES is the module-level constant (L100); _walk_ts_js_files already
+    # `_MAX_TS_FILES` is the module-level constant; _walk_ts_js_files already
     # uses it, so find_symbol's TS/JS cap reads the same SSOT rather than a class copy.
 
     # Per-file TS/JS module cache: path -> ((mtime_ns, size), {name -> [SymbolDef]}).

@@ -35,13 +35,13 @@ def _set_cap(monkeypatch, cap: int) -> None:
 def isolated_extract_cache():
     """Save/restore the process-wide cache and gc rate-limit around every test."""
     saved = dict(_extract_cache)
-    saved_deficit = rg_module._extract_cache_gc_deficit
+    saved_deficit = _extract_cache._gc_deficit
     _extract_cache.clear()
-    rg_module._extract_cache_gc_deficit = 0
+    _extract_cache._gc_deficit = 0
     yield
     _extract_cache.clear()
     _extract_cache.update(saved)
-    rg_module._extract_cache_gc_deficit = saved_deficit
+    _extract_cache._gc_deficit = saved_deficit
 
 
 def _make_repo(files: dict) -> str:

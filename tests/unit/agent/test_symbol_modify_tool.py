@@ -617,6 +617,157 @@ class TestFindSymbolLineRange:
         assert end == 4                             # def + two body lines
 
 
+# ── Python fallback must never use the C-family brace/indent heuristic ──────
+# Regression (2026-08-13): when the ast path missed — a wrong ``Class.`` prefix,
+# or (far more common) a file that does not currently parse — Python fell
+# through to the brace/indent heuristic written for C-family syntax. It matched
+# on the BARE name, ignored decorators, treated the ``) -> T:`` continuation of
+# a multi-line signature as a dedent boundary, and skipped comment lines as
+# boundary candidates. Observed on external_llm/languages/go_provider.py:
+#   GoProvider._find_top_level_definitions_regex  (multi-line sig, wrong class)
+#     -> (400, 402) instead of (400, 434): 2 lines, so the splice orphaned the
+#        body and the tool reported "re-indentation would break Python syntax"
+#   GoProvider._find_block_end                    (single-line sig, wrong class)
+#     -> (385, 400) instead of (384, 395): started BELOW @staticmethod and ran
+#        past the symbol, so modify_symbol returned ok=True after duplicating
+#        the decorator and deleting two section comments. Valid Python, so the
+#        post-edit syntax gate passed it — silent corruption.
+
+class TestPythonSymbolRangeFallback:
+    # Mirrors the go_provider.py shape that produced both bugs.
+    SRC: ClassVar[str] = (
+        "import re\n"                                            # 0
+        "\n"                                                     # 1
+        "\n"                                                     # 2
+        "class GoSyntaxProvider:\n"                              # 3
+        "    _KINDS = frozenset({'variable'})\n"                 # 4
+        "\n"                                                     # 5
+        "    @staticmethod\n"                                    # 6
+        "    def _find_block_end(content: str, offset: int) -> int:\n"   # 7
+        '        """Doc."""\n'                                   # 8
+        "        return 0\n"                                     # 9
+        "\n"                                                     # 10
+        "    # ── Definition keywords ──\n"                      # 11
+        "\n"                                                     # 12
+        "    # ── Regex fallback ──\n"                           # 13
+        "\n"                                                     # 14
+        "    def _find_defs(\n"                                  # 15
+        "        self, content: str,\n"                          # 16
+        "    ) -> list[tuple[str, int]]:\n"                      # 17
+        '        """Regex fallback."""\n'                        # 18
+        "        results = []\n"                                 # 19
+        "        return results\n"                               # 20
+        "\n"                                                     # 21
+        "\n"                                                     # 22
+        "class OtherProvider:\n"                                 # 23
+        "    def _find_block_end(self) -> int:\n"                # 24
+        "        return 1\n"                                     # 25
+    )
+
+    @staticmethod
+    def _unparseable(src: str) -> str:
+        """Same source with a syntax error planted far from the target symbols."""
+        return src.replace("import re\n", "def broken(  # unclosed\n", 1)
+
+    def test_multiline_signature_range_is_not_truncated(self):
+        """The ``) -> T:`` continuation line is part of the header, not a boundary."""
+        broken = self._unparseable(self.SRC)
+        r = _find_symbol_line_range(broken, "GoSyntaxProvider._find_defs", "p.py")
+        assert r == (15, 21), "multi-line signature truncated the range"
+
+    def test_decorator_included_and_next_symbol_comments_not_absorbed(self):
+        """Start covers ``@staticmethod``; end stops before the section comments."""
+        broken = self._unparseable(self.SRC)
+        r = _find_symbol_line_range(broken, "GoSyntaxProvider._find_block_end", "p.py")
+        assert r == (6, 10)
+        lines = broken.splitlines()
+        assert lines[r[0]].strip() == "@staticmethod"
+        assert lines[r[1] - 1].strip() == "return 0"
+        # The two "# ── ... ──" separators belong to the NEXT symbol.
+        assert "── Definition keywords ──" not in "\n".join(lines[r[0]:r[1]])
+
+    def test_fallback_matches_the_ast_answer_exactly(self):
+        """On an unparseable file the fallback must agree with ast on a clean one."""
+        broken = self._unparseable(self.SRC)
+        for sym in ("GoSyntaxProvider._find_block_end", "GoSyntaxProvider._find_defs"):
+            assert _find_symbol_line_range(self.SRC, sym, "p.py") == \
+                   _find_symbol_line_range(broken, sym, "p.py"), sym
+
+    @pytest.mark.parametrize("src_kind", ["clean", "unparseable"])
+    def test_wrong_class_qualifier_returns_none(self, src_kind):
+        """A qualifier naming no class in the file must NOT match the bare name.
+
+        ``GoProvider`` does not exist here; matching ``_find_block_end`` anywhere
+        would edit GoSyntaxProvider's (or OtherProvider's) method instead.
+        """
+        src = self.SRC if src_kind == "clean" else self._unparseable(self.SRC)
+        assert _find_symbol_line_range(src, "GoProvider._find_block_end", "p.py") is None
+        assert _find_symbol_line_range(src, "GoProvider._find_defs", "p.py") is None
+
+    def test_qualifier_selects_the_right_class(self):
+        """Two classes define ``_find_block_end``; the qualifier must disambiguate."""
+        broken = self._unparseable(self.SRC)
+        assert _find_symbol_line_range(broken, "GoSyntaxProvider._find_block_end", "p.py") == (6, 10)
+        assert _find_symbol_line_range(broken, "OtherProvider._find_block_end", "p.py") == (24, 26)
+
+    def test_multiline_decorator_run_is_included(self):
+        src = (
+            "def broken(  # unclosed\n"
+            "class C:\n"
+            "    @deco(\n"
+            "        'x',\n"
+            "    )\n"
+            "    @other\n"
+            "    def m(self):\n"
+            "        return 1\n"
+        )
+        assert _find_symbol_line_range(src, "C.m", "p.py") == (2, 8)
+
+    def test_wrong_qualifier_refused_with_actionable_message(self, tmp_path):
+        """End-to-end: modify_symbol must refuse and name the real class.
+
+        Previously this wrote successfully after duplicating the decorator.
+        """
+        f = tmp_path / "p.py"
+        f.write_text(self.SRC, encoding="utf-8")
+        before = f.read_text(encoding="utf-8")
+        ok, err, _ = modify_symbol(
+            "p.py", "GoProvider._find_block_end",
+            "    @staticmethod\n"
+            "    def _find_block_end(content: str, offset: int) -> int:\n"
+            "        return 99\n",
+            repo_root=str(tmp_path),
+        )
+        assert ok is False
+        assert "no class named 'GoProvider'" in err
+        assert "GoSyntaxProvider" in err                 # the suggestion
+        assert f.read_text(encoding="utf-8") == before   # file untouched
+
+    def test_unparseable_file_miss_explains_itself(self, tmp_path):
+        """A locate miss on a broken file must say so, not blame the splice."""
+        f = tmp_path / "p.py"
+        f.write_text(self._unparseable(self.SRC), encoding="utf-8")
+        ok, err, _ = modify_symbol(
+            "p.py", "GoSyntaxProvider.no_such_method", "    def no_such_method(self): ...\n",
+            repo_root=str(tmp_path),
+        )
+        assert ok is False
+        assert "does not currently parse" in err
+
+    def test_error_never_dead_ends_on_apply_patch_alone(self):
+        """apply_patch refuses session-edited files, so it cannot be the only advice.
+
+        The observed loop: modify_symbol said "Use apply_patch instead", and
+        apply_patch's session-edit guard replied "continue with the same
+        text-editing tool" — no exit.
+        """
+        import inspect
+        src = inspect.getsource(smt.modify_symbol)
+        for msg in ("Use apply_patch instead.", "Use apply_patch instead\""):
+            assert msg not in src
+        assert "edit_text" in src
+
+
 # ── Provider-based symbol location (modifiers / annotations) ────────────────
 # Regression: _find_symbol_line_range previously used a hardcoded prefix list
 # ("fun ", "func ", "def ", ...) and required the stripped line to *start*
@@ -868,7 +1019,7 @@ class TestKotlinBraceCorruptionFix:
         # SSOT helper shared by _looks_like_full_symbol_block and the surgical
         # full-block reclassification — must skip #/// AND /* */ (incl. multi-
         # line) so a javadoc-prefixed replacement is classified correctly.
-        from external_llm.agent.symbol_modify_tool import _first_significant_line
+        # (imported at module level below)
         # multi-line block comment
         assert _first_significant_line("/**\n * doc\n */\nint foo()") == "int foo()"
         # single-line block comment
@@ -1996,3 +2147,409 @@ class TestPreWriteGateWithoutToolchain:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── _python_symbol_miss_reason — narrowed diagnosis fallback ─────────────────
+
+class TestPythonSymbolMissReason:
+    """``_python_symbol_miss_reason`` swallows only compiler-real exceptions.
+
+    Regression for the silent-except gate (item 8): the handler was
+    ``except Exception: pass``, which (a) tripped check_no_new_silent_except
+    and (b) masked non-compiler failures (e.g. MemoryError) behind the
+    generic "no such symbol" message.  It is now narrowed to the exceptions
+    compile() can actually raise beyond SyntaxError, with a debug log for
+    observability — anything else must propagate.
+    """
+
+    def test_syntax_error_returns_parse_message(self):
+        msg = smt._python_symbol_miss_reason("def broken(:\n", "f")
+        assert "does not currently parse" in msg
+
+    @pytest.mark.parametrize("exc", [ValueError, TypeError, RecursionError])
+    def test_compiler_side_failures_fall_back_quietly(self, monkeypatch, exc):
+        def boom(*a, **k):
+            raise exc("probe")
+
+        monkeypatch.setattr(smt, "compile_quiet", boom)
+        assert smt._python_symbol_miss_reason("x = 1\n", "f") == "no such symbol in this file"
+
+    def test_non_compiler_failure_propagates(self, monkeypatch):
+        # RED before the fix: `except Exception: pass` swallowed MemoryError
+        # too, returning the generic miss message instead of surfacing it.
+        def boom(*a, **k):
+            raise MemoryError("probe")
+
+        monkeypatch.setattr(smt, "compile_quiet", boom)
+        with pytest.raises(MemoryError):
+            smt._python_symbol_miss_reason("x = 1\n", "f")
+
+
+# ── RED→GREEN gap coverage: remaining edge branches (round 32-7) ────────────
+from types import SimpleNamespace
+
+from external_llm.agent.symbol_modify_tool import (
+    _apply_diff_to_source,
+    _find_python_symbol_line_range,
+    _first_significant_line,
+    _post_edit_syntax_ok,
+    _py_brackets_balanced,
+    _py_code_part,
+    _python_symbol_miss_reason,
+    _ts_syntax_valid,
+)
+from external_llm.languages import LanguageId
+
+
+def test_first_significant_line_multiline_block_comment_tail():
+    """A multi-line /* */ block comment whose closing line carries trailing
+    code returns that code (the tail after */)."""
+    assert smt._first_significant_line("/* header\n*/ foo = 1\n") == "foo = 1"
+    assert smt._first_significant_line("/* header\n*/ // still comment\nx = 2\n") == "x = 2"
+
+
+def test_reindent_relative_blank_lines_and_char_switch():
+    """Blank body lines are preserved as empty; continuation lines of a
+    tab-model block are depth-remapped when the file uses spaces."""
+    out = smt._reindent_relative(["    x = 1", "", "    y = 2"], 0, "", " ", 4, " ", 4)
+    assert out == ["x = 1", "", "y = 2"]
+    out2 = smt._reindent_relative(["    x = call(", "\t\targ", "    )"], 0, "", "\t", 1, " ", 4)
+    assert out2 == ["x = call(", "arg", ")"]
+
+
+def test_mode_logical_indent_all_blank_returns_zero():
+    assert smt._mode_logical_indent(["", "   "]) == 0
+
+
+def test_block_parses_after_dedent_no_nonblank_returns_true():
+    assert smt._block_parses_after_dedent(["", "\n"]) is True
+
+
+def test_correct_full_block_body_drift_degenerate_inputs():
+    """Empty blocks, unit<=0 files and blocks without a def/class statement
+    all return the input unchanged (documented degrade)."""
+    assert smt._correct_full_block_body_drift([], " ", 0, 4, "foo") == []
+    assert smt._correct_full_block_body_drift(["def f():", "    pass"], " ", 0, 0, "foo") == ["def f():", "    pass"]
+    assert smt._correct_full_block_body_drift(["x = 1", "y = 2"], " ", 0, 4, "foo") == ["x = 1", "y = 2"]
+
+
+def test_find_symbol_ast_node_prefers_top_level_candidate():
+    """Two same-named symbols, one module-level: the top-level one wins."""
+    src = "def foo():\n    pass\n\nclass A:\n    def foo(self):\n        pass\n"
+    node = _find_symbol_ast_node(src, "foo")
+    assert node is not None
+    assert node.col_offset == 0
+
+
+def test_find_symbol_ast_node_no_top_level_takes_first():
+    """Two same-named methods in different classes: first candidate wins."""
+    src = "class A:\n    def foo(self):\n        pass\n\nclass B:\n    def foo(self):\n        pass\n"
+    node = _find_symbol_ast_node(src, "foo")
+    assert node is not None
+    assert node.col_offset == 4
+
+
+def test_ast_precise_blank_new_body_skipped():
+    assert _apply_ast_precise("x = 1\n", "f.py", "foo", "   ") == (None, "skipped_no_new_body")
+
+
+def test_ast_precise_no_end_lineno_skipped(monkeypatch):
+    fake = SimpleNamespace(lineno=1, col_offset=0, decorator_list=[], body=[])
+    monkeypatch.setattr(smt, "_find_symbol_ast_node", lambda *a, **k: fake)
+    assert _apply_ast_precise("x = 1\n", "f.py", "foo", "def foo():\n    pass\n") == (None, "skipped_no_end_lineno")
+
+
+def test_ast_precise_full_block_invalid_range_skipped(monkeypatch):
+    deco = SimpleNamespace(lineno=1)
+    fake = SimpleNamespace(lineno=2, end_lineno=100, col_offset=0, decorator_list=[deco], body=[])
+    monkeypatch.setattr(smt, "_find_symbol_ast_node", lambda *a, **k: fake)
+    assert _apply_ast_precise("x = 1\n", "f.py", "foo", "def foo():\n    pass\n") == (None, "skipped_invalid_range")
+
+
+def test_ast_precise_empty_body_skipped(monkeypatch):
+    fake = SimpleNamespace(lineno=1, end_lineno=1, col_offset=0, decorator_list=[], body=[])
+    monkeypatch.setattr(smt, "_find_symbol_ast_node", lambda *a, **k: fake)
+    assert _apply_ast_precise("x = 1\n", "f.py", "foo", "    return 1\n") == (None, "skipped_empty_body")
+
+
+def test_ast_precise_body_only_invalid_range_skipped(monkeypatch):
+    pass_node = ast.Pass(lineno=1, col_offset=4, end_lineno=1, end_col_offset=8)
+    fake = SimpleNamespace(lineno=1, end_lineno=100, col_offset=0, decorator_list=[], body=[pass_node])
+    monkeypatch.setattr(smt, "_find_symbol_ast_node", lambda *a, **k: fake)
+    assert _apply_ast_precise("x = 1\n", "f.py", "foo", "    return 1\n") == (None, "skipped_invalid_range")
+
+
+def test_ast_precise_empty_header_one_line_def_skipped():
+    """A one-line ``def foo(): pass`` has no header rows (deco_start ==
+    body_start) → documented skipped_empty_header."""
+    assert _apply_ast_precise("def foo(): pass\nx = 1\n", "f.py", "foo", "    return 1\n") == (None, "skipped_empty_header")
+
+
+def test_ast_precise_redundant_import_body_stripped_to_empty():
+    """Body-only code that is a redundant inline import is stripped to
+    nothing before splicing → skipped_empty_new_body."""
+    src = "import os\n\ndef foo():\n    pass\n"
+    assert _apply_ast_precise(src, "f.py", "foo", "import os\n") == (None, "skipped_empty_new_body")
+
+
+def test_surgical_body_only_single_line_header_no_colon():
+    """A C-style signature without a trailing colon ends the header scan on
+    its own row; the body starts on the next non-blank line."""
+    source = "int foo()\n{\n    return 1;\n}\n"
+    diff = _apply_surgical_edit(source, "f.c", "return 2;\n", 0, 4)
+    assert diff is not None
+
+
+def test_surgical_exact_match_no_change_returns_none():
+    """Replacing a symbol with its own exact body is a no-change edit."""
+    source = "def foo():\n    return 1\n"
+    assert _apply_surgical_edit(source, "f.py", "    return 1\n", 0, 2) is None
+
+
+class _BadRegexProvider:
+    """A provider whose symbol pattern is not a valid regex after
+    {name} substitution."""
+
+    def get_symbol_patterns(self, kind="any"):
+        return [SimpleNamespace(regex="({name}")]  # unbalanced paren → re.error
+
+
+class _FakeRegistry:
+    """LanguageRegistry stand-in returning the bad-regex provider."""
+
+    @staticmethod
+    def instance():
+        return _FakeRegistry()
+
+    def get(self, path):
+        return _BadRegexProvider()
+
+
+def test_find_symbol_def_line_invalid_provider_regex_falls_back(monkeypatch):
+    """A provider pattern that fails to compile is skipped; the legacy
+    prefix list still finds the symbol."""
+    monkeypatch.setattr(smt, "LanguageRegistry", _FakeRegistry)
+    assert smt._find_symbol_def_line(["def foo(): pass\n"], "foo", "x.py") == 0
+
+
+def test_find_symbol_def_line_legacy_prefix_fallback():
+    """Languages without a registered provider use the legacy prefix list."""
+    assert smt._find_symbol_def_line(["def foo(): pass\n"], "foo", "x.xyz") == 0
+    assert smt._find_symbol_def_line(["def foo(): pass\n"], "bar", "x.xyz") is None
+
+
+def test_ts_range_grammar_unavailable_returns_none(monkeypatch):
+    monkeypatch.setattr(
+        "external_llm.languages.tree_sitter_utils.is_language_available",
+        lambda lang: False,
+    )
+    assert _find_symbol_range_via_treesitter("function foo() {}\n", "foo", "x.js") is None
+
+
+def test_ts_range_extraction_failure_returns_none(monkeypatch):
+    def _boom(*a, **k):
+        raise RuntimeError("extraction boom")
+
+    monkeypatch.setattr("external_llm.languages.tree_sitter_utils.find_all_symbols", _boom)
+    assert _find_symbol_range_via_treesitter("function foo() {}\n", "foo", "x.js") is None
+
+
+def test_py_code_part_escapes_and_comments():
+    """A backslash inside a string skips the next char; a # outside a
+    string ends the code portion."""
+    assert _py_code_part('x = "a\\b" # c') == 'x = "a\\b" '
+    assert _py_code_part("x = 1  # note") == "x = 1  "
+
+
+def test_py_brackets_balanced_escaped_quote_and_comment():
+    """An escaped quote inside a single-quoted string does not close it; a
+    # comment runs to end-of-line (or end-of-text)."""
+    assert _py_brackets_balanced("x = 'a\\'b'") is True
+    assert _py_brackets_balanced("x = 1  # no (paren") is True
+    assert _py_brackets_balanced("x = 1  # no (paren\n)") is False
+
+
+def test_find_python_symbol_line_range_unsupported_shapes():
+    """A.B.c qualifiers and non-identifier symbols are refused outright."""
+    assert _find_python_symbol_line_range("def a(): pass\n", "A.B.c") is None
+    assert _find_python_symbol_line_range("def a(): pass\n", "foo-bar") is None
+
+
+def test_python_symbol_miss_reason_classes_listed_when_no_near_match():
+    src = "class Alpha:\n    pass\n\nclass Beta:\n    pass\n"
+    reason = _python_symbol_miss_reason(src, "GoProvider.method")
+    assert "defines no class named 'GoProvider'" in reason
+    assert "Classes defined here: Alpha, Beta." in reason
+
+
+def test_symbol_line_range_allman_comment_between_signature_and_brace(monkeypatch):
+    """A // comment between an Allman signature and its '{' is skipped while
+    scanning for the brace opener."""
+    monkeypatch.setattr(smt, "_find_symbol_range_via_treesitter", lambda *a, **k: None)
+    src = "int foo()\n// comment\n{\n    return 1;\n}\n"
+    assert _find_symbol_line_range(src, "foo", "x.c") == (0, 5)
+
+
+def test_symbol_line_range_unbalanced_brace_returns_def_line_only(monkeypatch):
+    """Unbalanced input (no matching }) degrades to the def line alone; the
+    post-edit brace gate then rejects the edit fail-closed."""
+    monkeypatch.setattr(smt, "_find_symbol_range_via_treesitter", lambda *a, **k: None)
+    assert _find_symbol_line_range("int foo() {\n    return 1;\n", "foo", "x.c") == (0, 1)
+
+
+def test_symbol_line_range_indent_based_extent_without_braces(monkeypatch):
+    """A brace-less symbol's extent is its indent block (exclusive end)."""
+    monkeypatch.setattr(smt, "_find_symbol_range_via_treesitter", lambda *a, **k: None)
+    src = "def foo()\n    body line\nother line\n"
+    assert _find_symbol_line_range(src, "foo", "x.txt") == (0, 2)
+
+
+def test_apply_diff_to_source_multiple_hunks():
+    """A second @@ hunk applies the pending first hunk and continues."""
+    source = "line1\nline2\nline3\nline4\n"
+    diff = (
+        "--- a\n+++ b\n"
+        "@@ -1,2 +1,2 @@\n line1\n-line2\n+X2\n"
+        "@@ -3,2 +3,2 @@\n line3\n-line4\n+X4\n"
+    )
+    assert _apply_diff_to_source(source, diff) == "line1\nX2\nline3\nX4\n"
+
+
+def test_post_edit_syntax_ok_node_infra_failure_falls_through(monkeypatch):
+    """node --check raising (timeout/OSError) must NOT be more permissive
+    than node being absent — it falls through to the toolchain-free tiers."""
+    def _which(name):
+        return "/usr/bin/node" if name == "node" else None
+
+    def _boom(*a, **k):
+        raise OSError("node crashed")
+
+    monkeypatch.setattr(smt.shutil, "which", _which)
+    monkeypatch.setattr(smt.subprocess, "run", _boom)
+    assert _post_edit_syntax_ok("const x = 1;\n", "x.js", "const y = 2;\n") is True
+
+
+def test_post_edit_syntax_ok_node_rejects_both_modes(monkeypatch):
+    """node available but both CJS/ESM checks fail → False."""
+    monkeypatch.setattr(smt.shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None)
+    monkeypatch.setattr(
+        smt.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=1, stderr=b""),
+    )
+    assert _post_edit_syntax_ok("const x = ;\n", "x.js", "const y = 2;\n") is False
+
+
+def test_post_edit_syntax_ok_gofmt_infra_failure_falls_through(monkeypatch):
+    """gofmt raising falls through — same discipline as the node branch."""
+    monkeypatch.setattr(smt.shutil, "which", lambda name: "/usr/bin/gofmt" if name == "gofmt" else None)
+
+    def _boom(*a, **k):
+        raise OSError("gofmt crashed")
+
+    monkeypatch.setattr(smt.subprocess, "run", _boom)
+    assert _post_edit_syntax_ok("package main\n", "x.go", "package main\n") is True
+
+
+def test_post_edit_syntax_ok_kotlin_treesitter_tier_rejects():
+    """Same net brace count but a parse error (extra '(') is caught by the
+    tree-sitter tier — the case brace counting is blind to."""
+    source = 'fun main() {\n    println("x")\n}\n'
+    content = 'fun main( {\n    println("x")\n}\n'
+    assert _post_edit_syntax_ok(content, "x.kt", source) is False
+
+
+def test_ts_syntax_valid_validator_failure_returns_none(monkeypatch):
+    """A raising validator means 'no opinion', not a syntax error."""
+    from external_llm.languages.syntax_validator import SyntaxValidator
+
+    def _boom(*a, **k):
+        raise RuntimeError("validator unavailable")
+
+    monkeypatch.setattr(SyntaxValidator, "validate_syntax", staticmethod(_boom))
+    assert _ts_syntax_valid("x = 1", LanguageId.PYTHON) is None
+
+
+def test_modify_symbol_empty_code_guard(tmp_path):
+    p = tmp_path / "m.py"
+    p.write_text("x = 1\n")
+    ok, msg, _ = modify_symbol(str(p), "foo", "   \n", str(tmp_path))
+    assert not ok
+    assert "Empty replacement code" in msg
+
+
+def test_modify_symbol_unreadable_file(tmp_path):
+    p = tmp_path / "m.py"
+    p.write_text("x = 1\n")
+    p.chmod(0)
+    try:
+        ok, msg, _ = modify_symbol(str(p), "foo", "def foo():\n    pass\n", str(tmp_path))
+        assert not ok
+        assert "Failed to read" in msg
+    finally:
+        p.chmod(0o644)
+
+
+def test_modify_symbol_diff_apply_failure_after_ast(tmp_path, monkeypatch):
+    p = tmp_path / "m.py"
+    p.write_text("def foo():\n    pass\n")
+
+    def _boom(*a, **k):
+        raise RuntimeError("apply boom")
+
+    monkeypatch.setattr(smt, "_apply_diff_to_source", _boom)
+    ok, msg, _ = modify_symbol(str(p), "foo", "def foo():\n    return 1\n", str(tmp_path))
+    assert not ok
+    assert "Diff apply failed after AST precise" in msg
+
+
+def test_modify_symbol_syntax_blocked_fallthrough_message(tmp_path, monkeypatch):
+    """Every strategy producing output that fails the syntax gate collapses
+    to the actionable fail-closed message."""
+    p = tmp_path / "m.py"
+    p.write_text("def foo():\n    pass\n")
+    monkeypatch.setattr(smt, "_post_edit_syntax_ok", lambda *a, **k: False)
+    ok, msg, _ = modify_symbol(str(p), "foo", "def foo():\n    return 1\n", str(tmp_path))
+    assert not ok
+    assert "could not produce syntactically valid code" in msg
+
+
+def test_modify_symbol_write_failure_after_surgical(tmp_path, monkeypatch):
+    p = tmp_path / "m.py"
+    p.write_text("def foo():\n    pass\n")
+    monkeypatch.setattr(smt, "_apply_ast_precise", lambda *a, **k: (None, "skipped_symbol_not_found"))
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(smt, "atomic_write_text", _boom)
+    ok, msg, _ = modify_symbol(str(p), "foo", "def foo():\n    return 1\n", str(tmp_path))
+    assert not ok
+    assert "Write failed after surgical edit" in msg
+
+
+def test_modify_symbol_text_fallback_success(tmp_path, monkeypatch):
+    """AST and surgical both refuse; the full-block text splice succeeds."""
+    p = tmp_path / "m.py"
+    p.write_text("def foo():\n    pass\n")
+    monkeypatch.setattr(smt, "_apply_ast_precise", lambda *a, **k: (None, "skipped_symbol_not_found"))
+    monkeypatch.setattr(smt, "_apply_surgical_edit", lambda *a, **k: None)
+    ok, _diff, new_content = modify_symbol(str(p), "foo", "def foo():\n    return 1\n", str(tmp_path))
+    assert ok
+    assert "return 1" in new_content
+    assert p.read_text() == "def foo():\n    return 1\n"
+
+
+def test_modify_symbol_write_failure_after_text_fallback(tmp_path, monkeypatch):
+    """The text-fallback write failing returns the dedicated error."""
+    p = tmp_path / "m.py"
+    p.write_text("def foo():\n    pass\n")
+    monkeypatch.setattr(smt, "_apply_ast_precise", lambda *a, **k: (None, "skipped_symbol_not_found"))
+    monkeypatch.setattr(smt, "_apply_surgical_edit", lambda *a, **k: None)
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(smt, "atomic_write_text", _boom)
+    ok, msg, _ = modify_symbol(str(p), "foo", "def foo():\n    return 1\n", str(tmp_path))
+    assert not ok
+    assert "Write failed after text replacement" in msg

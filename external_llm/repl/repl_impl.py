@@ -13,6 +13,7 @@ helpers (_print, _C, console setup, git helpers, ...). asi.py imports this modul
 ONLY at its very bottom (after every helper is defined), so ``import asi`` here
 always sees a fully initialized module. Never import this module before ``asi``.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -53,10 +54,10 @@ _prompt_history_path: str = ""  # run_repl sets to <repo>/.asicode/cli_history
 _ctrlc_armed: bool = False  # True after 1st Ctrl+C on empty prompt — reset by typing/sending etc.
 # ── Ghost suggestion for next action (filled by background LLM after turn end) ──
 _next_prompt_suggestion: str = ""  # Suggestion text shown dimmed on empty prompt
-_next_suggestion_gen: int = 0      # Incremented each new turn — invalidates stale suggestions
+_next_suggestion_gen: int = 0  # Incremented each new turn — invalidates stale suggestions
 # ── Auto-continue (/auto): countdown-submit the ghost suggestion (self-improve loop) ──
 _auto_continue_state: dict = {"on": False, "cap": 5, "depth": 0}
-_auto_submit_gen: int = 0           # Incremented to cancel a pending countdown (typing/Esc/new turn)
+_auto_submit_gen: int = 0  # Incremented to cancel a pending countdown (typing/Esc/new turn)
 _auto_countdown_active: bool = False  # True while a countdown is pending (Enter = run now)
 _last_input_was_auto: bool = False  # Set by the countdown submit; read+cleared by run_repl
 _REPO_ROOT: str = ""  # Set by run_repl/run_once — shortens absolute paths to relative for tool hints
@@ -108,6 +109,7 @@ _esc_watcher_pause = threading.Event()
 # from the same engine thread, so no lock needed).
 _active_spinner_printer: Optional["_ProgressPrinter"] = None
 
+
 class _ProgressPrinter:
     """Simple handler that prints stream_callback events to the terminal."""
 
@@ -126,8 +128,10 @@ class _ProgressPrinter:
         self._live_drawn: bool = False  # Whether a pending live line (no trailing newline) is at the bottom of screen
         self._pending_llm_tokens: int = 0  # Cache miss tokens from the last LLM call (billing accounting; ↑ display sums with hits via total_input_tokens())
         self._pending_llm_cache_read: int = 0  # Cache-read (hit) tokens from last LLM call (↑ sum + hit% numerator)
-        self._pending_llm_provider: str = ""   # Provider of last LLM call (used for ↑/hit% denominator branching)
-        self._pending_llm_cache_creation: int = 0  # Cache-creation (write) tokens from last LLM call (separate accounting only >0; ↑ sum + hit% numerator)
+        self._pending_llm_provider: str = ""  # Provider of last LLM call (used for ↑/hit% denominator branching)
+        self._pending_llm_cache_creation: int = (
+            0  # Cache-creation (write) tokens from last LLM call (separate accounting only >0; ↑ sum + hit% numerator)
+        )
         # Long-running tool ticker: periodically re-render the ○ line with spinner+elapsed time (prevents perceived freeze)
         self._ticker_stop: Optional[threading.Event] = None
         self._ticker_thread: Optional[threading.Thread] = None
@@ -144,12 +148,10 @@ class _ProgressPrinter:
         # ── Spinner (displayed while waiting for LLM response) ──
         self._spinner_running: bool = False
         self._spinner_thread: Optional[threading.Thread] = None
-        self._spinner_live: Optional[Any] = None   # Rich Live instance
-        self._spinner_obj: Optional[Any] = None    # Rich Spinner instance (preserves start_time)
+        self._spinner_live: Optional[Any] = None  # Rich Live instance
+        self._spinner_obj: Optional[Any] = None  # Rich Spinner instance (preserves start_time)
         self._spinner_msg: str = ""
         self._spinner_chars = "◴◷◶◵"
-
-
 
     # Strip rich markup for log file.
     @staticmethod
@@ -157,7 +159,8 @@ class _ProgressPrinter:
         # Strip [tag], [/tag], [tag word], [hex_color] rich markup
         # e.g. [bold #89b4fa]...[/bold], [#89b4fa]...[/#89b4fa], [dim]...[/dim]
         import re
-        return re.sub(r'\[/?[^\[\]\n]*\]', '', msg)
+
+        return re.sub(r"\[/?[^\[\]\n]*\]", "", msg)
 
     def _log(self, msg: str) -> None:
         logging.getLogger(__name__).info("[cli] %s", self._plain(msg))
@@ -174,6 +177,7 @@ class _ProgressPrinter:
         breaking renders where the width must be exact, like box-border alignment.
         """
         import unicodedata as _ud
+
         if max_cols <= 0:
             return ""
         flat = " ".join(msg.split()) if msg else ""
@@ -201,7 +205,9 @@ class _ProgressPrinter:
         stop = threading.Event()
         self._ticker_stop = stop
         self._ticker_thread = threading.Thread(
-            target=self._tool_ticker_worker, args=(stop,), daemon=True,
+            target=self._tool_ticker_worker,
+            args=(stop,),
+            daemon=True,
         )
         self._ticker_thread.start()
 
@@ -226,6 +232,7 @@ class _ProgressPrinter:
         if not self._inflight:
             return ""
         import shutil as _sh_tk
+
         _tw = _sh_tk.get_terminal_size((80, 24)).columns
         first = next(iter(self._inflight.values()))
         _tool = first["tool"]
@@ -278,7 +285,9 @@ class _ProgressPrinter:
         line is always last, and never has a trailing newline'."""
         with _TERM_WRITE_LOCK:
             if self._inflight:
-                sys.stdout.write(f"\r\x1b[2K{self._shimmer_row(self._fit_row(self._render_live_line('○')), time.perf_counter())}")
+                sys.stdout.write(
+                    f"\r\x1b[2K{self._shimmer_row(self._fit_row(self._render_live_line('○')), time.perf_counter())}"
+                )
                 sys.stdout.flush()
                 _tool_running_filter.active = True
                 _tool_running_filter.row_pending = True
@@ -318,7 +327,9 @@ class _ProgressPrinter:
                 # _TERM_WRITE_LOCK: serialize with log handler emit (_RowSafeEmitMixin)
                 # — without it, re-render would interleave during WARNING output, mangling lines.
                 with _TERM_WRITE_LOCK:
-                    sys.stdout.write(f"\r\x1b[2K{self._shimmer_row(self._fit_row(self._render_live_line(ch)), time.perf_counter())}")
+                    sys.stdout.write(
+                        f"\r\x1b[2K{self._shimmer_row(self._fit_row(self._render_live_line(ch)), time.perf_counter())}"
+                    )
                     sys.stdout.flush()
                     _tool_running_filter.row_pending = True
 
@@ -338,7 +349,8 @@ class _ProgressPrinter:
         self._think_tick_stop = threading.Event()
         self._think_tick_thread = threading.Thread(
             target=self._thinking_ticker_worker,
-            args=(self._think_tick_stop,), daemon=True,
+            args=(self._think_tick_stop,),
+            daemon=True,
         )
         self._think_tick_thread.start()
 
@@ -380,7 +392,7 @@ class _ProgressPrinter:
         sum. Next to the context size, cache hit rate is shown as 'N% cached'
         (e.g. ↑48k · 84% cached).
         """
-        n = self._pending_llm_tokens        # Cache miss tokens (billing accounting)
+        n = self._pending_llm_tokens  # Cache miss tokens (billing accounting)
         crt = self._pending_llm_cache_read  # Cache hit portion
         cc = self._pending_llm_cache_creation  # cache-creation(write) portion (separate accounting only >0)
         prov = self._pending_llm_provider
@@ -392,6 +404,7 @@ class _ProgressPrinter:
         self._pending_llm_provider = ""
         try:
             from external_llm.agent._shared_utils import cache_hit_pct, total_input_tokens
+
             _total = total_input_tokens(prov, n, crt, cc)
             if not _total:
                 return ""
@@ -412,6 +425,7 @@ class _ProgressPrinter:
         Unlike _spinner_safe this preserves intentional spacing (indent, gaps)."""
         import shutil as _sh_fr
         import unicodedata as _ud
+
         # leave 1 col of slack to avoid terminals auto-wrapping at the last column
         max_cols = max(20, _sh_fr.get_terminal_size((80, 24)).columns - 1)
         flat = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
@@ -452,15 +466,15 @@ class _ProgressPrinter:
         j = s.find("]", i) if i >= 0 else -1
         if i < 0 or j < 0:
             return s
-        out = s[:i] + "\x1b[2m" + s[i:j + 1] + "\x1b[22m"
-        rest = s[j + 1:]
+        out = s[:i] + "\x1b[2m" + s[i : j + 1] + "\x1b[22m"
+        rest = s[j + 1 :]
         if icon_hex:
             k = 0
             while k < len(rest) and rest[k] == " ":
                 k += 1  # Skip padding space after "]"
             if k < len(rest) and rest[k] != "…":
                 on, off = cls._hex_ansi(icon_hex)
-                rest = rest[:k] + on + rest[k] + off + rest[k + 1:]
+                rest = rest[:k] + on + rest[k] + off + rest[k + 1 :]
         return out + rest
 
     @classmethod
@@ -477,12 +491,12 @@ class _ProgressPrinter:
             return s
         k = 0
         while k < len(s) and s[k] == " ":
-            k += 1                       # Leading indent
+            k += 1  # Leading indent
         if k >= len(s):
             return s
-        k += 1                           # Skip rotating glyph 1 char (◴◷◶◵/○)
+        k += 1  # Skip rotating glyph 1 char (◴◷◶◵/○)
         if k < len(s) and s[k] == " ":
-            k += 1                       # Space after glyph
+            k += 1  # Space after glyph
         prefix, body = s[:k], s[k:]
         n = len(body)
         if n < 4 or not body.strip():
@@ -497,8 +511,9 @@ class _ProgressPrinter:
             out.append(on + ch + off)
         return "".join(out)
 
-    def _event(self, elapsed: float, icon: str, msg: str,
-               color: str = "text", icon_color: Optional[str] = None) -> None:
+    def _event(
+        self, elapsed: float, icon: str, msg: str, color: str = "text", icon_color: Optional[str] = None
+    ) -> None:
         """Print one observation line: dim [elapsed] · colored icon · body.
 
         color/icon_color are either _C palette keys or a style/hex string to use as-is.
@@ -508,6 +523,7 @@ class _ProgressPrinter:
         _istyle = _C.get(icon_color or color, color)
         if _RICH and asi._out_console:
             from rich.text import Text
+
             _f = asi._out_console.file
             if hasattr(_f, "reset_bol"):
                 _f.reset_bol()
@@ -538,11 +554,11 @@ class _ProgressPrinter:
     # ── update_plan specific rendering: full checklist + changes from previous plan ──
 
     _PLAN_STATUS_UI: ClassVar[dict] = {
-        "done":        ("✓", "green"),
+        "done": ("✓", "green"),
         "in_progress": ("▸", "sky"),
-        "pending":     ("○", "muted"),
-        "skipped":     ("⊘", "muted"),
-        "blocked":     ("✖", "red"),
+        "pending": ("○", "muted"),
+        "skipped": ("⊘", "muted"),
+        "blocked": ("✖", "red"),
     }
 
     def _emit_plan_line(self, parts: list) -> None:
@@ -554,6 +570,7 @@ class _ProgressPrinter:
         """
         if _RICH and asi._out_console:
             from rich.text import Text
+
             _f = asi._out_console.file
             if hasattr(_f, "reset_bol"):
                 _f.reset_bol()
@@ -596,6 +613,7 @@ class _ProgressPrinter:
           display width if they exceed the box width.
         """
         import shutil as _sh_pl
+
         items = [it for it in plan.get("items", []) if isinstance(it, dict)]
         if not items:
             return
@@ -630,9 +648,7 @@ class _ProgressPrinter:
             """
             w = sum(_cjk_width(_t) for _t, _ in inner)
             pad = max(0, content_w - w)
-            self._emit_plan_line(
-                [("│ ", "muted"), *inner, (" " * pad, None), (" │", "muted")]
-            )
+            self._emit_plan_line([("│ ", "muted"), *inner, (" " * pad, None), (" │", "muted")])
 
         total = len(items)
         done = sum(1 for it in items if it.get("status") == "done")
@@ -650,10 +666,12 @@ class _ProgressPrinter:
         goal = str(plan.get("goal", "")).strip()
         if goal:
             _glabel = "Goal  "
-            _box_row([
-                (_glabel, "muted"),
-                (self._spinner_safe(goal, max(4, content_w - _cjk_width(_glabel))), "mauve"),
-            ])
+            _box_row(
+                [
+                    (_glabel, "muted"),
+                    (self._spinner_safe(goal, max(4, content_w - _cjk_width(_glabel))), "mauve"),
+                ]
+            )
             self._emit_plan_line([("├" + "─" * (box_w - 2) + "┤", "muted")])
 
         collapse = len(items) > 15
@@ -684,17 +702,19 @@ class _ProgressPrinter:
                 body_c = _changed_body_c.get(status, "yellow")
             else:
                 body_c = (
-                    "sky" if status == "in_progress"
-                    else "green" if status == "done"
-                    else "muted" if status == "skipped" else "text"
+                    "sky"
+                    if status == "in_progress"
+                    else "green"
+                    if status == "done"
+                    else "muted"
+                    if status == "skipped"
+                    else "text"
                 )
             _icon_seg = f"{icon} "
             _bmax = max(4, content_w - _cjk_width(_icon_seg))
-            _box_row([(_icon_seg, icon_c),
-                      (self._spinner_safe(body, _bmax), body_c)])
+            _box_row([(_icon_seg, icon_c), (self._spinner_safe(body, _bmax), body_c)])
         if collapsed_done:
-            _box_row([("✓ ", "green"),
-                      (f"… {collapsed_done} done (unchanged)", "muted")])
+            _box_row([("✓ ", "green"), (f"… {collapsed_done} done (unchanged)", "muted")])
         # Reflect items removed since previous plan in the accumulated set (reappearance clears them).
         # Only expose as a count (n_removed), not individual lines — prevents denominator from silently
         # shrinking and inflating completion percentage. The only hint is the bottom '· N removed'.
@@ -713,15 +733,16 @@ class _ProgressPrinter:
         # for quick visual scanning. Width of 10 cells is proportionally allocated (largest remainder, exact sum of 10),
         # so the bar never fills entirely green when skipped/blocked items exist.
         def _alloc(counts: list, denom: int, width: int = 10) -> list:
-            if denom <= 0:
-                return [0] * len(counts)
+            # NOTE: no `denom <= 0` guard: `_render_plan_update` returns early
+            # when `items` is empty, so total (=denom) is always >= 1. The
+            # historical zero-guard was dead (A262 complement pattern) and
+            # removed — behavior unchanged.
             raw = [c * width / denom for c in counts]
             cells = [int(x) for x in raw]
-            for idx in sorted(range(len(counts)),
-                              key=lambda i: raw[i] - cells[i],
-                              reverse=True)[:width - sum(cells)]:
+            for idx in sorted(range(len(counts)), key=lambda i: raw[i] - cells[i], reverse=True)[: width - sum(cells)]:
                 cells[idx] += 1
             return cells
+
         d_cells, s_cells, b_cells, o_cells = _alloc([done, n_skipped, n_blocked, n_open], total)
         bar = [
             ("▰" * d_cells, "green"),
@@ -779,6 +800,7 @@ class _ProgressPrinter:
         self._stop_spinner()
         _active_spinner_printer = self
         import shutil as _sh_sp
+
         _indent = self._spinner_indent()
         _max = max(20, _sh_sp.get_terminal_size((80, 24)).columns - _CONSOLE_MARGIN * 2 - 4 - len(_indent))
         _safe_msg = self._spinner_safe(msg, _max)
@@ -796,10 +818,11 @@ class _ProgressPrinter:
         initial creation and _update_spinner's re-creation (recovery after a
         log emit brings the Live down)."""
         from rich.live import Live
+
         _indent = self._spinner_indent()
         _spin_text = f"{_indent}{safe_msg}" if safe_msg else ""
         _spinner = self._make_spinner(_spin_text, _C["blue"])
-        self._spinner_obj = _spinner   # _update_spinner updates via update() preserving start_time
+        self._spinner_obj = _spinner  # _update_spinner updates via update() preserving start_time
         self._spinner_live = Live(
             _spinner,
             console=asi._console,
@@ -807,7 +830,8 @@ class _ProgressPrinter:
             # See banner Live: dynamic _MarginIO + Rich's default stream redirect
             # form a self-referential FileProxy loop. Interleaving with log emits
             # is handled by _suspend_live_for_log/_TERM_WRITE_LOCK, not Rich reflow.
-            redirect_stdout=False, redirect_stderr=False,
+            redirect_stdout=False,
+            redirect_stderr=False,
             transient=True,
         )
         self._spinner_live.start()
@@ -836,6 +860,7 @@ class _ProgressPrinter:
     def _update_spinner(self, msg: str) -> None:
         # Collapse newlines and truncate to fit in one terminal line (CJK-aware)
         import shutil as _sh_sp2
+
         _indent = self._spinner_indent()
         _max = max(20, _sh_sp2.get_terminal_size((80, 24)).columns - _CONSOLE_MARGIN * 2 - 4 - len(_indent))
         _safe_msg = self._spinner_safe(msg, _max)
@@ -882,12 +907,14 @@ class _ProgressPrinter:
             self._spinner_thread = None
         if not _RICH:
             import shutil as _sh
+
             _tw = _sh.get_terminal_size((80, 24)).columns
             sys.stderr.write("\r" + " " * _tw + "\r")
             sys.stderr.flush()
 
     def _spinner_worker(self) -> None:
         import shutil as _sh
+
         i = 0
         _t0 = time.perf_counter()
         while self._spinner_running:
@@ -984,7 +1011,7 @@ class _ProgressPrinter:
                         sys.stdout.write("\n")
                     sys.stdout.write(f"\r\x1b[2K{_preview_line}")
                     sys.stdout.flush()
-                    _tool_running_filter.active = True   # suppress terminal logs during tool run
+                    _tool_running_filter.active = True  # suppress terminal logs during tool run
                     _tool_running_filter.row_pending = True
                 self._preview_active = True
                 self._preview_suffix = _preview_suffix
@@ -997,7 +1024,16 @@ class _ProgressPrinter:
                 err = data.get("result", {}).get("error", "")
                 if not ok and err:
                     # bash: informational stderr (file-not-found, etc.) is not displayed as error
-                    if tool == "bash" and any(kw in err for kw in ["No such file", "No such file or directory", "cannot access", "does not exist", "No such"]):
+                    if tool == "bash" and any(
+                        kw in err
+                        for kw in [
+                            "No such file",
+                            "No such file or directory",
+                            "cannot access",
+                            "does not exist",
+                            "No such",
+                        ]
+                    ):
                         _suffix = ""
                         _rc = data.get("result", {}).get("content", "")
                         _first_line = _relativize_repo_paths((_rc or err).split("\n", 1)[0].strip())
@@ -1006,7 +1042,9 @@ class _ProgressPrinter:
                         if self._preview_active:
                             with _TERM_WRITE_LOCK:
                                 _tool_running_filter.active = False
-                                sys.stdout.write(f"\r\x1b[2K{self._style_row(self._fit_row(f'  [{elapsed:5.1f}s] ✓ {tool}{_suffix}'), _C['green'])}\n")
+                                sys.stdout.write(
+                                    f"\r\x1b[2K{self._style_row(self._fit_row(f'  [{elapsed:5.1f}s] ✓ {tool}{_suffix}'), _C['green'])}\n"
+                                )
                                 sys.stdout.flush()
                             self._preview_active = False
                         else:
@@ -1017,7 +1055,9 @@ class _ProgressPrinter:
                         if self._preview_active:
                             with _TERM_WRITE_LOCK:
                                 _tool_running_filter.active = False
-                                sys.stdout.write(f"\r\x1b[2K{self._style_row(self._fit_row(f'  [{elapsed:5.1f}s] ✗ {tool}: {short_err}'), _C['red'])}\n")
+                                sys.stdout.write(
+                                    f"\r\x1b[2K{self._style_row(self._fit_row(f'  [{elapsed:5.1f}s] ✗ {tool}: {short_err}'), _C['red'])}\n"
+                                )
                                 sys.stdout.flush()
                             self._preview_active = False
                         else:
@@ -1041,20 +1081,25 @@ class _ProgressPrinter:
                             elif tool == "grep":
                                 # Extract "(N matches)" and optional "(context)" — string ops instead of regex
                                 _info = _first_line
-                                _open = _first_line.find('(')
+                                _open = _first_line.find("(")
                                 if _open != -1:
-                                    _close = _first_line.find(')', _open)
+                                    _close = _first_line.find(")", _open)
                                     if _close != -1:
-                                        _match_part = _first_line[_open:_close + 1]
-                                        if ' match' in _match_part:
+                                        _match_part = _first_line[_open : _close + 1]
+                                        if " match" in _match_part:
                                             _info = _match_part
-                                            _rest = _first_line[_close + 1:].strip()
-                                            if _rest.startswith('(') and _rest.endswith(')'):
-                                                _info += ' ' + _rest
-                            elif tool in ("read_symbol", "find_symbol",
-                                          "find_references",
-                                          "get_project_info", "find_relevant_files",
-                                          "search_code", "find_tests_for_symbol"):
+                                            _rest = _first_line[_close + 1 :].strip()
+                                            if _rest.startswith("(") and _rest.endswith(")"):
+                                                _info += " " + _rest
+                            elif tool in (
+                                "read_symbol",
+                                "find_symbol",
+                                "find_references",
+                                "get_project_info",
+                                "find_relevant_files",
+                                "search_code",
+                                "find_tests_for_symbol",
+                            ):
                                 _info = _first_line
                             else:
                                 _info = ""
@@ -1064,7 +1109,9 @@ class _ProgressPrinter:
                     if self._preview_active:
                         with _TERM_WRITE_LOCK:
                             _tool_running_filter.active = False
-                            sys.stdout.write(f"\r\x1b[2K{self._style_row(self._fit_row(_completion_msg), _C['green'])}\n")
+                            sys.stdout.write(
+                                f"\r\x1b[2K{self._style_row(self._fit_row(_completion_msg), _C['green'])}\n"
+                            )
                             sys.stdout.flush()
                         self._preview_active = False
                     elif self._verbose:
@@ -1125,17 +1172,15 @@ class _ProgressPrinter:
             if event_name == "agent_thinking":
                 content = data.get("content", "")
                 if content:
-                    flat = " ".join(
-                        ln.strip() for ln in content.strip().split("\n") if ln.strip()
-                    )
+                    flat = " ".join(ln.strip() for ln in content.strip().split("\n") if ln.strip())
                     # Spinner text: strip markdown symbols, keep as a single line.
                     # Strip markdown syntax — string ops instead of regex
-                    _markdown_chars = str.maketrans({'`': ' ', '*': ' ', '#': ' ', '_': ' ', '~': ' '})
+                    _markdown_chars = str.maketrans({"`": " ", "*": " ", "#": " ", "_": " ", "~": " "})
                     plain = flat.translate(_markdown_chars)
                     # Collapse multiple dashes and spaces
-                    while '---' in plain:
-                        plain = plain.replace('---', ' ')
-                    plain = ' '.join(plain.split())
+                    while "---" in plain:
+                        plain = plain.replace("---", " ")
+                    plain = " ".join(plain.split())
                     self._update_spinner(f"  [{elapsed:5.1f}s] … {plain[:120]}")
                 return
 
@@ -1178,6 +1223,7 @@ class _ProgressPrinter:
                 if _prov and (crt or tcrt):
                     try:
                         from external_llm.agent._shared_utils import cache_hit_pct
+
                         # cache_creation MUST be in the denominator for separate-
                         # accounting providers (Anthropic/z.ai): a cache-WRITE turn
                         # (cold start / post-eviction prefix rebuild) spends cc
@@ -1227,14 +1273,18 @@ class _ProgressPrinter:
                     self._inflight_ctr += 1
                     cid = data.get("call_id") or f"anon-{self._inflight_ctr}"
                     self._inflight[cid] = {
-                        "tool": tool, "hint": cmd_hint or "", "t0": time.perf_counter(),
+                        "tool": tool,
+                        "hint": cmd_hint or "",
+                        "t0": time.perf_counter(),
                     }
                     # Draw live line (representative tool + concurrent count) immediately at the bottom of screen.
                     # No number attached — assigned [1][2][3]… on the ✓ line in completion order.
                     # Synchronous render means even sub-1s tools briefly show ○ (ticker animates after 1s).
                     with _TERM_WRITE_LOCK:
-                        _tool_running_filter.active = True   # suppress terminal logs during run
-                        sys.stdout.write(f"\r\x1b[2K{self._shimmer_row(self._fit_row(self._render_live_line('○')), time.perf_counter())}")
+                        _tool_running_filter.active = True  # suppress terminal logs during run
+                        sys.stdout.write(
+                            f"\r\x1b[2K{self._shimmer_row(self._fit_row(self._render_live_line('○')), time.perf_counter())}"
+                        )
                         sys.stdout.flush()
                         _tool_running_filter.row_pending = True
                     self._live_drawn = True
@@ -1248,6 +1298,7 @@ class _ProgressPrinter:
                     _info = self._pop_inflight(data.get("call_id"))
                     _hint = _info["hint"] if _info else (cmd_hint or "")
                     import shutil as _shutil2
+
                     _tw = _shutil2.get_terminal_size((80, 24)).columns
                     # Duration of this tool (not session cumulative)
                     _tool_secs = (time.perf_counter() - _info["t0"]) if _info else elapsed
@@ -1283,29 +1334,32 @@ class _ProgressPrinter:
                         # _hint: cmd_hint from the in-flight item popped above (no recalculation)
                         _preview_lines = _relativize_repo_paths(_strip_ansi(preview)).split("\n")
                         _preview_lines = [
-                            ln for ln in _preview_lines
-                            if ln.strip() and not ln.strip().startswith("```")
+                            ln for ln in _preview_lines if ln.strip() and not ln.strip().startswith("```")
                         ]
                         # first line: strip repeated cmd hint
                         if _preview_lines:
                             _fl = _preview_lines[0]
                             if _hint and _hint in _fl:
                                 _fl = _fl.replace(_hint, "", 1).strip()
-                                _fl = _fl.lstrip('`').lstrip()  # strip leading backticks/whitespace — no regex
+                                _fl = _fl.lstrip("`").lstrip()  # strip leading backticks/whitespace — no regex
                                 for _pfx in ("grep:", "in ", "— ", ": ", "—"):
                                     if _fl.startswith(_pfx):
-                                        _fl = _fl[len(_pfx):].strip()
+                                        _fl = _fl[len(_pfx) :].strip()
                             if _fl:
                                 _preview_lines[0] = _fl
                             else:
                                 _preview_lines.pop(0)
                         import textwrap as _textwrap2
+
                         def _wrap_preview(text: str) -> str:
                             """Pre-wrap preview line so Rich continuation gets subsequent_indent."""
                             return _textwrap2.fill(
-                                text.strip(), width=_col_w,
-                                initial_indent="  ", subsequent_indent="  ",
+                                text.strip(),
+                                width=_col_w,
+                                initial_indent="  ",
+                                subsequent_indent="  ",
                             )
+
                         if tool == "read_file":
                             # Show line count info only: strip path to avoid
                             # truncating the line range at narrow terminal widths.
@@ -1326,7 +1380,7 @@ class _ProgressPrinter:
                             _def_tok = "defined in "
                             _di = _fl.find(_def_tok)
                             if _di != -1:
-                                _loc_raw = _fl[_di + len(_def_tok):].replace("`", "").strip()
+                                _loc_raw = _fl[_di + len(_def_tok) :].replace("`", "").strip()
                                 # Extract kind from **kind**
                                 _kind = ""
                                 if _fl.startswith("**"):
@@ -1345,6 +1399,7 @@ class _ProgressPrinter:
                         asi._margin_stderr.reset_bol()
                     import shutil as _shutil3
                     import textwrap as _textwrap
+
                     _tw = _shutil3.get_terminal_size((80, 24)).columns
                     _einfo = self._pop_inflight(data.get("call_id"))
                     _tool_secs = (time.perf_counter() - _einfo["t0"]) if _einfo else elapsed
@@ -1363,10 +1418,12 @@ class _ProgressPrinter:
                     _err_first_line = _strip_ansi(_preview_lines[0].strip())
                     # "[stderr]" alone is just a label — use the next non-empty line as the real message
                     if _err_first_line.lower() == "[stderr]" and len(_preview_lines) > 1:
-                        _err_first_line = _strip_ansi(
-                            next((ln.strip() for ln in _preview_lines[1:] if ln.strip()), "")
-                        )
-                    err = _err_first_line[:400] if _err_first_line else _strip_ansi((preview or "")[:400].replace("\n", " "))
+                        _err_first_line = _strip_ansi(next((ln.strip() for ln in _preview_lines[1:] if ln.strip()), ""))
+                    err = (
+                        _err_first_line[:400]
+                        if _err_first_line
+                        else _strip_ansi((preview or "")[:400].replace("\n", " "))
+                    )
                     err = _relativize_repo_paths(err)
                     # ✗ header: same raw write as ✓ success header (consistent indent)
                     # error detail: textwrap so continuation lines align (consistent with ✓ preview)
@@ -1380,15 +1437,15 @@ class _ProgressPrinter:
                     if err:
                         # _out_console width = _tw - _CONSOLE_MARGIN*2; match it so Rich never re-wraps
                         _detail_w = _tw - _CONSOLE_MARGIN * 2
-                        _wrapped = _textwrap.fill(err, width=_detail_w,
-                                                  initial_indent="  ",
-                                                  subsequent_indent="  ")
+                        _wrapped = _textwrap.fill(err, width=_detail_w, initial_indent="  ", subsequent_indent="  ")
                         _print(_wrapped, _C["red"])
                     self._refresh_live_line()
                 elif status == "switching":
                     # Join preview's newlines with spaces for single-line output (prevents line breakage)
                     _sw_flat = " ".join(ln.strip() for ln in (preview or "").split("\n") if ln.strip())
-                    self._event(elapsed, "⇄", "agent switch" + (f": {_sw_flat[:4000]}" if _sw_flat else ""), "blue", "blue")
+                    self._event(
+                        elapsed, "⇄", "agent switch" + (f": {_sw_flat[:4000]}" if _sw_flat else ""), "blue", "blue"
+                    )
                     # Log only first line — prevents duplication since full content goes through logging handler to terminal
                     self._log(f"agent_switch: {_sw_flat[:600]}")
                 return
@@ -1406,10 +1463,12 @@ class _ProgressPrinter:
                 if len(_open_titles) > 3:
                     _summary += f"; +{len(_open_titles) - 3} more"
                 self._event(
-                    elapsed, "↻",
+                    elapsed,
+                    "↻",
                     f"plan gate — {len(_open_titles)} open item(s), nudge {_nudge}/{_max_nudges}"
                     + (f": {_summary}" if _summary else ""),
-                    "yellow", "yellow",
+                    "yellow",
+                    "yellow",
                 )
                 return
 
@@ -1443,11 +1502,11 @@ class _ProgressPrinter:
                         from rich.segment import Segments as _Segs
                         from rich.style import Style as _Style
                         from rich.text import Text as _RichTxt
+
                         _f = asi._out_console.file
                         if hasattr(_f, "reset_bol"):
                             _f.reset_bol()
-                        _hdr = (f"💭 thought for {_think_secs:.1f}s"
-                                if _think_secs is not None else "💭 thinking")
+                        _hdr = f"💭 thought for {_think_secs:.1f}s" if _think_secs is not None else "💭 thinking"
                         # Header is NOT placed as panel title — Rich's title, even left-aligned,
                         # sits at a fixed offset (first char at body column), pushing 'thought' rightward
                         # by "💭 ". Instead, directly output a left-aligned header on the gutter baseline.
@@ -1458,12 +1517,12 @@ class _ProgressPrinter:
                         # rendering right below the header. Markdown style is preserved via render_lines.
                         asi._out_console.print()
                         asi._out_console.print(_RichTxt(_hdr, style=f"bold {_C['mauve']}"))
-                        _md_opts = asi._out_console.options.update(
-                            width=max(10, asi._out_console.width - 3))
-                        _md_lines = asi._out_console.render_lines(
-                            _RichMD(content.strip()), _md_opts, pad=False)
+                        _md_opts = asi._out_console.options.update(width=max(10, asi._out_console.width - 3))
+                        _md_lines = asi._out_console.render_lines(_RichMD(content.strip()), _md_opts, pad=False)
+
                         def _is_blank(_l):
                             return all(not _s.text.strip() for _s in _l)
+
                         while _md_lines and _is_blank(_md_lines[0]):
                             _md_lines.pop(0)
                         while _md_lines and _is_blank(_md_lines[-1]):
@@ -1480,10 +1539,10 @@ class _ProgressPrinter:
                     else:
                         import shutil as _sh_dt
                         import textwrap as _tw_dt
+
                         _dt_tw = _sh_dt.get_terminal_size((80, 24)).columns
                         # Plain fallback: left ▌ separates LLM utterance from tool lines
-                        _think_hdr = (f"thought for {_think_secs:.1f}s"
-                                      if _think_secs is not None else "thinking")
+                        _think_hdr = f"thought for {_think_secs:.1f}s" if _think_secs is not None else "thinking"
                         sys.stdout.write(f"\n 💭 {_think_hdr}\n")
                         _ind = "  ▌ "
                         for _ln in content.strip().split("\n"):
@@ -1491,8 +1550,9 @@ class _ProgressPrinter:
                             if not _ln:
                                 sys.stdout.write("  ▌\n")
                                 continue
-                            for _s in _tw_dt.wrap(_ln, width=max(40, _dt_tw - 2),
-                                                  initial_indent=_ind, subsequent_indent=_ind) or [_ind]:
+                            for _s in _tw_dt.wrap(
+                                _ln, width=max(40, _dt_tw - 2), initial_indent=_ind, subsequent_indent=_ind
+                            ) or [_ind]:
                                 sys.stdout.write(_s + "\n")
                         sys.stdout.flush()
                 return
@@ -1502,8 +1562,7 @@ class _ProgressPrinter:
                 if _sr_status == "start":
                     _files = data.get("files_changed", 0)
                     _chars = data.get("diff_chars", 0)
-                    _scope = (f"{_files} file{'' if _files == 1 else 's'}"
-                              if _files else f"{_chars} chars")
+                    _scope = f"{_files} file{'' if _files == 1 else 's'}" if _files else f"{_chars} chars"
                     self._update_spinner(f"  [{elapsed:5.1f}s] ⊙ self-review — checking diff ({_scope})")
                     return
                 self._stop_spinner()
@@ -1514,28 +1573,31 @@ class _ProgressPrinter:
                     self._log("self-review: LGTM")
                 elif _sr_status == "failed":
                     _err = data.get("error", "")
-                    self._event(elapsed, "⊙",
-                                f"self-review skipped (reviewer unavailable){_sr_meta}",
-                                "muted", "muted")
+                    self._event(elapsed, "⊙", f"self-review skipped (reviewer unavailable){_sr_meta}", "muted", "muted")
                     self._log(f"self-review failed: {_err}")
                 else:  # "issues"
                     _content = (data.get("content", "") or "").strip()
                     if _RICH and asi._out_console:
                         _RichMD = _rich_markdown_cls()
                         from rich.text import Text as _RichTxt
+
                         _f = asi._out_console.file
                         if hasattr(_f, "reset_bol"):
                             _f.reset_bol()
                         _title = _RichTxt(" ⊙ self-review ", style=f"bold {_C['yellow']}")
                         _title.append(f" issues found{_sr_meta}", style=_C["muted"])
                         asi._out_console.print()
-                        asi._out_console.print(_bar_panel(
-                            _RichMD(_content) if _content else _RichTxt("(no detail)"),
-                            title=_title, color=_C["yellow"],
-                        ))
+                        asi._out_console.print(
+                            _bar_panel(
+                                _RichMD(_content) if _content else _RichTxt("(no detail)"),
+                                title=_title,
+                                color=_C["yellow"],
+                            )
+                        )
                     else:
                         import shutil as _sh_sr
                         import textwrap as _tw_sr
+
                         _sr_tw = _sh_sr.get_terminal_size((80, 24)).columns
                         sys.stdout.write(f"\n  [{elapsed:5.1f}s] ⊙ self-review — issues found{_sr_meta}\n")
                         _ind = "  ▌ "
@@ -1544,8 +1606,9 @@ class _ProgressPrinter:
                             if not _ln:
                                 sys.stdout.write("  ▌\n")
                                 continue
-                            for _s in _tw_sr.wrap(_ln, width=max(40, _sr_tw - 2),
-                                                  initial_indent=_ind, subsequent_indent=_ind) or [_ind]:
+                            for _s in _tw_sr.wrap(
+                                _ln, width=max(40, _sr_tw - 2), initial_indent=_ind, subsequent_indent=_ind
+                            ) or [_ind]:
                                 sys.stdout.write(_s + "\n")
                         sys.stdout.flush()
                     self._log(f"self-review issues: {_content[:300]}")
@@ -1554,7 +1617,13 @@ class _ProgressPrinter:
             if event_name == "scope_violation":
                 _err = data.get("error", "")
                 _src = data.get("source", "")
-                self._event(elapsed, "\u25b2", "scope violation" + (f" ({_src})" if _src else "") + (f": {_err[:300]}" if _err else ""), "yellow", "yellow")
+                self._event(
+                    elapsed,
+                    "\u25b2",
+                    "scope violation" + (f" ({_src})" if _src else "") + (f": {_err[:300]}" if _err else ""),
+                    "yellow",
+                    "yellow",
+                )
                 self._log(f"scope_violation: {_err[:300]}")
                 return
 
@@ -1565,6 +1634,7 @@ class _ProgressPrinter:
 
 # ─── Direct engine execution ─────────────────────────────────────────────────────────
 
+
 def _cjk_width(s: str) -> int:
     """Display width of a string, counting CJK/full-width chars as 2 columns.
 
@@ -1573,6 +1643,7 @@ def _cjk_width(s: str) -> int:
     Mirrors the East-Asian-Width convention already used by _spinner_safe.
     """
     import unicodedata as _ud
+
     w = 0
     for ch in s:
         if _ud.combining(ch):
@@ -1695,8 +1766,8 @@ def _cli_checkpoint_cb(question_data: dict) -> dict:
             timeout = 120
 
         # Print question to terminal — indent to match _CONSOLE_MARGIN (4 spaces)
-        _M = " " * _CONSOLE_MARGIN       # "    "
-        _SEP_W = 60 - _CONSOLE_MARGIN    # separator width (fits within standard margin)
+        _M = " " * _CONSOLE_MARGIN  # "    "
+        _SEP_W = 60 - _CONSOLE_MARGIN  # separator width (fits within standard margin)
         print("\n" + _M + "─" * _SEP_W)
         print(_M + "🔔 [User Checkpoint] LLM has a question:")
         print(_M + "─" * _SEP_W)
@@ -1704,6 +1775,7 @@ def _cli_checkpoint_cb(question_data: dict) -> dict:
         # so soft-wrapped continuation rows keep a left margin instead of falling
         # flush against the terminal edge. _M2 (hanging indent) marks continuations.
         import shutil as _sh_q
+
         # Leave 1 col of right slack so a full-width CJK glyph never tips the
         # line over the terminal edge (which would re-wrap it at column 0).
         _wrap_w = max(20, _sh_q.get_terminal_size((80, 24)).columns - _CONSOLE_MARGIN - 1)
@@ -1732,17 +1804,18 @@ def _cli_checkpoint_cb(question_data: dict) -> dict:
                 # Wrap long options to prevent falling to col 0 — continuation lines get hanging indent
                 # of (_M2 + number width) for alignment.
                 _pfx = f"{i}. "
-                for _wline in _wrap_cjk(f"{_pfx}{opt}", _wrap_w,
-                                        initial_indent=_M2,
-                                        subsequent_indent=_M2 + " " * len(_pfx)):
+                for _wline in _wrap_cjk(
+                    f"{_pfx}{opt}", _wrap_w, initial_indent=_M2, subsequent_indent=_M2 + " " * len(_pfx)
+                ):
                     print(_wline)
         if default:
             print(_M)
             # [Default: …] (auto-applied in Ns) is long; if the terminal soft-wraps,
             # the continuation "(auto-applied …)" drops to col 0. Wrap with _wrap_cjk
             # (same as body) to maintain left margin (_M2) on continuation lines.
-            for _wline in _wrap_cjk(f"[Default: {default}] (auto-applied in {timeout}s)",
-                                    _wrap_w, initial_indent=_M, subsequent_indent=_M2):
+            for _wline in _wrap_cjk(
+                f"[Default: {default}] (auto-applied in {timeout}s)", _wrap_w, initial_indent=_M, subsequent_indent=_M2
+            ):
                 print(_wline)
         print(_M + "─" * _SEP_W)
 
@@ -1763,8 +1836,7 @@ def _cli_checkpoint_cb(question_data: dict) -> dict:
             if _milestones and remaining <= _milestones[0]:
                 while _milestones and remaining <= _milestones[0]:
                     _milestones.pop(0)  # Consume already-passed milestones in a batch
-                _sys.stdout.write(
-                    f"\n{_M}⏳ default auto-applies in {max(remaining, 1)}s\n{_M}❯ ")
+                _sys.stdout.write(f"\n{_M}⏳ default auto-applies in {max(remaining, 1)}s\n{_M}❯ ")
                 _sys.stdout.flush()
             timeout_sec = max(0, min(1, remaining))
             rlist, _, _ = _sel.select([_sys.stdin], [], [], timeout_sec)
@@ -1875,7 +1947,7 @@ def _build_engine(config: EngineConfig):
         run_lint=False,
         run_tests=False,
         cancel_event=config.cancel_event,
-        unrestricted_read=True,   # trusted local CLI: read tools may cross the repo boundary (bash already can)
+        unrestricted_read=True,  # trusted local CLI: read tools may cross the repo boundary (bash already can)
         user_checkpoint_callback=_cli_checkpoint_cb,
         scoped_verification=config.scoped_verification,
     )
@@ -1889,6 +1961,7 @@ def _build_engine(config: EngineConfig):
     registry = ToolRegistry(config.repo_root, agent_config)
 
     from external_llm.agent.agent_loop import AgentLoop
+
     return AgentLoop(
         llm_client=svc.llm_service.client,
         registry=registry,
@@ -1897,9 +1970,14 @@ def _build_engine(config: EngineConfig):
     )
 
 
-def _run_with_cancel(loop, request: str, context: str, cancel_event: threading.Event,
-                     esc_watcher_stop: Optional[threading.Event] = None,
-                     stream_callback: Optional[Callable] = None):
+def _run_with_cancel(
+    loop,
+    request: str,
+    context: str,
+    cancel_event: threading.Event,
+    esc_watcher_stop: Optional[threading.Event] = None,
+    stream_callback: Optional[Callable] = None,
+):
     """Run loop.run() in a separate thread and return the result.
 
     If the ESC watcher is running, sends a stop signal via esc_watcher_stop.
@@ -1951,6 +2029,7 @@ def _run_esc_watcher(cancel_event: threading.Event, stop_event: threading.Event)
     import copy as _copy
     import termios as _termios
     import time as _time
+
     fd = sys.stdin.fileno()
     if not os.isatty(fd):
         return
@@ -1976,7 +2055,7 @@ def _run_esc_watcher(cancel_event: threading.Event, stop_event: threading.Event)
                 r, _, _ = _select.select([fd], [], [], 0.3)
                 if r:
                     ch = os.read(fd, 1)
-                    if ch == b'\x1b':
+                    if ch == b"\x1b":
                         cancel_event.set()
                         # Drain remaining bytes in the ESC sequence (e.g. arrow keys)
                         _drain_stdin(0.02)
@@ -2030,6 +2109,7 @@ def _build_turn_digest(chat_result) -> str:
         return ""
     try:
         from external_llm.agent.work_state_digest import build_work_state_digest
+
         return build_work_state_digest(getattr(chat_result, "tool_results", None) or [])
     except (TypeError, ValueError, KeyError, AttributeError):  # result-shape tolerance
         return ""
@@ -2063,10 +2143,7 @@ def _build_orchestrator_digest(orch_result) -> str:
             _patches = getattr(_sr, "applied_patches", None) or []
             _final = (getattr(_sr, "final_message", "") or "").strip().split("\n", 1)[0][:80]
             if _patches:
-                _patch_names = [
-                    (p.get("file") or str(p)) if isinstance(p, dict) else str(p)
-                    for p in _patches[:5]
-                ]
+                _patch_names = [(p.get("file") or str(p)) if isinstance(p, dict) else str(p) for p in _patches[:5]]
                 _lines.append(f"  sub-{_i} [{_ss}]: patched {', '.join(_patch_names)}")
             elif _final:
                 _lines.append(f"  sub-{_i} [{_ss}]: {_final}")
@@ -2118,6 +2195,7 @@ _AUTO_NEXT_SUGGEST_SYSTEM = (
     "- Reply with the instruction text only — no quotes, no preamble, no numbering."
 )
 
+
 # Countdown before an auto-continue submit fires (seconds). The window exists so a
 # watching user can veto (typing/Esc) — too short removes the veto, too long makes
 # the loop crawl when unattended.
@@ -2138,13 +2216,15 @@ def _parse_auto_continue_delay() -> float:
     except ValueError:
         logging.getLogger(__name__).warning(
             "ASICODE_AUTO_CONTINUE_DELAY=%r is not a number; using %s default",
-            _raw, _default,
+            _raw,
+            _default,
         )
         return _default
     if not math.isfinite(_v):
         logging.getLogger(__name__).warning(
             "ASICODE_AUTO_CONTINUE_DELAY=%r is not finite; using %s default",
-            _raw, _default,
+            _raw,
+            _default,
         )
         return _default
     # Sub-floor values clamp up to the 2s veto floor (existing behavior): the
@@ -2200,14 +2280,12 @@ def _text_has_hangul(s: str) -> bool:
     """
     for ch in s:
         o = ord(ch)
-        if (0xAC00 <= o <= 0xD7A3 or 0x1100 <= o <= 0x11FF
-                or 0x3130 <= o <= 0x318F):
+        if 0xAC00 <= o <= 0xD7A3 or 0x1100 <= o <= 0x11FF or 0x3130 <= o <= 0x318F:
             return True
     return False
 
 
-def _validate_next_suggestion(text: str, user_request: str,
-                              max_len: int = 140) -> Optional[str]:
+def _validate_next_suggestion(text: str, user_request: str, max_len: int = 140) -> Optional[str]:
     """Enforce the rules stated in ``_NEXT_SUGGEST_SYSTEM`` structurally.
 
     The system prompt already tells the model: one short imperative line, same
@@ -2267,16 +2345,16 @@ def _maybe_arm_auto_submit() -> None:
     """
     global _auto_submit_gen, _auto_countdown_active
     st = _auto_continue_state
-    arm, reason = _auto_continue_should_arm(
-        st["on"], st["depth"], st["cap"], _next_prompt_suggestion)
+    arm, reason = _auto_continue_should_arm(st["on"], st["depth"], st["cap"], _next_prompt_suggestion)
     if not arm:
         if reason == "cap_reached":
             # Notify once, then stand down until the user re-anchors (manual
             # input resets depth) or re-arms via /auto.
             st["depth"] = 0
             _notify_above_prompt(
-                f"  🔁 auto-continue: cap reached ({st['cap']} consecutive steps) — "
-                "paused until your next input", _C["yellow"])
+                f"  🔁 auto-continue: cap reached ({st['cap']} consecutive steps) — paused until your next input",
+                _C["yellow"],
+            )
         return
     _auto_submit_gen += 1
     _auto_countdown_active = True
@@ -2285,7 +2363,8 @@ def _maybe_arm_auto_submit() -> None:
     _notify_above_prompt(
         f"  🔁 auto-continue {st['depth'] + 1}/{st['cap']} in "
         f"{_AUTO_CONTINUE_DELAY:.0f}s — type/Esc to cancel · Enter to run now",
-        _C["muted"])
+        _C["muted"],
+    )
 
     def _fire() -> None:
         _sess = _prompt_session
@@ -2361,31 +2440,34 @@ def _deliver_next_suggestion(text: str, gen: int) -> None:
     _next_prompt_suggestion = text
     try:
         from prompt_toolkit.auto_suggest import Suggestion
+
         _sess = _prompt_session
         _app = getattr(_sess, "app", None) if _sess is not None else None
         if _app is None or not _app.is_running or not _input_underline:
             return  # Displayed in the next prompt's pre_run seeding
+
         def _apply() -> None:
             try:
                 _buf = _app.current_buffer
-                if (not _buf.text and gen == _next_suggestion_gen
-                        and _next_prompt_suggestion):
+                if not _buf.text and gen == _next_suggestion_gen and _next_prompt_suggestion:
                     _buf.suggestion = Suggestion(_next_prompt_suggestion)
                     _app.invalidate()
                     _maybe_arm_auto_submit()
             except Exception:
                 logging.getLogger(__name__).debug("suggestion apply failed", exc_info=True)
+
         _loop = getattr(_app, "loop", None)
         if _loop is not None:
             _loop.call_soon_threadsafe(_apply)
     except Exception:
         logging.getLogger(__name__).debug(
-            "suggestion display failed — will be seeded in the next prompt", exc_info=True)
+            "suggestion display failed — will be seeded in the next prompt", exc_info=True
+        )
 
 
-def _kick_next_prompt_suggestion(llm_client, model: str, user_request: str,
-                                 final_message: str, digest: str,
-                                 auto_mode: bool = False) -> None:
+def _kick_next_prompt_suggestion(
+    llm_client, model: str, user_request: str, final_message: str, digest: str, auto_mode: bool = False
+) -> None:
     """Generate a "next task" suggestion in the background after turn end (fire-and-forget).
 
     ``auto_mode``: the suggestion will be countdown-submitted as the next turn's
@@ -2415,6 +2497,7 @@ def _kick_next_prompt_suggestion(llm_client, model: str, user_request: str,
         _llm_log.addFilter(_filt)
         try:
             from external_llm.client import LLMMessage, effective_content
+
             parts = [f"[user request]\n{user_request[:1500]}"]
             if final_message:
                 parts.append(f"[assistant final answer]\n{final_message[:3000]}")
@@ -2426,17 +2509,21 @@ def _kick_next_prompt_suggestion(llm_client, model: str, user_request: str,
                 return
             resp = llm_client.chat(
                 messages=[
-                    LLMMessage(role="system", content=(
-                        _AUTO_NEXT_SUGGEST_SYSTEM if auto_mode
-                        else _NEXT_SUGGEST_SYSTEM)),
+                    LLMMessage(
+                        role="system", content=(_AUTO_NEXT_SUGGEST_SYSTEM if auto_mode else _NEXT_SUGGEST_SYSTEM)
+                    ),
                     LLMMessage(role="user", content="\n\n".join(parts)),
                 ],
-                model=model, temperature=0.3, max_tokens=1024,
+                model=model,
+                temperature=0.3,
+                max_tokens=1024,
             )
-            _lines = effective_content(resp).strip().strip('"\'`').splitlines()
+            _lines = effective_content(resp).strip().strip("\"'`").splitlines()
             text = _validate_next_suggestion(
-                _lines[0].strip() if _lines else "", user_request,
-                max_len=_AUTO_SUGGESTION_MAX_LEN if auto_mode else 140)
+                _lines[0].strip() if _lines else "",
+                user_request,
+                max_len=_AUTO_SUGGESTION_MAX_LEN if auto_mode else 140,
+            )
             # System prompt rule (language match·length·preamble forbid·NONE) violations are suppressed
             if text is None:
                 if auto_mode and gen == _next_suggestion_gen and _auto_continue_state["on"]:
@@ -2445,12 +2532,13 @@ def _kick_next_prompt_suggestion(llm_client, model: str, user_request: str,
                     _d = _auto_continue_state["depth"]
                     _notify_above_prompt(
                         "  🔁 auto-continue: no required follow-up — stopped"
-                        + (f" after {_d} auto step(s)" if _d else ""), _C["muted"])
+                        + (f" after {_d} auto step(s)" if _d else ""),
+                        _C["muted"],
+                    )
                 return
             _deliver_next_suggestion(text, gen)
         except Exception:
-            logging.getLogger(__name__).debug(
-                "next-prompt suggestion failed", exc_info=True)
+            logging.getLogger(__name__).debug("next-prompt suggestion failed", exc_info=True)
         finally:
             _llm_log.removeFilter(_filt)
 
@@ -2511,8 +2599,7 @@ def _finalize_pending_design_chat(pending: dict, session_mgr, session_id: str, m
         note = (
             "[The previous task was interrupted after 60s timeout — "
             "the response did not complete in time. Please handle the next "
-            "user input as a fresh request or continuation as appropriate.]\n\n"
-            + _INTERRUPT_RESUME_INSTRUCTION
+            "user input as a fresh request or continuation as appropriate.]\n\n" + _INTERRUPT_RESUME_INSTRUCTION
         )
         digest_src = None
     else:
@@ -2523,7 +2610,10 @@ def _finalize_pending_design_chat(pending: dict, session_mgr, session_id: str, m
         # The 300-char summary is replaced/supplemented by full tool_results rendering at display time.
         interrupt_tool_results = list(getattr(partial, "tool_results", None) or [])
     session_mgr.add_turn(
-        session_id, "assistant", note, model=model,
+        session_id,
+        "assistant",
+        note,
+        model=model,
         digest=_build_turn_digest(digest_src),
         tool_results=interrupt_tool_results or None,
     )
@@ -2563,6 +2653,7 @@ def _graceful_join_design_chat(
 
 # ─── REPL ────────────────────────────────────────────────────────────────────
 
+
 def _format_result(result) -> str:
     """Build the dim token line shown under the result panel.
 
@@ -2587,7 +2678,9 @@ def _format_result(result) -> str:
 
 
 def _eval_ctrlc_armed(
-    current_armed: bool, is_main_prompt: bool, buffer_has_text: bool,
+    current_armed: bool,
+    is_main_prompt: bool,
+    buffer_has_text: bool,
 ) -> tuple[bool, bool]:
     """Pure Ctrl+C state machine — returns ``(new_armed, should_raise)``.
 
@@ -2610,12 +2703,12 @@ def _eval_ctrlc_armed(
     ============= ============ ============== =========== =============
     """
     if not is_main_prompt:
-        return (False, True)   # y/N etc → always raise immediately
+        return (False, True)  # y/N etc → always raise immediately
     if buffer_has_text:
         return (False, False)  # clear buffer + disarm
     if current_armed:
-        return (False, True)   # second Ctrl+C → raise
-    return (True, False)       # first Ctrl+C → arm
+        return (False, True)  # second Ctrl+C → raise
+    return (True, False)  # first Ctrl+C → arm
 
 
 def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
@@ -2649,10 +2742,10 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
     try:
         fd = sys.stdin.fileno()
     except (OSError, AttributeError):
-        fd = None            # Non-file stdin → prompt_toolkit fallback
+        fd = None  # Non-file stdin → prompt_toolkit fallback
     if fd is not None and not os.isatty(fd):
         line = sys.stdin.readline()
-        if not line:          # EOF (pipe/redirect)
+        if not line:  # EOF (pipe/redirect)
             raise EOFError
         return line.rstrip("\n").strip()
 
@@ -2672,14 +2765,16 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
         # reducing ghosts to 1-2. Remaining ghosts disappear on the next full repaint.
         try:
             from prompt_toolkit.application import Application as _PtApp
+
             if not getattr(_PtApp, "_asr_resize_debounced", False):
                 _orig_on_resize = _PtApp._on_resize
 
                 def _debounced_on_resize(self):
                     try:
                         import asyncio
+
                         _loop = asyncio.get_running_loop()
-                    except RuntimeError:
+                    except RuntimeError:  # pragma: no cover — ptk only calls _on_resize from its own loop
                         _orig_on_resize(self)
                         return
                     _h = getattr(self, "_asr_resize_handle", None)
@@ -2692,11 +2787,12 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
 
                 _PtApp._on_resize = _debounced_on_resize
                 _PtApp._asr_resize_debounced = True
-        except Exception:
+        except Exception:  # pragma: no cover — ptk API drift fallback
             logging.getLogger(__name__).debug("pt on_resize debounce patch failed", exc_info=True)
 
         kb = asi.KeyBindings()
-        @kb.add('escape')
+
+        @kb.add("escape")
         def _handle_escape(event):
             # Lone ESC: veto a pending auto-continue countdown (this turn only —
             # /auto mode itself stays on). Otherwise silently ignored (matches
@@ -2704,18 +2800,21 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
             if _auto_countdown_active:
                 _cancel_auto_submit()
                 _notify_above_prompt(
-                    "  🔁 auto-continue: cancelled this step (mode stays on — /auto off to disable)",
-                    _C["muted"])
+                    "  🔁 auto-continue: cancelled this step (mode stays on — /auto off to disable)", _C["muted"]
+                )
+
         # Ctrl+C: clear buffer only if input is in progress, require double press on empty prompt
         # to propagate KeyboardInterrupt (session exit) — prevents accidental
         # loss of a long session from a habitual single Ctrl+C (paste cancel, etc.). Ctrl+D exits immediately.
         # No time limit (past 2s expiry reset while reading hints, requiring
         # 3-4 presses to exit) — instead, typing/sending etc. disarms.
-        @kb.add('c-c')
+        @kb.add("c-c")
         def _handle_ctrlc(event):
             global _ctrlc_armed
             new_armed, should_raise = _eval_ctrlc_armed(
-                _ctrlc_armed, _input_underline, bool(event.current_buffer.text),
+                _ctrlc_armed,
+                _input_underline,
+                bool(event.current_buffer.text),
             )
             if not should_raise and event.current_buffer.text:
                 # Buffer reset is a side effect not captured by the pure
@@ -2733,16 +2832,17 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
                 # First Ctrl+C on main prompt: show "press again" hint.
                 try:
                     from prompt_toolkit.application import run_in_terminal
-                    run_in_terminal(
-                        lambda: _print("  press Ctrl+C again to exit", _C["muted"]))
-                except Exception:
+
+                    run_in_terminal(lambda: _print("  press Ctrl+C again to exit", _C["muted"]))
+                except Exception:  # pragma: no cover — hint display is best-effort
                     logging.getLogger(__name__).debug("ctrl+c hint print failed", exc_info=True)
+
         # Enter: immediate submit. Newline via Option(Alt)+Enter or Ctrl+J.
         # multiline=True means basic Enter inserts newline, so explicitly bind to submit.
         # (Korean IME uses first Enter during syllable composition to confirm syllable, not sending Return
         #  to the app — Terminal.app limitation. The double-Enter approach, due to this,
         #  requires an extra press in Korean, so submit stays as single Enter.)
-        @kb.add('enter')
+        @kb.add("enter")
         def _handle_enter(event):
             global _ctrlc_armed, _last_input_was_auto
             _ctrlc_armed = False
@@ -2750,40 +2850,47 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
             # Enter on an empty buffer while an auto-continue countdown is
             # pending = "run now": accept the ghost as this auto step (still
             # counted against the depth cap).
-            if (_auto_countdown_active and not _buf.text
-                    and _next_prompt_suggestion and _input_underline):
+            if _auto_countdown_active and not _buf.text and _next_prompt_suggestion and _input_underline:
                 _cancel_auto_submit()
                 _last_input_was_auto = True
                 _buf.insert_text(_next_prompt_suggestion)
             _buf.validate_and_handle()
+
         # Option(Alt)+Enter: insert newline
-        @kb.add('escape', 'enter')
+        @kb.add("escape", "enter")
         def _force_newline_meta_enter(event):
             event.current_buffer.insert_text("\n")
+
         # Ctrl+J: insert newline (multiline default behavior, but explicitly bound)
-        @kb.add('c-j')
+        @kb.add("c-j")
         def _newline_ctrl_j(event):
             event.current_buffer.insert_text("\n")
+
         # run_repl sets _prompt_history_path; if unset (edge case), use in-memory.
         _history = asi.InMemoryHistory()
         if _prompt_history_path:
             try:
                 from prompt_toolkit.history import FileHistory
+
                 Path(_prompt_history_path).parent.mkdir(parents=True, exist_ok=True)
                 # Cap history growth BEFORE FileHistory reads it all into memory.
                 _rotate_cli_history_if_needed(_prompt_history_path)
                 _history = FileHistory(_prompt_history_path)
             except Exception:
                 logging.getLogger(__name__).debug(
-                    "cli history persistence failed — falling back to in-memory", exc_info=True)
+                    "cli history persistence failed — falling back to in-memory", exc_info=True
+                )
         # Input underline (separator) is a thin "─" line in border color.
         # NO_COLOR convention (https://no-color.org) — Rich detects it automatically, but
         # prompt_toolkit styles must be emptied manually.
         _pt_app_style = asi._PtStyle.from_dict(
-            {} if os.environ.get("NO_COLOR") else {
+            {}
+            if os.environ.get("NO_COLOR")
+            else {
                 "separator": "fg:" + _C["border"],
                 "auto-suggestion": "fg:" + _C["muted"],
-            })
+            }
+        )
         # Ghost-text suggestion: history prefix matching (fish style) while typing,,
         # "next task" suggestion by LLM on empty buffer after turn end. Accept with → key.
         from prompt_toolkit.auto_suggest import (
@@ -2826,6 +2933,7 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
             # allocates space when shown — unaffected for slash command completion.
             reserve_space_for_menu=0,
         )
+
         # Typing (text change) disarms the Ctrl+C double-confirm armed state —
         # prevents accidental "habitual single Ctrl+C after reading hint" exit.
         def _disarm_ctrlc(_buf):
@@ -2836,6 +2944,7 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
             # this only fires for real user keystrokes).
             if _auto_countdown_active:
                 _cancel_auto_submit()
+
         _prompt_session.default_buffer.on_text_changed += _disarm_ctrlc
         # ── Input underline layout ────────────────────────────
         # Default bottom_toolbar is always fixed at screen bottom (large gap of cursor-above margin),
@@ -2900,12 +3009,9 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
             # grows with content). Regular prompts (_input_underline=False)
             # have the filter off, keeping original greedy behavior.
             try:
-                _prompt_session.app.layout.current_window.dont_extend_height = (
-                    _underline_on
-                )
-            except Exception:
-                logging.getLogger(__name__).debug(
-                    "pt current_window patch failed — skip underline only", exc_info=True)
+                _prompt_session.app.layout.current_window.dont_extend_height = _underline_on
+            except Exception:  # pragma: no cover — ptk API drift fallback
+                logging.getLogger(__name__).debug("pt current_window patch failed — skip underline only", exc_info=True)
             _new_root = _FloatContainer(
                 _HSplit([_orig_root, _sep]),
                 floats=[
@@ -2913,22 +3019,26 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
                     # vertical space, so re-host the menu to an outer FloatContainer to float it
                     # above the empty area below the separator.
                     _Float(
-                        xcursor=True, ycursor=True, transparent=True,
+                        xcursor=True,
+                        ycursor=True,
+                        transparent=True,
                         content=_CompletionsMenu(
-                            max_height=16, scroll_offset=1,
+                            max_height=16,
+                            scroll_offset=1,
                             extra_filter=_has_focus(_buf) & _underline_on,
                         ),
                     ),
                 ],
             )
             _prompt_session.app.layout = _Layout(_new_root)
-        except Exception:
+        except Exception:  # pragma: no cover — ptk API drift fallback
             logging.getLogger(__name__).debug("pt layout API patch failed — no underline", exc_info=True)
 
     # ── running event-loop guard ──────────────────────────────────
     _ev_loop_running = False
     try:
         import asyncio
+
         _ev_loop_running = asyncio.get_running_loop().is_running()
     except RuntimeError:
         logging.getLogger(__name__).debug("no running asyncio loop")
@@ -2952,7 +3062,7 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
                 if not _buf.text and _next_prompt_suggestion:
                     _buf.suggestion = _Sugg(_next_prompt_suggestion)
                     _maybe_arm_auto_submit()
-            except Exception:
+            except Exception:  # pragma: no cover — seed display is best-effort
                 logging.getLogger(__name__).debug("suggestion seed failed", exc_info=True)
 
         _prompt_kwargs["pre_run"] = _seed_suggestion
@@ -2988,6 +3098,7 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
             # the process terminates.  A single queue carries either the
             # result or the captured exception (no two-queue race).
             import queue as _queue
+
             _done_q = _queue.Queue()
 
             def _prompt_in_thread() -> None:
@@ -3026,8 +3137,7 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
             try:
                 signal.signal(signal.SIGWINCH, _handle_terminal_resize)
             except (ValueError, OSError):
-                logging.getLogger(__name__).debug(
-                    "SIGWINCH registration failed — non-main thread", exc_info=True)
+                logging.getLogger(__name__).debug("SIGWINCH registration failed — non-main thread", exc_info=True)
             _handle_terminal_resize()
 
     if len(text) > _MAX_INPUT_CHARS:
@@ -3050,11 +3160,16 @@ def _prompt_input(chat_mode: str = "code", status: str = "") -> str:
     """
     _ensure_out_console_imported()
     _mode_tag = "[General] " if chat_mode == "general" else ("[Orchestrator] " if chat_mode == "orchestrator" else "")
-    _display_mode = "General mode" if chat_mode == "general" else ("Orchestrator mode" if chat_mode == "orchestrator" else "Code mode")
+    _display_mode = (
+        "General mode"
+        if chat_mode == "general"
+        else ("Orchestrator mode" if chat_mode == "orchestrator" else "Code mode")
+    )
     if _RICH and asi._out_console:
         asi._out_console.rule(style=_C["border"])
         if status:
             from rich.text import Text as _RichText
+
             asi._out_console.print(_RichText(f"  {status}", style=_C["muted"]))
         asi._out_console.print(
             f"  [{_C['border']}]/help for commands  ·  Enter send  ·  Ctrl+C exit  · Alt+Enter new line · {_display_mode}[/{_C['border']}]"
@@ -3073,29 +3188,39 @@ def _wrap_preserve_code(text: str, width: int = 72) -> list[str]:
     """Wrap text to width, preserving code blocks (```...```) as-is."""
     result = []
     # Split on code fences — string ops instead of regex
-    raw = text.split('```')
+    raw = text.split("```")
     # Reconstruct: odd-indexed segments are code blocks (wrap with fences)
     segments = []
     for i, seg in enumerate(raw):
         if i % 2 == 1:
-            segments.append(f'```{seg}```')
+            segments.append(f"```{seg}```")
         else:
             segments.append(seg)
     for i, seg in enumerate(segments):
         if i % 2 == 1:
             # Code block: keep intact
-            result.extend(seg.split('\n'))
+            result.extend(seg.split("\n"))
         else:
             result.extend(textwrap.wrap(seg, width=width) if seg.strip() else [])
     return result
 
 
 def _show_result(
-    result, elapsed: float, *,
-    repo_root: Optional[str] = None, baseline: Optional[dict] = None,
+    result,
+    elapsed: float,
+    *,
+    repo_root: Optional[str] = None,
+    baseline: Optional[dict] = None,
 ) -> None:
     """Display execution result, then a colored diff of what the run changed."""
-    status_icon = {"success": "✓", "already_satisfied": "=", "max_turns": "▲", "error": "✗", "cancelled": "▲", "clarification_needed": "?"}.get(result.status, "·")
+    status_icon = {
+        "success": "✓",
+        "already_satisfied": "=",
+        "max_turns": "▲",
+        "error": "✗",
+        "cancelled": "▲",
+        "clarification_needed": "?",
+    }.get(result.status, "·")
     status_color = {
         "success": _C["green"],
         "already_satisfied": _C["green"],
@@ -3112,6 +3237,7 @@ def _show_result(
 
     if _RICH and asi._out_console:
         from rich.console import Group
+
         _RichMD = _rich_markdown_cls()
         from rich.text import Text
 
@@ -3172,6 +3298,7 @@ async def _run_collaborate_session(
 ) -> Any:
     """Run a single collaboration session (async wrapper for REPL /claude)."""
     from external_llm.repl.collaborate import CollaborationOrchestrator
+
     async with CollaborationOrchestrator(registry, config) as orch:
         return await orch.run(task=task, context=context, enable_preprocessing=True)
 
@@ -3215,8 +3342,7 @@ def _save_key_to_dotenv(repo_root: str, key: str, value: str) -> None:
             except OSError:
                 logging.getLogger(__name__).debug("dotenv tmp unlink failed", exc_info=True)
         _print(
-            f"  ! could not persist {dotenv_path} ({_e.strerror or _e}); "
-            f"the key is active for this session only.",
+            f"  ! could not persist {dotenv_path} ({_e.strerror or _e}); the key is active for this session only.",
             _C["yellow"],
         )
 
@@ -3356,7 +3482,9 @@ def _get_ollama_models(timeout: int = 5) -> list[str]:
     try:
         _r = subprocess.run(
             ["ollama", "list"],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
             check=False,
         )
         if _r.returncode != 0 or not _r.stdout.strip():
@@ -3393,7 +3521,9 @@ def _resolve_repo_root(repo_arg: Optional[str]) -> str:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
             cwd=os.getcwd(),
             check=False,
         )
@@ -3456,9 +3586,12 @@ def _seed_terminal_config(term_path: str, shared_path: str) -> None:
 
 # ── Pure helpers for insights compact (extracted for testability) ────────────
 
+
 def _insights_compact_is_noop(
-    result_text: str, content_text: str,
-    result_ents: list, orig_ents: list,
+    result_text: str,
+    content_text: str,
+    result_ents: list,
+    orig_ents: list,
 ) -> bool:
     """True when the compactor returned effectively the same content.
 
@@ -3470,21 +3603,26 @@ def _insights_compact_is_noop(
 
     def _norm(s: str) -> str:
         return _re.sub(r"\s+", " ", s).strip()
+
     return _norm(result_text) == _norm(content_text) and len(result_ents) == len(orig_ents)
 
 
 def _size_compact_budget(content: str) -> int:
     """Return the base ``max_tokens`` for a compact LLM call.
 
-    Uses byte-based estimate (UTF-8 ~2 bytes/token), which covers both
-    ASCII (1 byte/char) and CJK (3 bytes/char) correctly.  The char-based
-    estimate (len/3.5) would always be smaller for UTF-8, so byte/2 alone
-    is sufficient.  Slack (2048) is added and the floor is 8192 so that
-    even tiny inputs get a reasonable output window.
+    Delegates the byte-based token estimate (UTF-8 ~2 bytes/token, covering
+    both ASCII (1 byte/char) and CJK (3 bytes/char) correctly) to the single
+    canonical estimator :func:`_cjk_aware_tokens`, which adds the same +1
+    slack used across the agent/design-chat guard paths.  The char-based
+    estimate (len/3.5) would always be smaller for UTF-8, so the canonical
+    byte/2 (+1) alone is sufficient.  Slack (2048) is added and the floor is
+    8192 so that even tiny inputs get a reasonable output window.
 
     Callers may further raise the budget for reasoning models.
     """
-    _tokens = len(content.encode("utf-8")) // 2
+    from external_llm.agent._shared_utils import estimate_tokens
+
+    _tokens = estimate_tokens(content)
     return max(8192, _tokens + 2048)
 
 
@@ -3575,6 +3713,7 @@ def _init_session_state(repo_root: str, svc, design_config) -> dict:
         svc.llm_service.reasoning_effort = _reasoning_effort
 
     import atexit as _atexit
+
     _enable_bracketed_paste()
     _atexit.register(_disable_bracketed_paste)
     # Clean up baseline ref at session end — don't pollute user's stash list.
@@ -3632,6 +3771,7 @@ def _init_repl_engine(args: argparse.Namespace, repo_root: str) -> Optional[dict
     # ── Tier 2: design_insights accumulation nudge (non-blocking, threshold-only) ──
     try:
         from external_llm.agent.insights_manager import compute_stats, should_nudge
+
         _ins_nudge_fire, _ins_nudge_msg = should_nudge(compute_stats(repo_root))
         if _ins_nudge_fire:
             _parts = _ins_nudge_msg.split(" /insights", 1)
@@ -3646,7 +3786,7 @@ def _init_repl_engine(args: argparse.Namespace, repo_root: str) -> Optional[dict
     _provider_str = args.provider or os.getenv("EXTERNAL_LLM_PROVIDER", "(env)")
     _model_str = args.model or os.getenv("EXTERNAL_LLM_MODEL", "(env)")
 
-    # NOTE: per-terminal model restore already done in main() L8521-8547
+    # NOTE: per-terminal model restore already done in `main()`
     # (_terminal_config_path → _seed_terminal_config → args.provider/model applied).
     # run_repl is only called from main(), no need to re-execute here.
 
@@ -3667,11 +3807,13 @@ def _init_repl_engine(args: argparse.Namespace, repo_root: str) -> Optional[dict
 
     # ── Shared LLM service creation ──
     from external_llm.intelligent_service import create_intelligent_service_from_env
+
     svc = _retry_create_svc_with_api_key_prompt(
         create_intelligent_service_from_env,
         _provider_str if _provider_str != "(env)" else None,
         _model_str if _model_str != "(env)" else None,
-        api_key=args.api_key or None, repo_root=repo_root,
+        api_key=args.api_key or None,
+        repo_root=repo_root,
     )
     if svc is None:
         _print("failed to initialize LLM service.", _C["red"])
@@ -3693,12 +3835,13 @@ def _init_repl_engine(args: argparse.Namespace, repo_root: str) -> Optional[dict
     design_config = AgentConfig(
         model_name=svc.model or "",
         user_checkpoint_callback=_cli_checkpoint_cb,
-        unrestricted_read=True,   # trusted local CLI (also inherited by _orch_cfg via dataclasses.replace)
+        unrestricted_read=True,  # trusted local CLI (also inherited by _orch_cfg via dataclasses.replace)
     )
     design_config.thinking_mode = None  # overridden by saved config below
     design_registry = ToolRegistry(repo_root, design_config)
     _session_mgr = DesignSessionManager(repo_root)
     import hashlib as _hashlib
+
     _session_id = f"cli-{_hashlib.md5(repo_root.encode(), usedforsecurity=False).hexdigest()[:16]}"
     _session_mgr.get_or_create(_session_id)
 
@@ -3734,6 +3877,8 @@ def _stderr_spinner(stop: threading.Event, t0: float, msg: str) -> None:
         sys.stderr.write(f"\r\033[K  {frames[_i % len(frames)]}  {msg}  {_el:0.1f}s")
         sys.stderr.flush()
         _i += 1
+
+
 def _run_repl_impl(args: argparse.Namespace) -> None:
     """REPL main loop (implementation).
 
@@ -3751,13 +3896,9 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
 
         _swept = sweep_stale_lock_files(Path(repo_root) / ".asicode" / "locks")
         if _swept:
-            logging.getLogger(__name__).debug(
-                "stale-lock sweep removed %d file(s) from .asicode/locks", _swept
-            )
+            logging.getLogger(__name__).debug("stale-lock sweep removed %d file(s) from .asicode/locks", _swept)
     except Exception as _sweep_err:
-        logging.getLogger(__name__).debug(
-            "stale-lock sweep skipped: %s", _sweep_err
-        )
+        logging.getLogger(__name__).debug("stale-lock sweep skipped: %s", _sweep_err)
     _init = _init_repl_engine(args, repo_root)
     if _init is None:
         return
@@ -3817,7 +3958,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         # command — the in-memory state already reflects the change.
         try:
             atomic_write_json(_thinking_state_path, _cfg)
-        except OSError:
+        except OSError:  # pragma: no cover - defensive: read-only mounts must not kill the REPL
             logging.getLogger(__name__).debug("terminal config write failed", exc_info=True)
 
     def _persist_helper(provider: str, model: str) -> None:
@@ -3830,9 +3971,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
     def _persist_dev_models(dev_models: dict) -> None:
         """Persist ``/model dev_N`` slots (provider/model only; api_key resolved from env at orchestration time)."""
         if dev_models:
-            _update_terminal_config(
-                {"dev_models": {k: [v[0], v[1]] for k, v in dev_models.items()}}
-            )
+            _update_terminal_config({"dev_models": {k: [v[0], v[1]] for k, v in dev_models.items()}})
         else:
             _update_terminal_config({}, drops=("dev_models",))
 
@@ -3847,6 +3986,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         ``/helper``: every read/write flows through this one path.
         """
         _update_terminal_config({"chat_mode": mode})
+
     # Sentinel: marks that helper client creation already failed once.
     # Prevents re-attempting (and re-logging) on every compress call.
     _HELPER_CREATION_FAILED = object()
@@ -3890,6 +4030,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             load_insights_file,
             parse_insights,
         )
+
         _ci_content = load_insights_file(repo_root)
         if not _ci_content.strip():
             _print("  nothing to compact.", _C["muted"])
@@ -3910,7 +4051,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         _ci_spinner = threading.Thread(target=_ci_spin, daemon=True)
         if _ci_tty:
             _ci_spinner.start()
-        else:
+        else:  # pragma: no cover - non-tty stderr; the pty test env always has a tty
             _print("  Compacting design insights…", "dim")
         _ci_result = ""
         _ci_finish_reason = None  # for truncation detection
@@ -3922,17 +4063,19 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         # budget). The filter attaches to the "external_llm" parent logger — the
         # one providers.py emits ``logger.error`` on — so the ERROR spam is
         # suppressed here; a single user-facing notice is routed via
-        # ``_compress_failure_notice`` below instead. See context_manager.py:660-717
-        # for the same pattern in the background path.
+        # ``_compress_failure_notice`` below instead. See context_manager.py's
+        # ``_SuppressInfoFilter`` + ``_compress_failure_notice`` for the same pattern.
         from external_llm.agent.context_manager import (
             _compress_failure_notice,
             _SuppressInfoFilter,
         )
+
         _ci_llm_logger = logging.getLogger("external_llm")
         _ci_suppress = _SuppressInfoFilter()
         _ci_notice: Optional[str] = None
         try:
             from external_llm.client import LLMMessage
+
             _ci_client, _ci_model = _get_compress_llm()
             # DEBUG (not INFO): compaction runs automatically every turn the file
             # is over budget — INFO-level "insights compact: client/model" would
@@ -3940,12 +4083,12 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             # by default but recoverable via --debug.
             logging.getLogger(__name__).debug(
                 "insights compact: client=%s, model=%s",
-                type(_ci_client).__name__, _ci_model,
+                type(_ci_client).__name__,
+                _ci_model,
             )
             _ci_msgs = [
                 LLMMessage(role=_m["role"], content=_m["content"])
-                for _m in build_compact_messages(
-                    _ci_content, budget_bytes=COMPACT_BUDGET_BYTES)
+                for _m in build_compact_messages(_ci_content, budget_bytes=COMPACT_BUDGET_BYTES)
             ]
             # Compaction is deterministic curation, not a reasoning task: disable
             # thinking so the whole token budget goes to the rewritten file.
@@ -3967,11 +4110,13 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             # OpenAI (which routes to ``max_completion_tokens``) the extra headroom
             # is harmless — the model simply doesn't fill it.
             from external_llm.openai_client import _is_reasoning_model as _ci_is_reasoning
+
             if _ci_is_reasoning(_ci_model):
                 _ci_max_tokens = max(_ci_max_tokens, 32000)
             _ci_llm_logger.addFilter(_ci_suppress)
             from external_llm.agent._response_utils import _TRUNCATION_REASONS
             from external_llm.agent._shared_utils import coerce_token_count
+
             # Retry on finish_reason=length/truncated with doubled budget (capped at 128k).
             # Reasoning models can consume the entire shared budget on reasoning trace,
             # leaving nothing for content — a larger budget gives reasoning+content
@@ -3980,8 +4125,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             _ci_max_attempts = 2  # total attempts (initial + 1 retry on length)
             for _ci_attempt in range(_ci_max_attempts):
                 _ci_resp = _ci_client.chat(
-                    messages=_ci_msgs, model=_ci_model,
-                    temperature=0.1, max_tokens=_ci_max_tokens,
+                    messages=_ci_msgs,
+                    model=_ci_model,
+                    temperature=0.1,
+                    max_tokens=_ci_max_tokens,
                     thinking_mode=False,
                 )
                 _ci_result = (_ci_resp.content or "").strip()
@@ -3998,14 +4145,13 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 # Truncated with empty content — double budget for retry
                 _ci_max_tokens = min(_ci_max_tokens * 2, 128000)
                 logging.getLogger(__name__).debug(
-                    "insights compact: truncated (length), retrying with "
-                    "max_tokens=%d (attempt %d/%d)",
-                    _ci_max_tokens, _ci_attempt + 1, _ci_max_attempts,
+                    "insights compact: truncated (length), retrying with max_tokens=%d (attempt %d/%d)",
+                    _ci_max_tokens,
+                    _ci_attempt + 1,
+                    _ci_max_attempts,
                 )
         except Exception as _cie:
-            logging.getLogger(__name__).warning(
-                "insights compact LLM call failed: %s: %s",
-                type(_cie).__name__, _cie)
+            logging.getLogger(__name__).warning("insights compact LLM call failed: %s: %s", type(_cie).__name__, _cie)
             # Route ONE user-facing notice per failure-class per session — same
             # once-latch as the background path. ``_compress_failure_notice``
             # branches on provider exception types (LLMAuthenticationError etc.),
@@ -4015,7 +4161,8 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             # the duplicate from the other for the same failure class).
             try:
                 _ci_notice = _compress_failure_notice(
-                    "insights-compact", _ci_model if "_ci_model" in locals() else "",
+                    "insights-compact",
+                    _ci_model if "_ci_model" in locals() else "",
                     _cie,
                     use_latch=False,  # interactive path: report every failure, not once
                     context="interactive",
@@ -4023,9 +4170,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             except Exception as _cfn_err:
                 # Last-resort: if notice generation itself fails, surface the
                 # original error directly so the user can diagnose the problem.
-                _ci_notice = (
-                    f"⚠ insights compact failed: {type(_cie).__name__}: {_cie}"
-                )
+                _ci_notice = f"⚠ insights compact failed: {type(_cie).__name__}: {_cie}"
         except KeyboardInterrupt:
             # Ctrl+C during the blocking LLM call. ``except Exception`` above does
             # NOT catch BaseException subclasses (KeyboardInterrupt/SystemExit), so
@@ -4048,7 +4193,8 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         if _ci_finish_reason:
             logging.getLogger(__name__).debug(
                 "insights compact: finish_reason=%s, result_len=%d, model=%s",
-                _ci_finish_reason, len(_ci_result),
+                _ci_finish_reason,
+                len(_ci_result),
                 _ci_model if "_ci_model" in locals() else "?",
             )
         if _ci_notice:
@@ -4058,24 +4204,23 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 # The LLM call returned empty content without raising an exception.
                 # Surface diagnostic info so the user can identify the root cause
                 # (e.g. finish_reason=length, no choices, API returned empty body).
-                _ci_diag = (
-                    f"finish_reason={_ci_finish_reason}, "
-                    f"model={_ci_model if '_ci_model' in locals() else '?'}"
-                )
+                _ci_diag = f"finish_reason={_ci_finish_reason}, model={_ci_model if '_ci_model' in locals() else '?'}"
                 _print(
-                    f"  ✗ compaction failed — LLM returned empty content ({_ci_diag}). "
-                    f"File unchanged.", _C["yellow"])
+                    f"  ✗ compaction failed — LLM returned empty content ({_ci_diag}). File unchanged.", _C["yellow"]
+                )
             return False
         # ── sanity gates (before overwriting the gitignored single source of truth) ──
         if _ci_finish_reason in _TRUNCATION_REASONS:
-            _print("  ✗ compaction refused: LLM response truncated even after retry "
-                   "(finish_reason=length/truncated). File unchanged.", _C["yellow"])
+            _print(
+                "  ✗ compaction refused: LLM response truncated even after retry "
+                "(finish_reason=length/truncated). File unchanged.",
+                _C["yellow"],
+            )
             return False
         _, _ci_a_ents = parse_insights(_ci_result)
         _ci_a_n, _ci_a_b = len(_ci_a_ents), len(_ci_result.encode("utf-8"))
         if _ci_b_n > 0 and _ci_a_n == 0:
-            _print("  ✗ compaction refused: all entries were dropped "
-                   f"({_ci_b_n}→0). File unchanged.", _C["yellow"])
+            _print(f"  ✗ compaction refused: all entries were dropped ({_ci_b_n}→0). File unchanged.", _C["yellow"])
             return False
         # No-op: the model echoed the same content without meaningful changes.
         # Delegating to the module-level helper for testability.
@@ -4092,6 +4237,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     from external_llm.agent.insights_manager import (
                         enforce_budget_by_demotion as _ci_ebd,
                     )
+
                     _ci_n_demoted, _ci_a_b = _ci_ebd(repo_root, COMPACT_BUDGET_BYTES)
                 except Exception:
                     _ci_a_b = _ci_b_b
@@ -4101,13 +4247,16 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         f"{COMPACT_BUDGET_BYTES:,}); demoted {_ci_n_demoted} oldest "
                         f"entr{'y' if _ci_n_demoted == 1 else 'ies'} to "
                         f"design_insights_archive.md (not deleted; "
-                        f"/insights archive list|restore). Active now {_ci_a_b:,} bytes.", "dim")
+                        f"/insights archive list|restore). Active now {_ci_a_b:,} bytes.",
+                        "dim",
+                    )
                 else:
                     _print(
                         f"  ⚠ over budget ({_ci_b_b:,} > {COMPACT_BUDGET_BYTES:,} bytes) "
                         f"and no reduction possible (all entries protected principles). "
                         f"Manual /insights drop <n> or /insights prune <days> to remove.",
-                        _C["yellow"])
+                        _C["yellow"],
+                    )
             else:
                 _print(f"  ✓ already compact — no changes ({_ci_b_n} entries · {_ci_b_b:,} bytes).", "dim")
             return True
@@ -4120,9 +4269,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         # of-truth and .bak is overwritten each compact, warn the user.
         if _ci_b_n > 0 and not _ci_over_budget and _ci_a_n < _ci_b_n / 2:
             _dropped = _dropped_entries(_ci_ents, _ci_a_ents)
-            _dropped_hdrs = " ".join(
-                f"[{e.category or '?'}]" for e in _dropped
-            )
+            _dropped_hdrs = " ".join(f"[{e.category or '?'}]" for e in _dropped)
             _print(
                 f"  ⚠ {len(_dropped)} entries dropped ({_ci_b_n}→{_ci_a_n}) "
                 f"on non-over-budget compact — possible hallucinated deletion. "
@@ -4131,10 +4278,12 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             )
         # Write a backup before overwriting (the file is gitignored so git can't recover it)
         from external_llm.agent.insights_manager import insights_path as _ci_ip
+
         _ci_path = _ci_ip(repo_root)
         _ci_bak = _ci_path + ".bak"
         try:
             import shutil
+
             shutil.copy2(_ci_path, _ci_bak)
         except OSError:
             logging.getLogger(__name__).debug("insights backup failed", exc_info=True)
@@ -4155,6 +4304,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 from external_llm.agent.insights_manager import (
                     enforce_budget_by_demotion as _ci_ebd,
                 )
+
                 _ci_n_demoted, _ci_a_b = _ci_ebd(repo_root, COMPACT_BUDGET_BYTES)
                 if _ci_n_demoted:
                     _, _ci_a_ents = parse_insights(load_insights_file(repo_root))
@@ -4174,8 +4324,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             # of the first line only — wrapped continuation lines would start at col 4
             # (_MarginIO left margin alone) instead of col 6 (margin + literal indent),
             # leaving `deleted`/`Active now` misaligned with `before`/`after`.
-            _print(textwrap.fill(_ci_msg, width=max(40, _console_width),
-                                 initial_indent="  ", subsequent_indent="  "), "dim")
+            _print(
+                textwrap.fill(_ci_msg, width=max(40, _console_width), initial_indent="  ", subsequent_indent="  "),
+                "dim",
+            )
         elif _ci_a_b > COMPACT_BUDGET_BYTES:
             # Backstop could not reach budget: every remaining entry is a protected
             # timestamp-less principle (never demoted). Report honestly.
@@ -4184,8 +4336,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 f"all remaining entries are protected principles — no demotion "
                 f"possible. Manual /insights drop <n> to remove."
             )
-            _print(textwrap.fill(_ci_warn, width=max(40, _console_width),
-                                 initial_indent="  ", subsequent_indent="  "), _C["yellow"])
+            _print(
+                textwrap.fill(_ci_warn, width=max(40, _console_width), initial_indent="  ", subsequent_indent="  "),
+                _C["yellow"],
+            )
         else:
             _print(f"  ✓ design_insights compacted ({_ci_b_n}→{_ci_a_n} entries).", "dim")
         # ── Token accounting (interactive compact) ───────────────────────────
@@ -4199,9 +4353,11 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             if _ci_pt or _ci_ct:
                 logging.getLogger(__name__).debug(
                     "insights compact: tokens prompt=%d completion=%d cache_read=%d",
-                    _ci_pt, _ci_ct, _ci_crt,
+                    _ci_pt,
+                    _ci_ct,
+                    _ci_crt,
                 )
-        except Exception:
+        except Exception:  # pragma: no cover - the counters are locals already bound above
             logging.getLogger(__name__).debug("insights compact token accounting failed", exc_info=True)
         return True
 
@@ -4224,7 +4380,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         regular code/general turns. Never raises — a compact failure must
         never block the turn.
         """
-        if chat_result is None:
+        if chat_result is None:  # pragma: no cover - the only caller always passes a result
             return
         _names = {tc.get("tool") for tc in (getattr(chat_result, "tool_calls_made", None) or [])}
         if "save_insight" not in _names:
@@ -4234,6 +4390,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 COMPACT_BUDGET_BYTES,
                 compute_stats,
             )
+
             _stats = compute_stats(repo_root)
         except Exception:
             logging.getLogger(__name__).debug("auto-compact stats failed", exc_info=True)
@@ -4243,7 +4400,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         _print("  💡 design_insights over budget after save_insight — auto-compacting…", _C["muted"])
         try:
             _compact_insights_interactive()
-        except Exception:
+        except Exception:  # pragma: no cover - _compact_insights_interactive never raises
             logging.getLogger(__name__).debug("auto-compact failed", exc_info=True)
 
     def _verify_insights_interactive() -> bool:
@@ -4273,10 +4430,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
 
         _v_cb = _ProgressPrinter(verbose=args.verbose)
         _v_loop = DesignChatLoop(svc.llm_service.client, design_registry, svc.model)
-        _v_msgs = [
-            LLMMessage(role=_m["role"], content=_m["content"])
-            for _m in build_verify_messages(_v_content)
-        ]
+        _v_msgs = [LLMMessage(role=_m["role"], content=_m["content"]) for _m in build_verify_messages(_v_content)]
         _v_cb._start_spinner("Verifying design insights…")
         _v_result = None
         try:
@@ -4291,8 +4445,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 reasoning_effort=_reasoning_effort,
             )
         except Exception as _ve:
-            logging.getLogger(__name__).debug(
-                "insights verify tool loop failed: %s", _ve)
+            logging.getLogger(__name__).debug("insights verify tool loop failed: %s", _ve)
         except KeyboardInterrupt:
             # Ctrl+C during the blocking agent tool loop. ``except Exception`` does
             # not catch BaseException subclasses, so without this the interrupt
@@ -4353,7 +4506,17 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         The returned ``user_input`` may have been rewritten (mode-switch
         prefixes stripped, truncation applied, inline task extracted).
         """
-        nonlocal _current_chat_mode, _helper_client, _helper_model_str, _helper_provider_str, _model_str, _provider_str, _reasoning_effort, _thinking_state, _input_truncated, _pending_dc
+        nonlocal \
+            _current_chat_mode, \
+            _helper_client, \
+            _helper_model_str, \
+            _helper_provider_str, \
+            _model_str, \
+            _provider_str, \
+            _reasoning_effort, \
+            _thinking_state, \
+            _input_truncated, \
+            _pending_dc
         # ── Slash commands (utilities) ──
         _cmd_tok = user_input.strip().split(None, 1)
         _cmd_name = _SLASH_ALIASES.get(_cmd_tok[0].lower()) if _cmd_tok else None
@@ -4364,11 +4527,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         if _cmd_name is None and _cmd_tok:
             _tok0 = _cmd_tok[0]
             _word = _tok0[1:]
-            if (_tok0.startswith("/") and 0 < len(_word) <= 15
-                    and _word.isascii() and _word.isalpha()):
+            if _tok0.startswith("/") and 0 < len(_word) <= 15 and _word.isascii() and _word.isalpha():
                 import difflib as _difflib
-                _sugg = _difflib.get_close_matches(
-                    _tok0.lower(), list(_SLASH_ALIASES), n=1, cutoff=0.6)
+
+                _sugg = _difflib.get_close_matches(_tok0.lower(), list(_SLASH_ALIASES), n=1, cutoff=0.6)
                 _hint = f" — did you mean {_sugg[0]}?" if _sugg else ""
                 _print(f"  unknown command: {_tok0}{_hint}  (/help for commands)", _C["yellow"])
                 return ("continue", user_input)
@@ -4377,6 +4539,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             # ── Tier 3: suggest cleanup right before session end if design_insights exceeds threshold ──
             try:
                 from external_llm.agent.insights_manager import compute_stats, should_nudge
+
                 _end_fire, _end_msg = should_nudge(compute_stats(repo_root))
                 if _end_fire:
                     _parts = _end_msg.split(" /insights", 1)
@@ -4397,13 +4560,26 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             _print_session_summary(_session_tokens, _session_t0)
             _print("session ended.", "")
             return ("break", user_input)
-        if _cmd_name in ("/help", "/diff", "/undo", "/status", "/model", "/helper", "/clear", "/insights", "/copy"):
+        if _cmd_name in (
+            "/help",
+            "/diff",
+            "/undo",
+            "/status",
+            "/model",
+            "/helper",
+            "/clear",
+            "/insights",
+            "/copy",
+            "/failure-patterns",
+        ):
             _cur_mode = _current_chat_mode
             if _cmd_name == "/help":
                 _render_help()
             elif _cmd_name == "/diff":
-                if not (_last_run_diff.get("baseline") and
-                        _render_run_diff(_last_run_diff["repo_root"], _last_run_diff["baseline"])):
+                if not (
+                    _last_run_diff.get("baseline")
+                    and _render_run_diff(_last_run_diff["repo_root"], _last_run_diff["baseline"])
+                ):
                     _print("  no changes recorded yet.", _C["muted"])
             elif _cmd_name == "/undo":
                 _u_base = _last_run_diff.get("baseline")
@@ -4422,9 +4598,12 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     else:
                         for _p in _cp_files:
                             _print(f"  · {_p}", _C["text"])
-                        _print("  ▲ reverts these files to their pre-run state — "
-                               "files the run created are deleted, and manual edits "
-                               "made after the run are lost too.", _C["yellow"])
+                        _print(
+                            "  ▲ reverts these files to their pre-run state — "
+                            "files the run created are deleted, and manual edits "
+                            "made after the run are lost too.",
+                            _C["yellow"],
+                        )
                         try:
                             _u_ans = input(f"  revert {len(_cp_files)} file(s)? (y/N) ").strip().lower()
                         except (EOFError, KeyboardInterrupt):
@@ -4434,8 +4613,9 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                                 _print(f"  ✓ reverted {len(_cp_files)} file(s)", _C["green"])
                                 _last_run_diff["checkpoint"] = None
                             else:
-                                _print("  ✗ revert failed — see logs for the "
-                                       "files that could not be restored.", _C["red"])
+                                _print(
+                                    "  ✗ revert failed — see logs for the files that could not be restored.", _C["red"]
+                                )
                         else:
                             _print("  cancelled.", _C["muted"])
                 elif not _u_stats:
@@ -4444,8 +4624,11 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     # Use actual file count (unlimited) for the prompt, not max_files=20 from stats
                     _u_total = len(_changed_files_since(_u_root, _u_base)) if _u_base else 0
                     _print_run_change_summary(_u_root, _u_base)
-                    _print("  ▲ reverts these files to their pre-run state — "
-                           "manual edits made after the run are lost too.", _C["yellow"])
+                    _print(
+                        "  ▲ reverts these files to their pre-run state — "
+                        "manual edits made after the run are lost too.",
+                        _C["yellow"],
+                    )
                     try:
                         _u_ans = input(f"  revert {_u_total} file(s)? (y/N) ").strip().lower()
                     except (EOFError, KeyboardInterrupt):
@@ -4470,14 +4653,19 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         _tty_short = os.path.basename(_term_state_cfg)[:-5]  # strip .json
                         _print(f"  isolated to this terminal: {_tty_short}", _C["muted"])
                     if _helper_model_str:
-                        _print(f"  helper:  {_helper_provider_str} / {_helper_model_str}  (context compression)", _C["text"])
+                        _print(
+                            f"  helper:  {_helper_provider_str} / {_helper_model_str}  (context compression)",
+                            _C["text"],
+                        )
                     if _dev_models:
                         _print("  sub-agent slots (orchestrate):", _C["sky"])
                         for _dk in sorted(_dev_models, key=lambda x: int(x) if x.isdigit() else 999):
                             _dp, _dm = _dev_models[_dk]
-                            _fb = "  ← fallback" if _dk == min(
-                                (k for k in _dev_models if k.isdigit()), key=int, default=""
-                            ) else ""
+                            _fb = (
+                                "  ← fallback"
+                                if _dk == min((k for k in _dev_models if k.isdigit()), key=int, default="")
+                                else ""
+                            )
                             _print(f"    dev_{_dk}: {_dp} / {_dm}{_fb}", _C["text"])
                     _print("", "")
                     _print("  available models:", _C["sky"])
@@ -4505,7 +4693,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     if _dev_head and _dev_head[0].lower().startswith("dev_"):
                         _slot_str = _dev_head[0][4:]
                         if not _slot_str.isdigit() or int(_slot_str) < 1:
-                            _print("  invalid slot: use /model dev_N <model>  (N≥1, e.g. /model dev_1 qwen2.5-coder:3b)", _C["yellow"])
+                            _print(
+                                "  invalid slot: use /model dev_N <model>  (N≥1, e.g. /model dev_1 qwen2.5-coder:3b)",
+                                _C["yellow"],
+                            )
                             return ("continue", user_input)
                         _slot_key = str(int(_slot_str))
                         _dev_rest = _dev_head[1].strip() if len(_dev_head) > 1 else ""
@@ -4515,7 +4706,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                                 _p, _m = _dev_models[_slot_key]
                                 _print(f"  dev_{_slot_key}: {_p} / {_m}", _C["text"])
                             else:
-                                _print(f"  dev_{_slot_key}: (not set — falls back to lowest configured slot, else orchestrator model)", _C["muted"])
+                                _print(
+                                    f"  dev_{_slot_key}: (not set — falls back to lowest configured slot, else orchestrator model)",
+                                    _C["muted"],
+                                )
                             _print("  usage: /model dev_N <model>  or  /model dev_N off", _C["muted"])
                             return ("continue", user_input)
                         if _dev_rest.lower() == "off":
@@ -4523,9 +4717,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                             _persist_dev_models(_dev_models)
                             _print(f"  dev_{_slot_key} cleared.", _C["green"])
                             return ("continue", user_input)
-                        _resolved_dev = _resolve_model_interactive(
-                            _dev_rest, usage_hint="/model dev_N"
-                        )
+                        _resolved_dev = _resolve_model_interactive(_dev_rest, usage_hint="/model dev_N")
                         if _resolved_dev is None:
                             return ("continue", user_input)
                         _dv_provider, _dv_model = _resolved_dev
@@ -4533,7 +4725,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         _persist_dev_models(_dev_models)
                         _print(f"  dev_{_slot_key} set: {_dv_provider} / {_dv_model}", _C["green"])
                         if _slot_key != "1" and "1" not in _dev_models:
-                            _print("  (tip: unconfigured slots fall back to the lowest configured slot; set dev_1 to define a default)", _C["muted"])
+                            _print(
+                                "  (tip: unconfigured slots fall back to the lowest configured slot; set dev_1 to define a default)",
+                                _C["muted"],
+                            )
                         return ("continue", user_input)
                     _resolved = _resolve_model_interactive(_model_arg, usage_hint="/model")
                     if _resolved is None:
@@ -4543,7 +4738,9 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     _known_models_for_provider = _KNOWN_MODELS.get(_new_provider, [])
                     if _known_models_for_provider and _new_model not in _known_models_for_provider:
                         _print(f"  ⚠ model '{_new_model}' is not in the known list for {_new_provider}", _C["yellow"])
-                        _print(f"    (possible typo? known models: {', '.join(_known_models_for_provider)})", _C["muted"])
+                        _print(
+                            f"    (possible typo? known models: {', '.join(_known_models_for_provider)})", _C["muted"]
+                        )
                     if _new_model == _model_str and _new_provider == _provider_str:
                         _print(f"  already using {_new_provider} / {_new_model}", _C["muted"])
                     else:
@@ -4603,6 +4800,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                             try:
                                 from external_llm.client import create_llm_client as _create_llm
                                 from external_llm.client import resolve_provider_base_url
+
                                 svc.llm_service.client = _create_llm(
                                     provider=_new_provider,
                                     api_key=_ak,
@@ -4631,6 +4829,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         # show their real window so eviction's 75% gate is reachable.
                         try:
                             from external_llm.agent.context_budget import _resolve_context_limit as _rcl
+
                             _ctx = _rcl(_model_str)
                             if _ctx >= 1_000_000:
                                 _print(
@@ -4647,9 +4846,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         # ── Autocomplete context sync ──
                         _set_completer_context(_provider_str, _model_str)
                         # ── Model state persistence (restored on CLI restart) ──
-                        _update_terminal_config(
-                            {"provider": _provider_str, "model": _model_str}
-                        )
+                        _update_terminal_config({"provider": _provider_str, "model": _model_str})
             elif _cmd_name == "/helper":
                 # Context compression-only model. When set, compression (schedule_background_
                 # compress / /clear's compact_now) uses this model's
@@ -4661,7 +4858,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         _print(f"  compression helper: {_helper_provider_str} / {_helper_model_str}", _C["text"])
                         _print("  (use '/helper off' to fall back to the main model)", _C["muted"])
                     else:
-                        _print(f"  compression helper: (none — using main model {_provider_str} / {_model_str})", _C["muted"])
+                        _print(
+                            f"  compression helper: (none — using main model {_provider_str} / {_model_str})",
+                            _C["muted"],
+                        )
                     _print("", "")
                     _print("  usage: /helper <name>  or  /helper off", _C["muted"])
                     _print("  e.g.:  /helper gpt-4o-mini  or  /helper deepseek/deepseek-chat", _C["muted"])
@@ -4670,12 +4870,12 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     _helper_model_str = ""
                     _helper_client = None
                     _persist_helper(_helper_provider_str, _helper_model_str)
-                    _print(f"  compression helper cleared — using main model {_provider_str} / {_model_str}", _C["green"])
+                    _print(
+                        f"  compression helper cleared — using main model {_provider_str} / {_model_str}", _C["green"]
+                    )
                 else:
                     # ── Model name resolution: provider/name or autocomplete ──
-                    _resolved = _resolve_model_interactive(
-                        _helper_arg, usage_hint="/helper"
-                    )
+                    _resolved = _resolve_model_interactive(_helper_arg, usage_hint="/helper")
                     if _resolved is None:
                         return ("continue", user_input)
                     _new_provider, _new_model = _resolved
@@ -4695,7 +4895,16 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     _print("  (context compression will use this model instead of the main model)", _C["muted"])
             elif _cmd_name == "/status":
                 _helper_str = f"{_helper_provider_str} / {_helper_model_str}" if _helper_model_str else ""
-                _render_status(repo_root, _provider_str, _model_str, _cur_mode, _session_tokens, _thinking_state, _reasoning_effort, helper=_helper_str)
+                _render_status(
+                    repo_root,
+                    _provider_str,
+                    _model_str,
+                    _cur_mode,
+                    _session_tokens,
+                    _thinking_state,
+                    _reasoning_effort,
+                    helper=_helper_str,
+                )
             elif _cmd_name == "/copy":
                 if not _last_final_msg.strip():
                     _print("  no final message to copy yet.", _C["muted"])
@@ -4703,14 +4912,12 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     _via = _copy_to_clipboard(_last_final_msg)
                     if _via:
                         _print(
-                            f"  ✓ copied final message to clipboard "
-                            f"({len(_last_final_msg)} chars · {_via})",
+                            f"  ✓ copied final message to clipboard ({len(_last_final_msg)} chars · {_via})",
                             _C.get("green", "green"),
                         )
                     else:
                         _print(
-                            "  ✗ clipboard copy failed — no pbcopy/xclip/wl-copy "
-                            "and terminal lacks OSC 52 support.",
+                            "  ✗ clipboard copy failed — no pbcopy/xclip/wl-copy and terminal lacks OSC 52 support.",
                             _C["yellow"],
                         )
             elif _cmd_name == "/clear":
@@ -4734,13 +4941,15 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         _clr_spinner = threading.Thread(target=_clr_spin, daemon=True)
                         if _clr_tty:
                             _clr_spinner.start()
-                        else:
+                        else:  # pragma: no cover - non-tty stderr; the pty test env always has a tty
                             _print("  Compacting conversation into summary…", "dim")
                         try:
                             _clr_client, _clr_model = _get_compress_llm()
                             _compacted = _session_mgr.compact_now(
-                                _ds_clear, _clr_model,
-                                _clr_client, recent_keep=0,
+                                _ds_clear,
+                                _clr_model,
+                                _clr_client,
+                                recent_keep=0,
                             )
                         finally:
                             _clr_stop.set()
@@ -4749,8 +4958,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                                 sys.stderr.write("\r\033[K")
                                 sys.stderr.flush()
                 except Exception as _ce:
-                    logging.getLogger(__name__).debug(
-                        "/clear compaction failed: %s", _ce)
+                    logging.getLogger(__name__).debug("/clear compaction failed: %s", _ce)
                 # 2. Screen clear + banner
                 if sys.stdout.isatty():
                     sys.stdout.write("\x1b[2J\x1b[3J\x1b[H")
@@ -4776,8 +4984,9 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     select_entries_older_than,
                     serialize_insights,
                 )
+
                 _ins_rest = _cmd_tok[1].strip() if len(_cmd_tok) > 1 else ""
-                _ins_sub = (_ins_rest.split(None, 1)[0].lower() if _ins_rest else "list")
+                _ins_sub = _ins_rest.split(None, 1)[0].lower() if _ins_rest else "list"
                 _ins_path = os.path.join(repo_root, ".asicode", "design_insights.md")
 
                 if _ins_sub in ("", "list", "ls"):
@@ -4788,12 +4997,14 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         _ins_over = _ins_stats.bytes_size > COMPACT_BUDGET_BYTES
                         _ins_budget_s = (
                             f"  ⚠ over budget ({COMPACT_BUDGET_BYTES:,} bytes) — /insights compact will merge+tighten"
-                            if _ins_over else "")
+                            if _ins_over
+                            else ""
+                        )
                         _print(
                             f"  design_insights: {_ins_stats.count} entries · "
-                            f"{_ins_stats.bytes_size:,} bytes"
-                            + ("  ⚠ over budget" if _ins_over else ""),
-                            _C["yellow"] if _ins_over else _C["text"])
+                            f"{_ins_stats.bytes_size:,} bytes" + ("  ⚠ over budget" if _ins_over else ""),
+                            _C["yellow"] if _ins_over else _C["text"],
+                        )
                         if _ins_over:
                             _print(_ins_budget_s, _C["yellow"])
                         _, _ins_ents = parse_insights(load_insights_file(repo_root))
@@ -4810,12 +5021,19 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         # insights demoted to keep this file within budget.
                         try:
                             from external_llm.agent.insights_manager import load_archive_file
+
                             _ins_arch = parse_insights(load_archive_file(repo_root))[1]
                             if _ins_arch:
-                                _print(f"  archive: {len(_ins_arch)} demoted entries (not deleted; /insights archive list|restore <n>).", _C["muted"])
+                                _print(
+                                    f"  archive: {len(_ins_arch)} demoted entries (not deleted; /insights archive list|restore <n>).",
+                                    _C["muted"],
+                                )
                         except Exception:
                             logging.getLogger(__name__).debug("insights archive count failed", exc_info=True)
-                        _print("  /insights {list|archive|compact|verify|prune <days>|drop <n>|edit <n> <body>}", _C["muted"])
+                        _print(
+                            "  /insights {list|archive|compact|verify|prune <days>|drop <n>|edit <n> <body>}",
+                            _C["muted"],
+                        )
 
                 elif _ins_sub == "drop":
                     _ins_rest_toks = _ins_rest.split()
@@ -4855,7 +5073,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                             # so the round-trip invariant holds.  body= is NOT passed —
                             # it is a @property, not a dataclass field.
                             _hdr = _ins_old.lines[0] if _ins_old.lines else _ins_old.header_line + "\n"
-                            if not _hdr.endswith("\n"):
+                            if not _hdr.endswith("\n"):  # pragma: no cover - parser contract keeps the trailing \n
                                 _hdr += "\n"
                             _ins_new_ent = InsightEntry(
                                 lines=[_hdr, _ins_new_body.rstrip("\n") + "\n"],
@@ -4880,7 +5098,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         except ValueError:
                             _ins_days = None
                     if _ins_days is None or _ins_days < 0:
-                        _print("  usage: /insights prune <days>  (drop entries older than <days>, with confirmation)", _C["yellow"])
+                        _print(
+                            "  usage: /insights prune <days>  (drop entries older than <days>, with confirmation)",
+                            _C["yellow"],
+                        )
                     else:
                         _ins_content = load_insights_file(repo_root)
                         _ins_pre, _ins_ents = parse_insights(_ins_content)
@@ -4888,7 +5109,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         if not _ins_old_idx:
                             _print(f"  no entries older than {_ins_days} days.", _C["muted"])
                         else:
-                            _print(f"  {len(_ins_old_idx)} entr{'y' if len(_ins_old_idx)==1 else 'ies'} older than {_ins_days} days:", _C["yellow"])
+                            _print(
+                                f"  {len(_ins_old_idx)} entr{'y' if len(_ins_old_idx) == 1 else 'ies'} older than {_ins_days} days:",
+                                _C["yellow"],
+                            )
                             for _pi in _ins_old_idx:
                                 _pe = _ins_ents[_pi - 1]
                                 _page = entry_age_days(_pe)
@@ -4903,11 +5127,15 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                                 # Backup before overwrite (the file is gitignored)
                                 try:
                                     import shutil
+
                                     shutil.copy2(_ins_path, _ins_path + ".bak")
                                 except OSError:
                                     logging.getLogger(__name__).debug("insights prune backup failed", exc_info=True)
                                 atomic_write_text(_ins_path, serialize_insights(_ins_pre, _ins_keep))
-                                _print(f"  ✓ pruned {len(_ins_old_idx)} entries older than {_ins_days} days ({len(_ins_ents)}→{len(_ins_keep)}).", "dim")
+                                _print(
+                                    f"  ✓ pruned {len(_ins_old_idx)} entries older than {_ins_days} days ({len(_ins_ents)}→{len(_ins_keep)}).",
+                                    "dim",
+                                )
                             else:
                                 _print("  prune cancelled. File unchanged.", _C["muted"])
 
@@ -4920,7 +5148,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     _verify_insights_interactive()
 
                 elif _ins_sub not in _INSIGHTS_SUBCOMMANDS and _ins_sub != "ls":
-                    _print(f"  unknown subcommand '{_ins_sub}' — use: /insights [{'|'.join(_INSIGHTS_SUBCOMMANDS)}]", _C["yellow"])
+                    _print(
+                        f"  unknown subcommand '{_ins_sub}' — use: /insights [{'|'.join(_INSIGHTS_SUBCOMMANDS)}]",
+                        _C["yellow"],
+                    )
                     return ("continue", user_input)
 
             elif _cmd_name == "/failure-patterns":
@@ -4929,15 +5160,19 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 _fps_cmd = _fps_rest.split(None, 1)[0].lower() if _fps_rest else ""
                 try:
                     from external_llm.agent.failure_pattern_store import get_store
+
                     _fps = get_store(repo_root)
 
                     if _fps_cmd == "clear":
                         _fps_size = _fps.store_size()
                         _fps_size_str = (
-                            f" ({_fps_size} pattern{'' if _fps_size == 1 else 's'})"
-                            if _fps_size > 0 else ""
+                            f" ({_fps_size} pattern{'' if _fps_size == 1 else 's'})" if _fps_size > 0 else ""
                         )
-                        _ans = _collect_input(f"    Clear the failure-pattern store{_fps_size_str}? [y/N] ").strip().lower()
+                        _ans = (
+                            _collect_input(f"    Clear the failure-pattern store{_fps_size_str}? [y/N] ")
+                            .strip()
+                            .lower()
+                        )
                         if _ans in ("y", "yes"):
                             _fps.clear()
                             _print("  ✓ failure-pattern store cleared.", "dim")
@@ -4951,11 +5186,17 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                             try:
                                 _fps_prune_threshold = float(_fps_prune_toks[1])
                             except ValueError:
-                                _print("  usage: /failure-patterns prune [threshold]  (threshold default: 1.0)", _C["yellow"])
+                                _print(
+                                    "  usage: /failure-patterns prune [threshold]  (threshold default: 1.0)",
+                                    _C["yellow"],
+                                )
                                 return ("continue", user_input)
                         _fps_prune_count = _fps.prune(threshold=_fps_prune_threshold)
                         if _fps_prune_count > 0:
-                            _print(f"  ✓ pruned {_fps_prune_count} pattern{'' if _fps_prune_count == 1 else 's'} (effective < {_fps_prune_threshold})", "dim")
+                            _print(
+                                f"  ✓ pruned {_fps_prune_count} pattern{'' if _fps_prune_count == 1 else 's'} (effective < {_fps_prune_threshold})",
+                                "dim",
+                            )
                         else:
                             _print(f"  no patterns below threshold {_fps_prune_threshold} to prune.", _C["muted"])
 
@@ -4975,7 +5216,8 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                                 _fps_top_200 = _fps.top_patterns(limit=200)
                                 _fps_sub = _fps_drop_arg.lower()
                                 _fps_matches = [
-                                    _p for _p in _fps_top_200
+                                    _p
+                                    for _p in _fps_top_200
                                     if _fps_sub in _p.get("tool", "").lower()
                                     or _fps_sub in _p.get("reason", "").lower()
                                 ]
@@ -5000,7 +5242,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                                 _print(f"  no pattern #{_fps_drop_arg}  (valid: 1-{_fps.store_size()})", _C["yellow"])
 
                     elif _fps_cmd and _fps_cmd not in _FAILURE_PATTERNS_SUBCOMMANDS:
-                        _print(f"  unknown subcommand '{_fps_cmd}' — use: /failure-patterns [{'|'.join(_FAILURE_PATTERNS_SUBCOMMANDS)}]", _C["yellow"])
+                        _print(
+                            f"  unknown subcommand '{_fps_cmd}' — use: /failure-patterns [{'|'.join(_FAILURE_PATTERNS_SUBCOMMANDS)}]",
+                            _C["yellow"],
+                        )
                         return ("continue", user_input)
 
                     else:
@@ -5031,19 +5276,21 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         if _cmd_name == "/claude":
             _claude_raw = _cmd_tok[1].strip() if len(_cmd_tok) > 1 else ""
             # Parse `/claude [--fresh] [--model <name> | -m <name>] <task>`
-            _claude_model = None  # None → DEFAULT_COLLAB_MODEL (sonnet) — SDK default is user's default model (Opus-class), banned
+            _claude_model = (
+                None  # None → DEFAULT_COLLAB_MODEL (sonnet) — SDK default is user's default model (Opus-class), banned
+            )
             _claude_fresh = False  # True → do not share design session conversation context (blind verification)
             _rest = _claude_raw
             while True:
                 if _rest.startswith("--fresh"):
                     _claude_fresh = True
-                    _rest = _rest[len("--fresh"):].strip()
+                    _rest = _rest[len("--fresh") :].strip()
                 elif _rest.startswith("--model "):
-                    _sp_name, _, _rest = _rest[len("--model "):].strip().partition(" ")
+                    _sp_name, _, _rest = _rest[len("--model ") :].strip().partition(" ")
                     _claude_model = _sp_name.strip() or None
                     _rest = _rest.strip()
                 elif _rest.startswith("-m "):
-                    _sp_name, _, _rest = _rest[len("-m "):].strip().partition(" ")
+                    _sp_name, _, _rest = _rest[len("-m ") :].strip().partition(" ")
                     _claude_model = _sp_name.strip() or None
                     _rest = _rest.strip()
                 else:
@@ -5128,10 +5375,15 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             _tool_running_filter.active = True
             try:
                 import asyncio
-                _claude_result = asyncio.run(_run_collaborate_session(
-                    _claude_registry, _claude_config, _claude_task,
-                    context=_claude_context,
-                ))
+
+                _claude_result = asyncio.run(
+                    _run_collaborate_session(
+                        _claude_registry,
+                        _claude_config,
+                        _claude_task,
+                        context=_claude_context,
+                    )
+                )
                 _claude_display.print_summary(_claude_result)
                 _claude_display.flush_log()
                 # Claude→ASR: record verdict as a clearly source-labeled turn in the session —
@@ -5140,9 +5392,11 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 if _claude_result is not None and not _claude_result.error:
                     try:
                         _session_mgr.add_turn(
-                            _session_id, "assistant",
+                            _session_id,
+                            "assistant",
                             format_verdict_for_session(_claude_result, _claude_task),
-                            model="claude-code", exclude_from_compression=True,
+                            model="claude-code",
+                            exclude_from_compression=True,
                         )
                     except Exception:
                         logging.getLogger(__name__).debug("claude verdict record failed", exc_info=True)
@@ -5152,6 +5406,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 _print(f"  ✗ collaboration error: {_claude_err}", _C["red"])
                 if args.verbose:
                     import traceback as _tb_c
+
                     _tb_c.print_exc()
             finally:
                 # Stop ticker on cancel/error paths too — otherwise idle spinner keeps drawing
@@ -5168,22 +5423,22 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         # to maintain conversation order. If worker is still receiving response, wait here.
         if _pending_dc is not None:
             try:
-                _finalize_pending_design_chat(
-                    _pending_dc, _session_mgr, _session_id, svc.model or "")
+                _finalize_pending_design_chat(_pending_dc, _session_mgr, _session_id, svc.model or "")
             except KeyboardInterrupt:
                 _print("\nsession ended.", "")
                 return ("break", user_input)
             except Exception as _fe:
-                logging.getLogger(__name__).warning(
-                    "pending design chat finalize failed: %s", _fe)
+                logging.getLogger(__name__).warning("pending design chat finalize failed: %s", _fe)
             finally:
                 _pending_dc = None
 
         # ── Input length limit (prevents terminal/LLM overload) ──
         _input_truncated = False
         if len(user_input) > _cfg.lines.DESIGN_TURN_MAX_CHARS:
-            user_input = user_input[:_cfg.lines.DESIGN_TURN_MAX_CHARS] + "\n\n[TRUNCATED]"
-            _input_truncated = True
+            user_input = (
+                user_input[: _cfg.lines.DESIGN_TURN_MAX_CHARS] + "\n\n[TRUNCATED]"
+            )  # pragma: no cover - _collect_input caps at 50k < 100k
+            _input_truncated = True  # pragma: no cover - same unreachable guard
 
         # ── Mode switch prefix parsing: /general · /code · /orchestrate ──
         # /orchestrate is now a PERSISTENT mode (same model as /code and /general):
@@ -5202,20 +5457,23 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 _invalidate_next_suggestion()
                 _print("  switched to [General Chat] mode — no code context loaded.", _C["blue"])
                 _mode_switched = True
-            elif not _stripped[len("/general"):].strip():
+            elif not _stripped[len("/general") :].strip():
                 _print("  already in [General Chat] mode.", _C["sky"])
                 return ("continue", user_input)
-            user_input = _stripped[len("/general"):].lstrip()
+            user_input = _stripped[len("/general") :].lstrip()
         elif _stripped.startswith(("/orchestrate ", "/orch ")) or _stripped in {"/orchestrate", "/orch"}:
             # Extract the inline task (if any) after /orchestrate or /orch
             _tok0 = _cmd_tok[0].lower() if _cmd_tok else ""
-            _orch_inline = _stripped[len(_tok0):].lstrip() if _tok0 in ("/orchestrate", "/orch") else ""
+            _orch_inline = _stripped[len(_tok0) :].lstrip() if _tok0 in ("/orchestrate", "/orch") else ""
             if _current_chat_mode != "orchestrator":
                 _current_chat_mode = "orchestrator"
                 _ds = _session_mgr.get_or_create(_session_id)
                 _ds.chat_mode = "orchestrator"  # in-process sync only; NOT persisted to shared session
                 _persist_chat_mode("orchestrator")
-                _print("  switched to [Orchestrator] mode — decompose and dispatch tasks to sub-agents.  (/code to exit)", _C["blue"])
+                _print(
+                    "  switched to [Orchestrator] mode — decompose and dispatch tasks to sub-agents.  (/code to exit)",
+                    _C["blue"],
+                )
                 _mode_switched = True
             elif not _orch_inline:
                 # already in orchestrator mode AND no inline task → just nudge
@@ -5234,10 +5492,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 _invalidate_next_suggestion()
                 _print("  switched to [Code Chat] mode — full context loaded.", _C["blue"])
                 _mode_switched = True
-            elif not _stripped[len("/code"):].strip():
+            elif not _stripped[len("/code") :].strip():
                 _print("  already in [Code Chat] mode.", _C["sky"])
                 return ("continue", user_input)
-            user_input = _stripped[len("/code"):].lstrip()
+            user_input = _stripped[len("/code") :].lstrip()
 
         # ── /think on | off (thinking/reasoning toggle) ──
         if _cmd_name == "/think":
@@ -5274,17 +5532,14 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             if _reasoning_effort:
                 _state_label += f" (effort={_reasoning_effort})"
             # ── State persistence (restored on CLI restart) ──
-            _update_terminal_config(
-                {"thinking_state": _thinking_state, "reasoning_effort": _reasoning_effort}
-            )
+            _update_terminal_config({"thinking_state": _thinking_state, "reasoning_effort": _reasoning_effort})
             _print(f"  thinking/reasoning → {_state_label}", _C["sky"])
             return ("continue", user_input)
 
         # ── /auto [N|on|off] — auto-continue the suggested next step (self-improve loop) ──
         if _cmd_name == "/auto":
             _auto_arg = _cmd_tok[1].strip() if len(_cmd_tok) > 1 else ""
-            _new_on, _new_cap, _auto_err = _parse_auto_arg(
-                _auto_arg, _auto_continue_state["on"])
+            _new_on, _new_cap, _auto_err = _parse_auto_arg(_auto_arg, _auto_continue_state["on"])
             if _auto_err:
                 _print(f"  {_auto_err}", _C["yellow"])
                 return ("continue", user_input)
@@ -5297,11 +5552,14 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     f"  🔁 auto-continue ON — after each turn, a REQUIRED next step is "
                     f"auto-run after {_AUTO_CONTINUE_DELAY:.0f}s (max {_auto_continue_state['cap']} "
                     "consecutive; type/Esc cancels, Enter runs now, /auto off disables)",
-                    _C["sky"])
+                    _C["sky"],
+                )
                 if not _cfg.display.NEXT_SUGGEST:
-                    _print("  ▲ next-step suggestion is disabled in config "
-                           "(display.NEXT_SUGGEST) — auto-continue will never fire.",
-                           _C["yellow"])
+                    _print(
+                        "  ▲ next-step suggestion is disabled in config "
+                        "(display.NEXT_SUGGEST) — auto-continue will never fire.",
+                        _C["yellow"],
+                    )
             else:
                 _cancel_auto_submit()
                 _print("  🔁 auto-continue OFF", _C["sky"])
@@ -5355,11 +5613,12 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             # chat callback (user_checkpoint_callback / approval_callback) +
             # thinking_mode + thresholds, overriding only the per-task fields.
             import dataclasses as _dc
+
             _orch_cfg = _dc.replace(
                 design_config,
                 cancel_event=_orch_cancel,
                 stream_callback=_orch_printer,
-                _user_checkpoint_count=0,   # fresh question budget per task
+                _user_checkpoint_count=0,  # fresh question budget per task
             )
             _orch_registry = ToolRegistry(repo_root, _orch_cfg)
             _orch_client = create_llm_client(
@@ -5394,7 +5653,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 subagent_api_key=_orch_sub_api_key,
                 subagent_models=_orch_subagent_models,
             )
-            if sys.platform != "darwin":
+            if sys.platform != "darwin":  # pragma: no cover - macOS-only dev/test environment
                 _print(
                     "  ℹ non-macOS: sub-agents run as headless background workers "
                     "(logs in .asicode/subagents/<id>/worker.log)",
@@ -5426,6 +5685,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 _print(f"  ✗ orchestrator error: {_orch_err}", _C["red"])
                 if args.verbose:
                     import traceback as _tb_o
+
                     _tb_o.print_exc()
             finally:
                 _orch_printer._stop_spinner()
@@ -5434,7 +5694,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 _drain_stdin()
             if _orch_result:
                 _print("", "")
-                _print(f"  status: {_orch_result.status}", _C["green"] if _orch_result.status == "success" else _C["yellow"])
+                _print(
+                    f"  status: {_orch_result.status}",
+                    _C["green"] if _orch_result.status == "success" else _C["yellow"],
+                )
                 if _orch_result.summary:
                     _orch_body, _orch_ws = _split_work_state(_orch_result.summary)
                     if _orch_body.strip():
@@ -5442,23 +5705,29 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     if _RICH and asi._out_console:
                         try:
                             from rich.console import Group as _RichGroup
+
                             _RichMD = _rich_markdown_cls()
                             from rich.text import Text as _RichTxt
+
                             _f = asi._out_console.file
-                            if hasattr(_f, "reset_bol"):
+                            if hasattr(_f, "reset_bol"):  # pragma: no cover - plain file objects have no reset_bol
                                 _f.reset_bol()
                             _orch_rend: list = []
                             if _orch_body:
                                 _orch_rend.append(_RichMD(_orch_body))
-                            if _orch_ws:
+                            if _orch_ws:  # pragma: no cover - orchestrator results carry no workspace summary in tests
                                 _orch_rend.append(_RichTxt(_orch_ws, style=_C["muted"]))
                             asi._out_console.print()
-                            asi._out_console.print(_bar_panel(
-                                _RichGroup(*_orch_rend) if len(_orch_rend) > 1 else (_orch_rend[0] if _orch_rend else _RichTxt("")),
-                                title=_RichTxt(" ✦ orchestrator ", style=f"bold {_C['blue']}"),
-                                color=_C["blue"],
-                            ))
-                        except Exception:
+                            asi._out_console.print(
+                                _bar_panel(
+                                    _RichGroup(*_orch_rend)
+                                    if len(_orch_rend) > 1
+                                    else (_orch_rend[0] if _orch_rend else _RichTxt("")),
+                                    title=_RichTxt(" ✦ orchestrator ", style=f"bold {_C['blue']}"),
+                                    color=_C["blue"],
+                                )
+                            )
+                        except Exception:  # pragma: no cover - defensive render fallback
                             _print(f"\n{_orch_result.summary}", "")
                     else:
                         _print(f"\n{_orch_body}", "")
@@ -5473,7 +5742,9 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 _orch_summary = _orch_result.summary or f"[Orchestration status: {_orch_result.status}]"
                 try:
                     _session_mgr.add_turn(
-                        _session_id, "assistant", _orch_summary,
+                        _session_id,
+                        "assistant",
+                        _orch_summary,
                         model=svc.model or "",
                         digest=_build_orchestrator_digest(_orch_result),
                         auto=_was_auto_input,
@@ -5482,8 +5753,8 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     # not grow unbounded (same safeguard as design-chat).
                     _comp_client, _comp_model = _get_compress_llm()
                     _session_mgr.schedule_background_compress(
-                        _session_mgr.get_or_create(_session_id), _comp_model,
-                        _comp_client, notify=_deferred_notify)
+                        _session_mgr.get_or_create(_session_id), _comp_model, _comp_client, notify=_deferred_notify
+                    )
                 except Exception:
                     logging.getLogger(__name__).debug("orchestrator turn persist failed", exc_info=True)
             else:
@@ -5491,7 +5762,9 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 # turn so the session doesn't leave it dangling.
                 try:
                     _session_mgr.add_turn(
-                        _session_id, "assistant", "[Orchestration produced no result.]",
+                        _session_id,
+                        "assistant",
+                        "[Orchestration produced no result.]",
                         model=svc.model or "",
                         auto=_was_auto_input,
                     )
@@ -5502,7 +5775,9 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
 
         # ── Design Chat execution (all requests go through Design Chat first) ──
         if _input_truncated:
-            _print(f"  ▲ input truncated to {_cfg.lines.DESIGN_TURN_MAX_CHARS} chars.", _C["yellow"])
+            _print(
+                f"  ▲ input truncated to {_cfg.lines.DESIGN_TURN_MAX_CHARS} chars.", _C["yellow"]
+            )  # pragma: no cover - see _MAX_INPUT_CHARS cap above
 
         # Ctrl+C graceful-exit hooks — declared before the try so the
         # KeyboardInterrupt handler below can reference them even when the
@@ -5521,7 +5796,9 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             # mistaking it for their own request and duplicating execution
             _session_mgr.add_turn(_session_id, "user", _store_content, in_progress=True, auto=_was_auto_input)
             _ds = _session_mgr.get_or_create(_session_id)
-            _context_msgs = _session_mgr.build_context_messages(_ds, current_model=svc.model or "", mode=_current_chat_mode)
+            _context_msgs = _session_mgr.build_context_messages(
+                _ds, current_model=svc.model or "", mode=_current_chat_mode
+            )
             # Attach images to the LAST USER message — the context builder may
             # append trailing system messages (current-request marker, mode
             # notice) after it, so "last message" is not necessarily the request.
@@ -5530,8 +5807,11 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 default=-1,
             )
             _messages_for_llm = [
-                LLMMessage(role=_cm["role"], content=_cm["content"],
-                          images=(_current_user_images or None) if _i == _last_user_idx else None)
+                LLMMessage(
+                    role=_cm["role"],
+                    content=_cm["content"],
+                    images=(_current_user_images or None) if _i == _last_user_idx else None,
+                )
                 for _i, _cm in enumerate(_context_msgs)
             ]
 
@@ -5539,12 +5819,15 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             if _current_user_images:
                 try:
                     from external_llm.providers import _images_to_text
+
                     _ocr_text = _images_to_text(_current_user_images)
                     if _ocr_text.strip():
-                        _messages_for_llm.append(LLMMessage(
-                            role="system",
-                            content=f"=== ATTACHED IMAGE(S) OCR TEXT ===\n{_ocr_text}\n=== END OCR TEXT ===",
-                        ))
+                        _messages_for_llm.append(
+                            LLMMessage(
+                                role="system",
+                                content=f"=== ATTACHED IMAGE(S) OCR TEXT ===\n{_ocr_text}\n=== END OCR TEXT ===",
+                            )
+                        )
                 except Exception:
                     logging.getLogger(__name__).debug("OCR enrichment failed", exc_info=True)
 
@@ -5588,9 +5871,15 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             # right before next input — ensures interrupt note is recorded before new user turn.
             _dc_box: dict = {"result": None, "error": None, "elapsed": 0.0}
 
-            def _dc_worker(_box=_dc_box, _loop=design_loop, _msgs=_messages_for_llm,
-                           _cb=design_cb, _mode=_current_chat_mode,
-                           _thinking=_thinking_state, _effort=_reasoning_effort):
+            def _dc_worker(
+                _box=_dc_box,
+                _loop=design_loop,
+                _msgs=_messages_for_llm,
+                _cb=design_cb,
+                _mode=_current_chat_mode,
+                _thinking=_thinking_state,
+                _effort=_reasoning_effort,
+            ):
                 try:
                     # NOTE: token_callback not passed — CLI does not use token-by-token streaming.
                     # Uses only design_thinking_start/stop events
@@ -5616,7 +5905,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     # show how long the loop ran in the status line.
                     try:
                         _box["elapsed"] = time.monotonic() - _t_dc0
-                    except NameError:
+                    except NameError:  # pragma: no cover - _t_dc0 is the first statement of the try
                         logging.getLogger(__name__).debug("dc worker: t0 unbound (early failure)")
 
             _dc_thread = threading.Thread(target=_dc_worker, daemon=True)
@@ -5653,7 +5942,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             if chat_result is None:
                 _print("  ▲ design chat returned no result — please retry.", _C["yellow"])
                 _session_mgr.add_turn(
-                    _session_id, "assistant", "[No result — please retry.]", model=svc.model or "",
+                    _session_id,
+                    "assistant",
+                    "[No result — please retry.]",
+                    model=svc.model or "",
                     auto=_was_auto_input,
                 )
                 return "continue"
@@ -5674,9 +5966,13 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             _print(f"  ✗ design chat error: {_de}", _C["red"])
             if args.verbose:
                 import traceback as _tb
+
                 _tb.print_exc()
             _session_mgr.add_turn(
-                _session_id, "assistant", f"[Error: {_de}]", model=svc.model or "",
+                _session_id,
+                "assistant",
+                f"[Error: {_de}]",
+                model=svc.model or "",
                 auto=_was_auto_input,
             )
             return "continue"
@@ -5692,11 +5988,14 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
         # gate and ctx display work for EVERY model. Resolved outside `if _dt:`
         # so the gate still sees a valid budget on turns that report no tokens.
         from external_llm.agent.context_budget import _resolve_context_limit
+
         _ctx_budget = _resolve_context_limit(
             svc.model or chat_result.provider or args.provider or "",
-            base_url=getattr(getattr(svc.llm_service, 'client', None), 'base_url', None))
+            base_url=getattr(getattr(svc.llm_service, "client", None), "base_url", None),
+        )
         if _dt:
             from external_llm.agent._shared_utils import cache_cost_summary
+
             _provider = chat_result.provider or args.provider or ""
             _pt = chat_result.prompt_tokens or 0
             _ct = chat_result.completion_tokens or 0
@@ -5706,9 +6005,15 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             # full_cost = no-cache counterfactual; _actual = true billed cost.
             # Provider-aware: Anthropic reports prompt EXCLUDING cache, so the cost
             # math and hit% denominator differ from DeepSeek (which includes it).
-            _zai_base_url = getattr(getattr(svc.llm_service, 'client', None), 'base_url', '') or ''
+            _zai_base_url = getattr(getattr(svc.llm_service, "client", None), "base_url", "") or ""
             _cost, _actual, _hit_pct = cache_cost_summary(
-                _provider, _pt, _ct, _crt, _cct, model=svc.model or "", base_url=_zai_base_url,
+                _provider,
+                _pt,
+                _ct,
+                _crt,
+                _cct,
+                model=svc.model or "",
+                base_url=_zai_base_url,
             )
             _session_tokens["prompt"] += _pt
             _session_tokens["completion"] += _ct
@@ -5721,9 +6026,9 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 _ctx_pct = _lpt * 100 // _ctx_budget
                 # Show 1 decimal place for sub-1K values to avoid "0K" (e.g., 0.4K)
                 if _ctx_budget >= 1_000_000:
-                    _groups.append(f"ctx {_lpt/1000:.1f}K / {_ctx_budget/1_000_000:.0f}M ({_ctx_pct}%)")
+                    _groups.append(f"ctx {_lpt / 1000:.1f}K / {_ctx_budget / 1_000_000:.0f}M ({_ctx_pct}%)")
                 else:
-                    _groups.append(f"ctx {_lpt/1000:.1f}K / {_ctx_budget//1000}K ({_ctx_pct}%)")
+                    _groups.append(f"ctx {_lpt / 1000:.1f}K / {_ctx_budget // 1000}K ({_ctx_pct}%)")
             # Per-turn ambient status line — money is intentionally excluded: the
             # dollar amount is an estimate, not exact billing, so it is not shown on
             # any CLI surface (debug _log only). Token counts and the cache-hit ratio
@@ -5766,12 +6071,11 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             _print(f"\n{chat_result.content}", _C["red"])
             _dc_error_shown = True
             if _prompt_auth_retry_key(
-                svc.llm_service.provider, svc,
+                svc.llm_service.provider,
+                svc,
                 error_message=chat_result.content,
             ):
-                design_loop = DesignChatLoop(
-                    svc.llm_service.client, design_registry, svc.model
-                )
+                design_loop = DesignChatLoop(svc.llm_service.client, design_registry, svc.model)
                 _retry_cb = _ProgressPrinter(verbose=args.verbose)
                 _retry_cb._start_spinner("  🔄 retrying with new API key")
                 try:
@@ -5813,29 +6117,36 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             elif _RICH and asi._out_console:
                 try:
                     from rich.console import Group as _RichGroup
+
                     _RichMD = _rich_markdown_cls()
                     from rich.text import Text as _RichTxt
+
                     # Final answer also gets left gutter bar — same family as … thinking (mid-utterance),
                     # with title ✦(blue) to distinguish as "this turn's final answer"
                     _f = asi._out_console.file
-                    if hasattr(_f, "reset_bol"):
+                    if hasattr(_f, "reset_bol"):  # pragma: no cover - plain file objects have no reset_bol
                         _f.reset_bol()
                     _renderables: list = []
                     if _dc_body:
                         _renderables.append(_RichMD(_dc_body))
                     asi._out_console.print()
-                    asi._out_console.print(_bar_panel(
-                        _RichGroup(*_renderables),
-                        title=_RichTxt(" ✦ ", style=f"bold {_C['blue']}"),
-                        color=_C["blue"],
-                    ))
-                except Exception:
+                    asi._out_console.print(
+                        _bar_panel(
+                            _RichGroup(*_renderables),
+                            title=_RichTxt(" ✦ ", style=f"bold {_C['blue']}"),
+                            color=_C["blue"],
+                        )
+                    )
+                except Exception:  # pragma: no cover - defensive render fallback
                     _print(f"\n{chat_result.content}", "")
             elif _dc_body:
                 _print(f"\n{_dc_body}", "")
         _turn_digest = _build_turn_digest(chat_result)
         _session_mgr.add_turn(
-            _session_id, "assistant", chat_result.content, model=svc.model or "",
+            _session_id,
+            "assistant",
+            chat_result.content,
+            model=svc.model or "",
             digest=_turn_digest,
             auto=_was_auto_input,
         )
@@ -5848,16 +6159,18 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 # turns. Compression (summarize) fires only once the live context window
                 # nears its limit, preempting the lossy hard-cap front-trim. force=True
                 # bypasses the turn-count gate in needs_compression().
-                if _ctx_budget and _lpt and (
-                    _lpt / _ctx_budget >= _cfg.compression.GENERAL_MODE_COMPRESS_OCCUPANCY
-                ):
+                if _ctx_budget and _lpt and (_lpt / _ctx_budget >= _cfg.compression.GENERAL_MODE_COMPRESS_OCCUPANCY):
                     _session_mgr.schedule_background_compress(
-                        _session_mgr.get_or_create(_session_id), _comp_model,
-                        _comp_client, notify=_deferred_notify, force=True)
+                        _session_mgr.get_or_create(_session_id),
+                        _comp_model,
+                        _comp_client,
+                        notify=_deferred_notify,
+                        force=True,
+                    )
             else:
                 _session_mgr.schedule_background_compress(
-                    _session_mgr.get_or_create(_session_id), _comp_model,
-                    _comp_client, notify=_deferred_notify)
+                    _session_mgr.get_or_create(_session_id), _comp_model, _comp_client, notify=_deferred_notify
+                )
 
         # ── This turn's change summary (per-file +N -M) — enables /diff · /undo ──
         if _turn_baseline:
@@ -5885,21 +6198,22 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         _last_run_diff["repo_root"] = repo_root
                         _last_run_diff["baseline"] = None
                         _last_run_diff["checkpoint"] = _turn_cp
-                        _print(f"  {len(_cp_files)} file(s) changed  ·  /undo revert",
-                               _C["muted"])
+                        _print(f"  {len(_cp_files)} file(s) changed  ·  /undo revert", _C["muted"])
             except Exception:
-                logging.getLogger(__name__).debug(
-                    "turn checkpoint summary failed", exc_info=True
-                )
+                logging.getLogger(__name__).debug("turn checkpoint summary failed", exc_info=True)
 
         # ── Next-task ghost suggestion generation (background, helper model) ──
         if _cfg.display.NEXT_SUGGEST and not chat_result.is_error:
             try:
                 _sug_client, _sug_model = _get_compress_llm()
                 _kick_next_prompt_suggestion(
-                    _sug_client, _sug_model, user_input,
-                    chat_result.content or "", _turn_digest,
-                    auto_mode=_auto_continue_state["on"])
+                    _sug_client,
+                    _sug_model,
+                    user_input,
+                    chat_result.content or "",
+                    _turn_digest,
+                    auto_mode=_auto_continue_state["on"],
+                )
             except Exception:
                 logging.getLogger(__name__).debug("next-task suggestion kick failed", exc_info=True)
         elif chat_result.is_error and _auto_continue_state["on"]:
@@ -5931,8 +6245,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             if _auto_continue_state["on"]:
                 # Persistent mode indicator — the countdown fires turns later,
                 # so the user must be able to see the mode is armed.
-                _status_bits.append(
-                    f"🔁 auto-continue {_auto_continue_state['depth']}/{_auto_continue_state['cap']}")
+                _status_bits.append(f"🔁 auto-continue {_auto_continue_state['depth']}/{_auto_continue_state['cap']}")
             user_input = _prompt_input(chat_mode=_current_mode, status="  ·  ".join(_status_bits))
             # ── Auto-continue depth bookkeeping ──
             # Countdown-submitted input deepens the chain (capped); any manual
@@ -5943,7 +6256,8 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 _auto_continue_state["depth"] += 1
                 _print(
                     f"  🔁 auto-continue step {_auto_continue_state['depth']}/{_auto_continue_state['cap']}",
-                    _C["muted"])
+                    _C["muted"],
+                )
             else:
                 _auto_continue_state["depth"] = 0
 
@@ -5957,8 +6271,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                     _detected = _clip_images
             if _detected:
                 _img_hint = "  📷 " + ", ".join(
-                    f"{img['media_type']} ({len(img['data'])}B base64)"
-                    for img in _detected
+                    f"{img['media_type']} ({len(img['data'])}B base64)" for img in _detected
                 )
                 _print(_img_hint, _C["teal"])
                 user_input = _clean_input
@@ -5986,7 +6299,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
 
         # ── Chat turn: orchestrator / design-chat execution + post-processing ──
         _turn_act = _run_chat_turn(user_input)
-        if _turn_act == "break":
+        if _turn_act == "break":  # pragma: no cover - Ctrl+C mid-turn; the plain-prompt ^C path exits earlier
             break
         if _turn_act == "continue":
             continue
@@ -5999,6 +6312,8 @@ def run_repl(args: argparse.Namespace) -> None:
     original monolith — P1-1, docs/improvement_proposals.md).
     """
     _run_repl_impl(args)
+
+
 def _extract_patched_file(p) -> str:
     """Extract a repo-relative file path from one ``applied_patches`` entry.
 
@@ -6022,9 +6337,10 @@ def _extract_patched_file(p) -> str:
     # Structured tool-op prefixes: edit_file:PATH:..., edit_text:PATH:...
     for _prefix in ("edit_file:", "edit_text:", "modify_symbol:"):
         if s.startswith(_prefix):
-            return s[len(_prefix):].split(":", 1)[0].strip()
+            return s[len(_prefix) :].split(":", 1)[0].strip()
     # Raw unified-diff / patch text: prefer '+++ b/PATH', then 'diff --git a/PATH b/PATH'.
     import re
+
     _m = re.search(r"^\+\+\+ b/(.+)$", s, re.MULTILINE)
     if _m:
         return _m.group(1).strip()
@@ -6054,6 +6370,8 @@ def _turns_to_int(turns) -> int:
     if isinstance(turns, (int, float)):
         return int(turns)
     return 0
+
+
 def _result_output_dict(result, elapsed: float) -> dict:
     """Build the machine-readable result dict shared by --json and --json-stream.
 
@@ -6091,27 +6409,19 @@ def _result_output_dict(result, elapsed: float) -> dict:
         # can read ONE field for "why did it fail" instead of special-casing the
         # status. The engine surfaces a cancel as result.error="" on some paths;
         # fill the canonical reason there so error is never null on cancelled.
-        "error": (
-            result.error
-            or ("Request cancelled by user" if result.status == "cancelled" else None)
-        ),
+        "error": (result.error or ("Request cancelled by user" if result.status == "cancelled" else None)),
         "duration_ms": int(elapsed * 1000),
         "tokens_in": tokens.get("prompt", 0),
         "tokens_out": tokens.get("completion", 0),
         "total_tokens": tokens.get("total", 0),
         "cost_usd": tokens.get("cost_usd", 0),
         "patches": len(result.applied_patches) if result.applied_patches else 0,
-        "patched_files": [
-            _f for _f in (_extract_patched_file(p) for p in (result.applied_patches or [])) if _f
-        ],
+        "patched_files": [_f for _f in (_extract_patched_file(p) for p in (result.applied_patches or [])) if _f],
         # result.turns is ``list[AgentTurn]`` on the AgentResult path but an
         # ``int`` on the --orchestrate adapter path (see ``_turns_to_int``). When
         # it's falsy (empty list / 0), fall back to metadata["turns_used"], which
         # is where the normal MAIN_AGENT tool loop records the real turn count.
-        "turns": (
-            _turns_to_int(result.turns)
-            or int((getattr(result, "metadata", None) or {}).get("turns_used") or 0)
-        ),
+        "turns": (_turns_to_int(result.turns) or int((getattr(result, "metadata", None) or {}).get("turns_used") or 0)),
         "questions": questions,
     }
 
@@ -6129,28 +6439,35 @@ def _build_json_output(result, elapsed: float) -> None:
     except Exception as _bo_exc:
         logging.getLogger(__name__).exception("_build_json_output failed")
         _json_error_output(
-            "unexpected_error", f"output build failed: {_bo_exc}",
+            "unexpected_error",
+            f"output build failed: {_bo_exc}",
             duration_ms=int(elapsed * 1000),
         )
 
 
 def _json_error_output(status: str, error: str, duration_ms: int = 0) -> None:
     """Print minimal JSON error output to stdout (for --json flag / Tenet integration)."""
-    print(json.dumps({
-        "status": status,
-        "output": "",
-        "error": error,
-        "duration_ms": duration_ms,
-        "tokens_in": 0,
-        "tokens_out": 0,
-        "total_tokens": 0,
-        "cost_usd": 0,
-        "patches": 0,
-        "turns": 0,
-        # Stable schema: every status (success AND error) carries a questions
-        # list so consumers can read one field unconditionally without KeyError.
-        "questions": [],
-    }, ensure_ascii=False), flush=True)
+    print(
+        json.dumps(
+            {
+                "status": status,
+                "output": "",
+                "error": error,
+                "duration_ms": duration_ms,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "total_tokens": 0,
+                "cost_usd": 0,
+                "patches": 0,
+                "turns": 0,
+                # Stable schema: every status (success AND error) carries a questions
+                # list so consumers can read one field unconditionally without KeyError.
+                "questions": [],
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
 
 def _json_stream_emit(event: str, payload=None, **extra) -> None:
@@ -6189,9 +6506,10 @@ def _orchestrator_result_to_agent_like(orch_result):
     builder's ``_extract_patched_file`` normalizes both.
     """
     from types import SimpleNamespace
+
     _patches: list = []
     _turns = 0
-    for _sr in (getattr(orch_result, "subtask_results", None) or []):
+    for _sr in getattr(orch_result, "subtask_results", None) or []:
         if _sr is None:
             continue
         _patches.extend(getattr(_sr, "applied_patches", None) or [])
@@ -6212,7 +6530,11 @@ def _orchestrator_result_to_agent_like(orch_result):
 
 
 def _run_orchestrate_single_shot(
-    args: argparse.Namespace, repo_root: str, prompt: str, _stream_cb, cancel_event,
+    args: argparse.Namespace,
+    repo_root: str,
+    prompt: str,
+    _stream_cb,
+    cancel_event,
 ) -> "Any":
     """F5: build and run a single-shot OrchestratorAgent (``--orchestrate``).
 
@@ -6228,7 +6550,9 @@ def _run_orchestrate_single_shot(
     from external_llm.intelligent_service import create_intelligent_service_from_env
 
     svc = create_intelligent_service_from_env(
-        args.provider or None, args.model or None, api_key=args.api_key or None,
+        args.provider or None,
+        args.model or None,
+        api_key=args.api_key or None,
     )
     if svc is None:
         raise RuntimeError(
@@ -6240,7 +6564,7 @@ def _run_orchestrate_single_shot(
         stream_callback=_stream_cb,
         consume_content_events=False,
         cancel_event=cancel_event,
-        unrestricted_read=True,   # trusted local CLI
+        unrestricted_read=True,  # trusted local CLI
     )
     if getattr(args, "thinking_mode", None) is not None:
         _cfg.thinking_mode = args.thinking_mode
@@ -6293,9 +6617,11 @@ def run_once(args: argparse.Namespace, prompt: str) -> int:
     # (stream_callback(event, data)); it never reaches for printer-only methods.
     _use_json_blob = bool(getattr(args, "json", False)) and not _use_json_stream
     if _use_json_stream:
+
         def _stream_cb(event, payload=None, **kw):
             _json_stream_emit(event, payload, **kw)
     elif _use_json_blob:
+
         def _stream_cb(*_a, **_k):
             pass
     else:
@@ -6326,7 +6652,11 @@ def run_once(args: argparse.Namespace, prompt: str) -> int:
             # events flow through _stream_cb (NDJSON under --json-stream).
             _run_baseline = _git_baseline(repo_root)
             _orch_result = _run_orchestrate_single_shot(
-                args, repo_root, prompt, _stream_cb, cancel_event,
+                args,
+                repo_root,
+                prompt,
+                _stream_cb,
+                cancel_event,
             )
             result = _orchestrator_result_to_agent_like(_orch_result)
             elapsed = time.perf_counter() - t0
@@ -6344,8 +6674,7 @@ def run_once(args: argparse.Namespace, prompt: str) -> int:
                 reasoning_effort=getattr(args, "reasoning_effort", None),
                 scoped_verification=(
                     getattr(args, "scoped_verification", True)
-                    or os.environ.get("ASICODE_SCOPED_VERIFICATION", "").strip().lower()
-                    in ("1", "true", "yes", "on")
+                    or os.environ.get("ASICODE_SCOPED_VERIFICATION", "").strip().lower() in ("1", "true", "yes", "on")
                 ),
             )
             loop = _build_engine(config=engine_config)
@@ -6364,20 +6693,26 @@ def run_once(args: argparse.Namespace, prompt: str) -> int:
     except Exception as e:
         elapsed = time.perf_counter() - t0
         if _use_json_stream:
-            _json_stream_emit("error", {"status": "unexpected_error", "error": str(e), "duration_ms": int(elapsed * 1000)})
+            _json_stream_emit(
+                "error", {"status": "unexpected_error", "error": str(e), "duration_ms": int(elapsed * 1000)}
+            )
         elif args.json:
             _json_error_output("unexpected_error", str(e), duration_ms=int(elapsed * 1000))
         else:
             _print(f"unexpected error: {e}", _C["red"])
             if args.verbose:
                 import traceback
+
                 traceback.print_exc()
         return 1
 
     if result is None:
         elapsed = time.perf_counter() - t0
         if _use_json_stream:
-            _json_stream_emit("cancelled", {"status": "cancelled", "error": "Request cancelled by user", "duration_ms": int(elapsed * 1000)})
+            _json_stream_emit(
+                "cancelled",
+                {"status": "cancelled", "error": "Request cancelled by user", "duration_ms": int(elapsed * 1000)},
+            )
         elif args.json:
             _json_error_output("cancelled", "Request cancelled by user", duration_ms=int(elapsed * 1000))
         else:
@@ -6389,9 +6724,12 @@ def run_once(args: argparse.Namespace, prompt: str) -> int:
     # automation sees ONE cancel exit code regardless of whether the engine
     # surfaced the cancel as None or as a result with status="cancelled".
     _exit_for_status = (
-        0 if result.status in ("success", "already_satisfied")
-        else 2 if result.status == "clarification_needed"
-        else 130 if result.status == "cancelled"
+        0
+        if result.status in ("success", "already_satisfied")
+        else 2
+        if result.status == "clarification_needed"
+        else 130
+        if result.status == "cancelled"
         else 1
     )
 
@@ -6424,541 +6762,18 @@ def run_once(args: argparse.Namespace, prompt: str) -> int:
 # ─── Entry point ──────────────────────────────────────────────────────────────────
 
 
-def run_subagent_worker(args: argparse.Namespace) -> None:
-    """Sub-agent worker mode: poll task.json → run → write result.json.
 
-    Watches ``.asicode/subagents/<subagent_id>/task.json``; when a task arrives,
-    runs it via DesignChatLoop and writes ``result.json`` back.  Stays alive in a
-    loop so the orchestrator can reuse the worker for subsequent tasks (Ctrl-C
-    to exit).
+# ─── R1: sub-agent worker moved to repl_subagent.py (extracted seam) ─────────
+# The worker loop and its turn-budget resolver now live in
+# external_llm/repl/repl_subagent.py (lazy ``import asi`` inside the function),
+# so importing THIS module never triggers the asi ↔ repl_impl cycle twice.
+# Re-exported here to keep the public surface (asi.py barrel + any
+# ``from external_llm.repl.repl_impl import run_subagent_worker``) unchanged.
+from external_llm.repl.repl_subagent import (  # noqa: E402, F401, I001 — bottom re-export
+    _resolve_subagent_max_turns,
+    run_subagent_worker,
+)
 
-    Launched automatically by ``/orchestrate`` (auto_launch_terminal on macOS)
-    or manually: ``asi --subagent --subagent-id <id> --provider ... --model ...``
-    """
-    global _REPO_ROOT
-    repo_root = _resolve_repo_root(args.repo)
-    _REPO_ROOT = repo_root
-
-    agent_id = args.subagent_id
-    if not agent_id:
-        _print("--subagent-id is required with --subagent", _C["red"])
-        sys.exit(1)
-
-    # Capture the spawning parent PID ONCE at worker start. If the orchestrator
-    # (headless path: this worker is its direct child) is SIGKILL'd,
-    # poll_for_task's orphan check (_is_process_alive, cross-platform) detects
-    # that this pid is dead and self-exits. Captured here (not per-call)
-    # because the pid to watch never changes.
-    #
-    # getppid() is only correct on the direct-child launch path (headless
-    # background spawn). On the macOS Terminal.app path (osascript → Terminal
-    # → login shell → this worker) the parent is the login shell, NOT the
-    # orchestrator — getppid() never changes when the orchestrator itself
-    # dies, so orphan self-exit silently never fires and the worker idles up
-    # to max_poll_s (24h). --orch-pid carries the orchestrator's actual PID
-    # explicitly (set by asr_subagent_argv callers) so poll_for_task can
-    # probe it directly instead of trusting getppid(). Falls back to the old
-    # getppid()-based check when absent (manual launch, older orchestrator).
-    _origin_ppid = os.getppid()
-    _orch_pid = getattr(args, "orch_pid", 0) or None
-
-    # Idle heartbeat writer: proves the WORKER PROCESS is alive while it is
-    # between tasks (polling), independent of any task dir. The orchestrator's
-    # _claim_reusable_worker reads this to judge a Terminal-launched worker's
-    # (no PID handle) liveness BEFORE reuse — closing the gap where a hung
-    # Terminal worker was optimistically reused and burned ipc_timeout_s. See
-    # write_worker_idle_heartbeat / read_worker_idle_heartbeat_age.
-    from external_llm.agent.subagent_ipc import (
-        _IDLE_HEARTBEAT_INTERVAL_S,
-        HEARTBEAT_INTERVAL_S,
-        SubagentResult,
-        build_subagent_prompt,
-        partition_changed_files,
-        poll_for_task,
-        write_heartbeat,
-        write_result,
-        write_worker_exited_heartbeat,
-        write_worker_idle_heartbeat,
-    )
-
-    _print(
-        f"Sub-agent worker [{agent_id}] started, watching "
-        f"{repo_root}/.asicode/subagents/{agent_id}/task.json",
-        _C["teal"],
-    )
-
-    cancel_event = threading.Event()        # TASK-scope: abort the current task only
-    shutdown_event = threading.Event()      # PROCESS-scope: exit the worker loop
-
-    def _sigint_handler(sig, frame):
-        # Ctrl-C is a process-level intent: abort the in-flight task AND exit.
-        _print(f"\nSub-agent [{agent_id}] shutting down…", _C["yellow"])
-        cancel_event.set()        # abort in-flight task immediately
-        shutdown_event.set()      # exit the poll loop after the task unwinds
-
-    signal.signal(signal.SIGINT, _sigint_handler)
-
-    # ── Idle heartbeat: a long-lived daemon that writes worker.heartbeat.json
-    # into the worker's OWN poll directory every _IDLE_HEARTBEAT_INTERVAL_S for
-    # the ENTIRE process lifetime. This covers BOTH the between-tasks idle window
-    # AND task execution (redundant with the per-task heartbeat, but harmless —
-    # the idle heartbeat proves process liveness regardless of task state).
-    # _claim_reusable_worker reads it to reject a hung Terminal-launched worker
-    # (no PID handle) before reuse, so a dead worker is never re-dispatched.
-    _idle_hb_stop = threading.Event()
-    # Observability state for the idle heartbeat (Bug 4): mutated only by the
-    # main poll loop below (single-threaded), read by this daemon thread. Not
-    # lock-protected — advisory display data, not a correctness signal, and
-    # simple int/str assignment is atomic enough under the GIL.
-    _worker_start_ts = time.monotonic()
-    _worker_stats = {"tasks_served": 0, "last_task_id": ""}
-
-    def _write_idle_hb() -> None:
-        write_worker_idle_heartbeat(
-            repo_root, agent_id, pid=os.getpid(),
-            tasks_served=_worker_stats["tasks_served"],
-            last_task_id=_worker_stats["last_task_id"],
-            uptime_s=time.monotonic() - _worker_start_ts,
-        )
-
-    def _idle_heartbeat_writer() -> None:
-        while not _idle_hb_stop.wait(_IDLE_HEARTBEAT_INTERVAL_S):
-            try:
-                _write_idle_hb()
-            except Exception:
-                logging.getLogger(__name__).debug("idle heartbeat write failed", exc_info=True)
-
-    # Write one immediately so a fresh heartbeat exists before the first poll.
-    try:
-        _write_idle_hb()
-    except Exception:
-        logging.getLogger(__name__).debug("initial idle heartbeat write failed", exc_info=True)
-    threading.Thread(
-        target=_idle_heartbeat_writer,
-        name=f"ipc-idle-heartbeat-{agent_id}",
-        daemon=True,
-    ).start()
-
-    # ── External cancel watcher ────────────────────────────────────────────
-    # The orchestrator signals mid-task cancellation by writing a ``cancel.json``
-    # sentinel into this worker's poll directory.  This PER-TASK daemon thread
-    # polls for that sentinel WHILE a task runs and sets the task-scope
-    # ``cancel_event`` — DesignChatLoop already checks ``cancel_event`` at the top
-    # of every iteration (turn boundary) and aborts via ``AgentCancelled``.
-    #
-    # Lifecycle (B6): ``cancel.json`` is TASK-scoped, NOT process-scoped.  After
-    # the task aborts and writes its error result, ``cancel_event`` is cleared and
-    # the worker loops back to poll for the NEXT task — a single cancel no longer
-    # kills a reusable worker (saving the ~5-8s respawn cost per cancelled task).
-    # Only SIGINT, the ``shutdown.json`` sentinel, or orphan-detection exit the
-    # worker.  The watcher is started PER-TASK (not as one long-lived thread) so a
-    # stale sentinel cannot fire during idle polling between tasks (write_task also
-    # clears a stale cancel.json as a belt-and-braces measure).
-    from external_llm.agent.subagent_ipc import check_cancel_sentinel
-
-    def _cancel_watcher(stop_flag: threading.Event) -> None:
-        _cancel_path = os.path.join(
-            repo_root, ".asicode", "subagents", agent_id, "cancel.json",
-        )
-        while not stop_flag.is_set() and not cancel_event.is_set():
-            try:
-                if check_cancel_sentinel(repo_root, agent_id):
-                    _print(
-                        f"\nSub-agent [{agent_id}] cancel signal received "
-                        f"— aborting current task at the next turn boundary.",
-                        _C["yellow"],
-                    )
-                    try:
-                        os.unlink(_cancel_path)  # fire-once
-                    except OSError:
-                        logging.getLogger(__name__).debug("cancel sentinel unlink failed", exc_info=True)
-                    cancel_event.set()
-                    return
-            except Exception:
-                logging.getLogger(__name__).debug("cancel watcher poll failed", exc_info=True)
-            # P27-2: stop_flag.wait(0.5) — wake immediately on shutdown instead of
-            # sleeping the full poll interval (cancelable-sleep pattern; keeps the
-            # 0.5s cancel-sentinel cadence while a task runs).
-            stop_flag.wait(0.5)
-
-    # ── Per-process LLM service cache (worker reuse optimization).
-    # create_intelligent_service_from_env builds a client (auth handshake, model
-    # resolution) every call — a few seconds each. A reused worker serves MANY
-    # tasks, often with the SAME (provider, model, api_key), so re-creating it per
-    # task defeats the worker-reuse (P3) goal of saving the ~5-8s respawn cost.
-    # Cache the service keyed by (provider, model, api_key); a task that changes
-    # any of these misses the cache and re-initializes. The cache holds AT MOST
-    # one entry (the common case: all tasks use the same provider) — a different
-    # key evicts the prior entry. api_key is normalized to "" so None/"" collide.
-    _svc_cache: dict = {}  # {(provider, model, api_key): svc} — single-slot cache
-
-    # Run tasks in a loop.  The worker stays alive across tasks so the orchestrator
-    # can reuse it (no new Terminal/process per task).  Exit ONLY on: SIGINT
-    # (shutdown_event), the shutdown.json sentinel, or orphan-detection — NOT on a
-    # task-level cancel.json (B6: that aborts only the current task, then the
-    # worker loops back to serve the next one).
-    while not shutdown_event.is_set():
-        # Reset the task-scope cancel before polling so a previous task's cancel
-        # does not leak into the next poll (poll_for_task checks cancel_event and
-        # returns None if it is set).
-        cancel_event.clear()
-        _print(f"[{agent_id}] Polling for task… (Ctrl-C to exit)", _C["muted"])
-        task = poll_for_task(
-            repo_root=repo_root,
-            agent_id=agent_id,
-            poll_interval_s=1.0,
-            timeout_s=None,  # infinite — worker stays alive until killed
-            cancel_event=cancel_event,
-            expected_parent_pid=_origin_ppid,
-            orchestrator_pid=_orch_pid,
-        )
-        if task is None or shutdown_event.is_set():
-            break
-
-        # Start THIS task's cancel watcher (per-task; stopped after the result is
-        # written so it cannot fire during the next idle poll).
-        _watcher_stop = threading.Event()
-        threading.Thread(
-            target=_cancel_watcher, args=(_watcher_stop,),
-            name=f"ipc-cancel-{agent_id}-{task.task_id}", daemon=True,
-        ).start()
-
-        _print(f"[{agent_id}] Received task: {task.title}", _C["green"])
-        _print(f"  files: {task.assigned_files}", _C["muted"])
-        if task.description:
-            _print(f"  description: {task.description[:200]}", _C["muted"])
-
-        # Task payload can override provider/model/api_key; else use CLI args.
-        provider = task.provider or getattr(args, "provider", "") or ""
-        model = task.model or getattr(args, "model", "") or ""
-        api_key = task.api_key or getattr(args, "api_key", "") or None
-        max_turns = task.max_turns or getattr(args, "max_turns", 12) or 12
-
-        printer = _ProgressPrinter(verbose=getattr(args, "verbose", False))
-        ipc_result = None
-
-        # ── Heartbeat: prove liveness so the orchestrator's wait_for_result
-        # can distinguish a BUSY worker (long LLM/tool turn) from a DEAD one
-        # (OOM/segfault) instead of burning the full ipc_timeout_s. A daemon
-        # thread writes heartbeat.json (wall-clock ts) every HEARTBEAT_INTERVAL_S
-        # into the task's OWN dir (same as result.json) so the orchestrator can
-        # read it back. The thread is stopped once the result is written below.
-        # Uses pid so a diagnostic can identify the heartbeating process.
-        _hb_stop = threading.Event()
-        # Shared progress state, updated by the wrapped stream_callback below and
-        # read by the heartbeat thread so heartbeats carry "turn N, <tool>" hints
-        # (F3). Plain dict writes/reads are GIL-atomic for independent keys; the
-        # heartbeat is advisory, so a torn read across keys is harmless.
-        _hb_state = {"turn": 0, "last_tool": ""}
-
-        # Bind the task id NOW: the worker loop reassigns ``task`` for the next
-        # task, and the heartbeat thread may still be mid-write after
-        # _hb_stop.set() (wait→False race). Late-binding task.task_id would then
-        # stamp a heartbeat with the NEXT task's id into its dir. A plain local
-        # rebinding cannot pin the value (the closures read the CELL, rebound on
-        # the next iteration) — so _heartbeat_writer/_hb_stream_cb bind
-        # _hb_stop/_task_id/_hb_state/_printer as def-time default args (B023):
-        # each iteration's thread/callback is pinned to THIS iteration's
-        # objects, and a straggler thread heartbeats its own task dir instead
-        # of stamping the next task's id/state.
-        _task_id = task.task_id
-
-        def _heartbeat_writer(_hb_stop=_hb_stop, _task_id=_task_id, _hb_state=_hb_state) -> None:
-            while not _hb_stop.wait(HEARTBEAT_INTERVAL_S):
-                try:
-                    write_heartbeat(
-                        repo_root, _task_id, pid=os.getpid(),
-                        turn=_hb_state.get("turn", 0),
-                        last_tool=_hb_state.get("last_tool", ""),
-                    )
-                except Exception:
-                    logging.getLogger(__name__).debug("task heartbeat write failed", exc_info=True)
-
-        # Write one immediately so a heartbeat exists before the first poll gap.
-        try:
-            write_heartbeat(repo_root, task.task_id, pid=os.getpid())
-        except Exception:
-            logging.getLogger(__name__).debug("initial task heartbeat write failed", exc_info=True)
-        threading.Thread(
-            target=_heartbeat_writer,
-            name=f"ipc-heartbeat-{agent_id}-{task.task_id}",
-            daemon=True,
-        ).start()
-
-        try:
-            # ── DesignChatLoop-based execution (lighter than AgentLoop/router) ──
-            from external_llm.intelligent_service import (
-                create_intelligent_service_from_env,
-            )
-            # Reuse the LLM service across tasks when (provider, model, api_key)
-            # is unchanged (see _svc_cache decl above). A reused worker serves
-            # many tasks with the same provider, so re-initializing the service
-            # per task would burn seconds of auth/handshake each time — defeating
-            # the P3 reuse goal. Cache key is the resolved triple; api_key is
-            # normalized so None/"" collide.
-            _svc_key = (provider or "", model or "", api_key or "")
-            _cached = _svc_cache.get(_svc_key)
-            if _cached is not None:
-                svc = _cached
-            else:
-                svc = create_intelligent_service_from_env(
-                    provider or None, model or None, api_key=api_key or None,
-                )
-                if svc is not None:
-                    # Evict any prior entry (single-slot cache: the common case
-                    # is one provider per worker; a provider switch is rare).
-                    _svc_cache.clear()
-                    _svc_cache[_svc_key] = svc
-            if svc is None:
-                raise RuntimeError(
-                    f"failed to initialize LLM service for sub-agent {agent_id}\n"
-                    f"  --provider {provider or '(unset)'} --model {model or '(unset)'}"
-                )
-
-            from external_llm.agent.agent_loop_types import AgentCancelled
-            from external_llm.agent.design_chat_loop import DesignChatLoop
-            from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
-            from external_llm.client import LLMMessage
-
-            config = AgentConfig(
-                model_name=svc.model or "",
-                max_turns=max_turns,
-                stream_callback=printer,
-                consume_content_events=False,
-                run_lint=True,
-                run_tests=True,
-                cancel_event=cancel_event,
-                unrestricted_read=True,   # trusted local CLI
-            )
-
-            registry = ToolRegistry(repo_root, config)
-            design_loop = DesignChatLoop(svc.llm_service.client, registry, svc.model)
-            printer._start_spinner("")
-
-            t0 = time.perf_counter()
-
-            # Build the initial user message — mirroring the in-process path
-            # (orchestrator._run_subagent). ``build_subagent_prompt`` prefers
-            # ``task.predecessor_context`` (the richly-built task_text with
-            # predecessor results + shared memory) over bare ``task.description``
-            # and wraps it with ``task.original_request`` (the overall goal), so
-            # dependent IPC subtasks no longer run "blind".
-            messages = [LLMMessage(role="user", content=build_subagent_prompt(task))]
-
-            # Wrap the printer so design-loop stream events also feed the heartbeat
-            # progress state (F3): each LLM call bumps the turn counter, and a
-            # tool_call start records the tool name. The orchestrator's wait_for_result
-            # then surfaces "turn N, <tool>" instead of only elapsed time.
-            _printer = printer
-            def _hb_stream_cb(event: str, payload, _hb_state=_hb_state, _printer=_printer):
-                try:
-                    if event == "design_llm_call":
-                        _hb_state["turn"] = int(_hb_state.get("turn", 0)) + 1
-                    elif (
-                        event == "design_tool_call" and isinstance(payload, dict) and payload.get("status") == "running"
-                    ):
-                        _hb_state["last_tool"] = str(payload.get("tool") or "")
-                except Exception:
-                    logging.getLogger(__name__).debug("heartbeat stream state update failed", exc_info=True)
-                if _printer is not None:
-                    try:
-                        _printer(event, payload)
-                    except Exception:
-                        logging.getLogger(__name__).debug("subagent printer callback failed", exc_info=True)
-
-            dc_result = design_loop.respond(
-                messages,
-                stream_callback=_hb_stream_cb,
-                max_tool_iterations=max_turns,
-            )
-
-            elapsed = time.perf_counter() - t0
-
-            # Collect diff via git for the result payload.
-            diff = ""
-            try:
-                import subprocess as _sp
-                diff = _sp.run(
-                    ["git", "diff", "--stat", "HEAD", "--", *task.assigned_files],
-                    cwd=repo_root, capture_output=True, text=True, timeout=10,
-                    check=False,
-                ).stdout.strip()
-            except Exception:
-                logging.getLogger(__name__).debug("subagent git diff failed", exc_info=True)
-
-            # Map DesignChatResult → SubagentResult fields.
-            # is_error takes PRECEDENCE over hit_max_iterations: a task that both
-            # exhausted its turn budget AND then failed to generate its final
-            # response must surface as an error (not "max_turns"), otherwise the
-            # orchestrator misreads a generation failure as "budget exhausted /
-            # partial progress" and picks the wrong retry strategy. When
-            # DesignChatLoop reaches the max-iterations tail it leaves is_error
-            # False unless the final-response call itself failed (in which case
-            # it now sets is_error=True) — so a clean budget-exhaustion still
-            # reports "max_turns".
-            if dc_result.is_error:
-                status = "error"
-            elif dc_result.hit_max_iterations:
-                status = "max_turns"
-            else:
-                status = "success"
-            final_message = dc_result.content or ""
-            turns = dc_result.total_llm_calls or len(dc_result.tool_calls_made) or 1
-            # DesignChatLoop does not itself track applied patches — derive the
-            # file list from an UNSCOPED ``git status`` and partition into
-            # in-scope (applied_patches) vs out-of-scope (unassigned_changes)
-            # so the orchestrator's diff cross-verification AND scope-violation
-            # review both have full visibility (B5). Previously the call was
-            # scoped to assigned_files, hiding any out-of-scope write.
-            patches, unassigned = partition_changed_files(repo_root, task.assigned_files)
-            error_msg = dc_result.content if dc_result.is_error else ""
-
-            ipc_result = SubagentResult(
-                task_id=task.task_id,
-                status=status,
-                final_message=final_message,
-                diff=diff,
-                turns=turns,
-                applied_patches=patches,
-                error=error_msg,
-                epoch=task.epoch,
-                unassigned_changes=unassigned,
-            )
-
-            printer._stop_spinner()
-            _print(
-                f"[{agent_id}] Task complete: {status} ({turns} turns, {elapsed:.1f}s)",
-                _C["green"] if status == "success" else _C["yellow"],
-            )
-
-        except AgentCancelled:
-            # Task-level cancel (cancel.json sentinel, B6): abort ONLY this task,
-            # write a cancelled result, then loop back to poll for the next one.
-            # The worker process stays alive (shutdown_event is NOT set by a
-            # task-scope cancel) so the orchestrator can reuse it.
-            _cancel_msg = f"Sub-agent task '{task.task_id}' cancelled by orchestrator"
-            logging.getLogger(__name__).info(
-                "Sub-agent %s task %s cancelled (task-scope; worker stays alive)",
-                agent_id, task.task_id,
-            )
-            # Report partial edits even when cancelled: a mid-task abort can
-            # leave half-applied changes on disk. Without partition_changed_files
-            # here the result carries applied_patches=[]/unassigned_changes=[],
-            # leaving the orchestrator's diff cross-verification AND the B5 scope
-            # signal blind to whatever the worker wrote before it stopped — and
-            # hiding the exact set the orchestrator must revert (turn 13114 bug 1).
-            try:
-                patches, unassigned = partition_changed_files(repo_root, task.assigned_files)
-            except Exception:
-                patches, unassigned = [], []
-            ipc_result = SubagentResult(
-                task_id=task.task_id,
-                status="cancelled",
-                final_message=_cancel_msg,
-                applied_patches=patches,
-                error=_cancel_msg,
-                epoch=task.epoch,
-                unassigned_changes=unassigned,
-            )
-            try:
-                printer._stop_spinner()
-            except Exception:
-                logging.getLogger(__name__).debug("subagent cancel spinner stop failed", exc_info=True)
-            _print(f"[{agent_id}] Task cancelled (worker staying alive).", _C["yellow"])
-        except Exception as e:
-            logging.getLogger(__name__).exception(
-                "Sub-agent %s execution failed", agent_id,
-            )
-            # Drop the cached LLM service: an exception may mean it is broken
-            # (expired auth, dropped connection after a long idle period) rather
-            # than the task itself being bad. Without this, every subsequent
-            # reused-worker task would hit the same dead client and fail
-            # immediately instead of reinitializing. Cheap and safe — the next
-            # task just re-creates it (a few seconds, only once).
-            _svc_cache.clear()
-            # Same rationale as the cancelled branch: a task that crashed mid-run
-            # may have partial edits on disk. Report them so the orchestrator can
-            # attribute, cross-verify, and revert as needed.
-            try:
-                patches, unassigned = partition_changed_files(repo_root, task.assigned_files)
-            except Exception:
-                patches, unassigned = [], []
-            ipc_result = SubagentResult(
-                task_id=task.task_id,
-                status="error",
-                applied_patches=patches,
-                error=str(e),
-                epoch=task.epoch,
-                unassigned_changes=unassigned,
-            )
-            try:
-                printer._stop_spinner()
-            except Exception:
-                logging.getLogger(__name__).debug("subagent error spinner stop failed", exc_info=True)
-            _print(f"[{agent_id}] Task failed: {e}", _C["red"])
-
-        # Always write a result so the orchestrator's wait_for_result unblocks.
-        # write_result itself can raise (I/O error, serialization failure); if it
-        # does, the exception would propagate out of the poll loop and KILL the
-        # worker — result.json would never appear and the orchestrator would burn
-        # the full ipc_timeout_s before failing. Guard it so the "always writes a
-        # result" contract holds even then: retry once with a minimal error result.
-        if ipc_result is not None:
-            try:
-                write_result(repo_root, ipc_result)
-                _print(f"[{agent_id}] Result written.", _C["muted"])
-            except Exception as _wr_exc:
-                logging.getLogger(__name__).exception(
-                    "Sub-agent %s: result write failed (%s); retrying with a "
-                    "minimal error result", agent_id, _wr_exc,
-                )
-                try:
-                    write_result(repo_root, SubagentResult(
-                        task_id=ipc_result.task_id,
-                        status="error",
-                        final_message=f"result write failed: {_wr_exc}",
-                        error=f"result write failed: {_wr_exc}",
-                        epoch=ipc_result.epoch,
-                    ))
-                    _print(f"[{agent_id}] Minimal error result written.", _C["muted"])
-                except Exception:
-                    logging.getLogger(__name__).exception(
-                        "Sub-agent %s: minimal error-result write also failed; "
-                        "orchestrator will time out.", agent_id,
-                    )
-
-        # Record this task for the idle heartbeat's observability fields (Bug
-        # 4) before the worker goes back to idle polling — reflects in the
-        # NEXT periodic write (or the following task's completion), same as
-        # the pre-existing idle-heartbeat cadence.
-        _worker_stats["tasks_served"] += 1
-        _worker_stats["last_task_id"] = task.task_id
-
-        # Stop this task's heartbeat thread now that a result has been written
-        # (or the write is irrecoverably failed). Prevents the daemon thread
-        # from carrying a stale heartbeat into the next idle poll cycle.
-        _hb_stop.set()
-        # Stop this task's cancel watcher (B6): the task is done (or aborted), so
-        # there is nothing to cancel. The worker loops back to poll; a fresh
-        # watcher is started for the next task.
-        try:
-            _watcher_stop.set()
-        except Exception:
-            logging.getLogger(__name__).debug("subagent watcher stop failed", exc_info=True)
-
-    # Stop the idle-heartbeat daemon and mark the heartbeat "exited" BEFORE the
-    # process actually terminates. Without this, the last "idle" heartbeat (up
-    # to _IDLE_HEARTBEAT_INTERVAL_S stale) still reads as fresh to
-    # _claim_reusable_worker for up to ipc_heartbeat_stale_s (120s default)
-    # after this process is gone, so a dead worker gets re-claimed and burns
-    # the orchestrator's full ipc_timeout_s on the next dispatch.
-    _idle_hb_stop.set()
-    try:
-        write_worker_exited_heartbeat(repo_root, agent_id, pid=os.getpid())
-    except Exception:
-        logging.getLogger(__name__).debug("subagent exited-heartbeat write failed", exc_info=True)
-
-    _print(f"Sub-agent [{agent_id}] stopped.", _C["teal"])
 
 # ─── Cross-module cycle with asi.py (bottom-of-file imports, symmetric) ─────
 # asi.py imports THIS module at the very bottom of asi.py (barrel re-export),

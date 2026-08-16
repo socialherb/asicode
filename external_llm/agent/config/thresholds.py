@@ -71,17 +71,16 @@ class TokenLimits:
     LOCAL_ASSISTANT_SHORT: int = 512
     LOCAL_MODEL_CONTEXT_CHARS: int = 4000
     INTELLIGENT_SERVICE_DEFAULT: int = 4096
-    EXPLORATION: int = 4096
     AGENT_STREAM: int = 4096
     ANTHROPIC_DEFAULT: int = 65536
 
     AGENT_TOOL_CALL: int = 32768  # agent_loop.py _llm_call_with_tools default max_tokens
 
-    CONTEXT_HARD_CAP_SAFETY_MARGIN: int = 1024  # agent_loop.py: pre-flight input token guard
-                                                 # subtracted from model's context_limit before
-                                                 # triggering _preemptive_trim. Prevents
-                                                 # HTTP 400 "max context length exceeded" errors
-                                                 # from API providers (DeepSeek 1M, etc.).
+    CONTEXT_HARD_CAP_SAFETY_MARGIN: int = 1024  # agent_loop.py / design_chat_loop.py: pre-flight
+                                                 # message-budget margin subtracted from the model's
+                                                 # context_limit for the structural-collapse check.
+                                                 # Prevents HTTP 400 "max context length exceeded"
+                                                 # errors from API providers (DeepSeek 1M, etc.).
 
     BASH_OUTPUT_MAX_CHARS: int = 60_000   # git_tools.py: max chars returned by `bash` tool output
                                            # Prevents sudden token surges from large stdout/stderr.
@@ -279,7 +278,8 @@ class CountLimits:
     # ── Symbol Search / Tool Loop ────────────────────────────────────────
     SEARCH_RESULTS_CAP: int = 30             # symbol_search.py max results before early break
     AGENT_TOOL_RETRY_LIMIT: int = 5          # agent_loop.py per-tool cumulative exhaustion warning
-    AGENT_MAX_TURNS_DEFAULT: int = 500         # tool_registry + agent_stream + asi
+    AGENT_MAX_TURNS_DEFAULT: int = 500         # tool_registry + agent_stream + asi + subagent (ipc/orchestrator/worker) fallbacks
+    AGENT_MAX_TURNS_WEBAPP_MAX: int = 200      # webapp /agent/run ceiling — deliberately tighter than the CLI default (API-credit protection; see body_params.body_int P14-3 note)
     DESIGN_CHAT_MAX_TOOL_ITERATIONS: int = 500  # design_chat_loop.py + design_chat.py
     DESIGN_CHAT_LLM_MAX_RETRIES: int = 2        # design_chat_loop.py outer retries on transient LLM errors (on top of the client's own)
 
@@ -315,17 +315,6 @@ class DisplayConfig:
     start). When env vars are unset, the defaults below are used.
     """
 
-    # Whether to show change diffs inline for each successful op during execution.
-    #disable: ASICODE_INLINE_OP_DIFF=0 (or off/false/no)
-    #   Enable: ASICODE_INLINE_OP_DIFF=1  (default True)
-    INLINE_OP_DIFF: bool = field(
-        default_factory=lambda: _env_flag("ASICODE_INLINE_OP_DIFF", True)
-    )
-    # Max lines per op for inline diff display (excess truncated to "… N more lines").
-    #adjust: ASICODE_INLINE_OP_DIFF_MAX_LINES=80
-    INLINE_OP_DIFF_MAX_LINES: int = field(
-        default_factory=lambda: _env_int("ASICODE_INLINE_OP_DIFF_MAX_LINES", 40)
-    )
     # Whether to auto-display the full file diff ("changes" block) after successful
     # execution. Default off — use /diff when needed.
     #enable: ASICODE_RUN_DIFF=1 (or on/true/yes)

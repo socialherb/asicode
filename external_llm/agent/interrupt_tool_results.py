@@ -85,7 +85,7 @@ def render_interrupt_tool_results(
         parts.append(block)
         spent += len(block)
 
-    if not parts:
+    if not parts:  # pragma: no cover — 첫 항목은 spent=0으로 항상 append되므로 parts는 비어있을 수 없음
         return ""
     head = (
         f"{_HEADER}\n"

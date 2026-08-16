@@ -240,3 +240,31 @@ def test_save_streaming_peak_memory_bounded(cache_dir):
     finally:
         tracemalloc.stop()
     assert peak < total_bytes // 2, f"save peak {peak} vs serialized size {total_bytes}"
+
+
+def test_save_swallows_serialization_failure_and_cleans_tmp(cache_dir):
+    """C4 (2026-08-12): a non-serializable entry must not fail the caller
+    (best-effort contract) and must not leave the PID-suffixed tmp behind.
+
+    Pre-fix the entry-wise streaming writer opened the tmp BEFORE dumping
+    entries, so json.dumps raising TypeError on an unserializable value (a)
+    propagated to the caller, violating the documented fail-open contract,
+    and (b) stranded ``.tmp.<pid>`` (the pid suffix means a different
+    process's stale tmp is never reclaimed).  Post-fix TypeError/ValueError
+    join OSError in the catch, and finally unlinks the uncommitted tmp.
+    """
+    import external_llm.graph.structural_cache as sc  # module import — release-gate tracked
+
+    path = sc.default_cache_path(cache_dir)
+    manifest = {"a.py": [1000, 10]}
+    files = {"a.py": {"symbols": [{"name": "x", "bad": object()}], "calls": [], "imports": []}}
+    imported_names = {"a.py": ["os"]}
+    sc.save(path, manifest, files, imported_names)  # must NOT raise
+    assert not path.exists(), "failed save must not leave a committed cache"
+    leftovers = list(cache_dir.rglob("*.tmp.*"))
+    assert leftovers == [], f"uncommitted tmp not cleaned: {leftovers}"
+    # And the cache must still be writable afterwards (no stuck state).
+    files2 = {"a.py": {"symbols": [], "calls": [], "imports": []}}
+    sc.save(path, manifest, files2, imported_names)
+    assert path.exists(), "save must work after a failed attempt"
+    assert sc.load(path) is not None  # valid payload

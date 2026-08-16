@@ -15,6 +15,7 @@ import tempfile
 from collections.abc import Callable
 from typing import Any, Optional
 
+from external_llm.common.atomic_io import atomic_write_text
 from external_llm.languages.tree_sitter_utils import grammar_key_for_ext
 
 from .write_targets import parse_patch_targets, write_target_paths
@@ -807,7 +808,7 @@ class WriteSafetyManager:
 
             # New file (did not exist before edit): treat as empty content.
             # Required so _python_decl_sets / rollback paths don't choke on
-            # the _MISSING_SNAP sentinel (cf. new_semantic_warnings L476-477).
+            # the _MISSING_SNAP sentinel (cf. `new_semantic_warnings`).
             if pre_content is _MISSING_SNAP:
                 pre_content = ""
 
@@ -841,7 +842,7 @@ class WriteSafetyManager:
                 # Fall through to Phase 3 which has its own SyntaxError guard.
             else:
                 # --- F821: resolve import ---
-                # Filter from the 'post' list already computed above (L779)
+                # Filter from the 'post' list already computed above (via `ruff_findings_many`)
                 # instead of re-spawning ruff — current hasn't changed.
                 f821_findings = [f for f in post if f.get("code") == "F821"]
                 for finding in f821_findings:
@@ -881,19 +882,17 @@ class WriteSafetyManager:
 
                     # Snapshot pre-import state for selective rollback: if the import
                     # insertion breaks syntax, we roll back ONLY the import, not the
-                    # entire edit (which was already validated at L768).
+                    # entire edit (already validated by the `_validate_python_syntax` precondition).
                     _pre_import = current
                     current = self._insert_import_line(current, import_line)
                     try:
-                        with open(path, "w", encoding="utf-8") as f:
-                            f.write(current)
+                        atomic_write_text(path, current)
                     except OSError:
                         logger.debug("tool_safety: cannot write import repair into %s — skipping", path)
                         continue
                     # Safety net: validate syntax after repair, rollback on failure
                     if not self._validate_python_syntax(current):
-                        with open(path, "w", encoding="utf-8") as f:
-                            f.write(_pre_import)
+                        atomic_write_text(path, _pre_import)
                         current = _pre_import  # Reset in-memory state after rollback
                         logger.warning("Phase 2 F821 repair produced invalid syntax in %s — rolled back", path)
                         continue
@@ -929,7 +928,7 @@ class WriteSafetyManager:
                     # Phase 2 may have inserted imports (mutating `current`):
                     # re-scan only then; otherwise the batch scan above is
                     # still valid and is reused instead of re-spawning ruff
-                    # (cf. L816-818).
+                    # (cf. the `current = f.read()` read above).
                     remaining_f821 = (
                         ruff_findings(current, path=path)
                         if _current_mutated
@@ -975,8 +974,7 @@ class WriteSafetyManager:
                                 if not self._validate_python_syntax(current):
                                     logger.warning("Phase 3 decl-loss restore would produce invalid syntax in %s — skipped", path)
                                     continue
-                                with open(path, "w", encoding="utf-8") as f:
-                                    f.write(current)
+                                atomic_write_text(path, current)
                                 repaired_count += 1
                                 logger.info(
                                     "Phase 3: auto-restored symbols %s from pre-snapshot in %s",

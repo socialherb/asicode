@@ -238,6 +238,11 @@ class WriteToolsEditMixin:
                 execution_time=0,
             )
 
+        # F1 cross-process edit-lease guard.
+        _lease_refused = self._refuse_foreign_leased([file_path], start_time)
+        if _lease_refused is not None:
+            return _lease_refused
+
         _norm = _secured
         if not _norm.exists():
             return self._make_result(
@@ -432,7 +437,7 @@ class WriteToolsEditMixin:
                 # Syntax error detected — rollback file to original and return error.
                 # This prevents the LLM from operating on a broken file and avoids
                 # downstream verify_after_write failures that cause repeated 100K+
-                # token edit_file retry loops (observed: asi.py 8088 lines).
+                # token edit_file retry loops (observed on asi.py, a large file).
                 atomic_write_text(str(_norm), original)
                 _error_details = "; ".join(
                     f"line {e.get('line')}:{e.get('col')} \u2014 {e.get('message', '').strip()}"
@@ -454,6 +459,9 @@ class WriteToolsEditMixin:
         self._append_applied_patch(
             f"edit_file:{file_path}:{_op_type_breakdown}:{_added_lines:+}/{-_removed_lines:-}"
         )
+        # F1: stake our lease (edit_file does not call _record_text_edit, so
+        # the acquire lives here explicitly).
+        self._acquire_edit_leases([file_path])
         return self._make_result(
             ok=True,
             content=f"File updated: {file_path} ({_op_type_breakdown} →{_line_detail}) [{_exec:.1f}s]",
@@ -1381,7 +1389,7 @@ class WriteToolsEditMixin:
                 # still parses as valid Python (so the syntax gate can't catch it).
                 # Mirror _apply_scoped_replacement: splice at the matched line's char
                 # offset. (_reindent_to_match is idempotent, so re-applying it here to
-                # the already-reindented new_string from line 3430 is a no-op.)
+                # the already-reindented new_string from the earlier `_reindent_to_match` is a no-op.)
                 _offset_by_line = [0]
                 for _l in _orig_split:
                     _offset_by_line.append(_offset_by_line[-1] + len(_l))
@@ -1528,6 +1536,11 @@ class WriteToolsEditMixin:
                 ok=False, error=f"Path blocked (outside repo): {file_path}",
                 execution_time=0,
             )
+
+        # F1 cross-process edit-lease guard.
+        _lease_refused = self._refuse_foreign_leased([file_path], start_time)
+        if _lease_refused is not None:
+            return _lease_refused
 
         # ── Determine mode: batch (edits) vs single ──
         raw_edits = args.get("edits")
@@ -1852,7 +1865,7 @@ class WriteToolsEditMixin:
 
         # ── Language-neutral syntax gate (non-Python) ──────────────────────
         # edit_text is excluded from dispatch's snapshot+verify+rollback cycle
-        # (tool_registry.py:1264/1271) because it has no rollback path, and the
+        # (tool_registry.py's `_write_snapshots` gate) because it has no rollback path, and the
         # Python ``compile()`` gate above only covers .py. For every OTHER
         # language we run the SAME provider.validate_syntax the dispatch path
         # uses — in memory, BEFORE writing — so a broken new_string never reaches
@@ -2069,6 +2082,13 @@ class WriteToolsEditMixin:
                 execution_time=0,
             )
 
+        # F1 cross-process edit-lease guard (covers the freshly-created case too:
+        # a live foreign lease means a parallel session created/edited this
+        # path moments ago — overwriting it would clobber its WIP).
+        _lease_refused = self._refuse_foreign_leased([file_path], start_time)
+        if _lease_refused is not None:
+            return _lease_refused
+
         # ── Blocking syntax gate (in memory, before disk) ──
         # Python: compile() catches parse errors only (no undefined-name cascade
         # at compile time → no soft-fail needed). Non-Python: provider
@@ -2165,6 +2185,9 @@ class WriteToolsEditMixin:
             )
 
         _exec = _time.monotonic() - start_time
+        # F1: stake our lease so parallel sessions see this file as actively WIP
+        # (create_file has no _record_text_edit call — its own acquire).
+        self._acquire_edit_leases([file_path])
         _verb = "Overwrote" if _existed else "Created"
         _desc = f" ({description})" if description else ""
         _size = len(content)
@@ -2368,6 +2391,15 @@ class WriteToolsEditMixin:
             rel = self._norm_repo_rel(file_path)
             if rel:
                 self._text_edited_files.add(rel)
+        # F1: record the cross-process edit lease (fail-open; no-op without a
+        # repo_root) so parallel asicode sessions see this file as actively WIP.
+        try:
+            self._acquire_edit_leases([file_path])
+        except Exception:  # partial-mixin harness without the patch mixin
+            logger.debug(
+                "<module>::WriteToolsEditMixin::_record_text_edit:1 edit-lease acquire suppressed",
+                exc_info=True,
+            )
     def _tool_modify_symbol(self, args: dict[str, Any]) -> "ToolResult":
         """Modify a symbol in a file deterministically — no LLM call.
 
@@ -2395,6 +2427,11 @@ class WriteToolsEditMixin:
         abs_path = str(sec)
         if not os.path.isfile(abs_path):
                 return self._make_result(ok=False, content="", error=f"File not found: {file_path}{self._suggest_missing_paths(file_path)}")
+
+        # F1 cross-process edit-lease guard.
+        _lease_refused = self._refuse_foreign_leased([abs_path])
+        if _lease_refused is not None:
+            return _lease_refused
 
         rel_path = os.path.relpath(abs_path, self.repo_root)
 

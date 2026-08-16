@@ -313,44 +313,53 @@ def _ssrf_request_hook(request: Any) -> None:
     _assert_public_fetch_host(request.url.host)
 
 
-# Transient (retryable) HTTP errors shared by all search backends. A single tuple
-# keeps SearXNG / DuckDuckGo / Brave on one retry policy instead of each backend
-# ad-hoc-listing a subset (SearXNG used to be the only one with any retry).
-# Built on first use rather than at import: naming an httpx exception class here
-# would resolve the lazy module and re-introduce the import cost this module
-# exists to avoid. ``except`` takes an expression, so the call sites read the
-# same as a tuple constant.
-_TRANSIENT_HTTP_ERRORS_CACHE: Optional[tuple] = None
+# Lazy singleton registry shared by the search-backend helpers below.
+# Keyed by purpose; each value is built on first use (never at import), so
+# naming an httpx exception class / Timeout here does NOT resolve the lazy
+# module and re-introduce the import cost this module exists to avoid.
+# A plain dict (not module-level `Optional` globals) keeps the slots visible
+# to the structural dead-code scanners — a globals()[name] indirection would
+# look like an unreferenced assignment to them.
+_LAZY_CACHE: dict[str, Any] = {}
+
+
+def _lazy_once(key: str, build) -> Any:
+    """Resolve a lazy singleton from the registry on first use.
+
+    Shared by the three lazy builders below (``_transient_http_errors`` /
+    ``_connect_errors`` / ``_search_http_timeout``): each names a registry key
+    and a *build* callable, and this helper fills the slot once and returns it
+    forever.  Building on first use (rather than at import) keeps the httpx
+    lazy-import promise this module relies on.
+    """
+    cached = _LAZY_CACHE.get(key)
+    if cached is None:
+        cached = build()
+        _LAZY_CACHE[key] = cached
+    return cached
 
 
 def _transient_http_errors() -> tuple:
     """Transient (retryable) network errors, resolved lazily. See above."""
-    global _TRANSIENT_HTTP_ERRORS_CACHE
-    if _TRANSIENT_HTTP_ERRORS_CACHE is None:
-        _TRANSIENT_HTTP_ERRORS_CACHE = (
-            httpx.ConnectError,
-            httpx.RemoteProtocolError,
-            httpx.ReadTimeout,
-            httpx.ReadError,      # parent of ReadTimeout; also covers abrupt stream drops
-            httpx.ConnectTimeout,
-            httpx.PoolTimeout,
-        )
-    return _TRANSIENT_HTTP_ERRORS_CACHE
+    return _lazy_once("transient_http_errors", lambda: (
+        httpx.ConnectError,
+        httpx.RemoteProtocolError,
+        httpx.ReadTimeout,
+        httpx.ReadError,      # parent of ReadTimeout; also covers abrupt stream drops
+        httpx.ConnectTimeout,
+        httpx.PoolTimeout,
+    ))
 
 # Connect-level failures ("host unreachable / TCP handshake blocked"). These are
 # a SUBSET of _transient_http_errors() that must NOT be retried: unlike a slow read
 # or a 429, an immediate re-connect to an unreachable host just re-pays the whole
 # connect timeout. They fail fast so the fallback chain (and the session circuit
 # breaker) move on — the fix for an IP-blocked DuckDuckGo burning ~15s x2 per search.
-_CONNECT_ERRORS_CACHE: Optional[tuple] = None
 
 
 def _connect_errors() -> tuple:
     """Connect-level failures, resolved lazily. See _transient_http_errors."""
-    global _CONNECT_ERRORS_CACHE
-    if _CONNECT_ERRORS_CACHE is None:
-        _CONNECT_ERRORS_CACHE = (httpx.ConnectError, httpx.ConnectTimeout)
-    return _CONNECT_ERRORS_CACHE
+    return _lazy_once("connect_errors", lambda: (httpx.ConnectError, httpx.ConnectTimeout))
 
 # Transient HTTP status codes worth retrying: rate-limiting (429) and gateway /
 # overload responses (502/503/504). Shared by every backend routed through
@@ -363,17 +372,13 @@ _RETRYABLE_HTTP_STATUSES = frozenset({429, 502, 503, 504})
 # fast) paired with a patient read budget (some engines are genuinely slow). The
 # old flat ``timeout=15.0`` spent the full 15s on every connect attempt, so an
 # IP-blocked DuckDuckGo cost ~15s x2 retries ~= 31s per search; connect=4 caps that.
-_SEARCH_HTTP_TIMEOUT_CACHE: Optional[Any] = None
 
 
 def _search_http_timeout():
     """The shared search timeout, resolved lazily. See _transient_http_errors."""
-    global _SEARCH_HTTP_TIMEOUT_CACHE
-    if _SEARCH_HTTP_TIMEOUT_CACHE is None:
-        _SEARCH_HTTP_TIMEOUT_CACHE = httpx.Timeout(
-            connect=4.0, read=15.0, write=15.0, pool=15.0,
-        )
-    return _SEARCH_HTTP_TIMEOUT_CACHE
+    return _lazy_once("search_http_timeout", lambda: httpx.Timeout(
+        connect=4.0, read=15.0, write=15.0, pool=15.0,
+    ))
 
 # Seconds a backend is skipped (session circuit breaker) after a connect-level
 # failure. Long enough that a run of searches does not each re-pay a hard IP

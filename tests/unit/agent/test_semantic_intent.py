@@ -8,6 +8,7 @@ embedding model so they don't depend on the real SentenceTransformer.
 """
 import os
 import sys
+import threading
 
 import pytest
 
@@ -175,3 +176,110 @@ def test_build_is_idempotent_and_cached(monkeypatch):
     m.classify("remove x")
     m.classify("delete y")
     assert calls["n"] == 1  # model fetched once, examples encoded once
+
+
+# ── RED→GREEN: 남은 브랜치 (빌드 실패/빈 예시/이중 빌드/분류 실패) ──────────
+
+
+class _RaisesAtQueryModel:
+    """빌드 시 encode는 성공, classify 쿼리 encode(1개 텍스트)에서만 실패."""
+
+    def __init__(self, np_):
+        self._np = np_
+
+    def encode(self, texts, **kwargs):
+        if len(texts) == 1:
+            raise RuntimeError("embedding model crashed")
+        arr = self._np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype="float32")
+        return arr / self._np.linalg.norm(arr, axis=1, keepdims=True)
+
+
+class TestMatcherEdgePaths:
+    def test_empty_examples_disables_matcher(self, monkeypatch):
+        monkeypatch.setattr(
+            "external_llm.agent.semantic_intent.get_global_embedding_model",
+            lambda: _FakeModel(),
+        )
+        m = SemanticIntentMatcher({"x": ["", "   "]}, threshold=0.1)
+        assert m.classify("anything") is None
+
+    def test_build_encode_failure_disables_matcher(self, monkeypatch):
+        class _BoomModel:
+            def encode(self, texts, **kwargs):
+                raise RuntimeError("model load failed")
+
+        monkeypatch.setattr(
+            "external_llm.agent.semantic_intent.get_global_embedding_model",
+            lambda: _BoomModel(),
+        )
+        m = SemanticIntentMatcher(EXAMPLES, threshold=0.1)
+        assert m.classify("remove this") is None
+
+    def test_double_build_is_idempotent(self, monkeypatch):
+        monkeypatch.setattr(
+            "external_llm.agent.semantic_intent.get_global_embedding_model",
+            lambda: _FakeModel(),
+        )
+        m = SemanticIntentMatcher(EXAMPLES, threshold=0.0)
+        m._ensure_built()
+        m._ensure_built()  # 두 번째는 _built 가드에서 즉시 반환
+        assert m._available is True
+
+    def test_classify_query_failure_returns_none(self, monkeypatch):
+        monkeypatch.setattr(
+            "external_llm.agent.semantic_intent.get_global_embedding_model",
+            lambda: _RaisesAtQueryModel(np),
+        )
+        m = SemanticIntentMatcher(EXAMPLES, threshold=0.0)
+        assert m.classify("remove the import") is None
+
+    def test_empty_text_short_circuits_before_build(self, monkeypatch):
+        monkeypatch.setattr(
+            "external_llm.agent.semantic_intent.get_global_embedding_model",
+            lambda: _FakeModel(),
+        )
+        m = SemanticIntentMatcher(EXAMPLES, threshold=0.1)
+        assert m.classify("   ") is None
+        assert m._built is False  # 빌드 전에 거름
+
+
+class _GateLock:
+    """첫 번째 진입자만 게이트에서 대기시키는 락 프록시 (결정적 레이스 재현)."""
+
+    def __init__(self):
+        self._real = threading.Lock()
+        self._first = True
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __enter__(self):
+        if self._first:
+            self._first = False
+            self.entered.set()
+            self.release.wait(5)
+        self._real.acquire()
+        return self
+
+    def __exit__(self, *a):
+        self._real.release()
+
+
+class TestInLockDoubleBuildGuard:
+    def test_second_thread_sees_built_flag_inside_lock(self, monkeypatch):
+        """락 내부 이중 확인 가드: B가 77행을 통과한 뒤 대기하고, A가 빌드를
+        완료하면 B는 락 진입 후 `if self._built: return`(81행)에서 끝난다."""
+        monkeypatch.setattr(
+            "external_llm.agent.semantic_intent.get_global_embedding_model",
+            lambda: _FakeModel(),
+        )
+        m = SemanticIntentMatcher(EXAMPLES, threshold=0.1)
+        m._lock = _GateLock()
+
+        t = threading.Thread(target=m._ensure_built)
+        t.start()
+        assert m._lock.entered.wait(5)          # B가 락 게이트에서 대기
+        m._ensure_built()                        # A: 락 자유 — 빌드 완료
+        m._lock.release.set()                    # B가 락 획득 → _built True → 81행
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert m._available is True

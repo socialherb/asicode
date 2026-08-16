@@ -8,6 +8,7 @@ Flow (single-shot — run() executes exactly one analysis session, no iteration/
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections.abc import Callable
@@ -79,7 +80,6 @@ class CollaborationOrchestrator:
     ):
         self._registry = registry
         self._config = config or CollaborationOrchestratorConfig()
-        self._repo_root = getattr(registry, "repo_root", self._config.repo_root)
 
         if (
             self._config.allow_write_tools
@@ -170,7 +170,8 @@ class CollaborationOrchestrator:
             enable_preprocessing: If True, asicode generates a digest first.
 
         Returns:
-            SessionResult with verdict and full event log.
+            SessionResult with verdict and the most recent event log
+            (ring-capped at ``_MAX_RETAINED_EVENTS``).
         """
         # Phase 1: asicode Preprocessing
         digest = ""
@@ -394,6 +395,12 @@ def format_verdict_for_session(
     Labels the source clearly to prevent the design LLM from mistaking it
     for its own speech or the user's speech.
 
+    Carries the full verdict contract: status/summary/details/suggestions,
+    plus the structured ``plan`` (output_format schema: "structured plan for
+    asicode to execute") and ``metadata`` (tool calls, tokens, timing) when
+    present — previously parsed and stored but never surfaced, so the design
+    LLM could not act on the agent's execution plan.
+
     Does NOT truncate final findings (details/suggestions) -- a previous char cap
     cut the analysis body (e.g. a list of suggestions like "Imp 4") in the middle,
     causing the design LLM to misinterpret "the last suggestion was cut due to
@@ -420,6 +427,24 @@ def format_verdict_for_session(
             "suggestions:\n"
             + "\n".join(f"- {s}" for s in v.suggestions)
         )
+    if v.plan is not None:
+        # Structured plan (output_format schema: "structured plan for asicode to
+        # execute") — parsed and stored but previously never surfaced to the
+        # design session. default=str keeps untrusted/mixed-type model output
+        # (timestamps, sets, …) from crashing the injection path; the same
+        # SDK-XML strip as details keeps leaked tool tags out of the plan text.
+        _plan_json = _STRIP_XML_RE.sub(
+            "", json.dumps(v.plan, ensure_ascii=False, default=str)
+        )
+        lines.append(f"plan: {_plan_json}")
+    if v.metadata:
+        # Arbitrary extra data (tool calls, tokens, timing) — surfaced so the
+        # design LLM can gauge the analysis's grounding; same safety handling
+        # as plan above.
+        _metadata_json = _STRIP_XML_RE.sub(
+            "", json.dumps(v.metadata, ensure_ascii=False, default=str)
+        )
+        lines.append(f"metadata: {_metadata_json}")
     return "\n".join(lines)
 
 

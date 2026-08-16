@@ -201,3 +201,141 @@ class TestSymbolAwareTestFinder:
         finder = SymbolAwareTestFinder("/nonexistent/path")
         targets = finder.discover_test_targets(target_symbols=["Foo"])
         assert targets == []
+
+
+class TestSymbolAwareTestFinderGaps:
+    """Edge paths that round out full coverage of the finder."""
+
+    def test_empty_symbol_entries_are_skipped(self, test_repo):
+        """Symbols list may contain empty strings — they must be skipped, not searched."""
+        finder = SymbolAwareTestFinder(test_repo)
+        targets = finder.discover_test_targets(target_symbols=["", "PlannerAgent"])
+        assert any("test_planner_agent" in t.test_path for t in targets)
+
+    def test_graph_context_hotspot_symbols_supplement(self, test_repo):
+        """hotspot_symbols not already present are appended to the search list."""
+        finder = SymbolAwareTestFinder(test_repo)
+        targets = finder.discover_test_targets(
+            graph_context={"hotspot_symbols": ["", "PlannerAgent", "PlannerAgent"]},
+        )
+        paths = [t.test_path for t in targets]
+        assert any("test_planner_agent" in p for p in paths)
+
+    def test_hotspot_boost_raises_priority(self, test_repo):
+        """Targets matching hotspot symbols get a priority bump + reason code."""
+        finder = SymbolAwareTestFinder(test_repo)
+        targets = finder.discover_test_targets(
+            target_symbols=["PlannerAgent"],
+            graph_context={"hotspot_symbols": ["PlannerAgent"]},
+        )
+        top = targets[0]
+        assert "HOTSPOT_BOOST" in top.reason_codes
+        assert top.priority_score == min(1.0, MATCH_SCORES["direct_symbol"] + 0.1)
+
+    def test_filename_fallback_hit(self, tmp_path):
+        """No symbol/import/corresponding match → filename heuristic still finds tests."""
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "bridge.py").write_text("def run():\n    pass\n")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_bridge_adapters.py").write_text(
+            "def test_adapters():\n    pass\n"
+        )
+        finder = SymbolAwareTestFinder(str(tmp_path))
+        targets = finder.discover_test_targets(target_files=["pkg/bridge.py"])
+        assert len(targets) == 1
+        assert targets[0].test_path == "tests/test_bridge_adapters.py"
+        assert targets[0].match_type == "filename_fallback"
+        assert targets[0].priority_score == MATCH_SCORES["filename_fallback"]
+        assert "FILENAME_FALLBACK" in targets[0].reason_codes
+
+    def test_find_tests_for_symbol_wrapper(self, test_repo):
+        finder = SymbolAwareTestFinder(test_repo)
+        paths = finder.find_tests_for_symbol(symbol="PlannerAgent")
+        assert any("test_planner_agent" in p for p in paths)
+
+    def test_find_tests_for_symbol_by_file(self, test_repo):
+        finder = SymbolAwareTestFinder(test_repo)
+        paths = finder.find_tests_for_symbol(
+            file_path="external_llm/agent/tool_registry.py"
+        )
+        assert any("test_tool_registry" in p for p in paths)
+
+    def test_find_tests_for_symbol_no_args(self, test_repo):
+        finder = SymbolAwareTestFinder(test_repo)
+        assert finder.find_tests_for_symbol() == []
+
+    def test_test_files_are_cached(self, test_repo):
+        finder = SymbolAwareTestFinder(test_repo)
+        first = finder._find_all_test_files()
+        second = finder._find_all_test_files()
+        assert first == second
+        assert finder._test_files_cache is first
+
+    def test_is_test_filename_ts_js_go(self):
+        finder = SymbolAwareTestFinder("/tmp")
+        assert finder._is_test_filename("foo.test.ts") is True
+        assert finder._is_test_filename("foo.spec.tsx") is True
+        assert finder._is_test_filename("test_foo.js") is True
+        assert finder._is_test_filename("foo.ts") is False
+        assert finder._is_test_filename("widget_test.go") is True
+        assert finder._is_test_filename("widget.go") is False
+
+    def test_read_missing_test_file_returns_empty(self, test_repo):
+        finder = SymbolAwareTestFinder(test_repo)
+        assert finder._read_test_file("tests/unit/does_not_exist.py") == ""
+        # second read hits the memo
+        assert finder._read_test_file("tests/unit/does_not_exist.py") == ""
+
+    def test_read_test_file_oserror(self, test_repo, monkeypatch):
+        """isfile passes but open fails (e.g. permission) → empty content."""
+        finder = SymbolAwareTestFinder(test_repo)
+        monkeypatch.setattr("os.path.isfile", lambda p: True)
+        assert finder._read_test_file("tests/unit/definitely_missing.py") == ""
+
+    def test_file_references_symbol_empty_content(self, test_repo):
+        finder = SymbolAwareTestFinder(test_repo)
+        assert finder._file_references_symbol("tests/unit/missing.py", "Foo") is False
+
+    def test_file_references_symbol_oserror(self, test_repo, monkeypatch):
+        def _raise_oserror(self, tf):
+            raise OSError("denied")
+
+        monkeypatch.setattr(
+            SymbolAwareTestFinder, "_read_test_file", _raise_oserror, raising=True
+        )
+        finder = SymbolAwareTestFinder(test_repo)
+        assert finder._file_references_symbol("tests/x.py", "Foo") is False
+
+    def test_file_imports_module_empty_content(self, test_repo):
+        finder = SymbolAwareTestFinder(test_repo)
+        assert finder._file_imports_module("tests/unit/missing.py", "foo") is False
+
+    def test_file_imports_module_oserror(self, test_repo, monkeypatch):
+        def _raise_oserror(self, tf):
+            raise OSError("denied")
+
+        monkeypatch.setattr(
+            SymbolAwareTestFinder, "_read_test_file", _raise_oserror, raising=True
+        )
+        finder = SymbolAwareTestFinder(test_repo)
+        assert finder._file_imports_module("tests/x.py", "foo") is False
+
+    def test_find_corresponding_test_returns_none(self, test_repo):
+        finder = SymbolAwareTestFinder(test_repo)
+        test_files = finder._find_all_test_files()
+        assert (
+            finder._find_corresponding_test("external_llm/agent/ghost.py", test_files)
+            is None
+        )
+
+    def test_internal_failure_degrades_to_empty(self, test_repo, monkeypatch):
+        """Never raises — an internal failure returns an empty list instead."""
+
+        def _boom(self):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            SymbolAwareTestFinder, "_find_all_test_files", _boom, raising=True
+        )
+        finder = SymbolAwareTestFinder(test_repo)
+        assert finder.discover_test_targets(target_symbols=["PlannerAgent"]) == []

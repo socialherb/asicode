@@ -12,6 +12,7 @@ The filtering has two layers, both exercised here:
      when NO scanned file matches its supported_languages, emitting a visible
      ``Skipped:`` line (this file).
 """
+
 from __future__ import annotations
 
 import os
@@ -34,8 +35,12 @@ class _FakeAnalysisTools(AnalysisToolsMixin):
         return list(self._files)
 
     def _make_result(
-        self, ok: bool = True, content: str = "", error: str | None = None,
-        metadata: dict[str, Any] | None = None, retryable: bool = False,
+        self,
+        ok: bool = True,
+        content: str = "",
+        error: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        retryable: bool = False,
     ):
         return {"ok": ok, "content": content, "error": error, "metadata": metadata or {}}
 
@@ -67,22 +72,13 @@ class TestStructuralScanLanguageFilter:
             "public_dead_code_scanner",
         ]
         for name in py_only:
-            assert f"## {name}" in content, (
-                f"{name} missing from scan output:\n{content}"
-            )
-            assert "Skipped:" in content.split(f"## {name}")[1].split("##")[0], (
-                f"{name} not marked Skipped:\n{content}"
-            )
+            assert f"## {name}" in content, f"{name} missing from scan output:\n{content}"
+            assert "Skipped:" in content.split(f"## {name}")[1].split("##")[0], f"{name} not marked Skipped:\n{content}"
 
         # The metadata must record the skip reason for each.
-        skipped = [
-            e for e in result["metadata"].get("per_scanner", [])
-            if e.get("skipped_language_mismatch")
-        ]
+        skipped = [e for e in result["metadata"].get("per_scanner", []) if e.get("skipped_language_mismatch")]
         skipped_names = {e["scanner"] for e in skipped}
-        assert set(py_only) <= skipped_names, (
-            f"expected all Python-only scanners skipped, got {skipped_names}"
-        )
+        assert set(py_only) <= skipped_names, f"expected all Python-only scanners skipped, got {skipped_names}"
 
     def test_all_on_go_repo_runs_tree_sitter_scanners(self, tmp_path):
         """duplicate_definition_scanner is NOT skipped on a Go repo — Go is in
@@ -101,9 +97,7 @@ class TestStructuralScanLanguageFilter:
             assert f"## {name}" in content
             # They must NOT be marked skipped.
             block = content.split(f"## {name}")[1].split("##")[0]
-            assert "Skipped:" not in block, (
-                f"{name} wrongly skipped on Go repo:\n{block}"
-            )
+            assert "Skipped:" not in block, f"{name} wrongly skipped on Go repo:\n{block}"
 
     def test_single_python_scanner_on_go_repo_reports_skipped(self, tmp_path):
         """Explicitly invoking a Python-only scanner on Go files: the scanner
@@ -112,9 +106,7 @@ class TestStructuralScanLanguageFilter:
         files = ["main.go", "server.go"]
         tools = _FakeAnalysisTools(repo, files)
 
-        result = tools._tool_run_structural_scan(
-            {"scanner": "contradictory_logic_scanner", "path": ""}
-        )
+        result = tools._tool_run_structural_scan({"scanner": "contradictory_logic_scanner", "path": ""})
         content = result["content"]
         assert "Skipped:" in content
         assert "go" in content  # present language reported
@@ -126,9 +118,7 @@ class TestStructuralScanLanguageFilter:
         files = ["a.go", "b.go", "c.ts"]
         tools = _FakeAnalysisTools(repo, files)
 
-        result = tools._tool_run_structural_scan(
-            {"scanner": "vulture_dead_code_scanner", "path": ""}
-        )
+        result = tools._tool_run_structural_scan({"scanner": "vulture_dead_code_scanner", "path": ""})
         content = result["content"]
         # present languages include go + typescript; python absent
         assert "go" in content
@@ -142,9 +132,7 @@ class TestStructuralScanLanguageFilter:
         files = ["main.py", "lib/utils.py"]
         tools = _FakeAnalysisTools(repo, files)
 
-        result = tools._tool_run_structural_scan(
-            {"scanner": "unused_import_scanner", "path": ""}
-        )
+        result = tools._tool_run_structural_scan({"scanner": "unused_import_scanner", "path": ""})
         content = result["content"]
         assert "## unused_import_scanner" in content
         assert "Skipped:" not in content
@@ -216,13 +204,20 @@ class TestStructuralScanFreshnessBanner:
         repo = str(tmp_path)
         tools = _FakeAnalysisTools(repo, ["main.go"])
         stale_file = os.path.join(
-            repo, "external_llm/analysis/_dead_block_shared.py",
+            repo,
+            "external_llm/analysis/_dead_block_shared.py",
         )
-        monkeypatch.setattr(
-            sr_mod.ScannerRegistry,
-            "verify_loaded_sources",
-            lambda self: [stale_file],
-        )
+        # Patch the singleton INSTANCE, not the class: the handler resolves
+        # ``registry.verify_loaded_sources`` on the instance, and other tests
+        # (in this file and test_analysis_tools.py) instance-patch the same
+        # name. pytest 9 restores instance patches by setattr-back (not
+        # delattr), so the instance permanently carries the attribute — a later
+        # CLASS-level patch is then SHADOWED by that instance attribute and the
+        # banner silently disappears (flaky under xdist when this test lands on
+        # a worker that already ran one of those tests). Instance patching is
+        # immune to that ordering.
+        reg = sr_mod.get_registry()
+        monkeypatch.setattr(reg, "verify_loaded_sources", lambda: [stale_file])
 
         result = tools._tool_run_structural_scan({"scanner": "all", "path": ""})
 
@@ -257,9 +252,11 @@ def test_walk_scan_files_is_deterministic_and_sorted(tmp_path):
 
     assert first == second, "same tree must produce the same scan file set"
     assert first == [
-        "root_aa.py", "root_zz.py",
+        "root_aa.py",
+        "root_zz.py",
         "a_dir/m.py",
-        "z_dir/a.py", "z_dir/z.py",
+        "z_dir/a.py",
+        "z_dir/z.py",
     ]
 
 
@@ -313,7 +310,8 @@ class TestStructuralScanAutoReload:
 
     def test_auto_reload_replaces_banner_when_reload_succeeds(self, tmp_path, monkeypatch):
         stale_file = os.path.join(
-            str(tmp_path), "external_llm/analysis/_dead_block_shared.py",
+            str(tmp_path),
+            "external_llm/analysis/_dead_block_shared.py",
         )
         verifies = {"n": 0}
 
@@ -322,8 +320,12 @@ class TestStructuralScanAutoReload:
             return [stale_file] if verifies["n"] == 1 else []
 
         result = self._run(
-            tmp_path, monkeypatch, stale_file,
-            auto_reload=True, verify=fake_verify, reload_fn=lambda: [stale_file],
+            tmp_path,
+            monkeypatch,
+            stale_file,
+            auto_reload=True,
+            verify=fake_verify,
+            reload_fn=lambda: [stale_file],
         )
 
         assert verifies["n"] == 2  # stale check + post-reload re-check
@@ -332,10 +334,13 @@ class TestStructuralScanAutoReload:
 
     def test_auto_reload_keeps_banner_for_unreloadable_remainder(self, tmp_path, monkeypatch):
         stale_file = os.path.join(
-            str(tmp_path), "external_llm/analysis/_dead_block_shared.py",
+            str(tmp_path),
+            "external_llm/analysis/_dead_block_shared.py",
         )
         result = self._run(
-            tmp_path, monkeypatch, stale_file,
+            tmp_path,
+            monkeypatch,
+            stale_file,
             auto_reload=True,
             verify=lambda: [stale_file],
             reload_fn=lambda: [],  # reload failed for all
@@ -347,11 +352,14 @@ class TestStructuralScanAutoReload:
     def test_warning_only_when_flag_off(self, tmp_path, monkeypatch):
         """Default (flag off) keeps the restart notice — no reload attempted."""
         stale_file = os.path.join(
-            str(tmp_path), "external_llm/analysis/_dead_block_shared.py",
+            str(tmp_path),
+            "external_llm/analysis/_dead_block_shared.py",
         )
         reload_calls = []
         result = self._run(
-            tmp_path, monkeypatch, stale_file,
+            tmp_path,
+            monkeypatch,
+            stale_file,
             auto_reload=False,
             verify=lambda: [stale_file],
             reload_fn=lambda: reload_calls.append(1) or [],
@@ -393,9 +401,7 @@ class TestStructuralScanCrossRefsUnion:
         tools = _FakeAnalysisTools(str(tmp_path), ["a.py", "b.py"])
         tools._call_graph = _FakeGraph()
 
-        result = tools._tool_run_structural_scan(
-            {"scanner": "public_dead_code_scanner", "path": ""}
-        )
+        result = tools._tool_run_structural_scan({"scanner": "public_dead_code_scanner", "path": ""})
 
         assert result["ok"] is True
         assert captured["files"] == ["a.py", "b.py", "c.py"]  # union, not capped
@@ -419,9 +425,7 @@ class TestStructuralScanCrossRefsUnion:
         tools = _FakeAnalysisTools(str(tmp_path), ["a.py", "b.py"])
         # _FakeAnalysisTools.__init__ leaves _call_graph = None
 
-        result = tools._tool_run_structural_scan(
-            {"scanner": "public_dead_code_scanner", "path": ""}
-        )
+        result = tools._tool_run_structural_scan({"scanner": "public_dead_code_scanner", "path": ""})
 
         assert result["ok"] is True
         assert captured["files"] == ["a.py", "b.py"]

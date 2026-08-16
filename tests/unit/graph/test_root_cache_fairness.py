@@ -13,6 +13,10 @@ The unit tests pin the policy contracts; the last test reproduces the
 starvation regression end-to-end through RepositoryGraph.
 """
 
+import sys
+import threading
+import time
+
 import pytest
 
 from external_llm.graph.repository_graph import RepositoryGraph, _extract_cache
@@ -201,3 +205,101 @@ def test_multi_repo_starvation_regression(tmp_path):
     g3.build(collect_imported_names=True)
     assert g3.cache_stats["hit"] > 0, "repo2 must not be starved by repo1"
     assert _extract_cache.count(str(repo1)) > 0, "fair: repo1 keeps its quota share"
+
+
+# ── thread safety (C1, 2026-08-12) ────────────────────────────────────────
+
+
+def test_concurrent_admit_iterate_sweep_no_races():
+    """C1: 6 threads hammering admit/iterate/len/sweep on one shared RootCache.
+
+    Pre-fix the same harness raised ``RuntimeError: dictionary changed size
+    during iteration`` (``__len__``/``__iter__``) and ``KeyError``
+    (``sweep_dead``'s ``del`` racing another thread's eviction).  Post-fix it
+    must run clean AND ``_total`` must equal the live entry count (no lost
+    updates — the O(1) ``__len__`` counter is a read-modify-write under
+    contention).
+
+    ``sys.setswitchinterval(1e-6)`` is REQUIRED: at the default interval the
+    GIL almost never preempts inside one method and the lock-less version
+    passes (the historical trap).
+    """
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        c = RootCache(cap=200, max_roots=4)
+        errors: list[str] = []
+        stop = threading.Event()
+
+        def worker(n: int) -> None:
+            try:
+                i = 0
+                while not stop.is_set():
+                    if i % 7 == 0:
+                        c.sweep_dead()
+                    elif i % 5 == 0:
+                        len(c)
+                        list(c)
+                        c.quota()
+                    else:
+                        r = f"/repo{n}"
+                        c.admit((r, f"f{i}"), i)
+                        c.get((r, f"f{i}"))
+                    i += 1
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(f"worker{n}: {type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(6)]
+        for t in threads:
+            t.start()
+        time.sleep(1.0)
+        stop.set()
+        for t in threads:
+            t.join(timeout=15)
+        assert not errors, f"concurrent RootCache access raised: {errors[:3]}"
+        with c._lock:
+            assert c._total == sum(
+                len(inner) for inner in c._roots.values()
+            ), "O(1) _total counter desynced from live entries"
+    finally:
+        sys.setswitchinterval(old)
+
+
+def test_reads_keep_root_warm():
+    """C3 (2026-08-12): a root that only READS must not be dropped as coldest.
+
+    Pre-fix ``_last_seen`` updated only on ``__setitem__``/``admit``, so a
+    fully-warmed repo (steady state = hits only, zero admits) looked coldest
+    and was evicted ENTIRELY when a 5th repo arrived past ``max_roots`` — the
+    cache-efficiency champion became the first victim, re-introducing
+    multi-repo starvation in a different form.  Post-fix ``__getitem__`` hits
+    refresh recency too.
+    """
+    c = RootCache(cap=10, max_roots=2)
+    for i in range(6):
+        c.admit((R1, f"f{i}"), i)
+    for i in range(4):
+        c.admit((R2, f"g{i}"), i)
+    # R1 was admitted first (coldest so far); now it does read-only work.
+    for i in range(6):
+        c[(R1, f"f{i}")]  # __getitem__ hits refresh recency
+    assert c.admit((R3, "h0"), "h0") is True
+    assert c.count(R1) == 6, "read-heavy root must not be dropped as coldest"
+    assert c.count(R2) == 0, "the truly-cold (write-only) root is dropped"
+    assert c.count(R3) == 1
+
+
+def test_miss_does_not_touch_recency():
+    """C3: a MISS (KeyError) must not refresh recency — only hits keep a root
+    warm, otherwise a probing root could never be evicted."""
+    c = RootCache(cap=10, max_roots=2)
+    for i in range(6):
+        c.admit((R1, f"f{i}"), i)
+    for i in range(4):
+        c.admit((R2, f"g{i}"), i)
+    for _ in range(6):
+        c.get((R1, "nope"))  # all misses — no recency refresh
+    assert c.admit((R3, "h0"), "h0") is True
+    assert c.count(R1) == 0, "miss-only root stays coldest and is dropped"
+    assert c.count(R2) == 4
+    assert c.count(R3) == 1

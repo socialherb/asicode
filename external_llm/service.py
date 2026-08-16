@@ -205,15 +205,12 @@ class ExternalLLMService:
                           then synthesize unified diff server-side when possible.
     """
 
-    # Safety caps for auto-mode FILE rewrites (MVP)
-    _MAX_FILE_CHARS = 250_000
-    _MAX_PATCH_CHARS = 350_000
-
     # Safety caps for FILE-block retry (git-apply-check failed -> FILE rewrite -> synth diff)
     # NOTE: FILE-block rewrite is powerful; keep it constrained to avoid large, risky rewrites.
+    # P9-2: patch_engine is the single source of truth for FILE-size caps (_MAX_FILE_CHARS,
+    # _MAX_PATCH_CHARS, _MAX_FILE_REWRITE_CHANGE_RATIO, _MAX_FILE_REWRITE_CHANGED_LINES).
+    # Duplicated copies previously lived here and drifted (0.45/400 ghosts no longer in use).
     _MAX_FILE_RETRY_FILE_CHARS = 60_000            # only allow FILE retry when the target file is small
-    _MAX_FILE_REWRITE_CHANGE_RATIO = 0.45          # reject if rewrite changes "too much" of the file
-    _MAX_FILE_REWRITE_CHANGED_LINES = 400          # additional cap based on estimated changed lines
 
 
     @staticmethod
@@ -735,11 +732,16 @@ class ExternalLLMService:
     # ── Default model per provider ─────────────────────────────────────────
     # Used as fallback when no model is explicitly provided.
     _PROVIDER_DEFAULT_MODELS: ClassVar[dict[str, str]] = {
-        "openai": "gpt-4-turbo-preview",
-        "anthropic": "claude-sonnet-4-6",
-        "google": "gemini-2.0-flash",
-        "deepseek": "deepseek-chat",
-        "zai": "glm-4-plus",
+        # These MUST stay in sync with each provider client's DEFAULT_MODEL
+        # (test_default_models_sync_with_client_classes enforces it): the
+        # service forwards this value into real API calls, so a stale entry
+        # silently sends an outdated model even though the client knows the
+        # current one.
+        "openai": "gpt-5.6-sol",
+        "anthropic": "claude-sonnet-5",
+        "google": "gemini-2.5-flash",
+        "deepseek": "deepseek-v4-flash",
+        "zai": "glm-5.3",
         "openrouter": "deepseek/deepseek-v4-flash",
         "opencode": "deepseek-v4-flash",
         "ollama": "",  # ollama picks its own default at runtime
@@ -1624,12 +1626,23 @@ class ExternalLLMService:
 
 
     @staticmethod
+    def _compose_system_prompt(preamble: str, rules_block: str) -> str:
+        """Join a preamble and a CRITICAL OUTPUT RULES block into a system prompt.
+
+        Shared by the three ``_build_*_system_prompt`` builders: each supplies
+        its own preamble + rules text and the composition (concat + strip) is
+        the single source of the common shape.
+        """
+        return (preamble + rules_block).strip()
+
+    @staticmethod
     def _build_patch_only_system_prompt() -> str:
         """
         System prompt that forces unified diff output.
         (Standalone restoration — was mistakenly removed as 'dead code' in f7f7312a.)
         """
-        hard_rules = (
+        return ExternalLLMService._compose_system_prompt(
+            "You are an expert code editor. You produce precise, minimal unified diffs.\n",
             "\n\n"
             "CRITICAL OUTPUT RULES:\n"
             "- Output ONLY a valid unified diff (git apply compatible).\n"
@@ -1639,9 +1652,8 @@ class ExternalLLMService:
             "- Do NOT echo or paste the user's request into the code.\n"
             "- If the requested change is ALREADY PRESENT in the target file, output EXACTLY: NOOP\n"
             "- If the request is ambiguous (e.g., 'add a comment'), interpret it as a real code comment\n"
-            "  (e.g., a Python line starting with '#') and do NOT modify docstrings unless explicitly asked.\n"
+            "  (e.g., a Python line starting with '#') and do NOT modify docstrings unless explicitly asked.\n",
         )
-        return ("You are an expert code editor. You produce precise, minimal unified diffs.\n" + hard_rules).strip()
 
     @staticmethod
     def _build_file_block_only_system_prompt(target_file: str) -> str:
@@ -1673,7 +1685,8 @@ class ExternalLLMService:
 
         The server will reject multi-file edits in this mode.
         """
-        rules = (
+        return ExternalLLMService._compose_system_prompt(
+            "You are an expert code editor. Prefer unified diffs; fall back to file rewrite blocks.\n",
             "\n\n"
             "CRITICAL OUTPUT RULES (AUTO MODE):\n"
             "- Output MUST be EITHER:\n"
@@ -1691,9 +1704,8 @@ class ExternalLLMService:
             "FILE: <target_file_relative_path>\n"
             "```<any_language>\n"
             "... complete file content ...\n"
-            "```\n"
+            "```\n",
         )
-        return ("You are an expert code editor. Prefer unified diffs; fall back to file rewrite blocks.\n" + rules).strip()
 
     def _is_target_file_small_enough_for_file_retry(self, repo_root: str, target_file: str) -> bool:
         """

@@ -85,9 +85,8 @@ _file_cache = RootCache(_FILE_CACHE_MAX_ENTRIES)
 cache is full no longer starves — it claims slots from the most-over-quota
 hoarder; single-root behavior is unchanged.  Survives across indexer
 instances and rebuilds — stamp-keyed, exactly like
-RepositoryGraph._extract_cache."""
-
-_file_cache_gc_deficit = 0
+RepositoryGraph._extract_cache.  Sweep rate-limit deficit lives on the
+instance (``_gc_deficit``) under the cache's lock (C1, 2026-08-12)."""
 
 
 def _too_big_to_index(path: Path, max_bytes: int) -> bool:
@@ -126,16 +125,12 @@ def _gc_file_cache() -> None:
     """Dead-entry sweep for _file_cache (mirror of repository_graph._gc_names_cache).
 
     Sweeps only entries whose source file no longer exists — live files stay
-    warm across rebuilds.  Rate-limited by a deficit counter so each sweep
-    defers the next by one cap worth of insertions (total stat work stays
-    ~O(N) per build).
+    warm across rebuilds.  Rate-limited by a deficit counter on the cache
+    instance (``_gc_deficit``, under the cache's lock) so each sweep defers
+    the next by one cap worth of insertions (total stat work stays ~O(N) per
+    build).
     """
-    global _file_cache_gc_deficit
-    if _file_cache_gc_deficit > 0:
-        _file_cache_gc_deficit -= 1
-        return
-    _file_cache.sweep_dead()
-    _file_cache_gc_deficit = _FILE_CACHE_MAX_ENTRIES
+    _file_cache.sweep_dead(_FILE_CACHE_MAX_ENTRIES)
 
 
 def _walk_py_files(root: Path) -> list[Path]:
@@ -720,6 +715,27 @@ class CallGraphIndexer:
             )
             self._file_nodes.setdefault(rel, []).append(symbol)
 
+    def _lookup_edges_locked(
+        self,
+        forward: bool,
+        file_attr: str,
+        symbol: str,
+        file_path: Optional[str] = None,
+    ) -> list[CallEdge]:
+        """Resolve edges under the index lock, ensuring the graph is built.
+
+        Shared by ``get_callees`` / ``get_callers`` (the only two public
+        lookups): both need ``_ensure_built()`` + the lock + ``_lookup_edges``.
+
+        ``forward=True`` reads ``self._forward`` (caller→callee); ``False``
+        reads ``self._reverse`` (callee→caller).  The index is read AFTER
+        ``_ensure_built()`` so the fresh dict (build() replaces the attribute,
+        it does not mutate the old one) is the one consulted.
+        """
+        self._ensure_built()
+        with self._lock:
+            index = self._forward if forward else self._reverse
+            return self._lookup_edges(index, file_attr, symbol, file_path)
     def _lookup_edges(
         self,
         index: dict[str, list[CallEdge]],
@@ -763,9 +779,7 @@ class CallGraphIndexer:
         Suffix fallback: ``execute_plan_canonical`` matches the index key
         ``OperationExecutor.execute_plan_canonical``.
         """
-        self._ensure_built()
-        with self._lock:
-            return self._lookup_edges(self._forward, "caller_file", symbol, file_path)
+        return self._lookup_edges_locked(True, "caller_file", symbol, file_path)
 
     def get_callers(
         self, symbol: str, file_path: Optional[str] = None
@@ -775,9 +789,7 @@ class CallGraphIndexer:
         Same suffix-fallback logic as get_callees(): ``_schedule_operations``
         matches the index key ``OperationExecutor._schedule_operations``.
         """
-        self._ensure_built()
-        with self._lock:
-            return self._lookup_edges(self._reverse, "callee_file", symbol, file_path)
+        return self._lookup_edges_locked(False, "callee_file", symbol, file_path)
 
     def get_related_symbols(
         self,

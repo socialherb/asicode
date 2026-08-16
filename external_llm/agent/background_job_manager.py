@@ -24,13 +24,16 @@ from collections import OrderedDict
 from typing import Any, Optional
 
 from ..client import interruptible_sleep
+from ..common.bounded_capture import _BoundedCapture
 
 logger = logging.getLogger(__name__)
 
 # Cap per accumulated output stream. The reaper drains pipes every tick, so a
 # chatty long-running job (server logs, verbose build) would otherwise grow
-# the in-RAM buffer without bound. Keep the TAIL — the most recent output is
-# what a "what is this job doing" query needs.
+# the in-RAM buffer without bound.  The buffers are _BoundedCapture instances
+# (head+tail, chunk-fed — no O(n) re-materialisation per drain): the most
+# recent output is what a "what is this job doing" query needs, and the head
+# is what _truncate_bash_output's leading half (the failing command) needs.
 _OUTPUT_BUF_CAP = 2 * 1024 * 1024  # 2 MiB
 _TRUNCATION_MARKER = "…[oldest output truncated]…\n"
 # Max completed-job results preserved in the ring-buffer after reaping/eviction.
@@ -44,13 +47,38 @@ _REAPED_RESULTS_MAX = 20
 _REAPED_OUTPUT_CAP = 32 * 1024
 
 
-def _cap_tail(buf: str) -> str:
-    if len(buf) <= _OUTPUT_BUF_CAP:
-        return buf
-    return _TRUNCATION_MARKER + buf[-_OUTPUT_BUF_CAP:]
-
-
 _MALLOC_NOISE_TOKEN = "MallocStackLogging"
+
+
+def _tail_preview(buf: str) -> str:
+    """Keep the LAST 200 chars of *buf* for list_jobs() previews.
+
+    Tail, never head — a long command's answer (test summary, build verdict)
+    is at the END; a leading slice preserves boilerplate and drops the result.
+    Mirrors :func:`_reaped_tail` (which applies a different cap because it
+    feeds the preserved-output ring buffer rather than a one-line preview).
+    """
+    return buf[-200:] if len(buf) > 200 else buf
+
+
+def _close_job_pipes(job: "BackgroundJob") -> None:
+    """Close a job's pipe read ends — final resource reclaim for a dropped job.
+
+    Used when a stale victim is evicted from ``_stale_jobs`` without waiting
+    for its process to die (or on shutdown).  Closing the read ends makes the
+    orphan's next write hit EPIPE instead of blocking forever on a full pipe;
+    the capture buffers themselves are freed with the job object.
+    """
+    for _fd in (job.proc.stdout, job.proc.stderr):
+        if _fd is not None:
+            try:
+                _fd.close()
+            except Exception:
+                # A concurrently-closed fd (reaper drain) is the normal cause;
+                # the eviction already gave up on this job either way.
+                logger.debug(
+                    "Pipe close failed for dropped job %s", job.job_id, exc_info=True
+                )
 
 
 def strip_malloc_noise(text: str) -> str:
@@ -87,7 +115,8 @@ class BackgroundJobInfo:
     """Immutable snapshot of a background job's state."""
 
     def __init__(self, job_id: str, command: str, pid: Optional[int],
-                 status: str, elapsed: float, stdout: str, stderr: str):
+                 status: str, elapsed: float, stdout: str, stderr: str,
+                 stdout_total: int = 0, stderr_total: int = 0):
         self.job_id = job_id
         self.command = command
         self.pid = pid
@@ -95,6 +124,14 @@ class BackgroundJobInfo:
         self.elapsed = elapsed
         self.stdout = stdout
         self.stderr = stderr
+        # Characters the streams ACTUALLY produced, per the capture's `total`
+        # counter — deliberately separate from len(stdout)/len(stderr): a live
+        # buffer elides its middle past _OUTPUT_BUF_CAP and the reaped ring
+        # tails to _REAPED_OUTPUT_CAP, so the surviving text undercounts.  The
+        # render-time truncation notice names these totals (what the process
+        # printed), not what happened to survive.
+        self.stdout_total = stdout_total
+        self.stderr_total = stderr_total
 
     def __repr__(self) -> str:
         return (
@@ -132,9 +169,12 @@ class BackgroundJob:
         # Accumulated stdout/stderr buffers — read_output() drains into these
         # so that pipe data is never lost between calls.  get_info() reads the
         # accumulated buffer.  The reaper tick also drains periodically to
-        # prevent pipe-full deadlock (Bug #3). Tail-capped at _OUTPUT_BUF_CAP.
-        self._stdout_buf: str = ""
-        self._stderr_buf: str = ""
+        # prevent pipe-full deadlock (Bug #3).  _BoundedCapture caps each at
+        # _OUTPUT_BUF_CAP, keeping head AND tail: the tail is what a live
+        # "what is this job doing" query needs, the head is what a later
+        # truncation of the rendered result keeps as its leading half.
+        self._stdout_buf = _BoundedCapture(_OUTPUT_BUF_CAP)
+        self._stderr_buf = _BoundedCapture(_OUTPUT_BUF_CAP)
         # Serializes drains: the reaper thread and an agent thread calling
         # get_info()/list_jobs() concurrently would otherwise interleave fd
         # reads (chunk-order corruption) and race the non-atomic `buf +=`.
@@ -150,8 +190,8 @@ class BackgroundJob:
         """Read available stdout/stderr (non-blocking) and accumulate in buffer.
 
         Returns the *new* data read this call (not the entire accumulated
-        buffer).  Use :attr:`_stdout_buf` / :attr:`_stderr_buf` for the full
-        accumulated output.
+        buffer).  Use :attr:`_stdout_buf` / :attr:`_stderr_buf` (each a
+        ``_BoundedCapture``; read via ``.text()``) for the accumulated output.
         """
         with self._io_lock:
             stdout = ""
@@ -183,8 +223,8 @@ class BackgroundJob:
             if self.proc.stderr:
                 with contextlib.suppress(UnicodeDecodeError, OSError):
                     stderr += self._read_fd(self.proc.stderr)
-            self._stdout_buf = _cap_tail(self._stdout_buf + stdout)
-            self._stderr_buf = _cap_tail(self._stderr_buf + stderr)
+            self._stdout_buf.feed(stdout)
+            self._stderr_buf.feed(stderr)
             return stdout, stderr
 
     @staticmethod
@@ -214,9 +254,24 @@ class BackgroundJob:
         """Update and return current status.
 
         Thread-safe: wraps status in self._lock to avoid TOCTOU with kill().
+
+        The lock is acquired *non-blocking*: kill() holds ``self._lock`` for
+        up to ~6 s (SIGTERM wait + SIGKILL fallback), and ``cleanup()`` /
+        ``_evict_over_capacity_locked`` call this while holding the manager
+        lock.  A blocking acquire there would freeze the entire manager
+        (list_jobs / get_info / start) behind one mid-teardown job.  On lock
+        contention we return the last-known status — slightly stale, but
+        non-blocking; the next poll resolves it.
         """
-        with self._lock:
-            if self.status in ("completed", "failed", "killed"):
+        if not self._lock.acquire(blocking=False):
+            # kill() is mid-teardown; report the cached status rather than
+            # block (up to ~6 s) on the job lock.
+            return self.status
+        try:
+            if self.status in ("completed", "failed", "killed", "killing"):
+                # "killing" is set by _evict_over_capacity_locked for a victim
+                # whose kill is in flight outside the lock; never regress it
+                # back to "running" from a stale poll.
                 return self.status
             ret = self.proc.poll()
             if ret is None:
@@ -226,11 +281,50 @@ class BackgroundJob:
             else:
                 self.status = "failed"
             return self.status
+        finally:
+            self._lock.release()
+
+    def _settle_status(self) -> None:
+        """Resolve status after a kill attempt that could not finish.
+
+        The transient ``"killing"`` marker (set by over-capacity eviction)
+        must never outlive a kill() attempt: if the process is dead,
+        classify its real rc (0 -> completed, <0 -> killed, >0 -> failed);
+        if it is still alive, revert to "running" so the job stays honest
+        and an eviction victim gets re-tracked for reaping instead of
+        freezing the ring as a permanent "killing" entry.
+        """
+        try:
+            ret = self.proc.poll()
+        except Exception:
+            logger.warning("poll() failed while settling status for job %s",
+                           self.job_id, exc_info=True)
+            return  # keep the current status — the next reap tick retries
+        if ret is None:
+            self.status = "running"
+        elif ret == 0:
+            self.status = "completed"
+        elif ret < 0:
+            self.status = "killed"  # died from a signal (typically our SIGKILL)
+        else:
+            self.status = "failed"
 
     def kill(self) -> None:
         """Terminate the process tree."""
         with self._lock:
             if self.status in ("completed", "failed", "killed"):
+                return
+            # Resolve the real exit status FIRST.  status is only refreshed by
+            # poll_status(), which the reaper calls on a 30s tick — a process
+            # that exited between ticks still reads "running" here.  Killing it
+            # would then take the ProcessLookupError fallback (no-op on a dead
+            # leader) and force status="killed", destroying the real outcome:
+            # a build that succeeded (rc=0) and one that failed (rc=7) both
+            # read "killed" afterwards, permanently (poll_status() early-returns
+            # on terminal states).  A pre-poll preserves the truth.
+            ret = self.proc.poll()
+            if ret is not None:
+                self.status = "completed" if ret == 0 else "failed"
                 return
             try:
                 # Kill the process group to catch children. Uses the pgid
@@ -250,17 +344,45 @@ class BackgroundJob:
                         logger.warning(
                             "Job %s did not die after SIGKILL — process still alive", self.job_id,
                         )
-                        return  # Don't set status to "killed" if still alive
+                        # Don't claim "killed" for a live process — and never
+                        # leave the transient "killing" marker (eviction
+                        # victims) set once the kill attempt has returned.
+                        self._settle_status()
+                        return
             except (ProcessLookupError, PermissionError, OSError):
-                # Already dead or no permission
-                self.proc.kill()
+                # Already dead or no permission.  This is also the R2 TOCTOU
+                # residual of the F1 pre-poll: the leader can exit between
+                # poll() and killpg(), and the fallback wait() then returns
+                # the REAL exit code.  Honor it (rc==0 -> completed, rc>0 ->
+                # failed) instead of stamping "killed" unconditionally — a
+                # build that succeeded and one that failed must stay
+                # distinguishable even in this narrow window.  rc<0 (signal
+                # death, typically our SIGKILL) stays "killed".
                 try:
-                    self.proc.wait(timeout=3)
+                    self.proc.kill()  # no-op on an already-dead leader
+                    rc = self.proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     logger.warning("Job %s did not die after SIGKILL (fallback path)", self.job_id)
-                    return  # Don't set status to "killed" if still alive
+                    # Same convergence contract as the main path: never return
+                    # with the transient "killing" marker still set.
+                    self._settle_status()
+                    return
+                except (ProcessLookupError, ChildProcessError):
+                    rc = self.proc.returncode  # leader already reaped — use recorded rc
+                if rc is None:
+                    self.status = "killed"  # no recorded exit code — assume killed
+                elif rc == 0:
+                    self.status = "completed"
+                elif rc < 0:
+                    self.status = "killed"  # died from a signal (our SIGKILL)
+                else:
+                    self.status = "failed"
+                return
             except Exception as e:
                 logger.warning("Failed to kill job %s: %s", self.job_id, e)
+                # Same convergence contract: settle so the victim never freezes
+                # as a permanent "killing" ring entry.
+                self._settle_status()
                 return
             self.status = "killed"
 
@@ -286,6 +408,13 @@ class BackgroundJobManager:
         # Maps job_id -> BackgroundJobInfo.  Bounded at _REAPED_RESULTS_MAX
         # (oldest entries evicted first via popitem(last=False)).
         self._reaped_results: "OrderedDict[str, BackgroundJobInfo]" = OrderedDict()
+        # Eviction victims whose kill could not finish (process still alive,
+        # e.g. D-state after SIGKILL).  They are out of _jobs — the slot was
+        # freed — but not dead, so the reaper tracks them here and converges
+        # the ring placeholder to the real status when they finally die.
+        # Deliberately NOT re-inserted into _jobs: that would break the
+        # max_jobs hard bound and re-evict the same victim on every start.
+        self._stale_jobs: dict[str, BackgroundJob] = {}
         self._lock = threading.Lock()
         self._last_reap: float = 0.0
         self._reaper_timer: Optional[threading.Timer] = None
@@ -300,7 +429,8 @@ class BackgroundJobManager:
         final line of a script — is at the END. A leading slice preserves the
         boilerplate and drops the result, which is worse than useless because
         it looks like a successful retrieval. (Same reasoning, and the same
-        direction, as :func:`_cap_tail` for live buffers.)
+        direction, as :func:`_tail_preview` and the live buffers' head+tail
+        capture for live reads.)
         """
         buf = buf or ""
         if len(buf) <= _REAPED_OUTPUT_CAP:
@@ -319,8 +449,10 @@ class BackgroundJobManager:
             pid=job.proc.pid,
             status=job.status,
             elapsed=job.elapsed,
-            stdout=self._reaped_tail(job._stdout_buf),
-            stderr=self._reaped_tail(strip_malloc_noise(job._stderr_buf)),
+            stdout=self._reaped_tail(job._stdout_buf.text()),
+            stderr=self._reaped_tail(strip_malloc_noise(job._stderr_buf.text())),
+            stdout_total=job._stdout_buf.total,
+            stderr_total=job._stderr_buf.total,
         )
 
     def _store_reaped_locked(self, job_id: str, info: BackgroundJobInfo) -> None:
@@ -382,12 +514,35 @@ class BackgroundJobManager:
                 logger.debug(
                     "Final drain failed for evicted job %s", victim_id, exc_info=True
                 )
-            # Snapshot the victim's final state into the ring buffer so
-            # get_info() can still retrieve output after eviction.
+            # Overwrite the "killing" placeholder (pre-snapshotted under the
+            # lock in _evict_over_capacity_locked) with the true outcome after
+            # the kill: the final state, or — when the kill could not finish
+            # and the process is still alive — a "running" snapshot plus
+            # stale re-tracking (R3: the placeholder must never freeze).
             with self._lock:
-                if victim_id not in self._reaped_results:
-                    info = self._snapshot_job_locked(victim_id, victim_job)
-                    self._store_reaped_locked(victim_id, info)
+                info = self._snapshot_job_locked(victim_id, victim_job)
+                self._store_reaped_locked(victim_id, info)
+                if victim_job.status not in ("completed", "failed", "killed"):
+                    self._stale_jobs[victim_id] = victim_job
+                    # F4: _stale_jobs must stay bounded like every other
+                    # registry.  A SIGKILL-surviving victim (D-state) can
+                    # outlive the whole session, and without a cap each
+                    # over-capacity start would pile up one Popen + two pipes
+                    # + the output buffers forever.  FIFO: the oldest
+                    # un-converged victim is dropped, its pipes closed so a
+                    # later write EPIPEs instead of blocking the orphan.
+                    while len(self._stale_jobs) > self.max_jobs:
+                        _oldest_id, _oldest_job = next(iter(self._stale_jobs.items()))
+                        del self._stale_jobs[_oldest_id]
+                        _close_job_pipes(_oldest_job)
+                        logger.warning(
+                            "Dropped oldest stale job %s (cap %d): still alive after SIGKILL",
+                            _oldest_id, self.max_jobs,
+                        )
+                    logger.warning(
+                        "Evicted job %s still alive after kill — re-tracking for reap: cmd=%.200s",
+                        victim_id, victim_cmd,
+                    )
             logger.warning(
                 "Killed oldest job to enforce max_jobs=%d: id=%s cmd=%.200s",
                 self.max_jobs, victim_id, victim_cmd,
@@ -421,17 +576,16 @@ class BackgroundJobManager:
 
         # ── I/O outside the lock ──
         status = job.poll_status()
-        # drain pipe → accumulates into _stdout_buf/_stderr_buf
-        with contextlib.suppress(UnicodeDecodeError, OSError):  # binary output / closed pipe
-            job.read_output()
+        # drain pipe → accumulates into _stdout_buf/_stderr_buf.
+        # read_output() swallows UnicodeDecodeError/OSError internally.
+        job.read_output()
 
         if status in ("completed", "failed", "killed"):
             # final drain (process is dead, pipe is flushing)
-            with contextlib.suppress(UnicodeDecodeError, OSError):
-                job.read_output()
+            job.read_output()
 
-        stdout = job._stdout_buf
-        stderr = strip_malloc_noise(job._stderr_buf)
+        stdout = job._stdout_buf.text()
+        stderr = strip_malloc_noise(job._stderr_buf.text())
 
         return BackgroundJobInfo(
             job_id=job_id,
@@ -441,6 +595,8 @@ class BackgroundJobManager:
             elapsed=job.elapsed,
             stdout=stdout or "",
             stderr=stderr or "",
+            stdout_total=job._stdout_buf.total,
+            stderr_total=job._stderr_buf.total,
         )
 
     def wait_for_completion(self, job_id: str, timeout: float = 120.0,
@@ -460,13 +616,36 @@ class BackgroundJobManager:
         the wait is abandoned at the next poll tick and the current snapshot
         is returned so the caller can surface the cancellation — a raw
         ``time.sleep`` here would otherwise ignore ESC for the whole budget.
+
+        A transient ``None`` (a job that is being evicted over capacity and
+        is mid-kill) is tolerated for a short grace window instead of being
+        reported as "not found" — the eviction placeholder in
+        ``_reaped_results`` normally covers this, but a caller that started
+        polling before the placeholder was written needs the retry.  The
+        grace never outlives *timeout*: a job that is still not found when
+        the deadline arrives returns ``None`` at the deadline.
         """
         deadline = time.monotonic() + timeout
+        none_since: Optional[float] = None
         while True:
             info = self.get_info(job_id)
             if info is None:
-                return None
-            if info.status != "running":
+                now = time.monotonic()
+                remaining = deadline - now
+                if remaining <= 0:
+                    return None  # timeout — job still not found
+                if none_since is None:
+                    none_since = now
+                if now - none_since >= min(3.0, remaining):
+                    return None  # genuinely not found — give up
+                if interruptible_sleep(min(0.1, poll_interval), cancel_event):
+                    return None  # cancelled — abandon
+                continue
+            none_since = None
+            if info.status not in ("running", "killing"):
+                # "killing" is the transient eviction placeholder — the final
+                # status lands right after the kill completes outside the
+                # lock, so keep polling instead of returning it as final.
                 return info
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -477,8 +656,20 @@ class BackgroundJobManager:
     def list_jobs(self, include_completed: bool = True) -> list[BackgroundJobInfo]:
         """List all tracked jobs, lazily reaping old completed ones first.
 
+        The list merges two registries: active jobs in ``_jobs`` and the
+        ``_reaped_results`` ring.  Reaped jobs (cleanup / capacity eviction /
+        stale convergence) stay retrievable via :meth:`get_info`, so dropping
+        them from the list would hide final states a caller is still waiting
+        on — the merged ring keeps ``action=list`` a complete picture.
+
         I/O (``poll_status``, ``read_output``) is performed *outside*
         ``self._lock`` so that pipe reads do not block other callers.
+
+        Preview fields are the TAIL of each buffer (``_tail_preview``): a
+        running job's verdict — build result, test summary — arrives last,
+        so a head slice would freeze the preview on boilerplate.  This makes
+        ``action=list`` a usable progress signal without a separate
+        ``action=output`` call.
         """
         self._maybe_reap()
         with self._lock:
@@ -487,6 +678,7 @@ class BackgroundJobManager:
                 (job_id, job, job.command, job.proc.pid)
                 for job_id, job in list(self._jobs.items())
             ]
+            reaped = list(self._reaped_results.values())
 
         # ── I/O outside the lock ──
         infos = []
@@ -494,20 +686,38 @@ class BackgroundJobManager:
             status = job.poll_status()
             if not include_completed and status in ("completed", "failed", "killed"):
                 continue
-            # drain pipe → accumulates into buffer
-            with contextlib.suppress(UnicodeDecodeError, OSError):  # binary output / closed pipe
-                job.read_output()
-            stdout = job._stdout_buf
-            stderr = strip_malloc_noise(job._stderr_buf)
+            # drain pipe → accumulates into buffer (read_output() swallows
+            # UnicodeDecodeError/OSError internally)
+            job.read_output()
+            stdout = job._stdout_buf.text()
+            stderr = strip_malloc_noise(job._stderr_buf.text())
             infos.append(BackgroundJobInfo(
                 job_id=job_id,
                 command=command,
                 pid=pid,
                 status=status,
                 elapsed=job.elapsed,
-                stdout=(stdout or "")[:200],
-                stderr=(stderr or "")[:200],
+                stdout=_tail_preview(stdout or ""),
+                stderr=_tail_preview(stderr or ""),
+                stdout_total=job._stdout_buf.total,
+                stderr_total=job._stderr_buf.total,
             ))
+
+        # ── Reaped-results ring (already-snapshotted; no I/O needed) ──
+        # Terminal entries respect include_completed; the transient
+        # "killing"/"running" placeholders of evicted victims are NOT
+        # terminal, so they stay listed for include_completed=False too.
+        # Dedup against active ids: no current path creates the overlap, but
+        # a duplicate entry in a job list is a silent correctness trap.
+        active_ids = {job_id for job_id, *_ in snapshots}
+        if include_completed:
+            infos.extend(r for r in reaped if r.job_id not in active_ids)
+        else:
+            infos.extend(
+                r for r in reaped
+                if r.status not in ("completed", "failed", "killed")
+                and r.job_id not in active_ids
+            )
         return infos
 
     def kill(self, job_id: str) -> Optional[str]:
@@ -577,10 +787,38 @@ class BackgroundJobManager:
                 logger.debug("Cleaned up %d background job(s)", removed)
             return removed
 
-    def get(self, job_id: str) -> Optional[BackgroundJob]:
-        """Direct access to internal job (for integration use)."""
+    def _reap_stale(self) -> None:
+        """Converge stale victims: evicted jobs whose kill could not finish.
+
+        Such a job lives only in ``_stale_jobs`` plus a "running" ring
+        placeholder.  Every reap tick, settle its status: when the process
+        finally dies (e.g. a D-state process that SIGKILL could not
+        interrupt), snapshot the REAL terminal status into the ring,
+        replacing the placeholder — otherwise the ring would serve
+        "running" forever.  While still alive, keep draining its pipes so a
+        stuck-but-productive process cannot deadlock on a full pipe buffer.
+        Deliberately no kill retry: SIGKILL was already delivered, and a
+        process that survived it is uninterruptible.
+        """
         with self._lock:
-            return self._jobs.get(job_id)
+            stale = list(self._stale_jobs.items())
+        for jid, job in stale:
+            try:
+                job._settle_status()
+                if job.status in ("completed", "failed", "killed"):
+                    job.read_output()  # final drain — process is dead, pipe flushing
+                    with self._lock:
+                        if jid in self._stale_jobs:  # still tracked
+                            del self._stale_jobs[jid]
+                            info = self._snapshot_job_locked(jid, job)
+                            self._store_reaped_locked(jid, info)
+                            logger.debug("Stale job %s converged to %s", jid, job.status)
+                else:
+                    job.read_output()  # still alive — keep the pipes drained
+            except Exception:
+                # Never let one unreadable pipe abort the sweep for the rest;
+                # the next tick retries.
+                logger.debug("Stale-job reap failed for %s", jid, exc_info=True)
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
@@ -597,6 +835,12 @@ class BackgroundJobManager:
         observe an intermediate (sub-max) count and pile on:
         ``len(_jobs) <= max_jobs`` is an invariant visible to every lock
         holder.
+
+        A running victim is pre-snapshotted into ``_reaped_results`` (status
+        ``"killing"``) *before* the lock is released: the caller kills it
+        outside the lock for up to ~6 s, and without this placeholder the
+        victim would be in neither registry during that window — get_info()
+        would answer "not found" for a job that is alive and dying.
         """
         victims: list = []
         while len(self._jobs) > self.max_jobs:
@@ -619,10 +863,15 @@ class BackgroundJobManager:
             killed_one = False
             for jid, job in list(self._jobs.items()):
                 if jid != keep_job_id:
-                    # Victim will be killed outside the lock.  Don't snapshot
-                    # yet — the status is still "running" here.  The caller
-                    # (start()) snapshots after the kill so the ring buffer
-                    # gets the correct "killed" status.
+                    # Pre-snapshot NOW, under the lock, with an explicit
+                    # "killing" marker.  The victim leaves _jobs immediately
+                    # but the actual kill runs outside the lock (up to ~6 s);
+                    # the placeholder keeps get_info()/wait_for_completion()
+                    # from reporting "not found" in that window.  The caller
+                    # overwrites it with the final status after the kill.
+                    job.status = "killing"
+                    info = self._snapshot_job_locked(jid, job)
+                    self._store_reaped_locked(jid, info)
                     del self._jobs[jid]
                     victims.append((jid, job, job.command))
                     killed_one = True
@@ -647,6 +896,7 @@ class BackgroundJobManager:
                 return
             self._last_reap = now
         self.cleanup()
+        self._reap_stale()
 
     # ── Background reaper (periodic zombie / stale-job cleanup) ────────────
 
@@ -700,12 +950,21 @@ class BackgroundJobManager:
     def shutdown(self) -> None:
         """Stop the background reaper and cancel the pending tick.
 
-        Safe to call multiple times. Does not touch tracked jobs.
+        Safe to call multiple times. Does not touch tracked (active) jobs;
+        stale re-tracking is dropped — the reaper that would converge it is
+        stopped, so the dict would otherwise pin Popen + pipes forever.
         """
         with self._lock:
             self._reaper_active = False
             t = self._reaper_timer
             self._reaper_timer = None
+            # F4: no reaper tick will ever converge these again — drop them
+            # now (pipes closed so an orphan's write EPIPEs instead of
+            # blocking).  Safe against a mid-settle _reap_stale: its
+            # `jid in self._stale_jobs` re-check under this lock no-ops.
+            for _job in self._stale_jobs.values():
+                _close_job_pipes(_job)
+            self._stale_jobs.clear()
         if t is not None:
             t.cancel()
 
@@ -720,10 +979,20 @@ def get_global_background_job_manager(max_jobs: int = 5) -> BackgroundJobManager
 
     ToolRegistry clones (subagents) share this singleton so that
     background jobs survive subagent lifecycle.
+
+    Only the FIRST call's *max_jobs* takes effect — the singleton is created
+    once.  Later calls with a different value log a warning instead of
+    silently ignoring the caller's intent.
     """
     global _global_bg_manager
     if _global_bg_manager is None:
         with _global_bg_manager_lock:
             if _global_bg_manager is None:
                 _global_bg_manager = BackgroundJobManager(max_jobs=max_jobs)
+    elif max_jobs != _global_bg_manager.max_jobs:
+        logger.warning(
+            "get_global_background_job_manager(max_jobs=%d) ignored: singleton "
+            "already created with max_jobs=%d",
+            max_jobs, _global_bg_manager.max_jobs,
+        )
     return _global_bg_manager

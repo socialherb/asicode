@@ -182,8 +182,10 @@ class TestToolsMixin:
                 content_parts.append("")
 
         if not content_parts:
-            if result.summary_line:
-                content_parts.append(result.summary_line)
+            # Dead-branch audit: reaching here requires total_tests == 0 AND
+            # not result.summary_line (the L114 guard's complement), so a
+            # truthy summary_line is impossible at this point — the former
+            # `if result.summary_line:` below was unreachable dead code.
             if result.failing_tests:
                 content_parts.append("Failing tests:")
                 content_parts.extend(f"  - {t}" for t in result.failing_tests[:20])

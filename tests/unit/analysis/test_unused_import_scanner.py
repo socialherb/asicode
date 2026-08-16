@@ -538,3 +538,107 @@ def test_pep695_type_statement_string_not_flagged():
         )
     finally:
         Path(path).unlink(missing_ok=True)
+
+
+# ── Per-file analysis disk cache ───────────────────────────────────────────
+
+
+def _uic_sig(candidates):
+    return sorted((c.file, c.symbol_name, c.lineno) for c in candidates)
+
+
+def test_analysis_cache_hot_run_matches_cold(tmp_path):
+    """A cache-hot run must reproduce the cold candidate set while reusing the
+    on-disk per-file analysis (the scanner's dominant cost in the gate)."""
+    import os
+
+    from external_llm.analysis.unused_import_scanner import _uic_cache_path
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "mod.py").write_text(textwrap.dedent("""\
+        import os
+        import sys
+
+        def f():
+            return os.getcwd()
+    """))
+    cache_path = _uic_cache_path(str(repo))
+    assert not os.path.exists(cache_path)
+
+    first = scan_unused_imports(repo_root=str(repo), file_paths=["mod.py"])
+    assert os.path.exists(cache_path), "cold run must persist the analysis cache"
+    second = scan_unused_imports(repo_root=str(repo), file_paths=["mod.py"])
+    assert _uic_sig(first) == _uic_sig(second)
+    assert [c.symbol_name for c in second] == ["sys"], (
+        "sys is unused; os is used by f()"
+    )
+
+
+def test_analysis_cache_invalidates_on_edit(tmp_path):
+    """Editing a file (fingerprint change) must re-analyze THAT file — a stale
+    entry would serve pre-edit import/load names."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "mod.py"
+    target.write_text("import os\n\ndef f():\n    return 1\n")
+    scan_unused_imports(repo_root=str(repo), file_paths=["mod.py"])
+
+    # Rewrite: os is now used.
+    target.write_text("import os\n\ndef f():\n    return os.getcwd()\n")
+    candidates = scan_unused_imports(repo_root=str(repo), file_paths=["mod.py"])
+    assert [c.symbol_name for c in candidates] == [], "stale analysis served after edit"
+
+
+def test_analysis_cache_corrupt_falls_back_to_full_scan(tmp_path):
+    """A corrupt cache file must fail OPEN to a full re-analysis."""
+    from external_llm.analysis.unused_import_scanner import _uic_cache_path
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "mod.py").write_text("import os\n\ndef f():\n    return 1\n")
+    scan_unused_imports(repo_root=str(repo), file_paths=["mod.py"])
+    with open(_uic_cache_path(str(repo)), "w", encoding="utf-8") as fh:
+        fh.write("{not json!!")
+
+    candidates = scan_unused_imports(repo_root=str(repo), file_paths=["mod.py"])
+    assert [c.symbol_name for c in candidates] == ["os"]
+
+
+def test_analysis_cache_version_mismatch_discarded(tmp_path):
+    """A cache written by a different analysis version must be discarded."""
+    import json
+
+    from external_llm.analysis.unused_import_scanner import _uic_cache_path
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "mod.py").write_text("import os\n\ndef f():\n    return 1\n")
+    scan_unused_imports(repo_root=str(repo), file_paths=["mod.py"])
+    path = _uic_cache_path(str(repo))
+    with open(path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    payload["format"] = payload["format"] + 99
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+
+    candidates = scan_unused_imports(repo_root=str(repo), file_paths=["mod.py"])
+    assert [c.symbol_name for c in candidates] == ["os"]
+
+
+def test_uic_cache_path_goes_through_path_guard(tmp_path, monkeypatch):
+    """P-1 regression: the cache path must route through the fail-closed guard."""
+    from external_llm.analysis import parse_cache
+    from external_llm.analysis.unused_import_scanner import (
+        _UIC_CACHE_VERSION,
+        _uic_cache_path,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        parse_cache,
+        "cache_file_path",
+        lambda root, filename: calls.append((root, filename)) or "/guarded",
+    )
+    assert _uic_cache_path(str(tmp_path)) == "/guarded"
+    assert calls == [(str(tmp_path), f"unused_import_v{_UIC_CACHE_VERSION}.json")]

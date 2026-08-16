@@ -45,9 +45,12 @@ symbols from the structural gate.
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 from typing import Optional
+
+from external_llm.common.atomic_io import atomic_write_json
 
 from ..graph.repository_graph import path_to_module
 from ..languages import LanguageId
@@ -73,6 +76,7 @@ def _scanner_resident_entry_points() -> set:
     """
     try:
         from ..agent.scanner_registry import get_registry
+
         return get_registry().resident_entry_point_names()
     except Exception:
         logger.debug("[CROSS_FILE_REFS] scanner registry unavailable", exc_info=True)
@@ -243,11 +247,7 @@ def compute_cross_file_referenced_names_light(
     # build's earlier sizing and the registry's later one compose (P2 2026-08-11).
     parse_cache.ensure_capacity(len(py_files))
     try:
-        refs = (
-            set(imported_names)
-            if imported_names is not None
-            else compute_imported_names(repo_root, candidate_files)
-        )
+        refs = set(imported_names) if imported_names is not None else compute_imported_names(repo_root, candidate_files)
         # Scanner entry points resident in the registry (e.g.
         # ``scan_vulture_dead_code``) are alive by construction but have no
         # call edge and no ``from m import fn`` entry — they are passed to
@@ -257,17 +257,33 @@ def compute_cross_file_referenced_names_light(
         rr = repo_root or ""
         for f in py_files:
             # 1. Caller edges (call graph) — catches function calls.
-            for sym in (graph.get_symbols_in_file(f) or []):
+            for sym in graph.get_symbols_in_file(f) or []:
                 name = sym.name if hasattr(sym, "name") else (getattr(sym, "symbol_name", "") or "")
                 if name and graph.get_callers(name):
                     refs.add(name)
-            # 2. Importer files that do ``from <candidate module> import X``
-            #    — catches classes/constants exported but never called.
-            if has_importers:
-                refs.update(_importer_exported_names(graph, rr, f))
+        # 2. Importer files that do ``from <candidate module> import X``
+        #    — catches classes/constants exported but never called.  One
+        #    parse per UNIQUE importer (inverted index over the union of all
+        #    importer files), NOT one parse per (candidate, importer) pair —
+        #    the per-candidate re-parse measured ~153K ast.parse + ~12M
+        #    ast.walk calls / ~35s on asicode (928 candidates x ~165 importers
+        #    each, round 32-P-F).  Must sit OUTSIDE the caller-edge loop: the
+        #    index build re-parses the whole importer union, and nesting it
+        #    inside the per-candidate loop re-ran it len(py_files) times
+        #    (~3900s on asicode — caught 2026-08-16 by the gate tests
+        #    timing out at 120s).
+        if has_importers:
+            importer_index = _build_importer_export_index(graph, rr, py_files)
+            if importer_index:
+                for f in py_files:
+                    module_prefix = path_to_module(f, rr)
+                    for imp_src_abs, names in importer_index.items():
+                        if imp_src_abs == module_prefix or imp_src_abs.startswith(module_prefix + "."):
+                            refs.update(names)
         logger.debug(
             "[CROSS_FILE_REFS] light: %d referenced name(s) from %d Python file(s)",
-            len(refs), len(py_files),
+            len(refs),
+            len(py_files),
         )
     except Exception:
         logger.debug("[CROSS_FILE_REFS] light computation failed — staying conservative", exc_info=True)
@@ -276,51 +292,174 @@ def compute_cross_file_referenced_names_light(
         return refs
 
 
-def _importer_exported_names(graph, repo_root: str, candidate_file: str) -> set:
-    """Names other Python files import from *candidate_file* via ``from m import X``.
+# ── Importer-export disk cache (round 32-F2) ────────────────────────────────
+# Per-importer extraction is a pure function of file content (see
+# ``_extract_importer_exports``), so it is cached on disk with the shared
+# ``(mtime_ns, size)`` fingerprint pattern: corruption / version mismatch /
+# read-write errors all fail OPEN to a full re-parse (never wrong results).
+# Bump the version when the extraction semantics change.
+_IMPORTER_EXPORT_CACHE_VERSION = 1
 
-    Parses each importer the graph reports (``get_importers``), resolves
-    relative imports against the importer's package, and records every name
-    bound by a ``from <candidate module> import X [as Y]``.  Both X (the
-    exported symbol) and Y (the local alias) are recorded so judging the
-    original dead while an aliased import lives is impossible.
 
-    Deliberately does NOT cover ``module.attr`` reads, and returns empty when
-    the graph reports no importers — both are the seed channel's job
-    (``compute_imported_names``), and the seed only covers the files its
-    caller passes.  See the module docstring's CALLER CONTRACT: a caller that
-    seeds from a partial file list loses that coverage here silently.
+def _importer_export_cache_path(repo_root: str) -> str:
+    return parse_cache.cache_file_path(repo_root, f"importer_export_v{_IMPORTER_EXPORT_CACHE_VERSION}.json")
+
+
+def _load_importer_export_cache(repo_root: str) -> dict[str, dict]:
+    """``importer path → {fp, mods}`` entries; empty on any failure.
+
+    An empty *repo_root* (unit-test convention) bypasses the cache entirely.
     """
-    out: set = set()
-    importers = graph.get_importers(candidate_file)
-    if not importers:
-        return out
-    # Canonical path→module prefix (single source with the graph builder):
-    # "pkg/__init__.py" → "pkg" so `from pkg import X` importer matches resolve
-    # (B1, 2026-08-11 — the raw-path form produced "pkg.__init__", which no
-    # import edge stores, silently dropping package re-export importers).
-    module_prefix = path_to_module(candidate_file, repo_root)
-    for importer in importers:
-        abs_imp = importer if os.path.isabs(importer) else os.path.join(repo_root, importer)
-        tree = parse_cache.parse_ast(abs_imp)
-        if tree is None:
+    if not repo_root:
+        return {}
+    cache_path = _importer_export_cache_path(repo_root)  # outside try: CachePathError must propagate
+    try:
+        with open(cache_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if payload.get("format") != _IMPORTER_EXPORT_CACHE_VERSION:
+            return {}
+        files = payload.get("files")
+        if not isinstance(files, dict):
+            return {}
+        return {
+            path: entry
+            for path, entry in files.items()
+            if isinstance(entry, dict) and isinstance(entry.get("fp"), list)
+        }
+    except (OSError, ValueError, TypeError):
+        logger.debug("importer-export cache unreadable — full re-parse", exc_info=True)
+        return {}
+
+
+def _save_importer_export_cache(repo_root: str, cache_files: dict[str, dict]) -> None:
+    """Atomic best-effort persist; empty *repo_root* skips the write.
+
+    Delegates to :func:`atomic_write_json` (B2) — same rename atomicity the
+    hand-rolled pid-tmp+``os.replace`` here provided, plus fsync, failure-path
+    temp cleanup and the stale-temp sweep.  Lock-free last-writer-wins; see
+    the disk-cache concurrency policy in ``parse_cache``.
+    """
+    if not repo_root:
+        return
+    try:
+        cache_path = _importer_export_cache_path(repo_root)
+        atomic_write_json(
+            cache_path,
+            {"format": _IMPORTER_EXPORT_CACHE_VERSION, "files": cache_files},
+            indent=None,
+            ensure_ascii=True,
+        )
+    except (OSError, TypeError, ValueError):
+        logger.debug("importer-export cache write failed", exc_info=True)
+
+
+def _extract_importer_exports(tree: ast.Module, importer: str) -> dict[str, set]:
+    """``module → bound names`` for every ``from ... import X`` in *tree*.
+
+    Pure function of the tree and the importer's path-derived package —
+    the cacheable half of :func:`_build_importer_export_index`.  Both X (the
+    exported symbol) and Y (the local alias) of ``from <src> import X as Y``
+    are recorded so judging the original dead while an aliased import lives
+    is impossible.
+
+    Relative imports are resolved per ImportFrom node against the importer's
+    own package (``from . import X`` / ``from ..pkg import Y``).  Unlike the
+    pre-32-P-F loop — which mutated its base package across nodes, so a
+    ``level >= 2`` import corrupted the base of every later ``from .`` in the
+    same file — each node starts from the importer's package, the intended
+    semantics.  The old drift only ever *narrowed* matches (a corrupted base
+    matched fewer candidate modules), so this can only ADD names to the ref
+    set — the safe direction for dead-code judgement.
+    """
+    index: dict[str, set] = {}
+    imp_pkg = os.path.dirname(importer).replace(os.sep, ".").replace("/", ".")
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
             continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom):
+        imp_src = node.module or ""
+        level = node.level or 0
+        if level > 0:
+            pkg = imp_pkg
+            for _ in range(level - 1):
+                pkg = pkg.rsplit(".", 1)[0] if "." in pkg else ""
+            imp_src_abs = (pkg + "." + imp_src).strip(".") if imp_src else pkg
+        else:
+            imp_src_abs = imp_src
+        if not imp_src_abs:
+            continue
+        names = index.setdefault(imp_src_abs, set())
+        for alias in node.names:
+            if alias.name and alias.name != "*":
+                names.add(alias.name)
+            if alias.asname:
+                names.add(alias.asname)
+    return index
+
+
+def _ie_stat(abs_path: str) -> Optional[tuple[int, int]]:
+    """(st_mtime_ns, st_size) — delegates to the canonical parse_cache helper
+    (single stat code path; order contract documented there, B1)."""
+    return parse_cache.stat_fingerprint(abs_path)
+
+
+def _build_importer_export_index(
+    graph,
+    repo_root: str,
+    candidate_files: list[str],
+) -> dict[str, set]:
+    """Inverted index: resolved import source → names bound by ``from <src> import X``.
+
+    One AST parse per UNIQUE importer file (the union of ``get_importers``
+    across all candidates), replacing the per-candidate importer re-parse —
+    O(candidates * importers) parses/walks, measured ~153K ast.parse + ~12M
+    ast.walk calls / ~35s on asicode for 928 candidates (round 32-P-F).  The
+    index maps the resolved dotted module of every ``from ... import`` to the
+    names it binds; the caller then matches candidate module prefixes against
+    it (``module_prefix == src`` or ``module_prefix + "."`` — the same
+    prefix contract as before, kept in the caller).
+
+    Round 32-F2: the per-importer extraction (a pure function of the file's
+    content — see :func:`_extract_importer_exports`) is cached on disk keyed
+    by ``(mtime_ns, size)`` under ``<repo_root>/.cache/importer_export_v1.json``,
+    the same fail-open pattern as the other four scanner caches.  A fresh
+    process (every gate run) re-parses only importers whose fingerprint
+    changed instead of the whole importer union (~724 files / ~6s on asicode).
+    Must sit OUTSIDE the caller-edge loop (see the nesting warning above).
+
+    Deliberately does NOT cover ``module.attr`` reads — that is the seed
+    channel's job (``compute_imported_names``).
+    """
+    index: dict[str, set] = {}
+    importer_files: set[str] = set()
+    for f in candidate_files:
+        importers = graph.get_importers(f)
+        if importers:
+            importer_files.update(importers)
+    if not importer_files:
+        return index
+    cache_files = _load_importer_export_cache(repo_root)
+    dirty = 0
+    for importer in sorted(importer_files):
+        abs_imp = importer if os.path.isabs(importer) else os.path.join(repo_root, importer)
+        fp = _ie_stat(abs_imp)
+        if fp is None:
+            continue  # vanished importer — same skip as a failed parse below
+        entry = cache_files.get(importer)
+        mods = None
+        if entry is not None and tuple(entry.get("fp") or ()) == fp and isinstance(entry.get("mods"), dict):
+            mods = {src: set(names) for src, names in entry["mods"].items() if isinstance(names, list)}
+        if mods is None:
+            tree = parse_cache.parse_ast(abs_imp)
+            if tree is None:
                 continue
-            imp_src = node.module or ""
-            level = node.level or 0
-            if level > 0:
-                imp_pkg = os.path.dirname(importer).replace(os.sep, ".").replace("/", ".")
-                for _ in range(level - 1):
-                    imp_pkg = imp_pkg.rsplit(".", 1)[0] if "." in imp_pkg else ""
-                imp_src_abs = (imp_pkg + "." + imp_src).strip(".") if imp_src else imp_pkg
-            else:
-                imp_src_abs = imp_src
-            if imp_src_abs == module_prefix or imp_src_abs.startswith(module_prefix + "."):
-                for alias in node.names:
-                    if alias.name and alias.name != "*":
-                        out.add(alias.name)
-                    if alias.asname:
-                        out.add(alias.asname)
-    return out
+            mods = _extract_importer_exports(tree, importer)
+            cache_files[importer] = {
+                "fp": list(fp),
+                "mods": {src: sorted(names) for src, names in mods.items()},
+            }
+            dirty += 1
+        for src, names in mods.items():
+            index.setdefault(src, set()).update(names)
+    if parse_cache.should_persist_partial_update(dirty, len(cache_files)):
+        _save_importer_export_cache(repo_root, cache_files)
+    return index

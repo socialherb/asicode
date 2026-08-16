@@ -1114,3 +1114,76 @@ class TestAutoRestoreDeclLoss:
             "pre-snapshot text must be parsed exactly once "
             "(decl_sets + Phase 3 shared tree)"
         )
+
+
+# ── Crash-safe repair writes: atomic_write_text, never open(path,'w') ─────────
+# A truncating open(path, 'w') clears the file BEFORE the new bytes land, so a
+# SIGKILL / crash between open and write-completion leaves a torn source file.
+# atomic_write_text writes a sibling temp + fsync + rename, closing that window.
+# These tests verify the F821 repair paths route through atomic_write_text by
+# spying on builtins.open: atomic_write_text writes via os.fdopen (not
+# builtins.open), so a correctly-routed repair records ZERO write-opens.
+
+def _spy_write_opens(monkeypatch, target):
+    """Record any builtins.open(file, mode='w...') hitting `target`."""
+    import builtins
+    real_open = builtins.open
+    target_abs = os.path.abspath(target)
+    writes: list = []
+
+    def _spy(file, mode="r", *args, **kwargs):
+        if "w" in mode and os.path.abspath(str(file)) == target_abs:
+            writes.append(str(file))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _spy)
+    return writes
+
+
+class TestRepairUsesAtomicWrite:
+    """auto_repair_semantic's import-insertion write and its rollback restore
+    must both be crash-safe (atomic_write_text), never a truncating open."""
+
+    def test_f821_import_repair_uses_atomic_write(self, manager, tmp_repo, monkeypatch):
+        target = os.path.join(tmp_repo, "use_optional_aw.py")
+        content = "x = Optional[int]\n"
+        with open(target, "w") as f:
+            f.write(content)
+        agent_dir = os.path.join(tmp_repo, "external_llm", "agent")
+        os.makedirs(agent_dir, exist_ok=True)
+        with open(os.path.join(agent_dir, "typing_stubs_aw.py"), "w") as f:
+            f.write("from typing import Optional\n")
+
+        writes = _spy_write_opens(monkeypatch, target)
+        count = manager.auto_repair_semantic({target: content})
+
+        assert count == 1, "expected F821 import repair"
+        with open(target) as f:
+            assert "from typing import Optional" in f.read()
+        assert writes == [], (
+            "F821 import-repair used a truncating open(target,'w'); must route "
+            "through atomic_write_text so a crash never tears the source file"
+        )
+
+    def test_f821_rollback_restore_uses_atomic_write(self, manager, tmp_repo, monkeypatch):
+        target = os.path.join(tmp_repo, "use_optional_rb.py")
+        content = "x = Optional[int]\n"
+        with open(target, "w") as f:
+            f.write(content)
+        agent_dir = os.path.join(tmp_repo, "external_llm", "agent")
+        os.makedirs(agent_dir, exist_ok=True)
+        with open(os.path.join(agent_dir, "typing_stubs_rb.py"), "w") as f:
+            f.write("from typing import Optional\n")
+
+        # Force the post-insertion syntax check to fail so the import is rolled
+        # back to _pre_import. Both the insert write AND the rollback restore
+        # must be atomic.
+        monkeypatch.setattr(manager, "_validate_python_syntax", lambda src: False)
+
+        writes = _spy_write_opens(monkeypatch, target)
+        manager.auto_repair_semantic({target: content})
+
+        assert writes == [], (
+            "F821 rollback restore used a truncating open(target,'w'); must "
+            "route through atomic_write_text"
+        )

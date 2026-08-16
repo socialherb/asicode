@@ -569,8 +569,12 @@ def _glob_to_regex(pattern: str) -> re.Pattern:
                 # POSIX glob: backslash is literal inside a class, and a
                 # leading `]` (even after `!`/`^`) is a member, not the
                 # closer. Make both regex-safe so `[]]`/`[a\]`/`[!]]`
-                # compile instead of surfacing a raw re.error.
+                # compile instead of surfacing a raw re.error. Literal `[`
+                # and `&` are escaped too: Python 3.13+ nested sets and set
+                # intersections would reinterpret a leading `[[` / any `&&`
+                # (FutureWarning today, silent semantics change later).
                 body = body.replace("\\", "\\\\")
+                body = body.replace("[", "\\[").replace("&", "\\&")
                 if body.startswith("]"):
                     body = "\\]" + body[1:]
                 cls = ("^" if negated else "") + body

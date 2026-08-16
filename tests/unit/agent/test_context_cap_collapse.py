@@ -10,9 +10,9 @@ this fix the loops:
   3. never fit, burned every retry, and re-raised the raw provider error.
 
 Now the pre-flight guards (``_apply_context_hard_cap`` / ``_llm_call_with_tools``)
-raise :class:`ContextWindowCollapseError` immediately, and the in-turn re-trim
-callbacks recognize the collapse and skip the doomed trim (return None so the
-caller propagates the original 400 at once, without another attempt).
+raise :class:`ContextWindowCollapseError` immediately. preemptive_trim and the
+in-turn re-trim callbacks were REMOVED (2026-08) — a context-length 400 records
+an overflow override and propagates at once, without another attempt.
 """
 from __future__ import annotations
 
@@ -102,12 +102,12 @@ def test_agent_loop_preflight_raises_on_collapse_before_request():
 # ── in-turn retry path (pre-flight absent) must skip the doomed trim ────────
 
 
-def test_agent_loop_retry_callback_skips_doomed_trim_on_collapse():
+def test_agent_loop_overflow_propagates_without_retry_cb():
     """_context_budget=None disables the pre-flight guard, so the collapse
-    surfaces as a provider 400. The re-trim callback must recognize it, skip
-    the pointless trim, and return None → the ORIGINAL 400 propagates after
-    exactly ONE attempt (old behaviour: trim → still 400 → retry x3 → then
-    raise, while the trim kept shrinking the conversation)."""
+    surfaces as a provider 400. No overflow retry callback is registered
+    (preemptive_trim + its re-trim wrapper were removed) → the ORIGINAL 400
+    propagates after exactly ONE attempt (old behaviour: re-trim → still 400
+    → retry x3 → then raise, while the trim kept shrinking the conversation)."""
     loop = AgentLoop.__new__(AgentLoop)
     loop.model = "tiny-model"
     loop.config = _tiny_config()
@@ -125,13 +125,11 @@ def test_agent_loop_retry_callback_skips_doomed_trim_on_collapse():
     with (
         mock.patch("external_llm.agent.agent_loop._resolve_context_limit", return_value=4096),
         mock.patch("external_llm.agent.agent_loop._record_context_overflow"),
-        mock.patch("external_llm.agent.agent_loop.preemptive_trim") as _trim,
         pytest.raises(LLMAPIError),
     ):
         loop._llm_call_with_tools([LLMMessage(role="user", content="hi")])
 
     assert loop.llm_client.chat_with_tools.call_count == 1  # no doomed retry
-    _trim.assert_not_called()  # the collapse is recognized BEFORE the trim runs
 
 
 # ── user-facing error mapping ───────────────────────────────────────────────

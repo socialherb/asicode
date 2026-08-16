@@ -15,6 +15,29 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache gate analyzer results (.cache/)
+        # P8-1 (2026-08-16): the structural-scanner step below cold-boots
+        # ~69s without the per-file disk caches (cold measured 2026-08-16,
+        # warm 15-18s --gate-only; see docs/improvement_proposals.md P8-1).
+        # Restore <repo_root>/.cache/ from a previous run here; the post
+        # step saves it back when the job finishes. Cache fingerprints are
+        # (path, mtime_ns, size); actions/cache's tar restore preserves
+        # mtime/size, so unchanged files hit and changed files re-analyze
+        # (self-heal — first run after a source change equals a cold boot).
+        # Cache version keys (CACHE_VERSION / _DBX_CACHE_VERSION /
+        # _CRX_CACHE_VERSION) are embedded in each payload, so a scanner
+        # logic change auto-invalidates via the hashFiles source key below —
+        # do NOT add version keys here or the cache fragments per version.
+        # B2 (73baaf43) atomic writes + fail-open loads mean a corrupted
+        # restored cache costs a full re-analysis, never a wrong result.
+        id: gate-cache
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: gate-scanners-${{ runner.os }}-${{ hashFiles('external_llm/**/*.py', 'scripts/*.py') }}
+          restore-keys: |
+            gate-scanners-${{ runner.os }}-
+
       - name: Install ruff
         run: |
           python -m pip install --upgrade pip
@@ -173,12 +196,14 @@ jobs:
         # no-op — and vulture's 36 framework-dispatch false positives (enum
         # members, pydantic/dataclass fields, http.server protocol methods,
         # foreign-object attribute assignments) are suppressed structurally in
-        # vulture_scanner._framework_live_for_file. Remaining report-only:
-        # ast_similarity / container_reachability. See
+        # vulture_scanner._framework_live_for_file. ast_similarity is gated at
+        # the exact-duplicate (similarity 1.0, non-test source) contract — the
+        # ranked near-duplicate set is not an enumeration contract. See
         # scripts/check_structural_scanners.py.
-        # --gate-only skips the two report-only scanners (~15% of wall time) —
-        # the zero-tolerance gate is unchanged, CI just stops paying for the
-        # drift report every push. Run the no-flag form manually/weekly for
+        # --gate-only runs the full gate including the ast_similarity exact
+        # pair check (~15% extra wall time) — the zero-tolerance gate is
+        # unchanged, CI just stops paying for the ranked near-duplicate drift
+        # report every push. Run the no-flag form manually/weekly for
         # report-only drift checks.
         # Package install needed: the script imports external_llm's registry
         # (tree-sitter-language-pack is a core dependency).
@@ -200,18 +225,40 @@ jobs:
         # noise to every commit; CI is the gate surface that matters.)
         run: python scripts/check_plr2004_observation.py
 
+      - name: JS suite + coverage gate (executed-handler baseline-diff)
+        # P3 (round 32-5): every tests/js/test_*.js runs under
+        # tests/js/coverage_preload.js, which records the exact body text of
+        # every `new Function`-compiled function that a test actually CALLS.
+        # run_coverage_gate.js then gates that every LIVE handlers-map key of
+        # agent-panel.js and every sse.addEventListener listener of
+        # design-chat.js is exercised by at least one test — the automated
+        # dead-code hunt that rounds 32-1..3 did manually. Baseline-diff
+        # semantics (like check_f821_no_new.py): the gate fails ONLY on
+        # NET-NEW uncovered keys; deliberate re-baselining is an explicit
+        # `--update` flag, never automatic.
+        # V8 native coverage cannot be used here: tests compile source
+        # STRINGS via `new Function`, which V8 attributes to empty-url eval
+        # scripts — the real files measure 0% regardless of execution.
+        # Node is preinstalled on ubuntu-latest; the preload uses only
+        # stable Proxy/Reflect/spawnSync APIs (works on Node >= 18).
+        run: node tests/js/run_coverage_gate.js
+
   # ── Unit-test gate ─────────────────────────────────────────────────────────
   # This is the ONLY workflow that executes on every push/PR (release.yml only
   # runs on tags). Until this job existed, a green CI meant ZERO tests had run — the
   # whole suite was gated by nothing but ruff/AST checks.
   #
-  # The job mirrors release.yml's test job exactly — same install, same
-  # command, same Python version — so a PR faces the same gate a release
-  # faces, on the exact configuration where the suite is proven green on the
-  # exported tree (no deselections: a perpetually-red gate trains everyone to
-  # bypass it). Mirrored, not re-invented, so the two can never drift apart.
+  # The job mirrors release.yml's test job — same command, same Python
+  # version, no deselections — so a PR faces the same gate a release faces.
+  # ONE deliberate difference: this job checks out the FULL private tree
+  # (release.yml checks out the exported tag, where lane/, webapp/, tools/
+  # and their coupled tests are absent), so the install below adds the
+  # webapp extra — 83 tests/unit files import webapp at module level
+  # (test_ui_tools_*, test_llm_execution_*, ...) and collection would fail
+  # with ImportError without fastapi. Locally fastapi is always present in
+  # dev installs, which is why this gap only manifests in CI.
   unit-tests:
-    name: Unit tests (exported tree, clean install)
+    name: Unit tests (full tree, clean install)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -219,8 +266,8 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          # Match release.yml's test job (the version where the suite is
-          # proven green on the export), not the lint job's 3.11.
+          # Match release.yml's test job's Python version (3.12), not the
+          # lint job's 3.11 — both test jobs run the same suite version.
           python-version: "3.12"
 
       - name: Install ripgrep
@@ -231,14 +278,20 @@ jobs:
           sudo apt-get install -y -qq ripgrep
 
       - name: Install package + test dependencies
+        # [dev,webapp] — see the job comment above: the full-tree checkout
+        # includes webapp-coupled unit tests, so fastapi/uvicorn/jinja2 must
+        # be present or collection fails before any test runs.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e '.[dev]'
+          python -m pip install -e '.[dev,webapp]'
 
       - name: Unit tests
-        # --timeout 300 realises the pytest-timeout intent recorded in
-        # pyproject.toml ([dev] dep, but no ini default): a hung test fails as
-        # a test instead of burning the whole 30-minute job timeout.
+        # pytest-timeout is active via the pyproject.toml ini default
+        # (`timeout = 300` under [tool.pytest.ini_options], added ae465e9b):
+        # a hung test fails as a test instead of burning the whole 30-minute
+        # job timeout. The CLI flag is omitted here — the ini default is the
+        # single source of truth for this job, the integration job and
+        # release.yml's test job alike.
         #
         # -n auto now defaults via pyproject.toml [tool.pytest.ini_options]
         # addopts; the CLI flag is omitted here to avoid the duplicate.
@@ -251,18 +304,36 @@ jobs:
         # 0 failed / 14 xfailed in 0:19. One earlier hash-order collection
         # nondeterminism (test_scanner_to_ops_pipeline parametrize over a
         # frozenset) was fixed and has stayed fixed.
+        #
+        # Coverage gate (P-6): scripts/cov.sh wraps the same pytest command —
+        # COVERAGE_PROCESS_START (auto-installed a1_coverage.pth) injects
+        # coverage into every xdist worker/spawned subprocess, combine merges
+        # the parallel data files, and `coverage report` enforces
+        # [tool.coverage.report] fail_under. COV_DIR is pinned so the raw
+        # data can be uploaded as an artifact below.
         run: |
-          python -m pytest tests/unit -q --timeout 300 -m "not slow"
+          COV_DIR=coverage-data PYTHON=python ./scripts/cov.sh tests/unit -q -m "not slow"
+
+      - name: Upload coverage data (raw, for re-reporting)
+        # if: always() — a failing test run is exactly when the coverage
+        # picture is most valuable for triage; the default is to skip upload
+        # whenever the job fails.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: coverage-data/coverage
+          if-no-files-found: error
 
   # ── Integration-test gate ────────────────────────────────────────────────────
   # tests/integration never ran anywhere in CI: p11-ci.yml (which nominally ran
   # a 2-file slice) was deleted in 69c53035 as dead, and release.yml only runs
   # tests/unit. The suite is hermetic — mocked LLM service, tmpdir git repos,
   # no network — so it is CI-safe as-is. slow-marked tests are deselected
-  # (marker doc: "skip in CI") and optional-dependency tests (numpy/faiss
+  # (marker doc: deselected by default) and optional-dependency tests (numpy/faiss
   # vector cache) self-skip. Measured locally: 358 passed in ~3 min.
   integration-tests:
-    name: Integration tests (exported tree, clean install)
+    name: Integration tests (full tree, clean install)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -279,12 +350,12 @@ jobs:
 
       - name: Install package + test dependencies
         # webapp extra: the integration API tests exercise the FastAPI app.
-        # The unit-tests job does NOT need it — every fastapi-importing unit
-        # test is webapp-coupled and excluded from the export.
+        # The unit-tests job needs it too — its full-tree checkout includes
+        # webapp-coupled unit tests, so the install is identical here.
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev,webapp]'
 
       - name: Integration tests (no slow)
         run: |
-          python -m pytest tests/integration -q --timeout 300 -m "not slow"
+          python -m pytest tests/integration -q -m "not slow"

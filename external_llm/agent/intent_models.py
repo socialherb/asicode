@@ -243,7 +243,7 @@ class IntentResult:
                 condition=_condition,
                 control=d.get("control", ""),
             )
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError) as exc:  # pragma: no cover — GuardIR은 plain dataclass라 생성이 던질 수 없음 (실측: compact=123/None/dict 모두 통과)
             _logger.debug("failed to rehydrate GuardIR from %r: %s", d, exc)
             return None
 

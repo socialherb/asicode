@@ -74,6 +74,9 @@ jobs:
           python -m pip install -e '.[dev]'
 
       - name: Unit tests
+        # Hung-test protection comes from the pyproject.toml pytest-timeout ini
+        # default (`timeout = 300`) — no CLI flag, same source of truth as
+        # lint.yml's unit/integration jobs.
         # No deselections: every test in tests/unit runs on the exported tree.
         # The five that were previously --deselect-ed were each fixed to run in
         # CI, so the gate is clean rather than carrying permanent debt (a
@@ -96,8 +99,25 @@ jobs:
         #     dropped). A subset of a clean tree is clean, so they pass; verified
         #     by running both against a locally-built export snapshot. The
         #     "different file set" hunch that originally deselected them was wrong.
+        #
+        # Coverage: measured via scripts/cov.sh (same wrapper as lint.yml) so
+        # the release run carries coverage data too, but REPORT-ONLY:
+        # COV_FAIL_UNDER=0 keeps the publish pipeline from being blocked by the
+        # fail_under ratchet, which is tuned to lint.yml's deselected suite —
+        # a release gate must not depend on a coverage percentage.
         run: |
-          python -m pytest tests/unit -q
+          COV_DIR=coverage-data PYTHON=python COV_FAIL_UNDER=0 ./scripts/cov.sh tests/unit -q
+
+      - name: Upload coverage data (raw, for re-reporting)
+        # if: always() — a failing test run is exactly when the coverage
+        # picture is most valuable for triage; the default is to skip upload
+        # whenever the job fails.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-release
+          path: coverage-data/coverage
+          if-no-files-found: error
 
   publish:
     name: Build and publish to PyPI

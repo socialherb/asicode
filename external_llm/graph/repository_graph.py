@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from external_llm.agent.config.thresholds import config as _cfg
+from external_llm.languages.base import build_line_index, line_at_offset
 
 from ..analysis import parse_cache
 from ..common.walk_policy import (
@@ -97,13 +98,10 @@ _logger = logging.getLogger(__name__)
 # unchanged (quota == cap).
 _EXTRACT_CACHE_MAX_ENTRIES = 2048
 _extract_cache = RootCache(_EXTRACT_CACHE_MAX_ENTRIES)
-# Rate-limit for the dead-file sweep (see _gc_extract_cache): counts down the
-# calls to skip between full sweeps so total stat work stays ~O(N)/build.
-_extract_cache_gc_deficit: int = 0
-# Rate-limit for the names-cache dead-file sweep (see _gc_names_cache): the
-# same countdown contract as _extract_cache_gc_deficit — total sweep stat work
-# stays ~O(N)/build instead of O(N*cap).
-_names_cache_gc_deficit: int = 0
+# Dead-file sweep rate-limit for both caches now lives on the RootCache
+# instance (``_gc_deficit``, see sweep_dead) under the cache's own lock
+# (C1, 2026-08-12) — the module globals this replaced were read-modify-write
+# races across webapp sessions.
 # Process-wide memo of persisted snapshot manifest lengths, keyed by cache
 # path (A5, 2026-08-12): the on-disk snapshot is a process-wide artifact
 # (like _extract_cache), so a SECOND RepositoryGraph over the same repo in
@@ -153,14 +151,11 @@ def _gc_extract_cache() -> None:
     per cap-worth of rejections reclaims promptly without a per-insert storm.
     The sweep itself is delegated to :meth:`RootCache.sweep_dead`
     (root-partitioned, 2026-08-12): keys are ``(root, abs path)`` tuples, so
-    the stat target is ``key[1]``.
+    the stat target is ``key[1]``.  The rate-limit deficit counter lives on
+    the cache instance (``_gc_deficit``) under the cache's lock (C1,
+    2026-08-12).
     """
-    global _extract_cache_gc_deficit
-    if _extract_cache_gc_deficit > 0:
-        _extract_cache_gc_deficit -= 1
-        return
-    _extract_cache.sweep_dead()
-    _extract_cache_gc_deficit = _EXTRACT_CACHE_MAX_ENTRIES
+    _extract_cache.sweep_dead(_EXTRACT_CACHE_MAX_ENTRIES)
 
 
 def _gc_names_cache() -> None:
@@ -178,14 +173,10 @@ def _gc_names_cache() -> None:
 
     Rate-limited identically: a full sweep is O(cap) stat calls; a sweep
     defers the next one by ``cap`` calls, keeping total sweep work
-    ~O(N)/build.
+    ~O(N)/build.  Deficit counter on the cache instance (``_gc_deficit``),
+    under the cache's lock (C1, 2026-08-12).
     """
-    global _names_cache_gc_deficit
-    if _names_cache_gc_deficit > 0:
-        _names_cache_gc_deficit -= 1
-        return
-    _names_cache.sweep_dead()
-    _names_cache_gc_deficit = _EXTRACT_CACHE_MAX_ENTRIES
+    _names_cache.sweep_dead(_EXTRACT_CACHE_MAX_ENTRIES)
 
 
 def _dedupe_importers(entries: list[tuple[str, int]]) -> list[str]:
@@ -1149,12 +1140,13 @@ class RepositoryGraph:
             return {"symbols": symbols, "calls": calls, "imports": imports}
 
         # Fallback: regex-based extraction (end_line approximate)
+        nl = build_line_index(content)
         for sp in provider.get_symbol_patterns("any"):
             # Replace {name} with a capture group to find all definitions
             pat = sp.regex.replace(r"{name}", r"(\w+)")
             for m in re.finditer(pat, content, re.MULTILINE):
                 sym_name = m.group(1)
-                lineno = content[: m.start()].count("\n") + 1
+                lineno = line_at_offset(nl, m.start())
                 qualname = sym_name
                 if qualname in seen_qualnames:
                     continue
@@ -1887,9 +1879,19 @@ class GraphVisitor(ast.NodeVisitor):
         B2: previously wrapped in ``suppress(Exception)`` which silently
         degraded to ``None`` (missing change detection / duplicate-symbol
         quality loss) on any bug.  Fail-fast now.
+
+        RG-B1: positional-only args (``def f(a, /, b)``) were dropped —
+        ``def f(b)`` and ``def f(a, /, b)`` collided to the same hash, so a
+        posonly arg added/removed was invisible to change detection.  The
+        ``/`` boundary marker is now encoded so a posonly↔regular conversion
+        (an API-breaking change) also changes the hash.
         """
         parts = [node.name]
-        # Add positional arguments
+        # positional-only args (def f(a, /, b))
+        parts.extend(arg.arg for arg in node.args.posonlyargs)
+        if node.args.posonlyargs:
+            parts.append("/")  # encode boundary so posonly↔regular changes the hash
+        # Add positional-or-keyword arguments
         parts.extend(arg.arg for arg in node.args.args)
         # Add vararg
         if node.args.vararg:
@@ -1911,21 +1913,37 @@ class GraphVisitor(ast.NodeVisitor):
         defense; a failure here is a bug and must fail loudly instead of
         silently indexing the symbol WITHOUT a signature (search/read output
         degradation).
+
+        RG-B1: positional-only args were dropped — ``def f(a, /, b)``
+        rendered as ``def f(b)`` (losing the ``a`` parameter entirely),
+        corrupting the LLM-facing signature.  Defaults span BOTH posonlyargs
+        and regular args (``node.args.defaults`` covers the trailing
+        positional params of the combined list), so the offset is computed
+        over the merged list.
         """
         params = []
         args = node.args
 
-        # positional args (includes self)
-        defaults_offset = len(args.args) - len(args.defaults)
-        for i, arg in enumerate(args.args):
+        # positional-only + positional-or-keyword args (def f(a, /, b, c=1)).
+        # ``defaults`` covers the TRAILING positional params across BOTH
+        # groups, so the offset must be over the combined list — otherwise a
+        # posonlyarg default misaligns with the wrong regular arg.
+        pos_params = list(args.posonlyargs) + list(args.args)
+        defaults_offset = len(pos_params) - len(args.defaults)
+        n_posonly = len(args.posonlyargs)
+        for i, arg in enumerate(pos_params):
             p = arg.arg
             if arg.annotation:
                 p += f": {ast.unparse(arg.annotation)}"
             # defaults
             default_idx = i - defaults_offset
-            if default_idx >= 0 and default_idx < len(args.defaults):
+            if 0 <= default_idx < len(args.defaults):
                 p += f" = {ast.unparse(args.defaults[default_idx])}"
             params.append(p)
+        # bare '/' separator after positional-only args — always rendered
+        # when posonlyargs exist; coexists with *args (def f(a, /, *args, b)).
+        if n_posonly:
+            params.insert(n_posonly, "/")
 
         # *args
         if args.vararg:

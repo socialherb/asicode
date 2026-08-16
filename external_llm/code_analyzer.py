@@ -30,6 +30,10 @@ class FunctionInfo:
     line_number: int = 0
     is_async: bool = False
     type_hints: dict[str, str] = field(default_factory=dict)
+    # Call targets made within THIS function's own scope (not file-level).
+    # Used by DependencyGraphBuilder._track_internal_calls for caller-accurate
+    # edges instead of the lossy whole-file call set. (DG-B1)
+    calls: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -95,17 +99,25 @@ class CodeAnalyzer:
         # Module docstring
         analysis.module_docstring = ast.get_docstring(tree)
 
+        # Identity set of top-level body nodes. ``ast.walk`` visits every node
+        # (n); the prior ``_is_top_level`` re-scanned ``tree.body`` (m items) on
+        # every qualifying node — O(n*m). A precomputed id-set gives O(1)
+        # membership tests with identical identity semantics (AST nodes compare
+        # by identity, so ``item == node`` was already ``item is node``).
+        # (CA-P1: O(n*m) -> O(n).)
+        top_level_ids = {id(item) for item in tree.body}
+
         # Walk through all nodes
         for node in ast.walk(tree):
             # Functions
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if self._is_top_level(node, tree):
+                if id(node) in top_level_ids:
                     func_info = self._extract_function_info(node)
                     analysis.functions.append(func_info)
 
             # Classes
             elif isinstance(node, ast.ClassDef):
-                if self._is_top_level(node, tree):
+                if id(node) in top_level_ids:
                     class_info = self._extract_class_info(node)
                     analysis.classes.append(class_info)
 
@@ -119,6 +131,17 @@ class CodeAnalyzer:
 
             elif isinstance(node, ast.ImportFrom):
                 module = node.module or ""
+                # Encode the relative-import level as leading dots so downstream
+                # consumers can tell a relative import (``from .sibling import x``)
+                # from an absolute one (``from sibling import x``). ``node.module``
+                # alone is always dot-free; the level lives in ``node.level``.
+                # Without this, DependencyGraphBuilder._resolve_import takes the
+                # absolute branch and silently mis-resolves in-package relative
+                # imports (or matches a stray same-named file at repo root).
+                # Mirrors the canonical pattern at ast_op_executor.py:1018 and
+                # tool_safety.py:634 — code_analyzer was the sole outlier.
+                if node.level:
+                    module = "." * node.level + module
                 names = [alias.name for alias in node.names]
                 analysis.imports.append(ImportInfo(
                     module=module,
@@ -131,29 +154,83 @@ class CodeAnalyzer:
                 if call_name:
                     analysis.calls.add(call_name)
 
-            # Global assignments (constants, config)
-            elif isinstance(node, ast.Assign) and self._is_top_level(node, tree):
-                for target in node.targets:
+            # Global assignments (constants, config). Two node kinds share a
+            # ``.value`` but differ in targets:
+            #   Assign    `X = 5`       — ``node.targets`` may name several
+            #   AnnAssign `X: int = 5`  — single ``node.target``; ``.value`` is
+            #       Optional (None for an annotation-only `x: int` declaration,
+            #       excluded by the ``node.value is not None`` guard below).
+            # Both feed the LLM-facing "Type aliases/Constants" block; AnnAssign
+            # was dropped entirely before. (CA-B3)
+            elif (
+                isinstance(node, (ast.Assign, ast.AnnAssign))
+                and id(node) in top_level_ids
+                and node.value is not None  # skip annotation-only `x: int`
+            ):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
                     if isinstance(target, ast.Name):
-                        value_str = self._node_to_string(node.value)
-                        analysis.global_vars[target.id] = value_str
+                        analysis.global_vars[target.id] = self._node_to_string(node.value)
 
         return analysis
 
-    def _is_top_level(self, node: ast.AST, tree: ast.Module) -> bool:
-        """Check if node is at module level (not nested)"""
-        return any(item == node for item in tree.body)
-
     def _extract_function_info(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> FunctionInfo:
-        """Extract function information"""
-        # Arguments
-        args = []
-        type_hints = {}
+        """Extract function information, preserving every parameter kind.
 
-        for arg in node.args.args:
+        Assembles positional-only (before ``/``), positional-or-keyword,
+        ``*vararg``, keyword-only (after ``*``), and ``**kwarg`` so the rendered
+        signature is faithful to the source. Separator markers (``/`` and ``*``)
+        are stored as pseudo-arg strings; ``format_function_signature`` appends
+        unknown strings verbatim, so they render as the correct Python
+        separators. (CA-B2: previously only ``node.args.args`` was iterated,
+        silently dropping every other parameter kind from the LLM-facing
+        signature.)
+        """
+        args: list[str] = []
+        type_hints: dict[str, str] = {}
+
+        sig_args = node.args
+
+        # positional-only (before '/')
+        for arg in sig_args.posonlyargs:
             args.append(arg.arg)
             if arg.annotation:
                 type_hints[arg.arg] = self._node_to_string(arg.annotation)
+        if sig_args.posonlyargs:
+            args.append("/")
+
+        # positional-or-keyword
+        for arg in sig_args.args:
+            args.append(arg.arg)
+            if arg.annotation:
+                type_hints[arg.arg] = self._node_to_string(arg.annotation)
+
+        # *vararg, or a bare '*' separator when keyword-only args follow without one
+        if sig_args.vararg:
+            marker = f"*{sig_args.vararg.arg}"
+            args.append(marker)
+            if sig_args.vararg.annotation:
+                type_hints[marker] = self._node_to_string(sig_args.vararg.annotation)
+        elif sig_args.kwonlyargs:
+            args.append("*")
+
+        # keyword-only (after '*')
+        for arg in sig_args.kwonlyargs:
+            args.append(arg.arg)
+            if arg.annotation:
+                type_hints[arg.arg] = self._node_to_string(arg.annotation)
+
+        # **kwarg
+        if sig_args.kwarg:
+            marker = f"**{sig_args.kwarg.arg}"
+            args.append(marker)
+            if sig_args.kwarg.annotation:
+                type_hints[marker] = self._node_to_string(sig_args.kwarg.annotation)
+
+        # Per-function calls (DG-B1): Call targets in THIS function's body only,
+        # without descending into nested function/class definitions.
+        func_calls: set[str] = set()
+        self._collect_calls(node, func_calls)
 
         # Return type
         return_type = None
@@ -175,7 +252,23 @@ class CodeAnalyzer:
             line_number=node.lineno,
             is_async=isinstance(node, ast.AsyncFunctionDef),
             type_hints=type_hints,
+            calls=func_calls,
         )
+
+    def _collect_calls(self, node: ast.AST, out: set[str]) -> None:
+        """Collect function-call target names within ``node``'s own scope.
+
+        Skips nested function/class definitions so their calls are not
+        mis-attributed to the enclosing scope (DG-B1: caller-accurate edges).
+        """
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue  # nested scope — its calls belong to it, not to this scope
+            if isinstance(child, ast.Call):
+                call_name = self._get_call_name(child)
+                if call_name:
+                    out.add(call_name)
+            self._collect_calls(child, out)
 
     def _extract_class_info(self, node: ast.ClassDef) -> ClassInfo:
         """Extract class information"""

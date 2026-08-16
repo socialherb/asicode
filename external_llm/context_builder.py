@@ -263,7 +263,16 @@ class EnhancedContextBuilder:
             out.append("```")
             out.append("")
             if truncated or len(lines) > _FILE_CONTEXT_MAX_LINES:
-                out.append(f"**Total lines**: >={total} (head only — file exceeds 1 MiB)")
+                # State the TRUE cause: a byte-bound truncation and a line-cap
+                # truncation are different facts, and telling the model "exceeds
+                # 1 MiB" when the file is actually < 1 MiB (just long) is a
+                # false statement about what it is not seeing.
+                cause = (
+                    "file exceeds 1 MiB"
+                    if truncated
+                    else f"showing first {_FILE_CONTEXT_MAX_LINES} lines"
+                )
+                out.append(f"**Total lines**: >={total} (head only — {cause})")
             else:
                 out.append(f"**Total lines**: {total}")
 
@@ -295,7 +304,20 @@ class EnhancedContextBuilder:
                     logger.debug("related file read failed: %s", rel_file, exc_info=True)
                     continue
 
-                snippet = content
+                # P21-3 output bound applies to related files too: the target
+                # block is capped at 5000 numbered lines (~70-90 KB), but the
+                # raw related head used to be embedded UNcapped — up to 1 MiB
+                # of prompt per related file (x3), dwarfing the target's own
+                # output bound.  Same line cap as the target block.
+                snippet_lines = content.split("\n")
+                if len(snippet_lines) > _FILE_CONTEXT_MAX_LINES:
+                    snippet = "\n".join(snippet_lines[:_FILE_CONTEXT_MAX_LINES])
+                    snippet += (
+                        f"\n...[more lines omitted — "
+                        f"showing first {_FILE_CONTEXT_MAX_LINES}]"
+                    )
+                else:
+                    snippet = content
                 if truncated:
                     snippet += "\n...[TRUNCATED — head only]..."
 
@@ -314,6 +336,13 @@ class EnhancedContextBuilder:
             return ""
 
     def _find_related_files(self, target_file: str, max_files: int) -> list[str]:
+        # Normalized ONCE and used by BOTH paths: the context_collector
+        # comparison below and the fallback's candidate comparison.  The
+        # fallback used to compare the raw ``target_file`` — a
+        # "./pkg/__init__.py" form never matched "pkg/__init__.py", so a
+        # target importing its own package leaked into its own Related
+        # Files (defect A class, fallback half).
+        rel = normalize_rel_path_fast(target_file)
         # 1) Preferred: context_collector (shallow)
         try:
             from context_collector import collect_related_files_shallow  # type: ignore
@@ -325,7 +354,6 @@ class EnhancedContextBuilder:
             # SET {'.','/'} and would strip a dotfile's leading dot, e.g.
             # ".config.py" -> "config.py", leaking the target into its own
             # Related Files list.  See go_provider.py for the same fix.
-            rel = normalize_rel_path_fast(target_file)
             related = [x for x in (selected or []) if x and x != rel]
             if related:
                 return related[:max_files]
@@ -373,7 +401,7 @@ class EnhancedContextBuilder:
                 for cand in candidates:
                     if cand.exists() and cand.is_file():
                         relp = str(cand.relative_to(self.repo_root))
-                        if relp != target_file and relp not in related:
+                        if relp != rel and relp not in related:
                             related.append(relp)
                             break
 

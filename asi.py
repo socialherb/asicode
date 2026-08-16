@@ -147,7 +147,7 @@ def _load_prompt_toolkit() -> bool:
         from prompt_toolkit.key_binding import KeyBindings as _KB  # noqa: N814 — private lazy-import alias
         from prompt_toolkit.patch_stdout import patch_stdout as _PatchStdout  # noqa: N812 — private lazy-import alias
         from prompt_toolkit.styles import Style as _Style
-    except ModuleNotFoundError:
+    except ModuleNotFoundError:  # pragma: no cover — prompt_toolkit absent (optional dep; REPL tests run with it)
         return False
     PromptSession = _PS
     Completion = _Cmpl
@@ -461,15 +461,27 @@ def _import_rich_console() -> Optional[type]:
         return None
 
 
+def _make_rich_console(file, width: int):
+    """Create a rich Console bound to *file*, or None when Rich is unavailable.
+
+    Single source for the console-construction step shared by the
+    ``_ensure_*_console_imported()`` builders (after ``_import_rich_console()``
+    has already decided Rich availability).  Returns None when Rich is not
+    importable, so callers keep their module-level console slot untouched.
+    """
+    console_cls = _import_rich_console()
+    if console_cls is None:
+        return None
+    return console_cls(file=file, width=width, force_terminal=True)
+
+
 def _ensure_console_imported() -> None:
     """Lazily create _console (spinner/Live) on first use. No-op if Rich unavailable."""
     global _console
     if _console is not None:
         return
-    _console_cls = _import_rich_console()
-    if _console_cls is not None:
-        # _console: for spinner/Live only — uses cursor-movement ANSI escapes, so MarginIO is not applicable.
-        _console = _console_cls(file=sys.stderr, width=_console_width, force_terminal=True)
+    # _console: for spinner/Live only — uses cursor-movement ANSI escapes, so MarginIO is not applicable.
+    _console = _make_rich_console(sys.stderr, _console_width)
 
 
 def _ensure_log_console_imported() -> None:
@@ -477,13 +489,16 @@ def _ensure_log_console_imported() -> None:
     global _log_console, _margin_stderr
     if _log_console is not None:
         return
-    _console_cls = _import_rich_console()
-    if _console_cls is not None:
-        # _log_console: for RichHandler only — wrapped in _margin_stderr(MarginIO) to align INFO logs
-        # from col 0 → col _LOG_MARGIN. Unlike spinner/Live, it does not use cursor-movement escapes,
-        # so left-margin injection is safe. (_margin_stderr.reset_bol() on spinner→log transition.)
-        _margin_stderr = _MarginIO("stderr", _LOG_MARGIN)
-        _log_console = _console_cls(file=_margin_stderr, width=_log_console_width, force_terminal=True)
+    # _log_console: for RichHandler only — wrapped in _margin_stderr(MarginIO) to align INFO logs
+    # from col 0 → col _LOG_MARGIN. Unlike spinner/Live, it does not use cursor-movement escapes,
+    # so left-margin injection is safe. (_margin_stderr.reset_bol() on spinner→log transition.)
+    # _margin_stderr is committed only when Rich actually imported, so the no-Rich
+    # no-op contract (both slots stay None) is preserved.
+    margin = _MarginIO("stderr", _LOG_MARGIN)
+    console = _make_rich_console(margin, _log_console_width)
+    if console is not None:
+        _margin_stderr = margin
+        _log_console = console
 
 
 RichHandler = None  # type: ignore[assignment] — set lazily in _setup_logging()
@@ -807,7 +822,7 @@ class _SafeRichFormatter(logging.Formatter):
             record.args = tuple(_escape(a) if isinstance(a, str) else a for a in record.args)
         elif isinstance(record.args, dict):
             record.args = {k: (_escape(v) if isinstance(v, str) else v) for k, v in record.args.items()}
-        elif isinstance(record.args, str):
+        elif isinstance(record.args, str):  # pragma: no cover — logging.LogRecord normalizes args to tuple/dict
             record.args = _escape(record.args)
         try:
             result = super().format(record)
@@ -1465,7 +1480,7 @@ _SLASH_COMMANDS: list[tuple[str, tuple[str, ...], str, str]] = [
     ("/helper",  (),              "[name]",  "model for context-compression: /helper <name> or /helper off (= use main model)"),
     ("/clear",   ("/cls",),       "",       "clear screen + compact conversation into summary"),
     # arg hint is concise one-liner — detailed usage printed when command runs alone
-    # (e.g., /insights → subcommands at L6369, /think → tab completion).
+    # (e.g., /insights → subcommands in the `/insights` handler, /think → tab completion).
     ("/insights",(),              "[subcommand]", "manage design_insights.md: list, compact, verify, archive, prune, drop, or edit"),
     ("/failure-patterns", (),     "[subcommand]", "failure-pattern store: list (default), clear, drop <n>"),
     ("/copy",    ("/yank",),      "",       "copy the last final message to the clipboard"),
@@ -2199,7 +2214,7 @@ def _grouped_slash_commands() -> list[tuple[str, list[tuple]]]:
         if cmds:
             grouped.append((title, cmds))
     leftover = [c for c in _SLASH_COMMANDS if c[0] not in seen]
-    if leftover:
+    if leftover:  # pragma: no cover — all commands are grouped in _SLASH_GROUPS; kept as safety net
         grouped.append(("other", leftover))
     return grouped
 

@@ -13,11 +13,43 @@ Features:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Keyword matching — word-boundary aware
+#
+# SA-B1 fix: the previous ``kw in text`` substring check misclassified
+# requests because short keywords matched inside larger words ('ui' ⊂
+# 'fluid'/'guide', 'fix' ⊂ 'suffix', 'api' ⊂ 'rapid'). Every keyword is now
+# anchored with ``\b`` so it matches only as a whole word/phrase.
+# ---------------------------------------------------------------------------
+
+_KEYWORD_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _keyword_pattern(keyword: str) -> re.Pattern[str]:
+    """Return a compiled word-boundary regex for *keyword* (cached).
+
+    ``\b`` anchors ensure short keywords match only as whole words, not as
+    substrings of larger words. Multi-word keywords ('sign in') are anchored
+    as a complete phrase.
+    """
+    pat = _KEYWORD_PATTERN_CACHE.get(keyword)
+    if pat is None:
+        pat = re.compile(rf"\b{re.escape(keyword)}\b")
+        _KEYWORD_PATTERN_CACHE[keyword] = pat
+    return pat
+
+
+def _keyword_in(keyword: str, text: str) -> bool:
+    """True if *keyword* appears in *text* as a whole word/phrase."""
+    return _keyword_pattern(keyword).search(text) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +219,12 @@ _FEATURE_PATTERNS: list[FeaturePattern] = [
                      weight=0.8, description="UI/frontend feature"),
 ]
 
+# Key files probed for content-pattern tech detection. Read ONCE per
+# _detect_tech_stack call (SA-P1 fix): the previous pattern-outer/file-inner
+# loop re-read every file for every content pattern (up to 56 read_text calls
+# per analyze()). The dict keyed by filename preserves the probe order.
+_KEY_PROBE_FILES: tuple[str, ...] = ("main.py", "package.json", "setup.py", "pyproject.toml")
+
 # Typed tech stack detectors (project file inspection)
 _TECH_DETECTORS: list[TechDetector] = [
     TechDetector(tech="django",
@@ -278,7 +316,7 @@ class SmartRequestAnalyzer:
         best_score = 0.0
 
         for rule in self.intent_rules:
-            score = sum(rule.priority for kw in rule.keywords if kw in req_lower)
+            score = sum(rule.priority for kw in rule.keywords if _keyword_in(kw, req_lower))
             if score > best_score:
                 best_score = score
                 best_intent = rule.intent
@@ -297,7 +335,7 @@ class SmartRequestAnalyzer:
         """
         for fp in self.feature_patterns:
             for kw in fp.keywords:
-                if kw in req_lower:
+                if _keyword_in(kw, req_lower):
                     return fp.feature
         return None
 
@@ -310,6 +348,18 @@ class SmartRequestAnalyzer:
         specific files and targeted content pattern matching.
         """
         detected: list[str] = []
+
+        # Read the probe files once up front (best-effort, per-file). The
+        # content-pattern loop below scans only these cached contents, so no
+        # file is read more than once per call regardless of pattern count.
+        key_contents: dict[str, str] = {}
+        for fname in _KEY_PROBE_FILES:
+            fpath = self.repo_root / fname
+            try:
+                if fpath.exists():
+                    key_contents[fname] = fpath.read_text(encoding="utf-8", errors="replace").lower()
+            except Exception:
+                logger.debug("tech probe read failed: %s", fpath, exc_info=True)
 
         for detector in self.tech_detectors:
             try:
@@ -325,19 +375,12 @@ class SmartRequestAnalyzer:
 
                 # Check content patterns in key files
                 for pattern in detector.content_patterns:
-                    # Fast check: scan key files for pattern
-                    for fname in ("main.py", "package.json", "setup.py", "pyproject.toml"):
-                        fpath = self.repo_root / fname
-                        if fpath.exists():
-                            try:
-                                content = fpath.read_text(encoding="utf-8", errors="replace")
-                                if pattern in content.lower():
-                                    detected.append(detector.tech)
-                                    found = True
-                                    break
-                            except Exception:
-                                logger.debug("tech probe read failed: %s", fpath, exc_info=True)
-                                continue
+                    # Fast check: scan cached key-file contents for pattern
+                    for content in key_contents.values():
+                        if pattern in content:
+                            detected.append(detector.tech)
+                            found = True
+                            break
                     if found:
                         break
             except Exception as e:

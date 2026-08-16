@@ -6,6 +6,8 @@ from __future__ import annotations
 import json as _json
 import logging
 import time
+from collections import OrderedDict
+from collections.abc import Callable
 from typing import Any, Optional
 
 import requests
@@ -14,6 +16,7 @@ from .client import (
     LLMAPIError,
     LLMAuthenticationError,
     LLMClient,
+    LLMClientError,
     LLMConnectionError,
     LLMMessage,
     LLMQuotaExceededError,
@@ -22,8 +25,10 @@ from .client import (
     LLMServerUnavailableError,
     ToolCallRequest,
     ToolCallResponse,
+    guard_sse_iteration,
     iter_sse_data_events,
     parse_retry_after,
+    raise_sse_iteration_failure,
 )
 from .output_parser import parse_tool_args
 
@@ -192,6 +197,50 @@ def _is_gemini_3(model: str) -> bool:
 _OCR_RESOLVED_LANG: str | None = None
 
 
+# module-level LRU: base64 data → OCR text.  The per-dict ``ocr_text`` key
+# only survives as long as the SAME dict object is re-used (design_chat's
+# store persists it across turns; a fresh request-scoped dict misses it), so a
+# repeated image that arrives in a NEW dict re-runs tesseract every time.  This
+# cache closes that gap for the process lifetime: identical base64 always
+# short-circuits before pytesseract.  Bounded by ``_OCR_TEXT_CACHE_MAX``;
+# ``None``-valued failures are cached too (a textless image must not re-run).
+_OCR_TEXT_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_OCR_TEXT_CACHE_MAX = 128
+
+
+def _cached_ocr_text(b64_data: str, compute: Callable[[], str]) -> str:
+    """Memoize OCR text by exact base64 in a bounded LRU.
+
+    Thread-safety: an unsynchronized LRU can lose keys / allow duplicate OCR
+    under race (harmless, merely redundant work) but never corrupt the cache —
+    ``dict``/``OrderedDict`` ops are atomic under the GIL.
+    """
+    if b64_data in _OCR_TEXT_CACHE:
+        _OCR_TEXT_CACHE.move_to_end(b64_data)
+        return _OCR_TEXT_CACHE[b64_data]
+    rendered = compute()
+    _OCR_TEXT_CACHE[b64_data] = rendered
+    if len(_OCR_TEXT_CACHE) > _OCR_TEXT_CACHE_MAX:
+        _OCR_TEXT_CACHE.popitem(last=False)
+    return rendered
+
+
+class _OCRTextCacheAccess:
+    """Public test hooks (``pytest``): read/clear the module-level LRU."""
+
+    @staticmethod
+    def keys() -> list[str]:
+        return list(_OCR_TEXT_CACHE.keys())
+
+    @staticmethod
+    def values() -> list[str]:
+        return list(_OCR_TEXT_CACHE.values())
+
+    @staticmethod
+    def clear() -> None:
+        _OCR_TEXT_CACHE.clear()
+
+
 _OCR_AVAILABLE_LANGS: frozenset | None = None
 # Cache of the ``tesseract --list-langs`` probe (one cheap subprocess per
 # process). ``None`` = not probed yet; a probe *failure* is cached separately
@@ -329,61 +378,66 @@ def _try_ocr_base64(b64_data: str) -> str:
     if not b64_data:
         return ""
 
-    _lang, img_w, img_h, data = _detect_image_ocr_lang(b64_data)
-    if data is None or not data.get('text'):
-        return ""
+    def _compute() -> str:
+        _lang, img_w, img_h, data = _detect_image_ocr_lang(b64_data)
+        if data is None or not data.get('text'):
+            return ""
 
-    # Collect words with sufficient confidence
-    words = []
-    for i in range(len(data["text"])):
-        text = (data["text"][i] or "").strip()
-        conf = int(data["conf"][i])
-        if not text or conf < 20:
-            continue
-        words.append({
-            "text": text,
-            "x": data["left"][i],
-            "y": data["top"][i],
-            "w": data["width"][i],
-            "h": data["height"][i],
-        })
+        # Collect words with sufficient confidence
+        words = []
+        for i in range(len(data["text"])):
+            text = (data["text"][i] or "").strip()
+            conf = int(data["conf"][i])
+            if not text or conf < 20:
+                continue
+            words.append({
+                "text": text,
+                "x": data["left"][i],
+                "y": data["top"][i],
+                "w": data["width"][i],
+                "h": data["height"][i],
+            })
 
-    if not words:
-        return ""
+        # No `if not words: return ""` guard here: `_detect_image_ocr_lang` only
+        # returns non-None data when at least one word passed the identical
+        # (strip + conf >= 20) filter, so `words` is never empty at this point.
+        # A guard here would be dead code (the complement of the caller's contract).
 
-    # Group words into lines: new line when y jumps by more than avg word height
-    words.sort(key=lambda w: (w["y"], w["x"]))
-    avg_word_h = sum(w["h"] for w in words) / len(words)
-    line_thresh = max(8, avg_word_h * 0.6)
+        # Group words into lines: new line when y jumps by more than avg word height
+        words.sort(key=lambda w: (w["y"], w["x"]))
+        avg_word_h = sum(w["h"] for w in words) / len(words)
+        line_thresh = max(8, avg_word_h * 0.6)
 
-    lines: list[list[dict]] = []
-    cur: list[dict] = []
-    cur_y: float = words[0]["y"]
-    for word in words:
-        if abs(word["y"] - cur_y) <= line_thresh:
-            cur.append(word)
-            cur_y = sum(w["y"] for w in cur) / len(cur)  # rolling mean
-        else:
-            if cur:
-                lines.append(sorted(cur, key=lambda w: w["x"]))
-            cur = [word]
-            cur_y = float(word["y"])
-    if cur:
-        lines.append(sorted(cur, key=lambda w: w["x"]))
+        lines: list[list[dict]] = []
+        cur: list[dict] = []
+        cur_y: float = words[0]["y"]
+        for word in words:
+            if abs(word["y"] - cur_y) <= line_thresh:
+                cur.append(word)
+                cur_y = sum(w["y"] for w in cur) / len(cur)  # rolling mean
+            else:
+                if cur:
+                    lines.append(sorted(cur, key=lambda w: w["x"]))
+                cur = [word]
+                cur_y = float(word["y"])
+        if cur:
+            lines.append(sorted(cur, key=lambda w: w["x"]))
 
-    # Build output with spatial labels
-    result = [f"[Image OCR — Position Includes ({img_w}×{img_h}px):"]
-    for line_words in lines:
-        line_text = " ".join(w["text"] for w in line_words)
-        avg_cx = sum(w["x"] + w["w"] / 2 for w in line_words) / len(line_words)
-        avg_ty = sum(w["y"] for w in line_words) / len(line_words)
+        # Build output with spatial labels
+        result = [f"[Image OCR — Position Includes ({img_w}×{img_h}px):"]
+        for line_words in lines:
+            line_text = " ".join(w["text"] for w in line_words)
+            avg_cx = sum(w["x"] + w["w"] / 2 for w in line_words) / len(line_words)
+            avg_ty = sum(w["y"] for w in line_words) / len(line_words)
 
-        v = "top" if avg_ty < img_h * 0.30 else ("bottom" if avg_ty > img_h * 0.70 else "middle")
-        h = "left" if avg_cx < img_w * 0.33 else ("right" if avg_cx > img_w * 0.67 else "center")
-        result.append(f"  [{v}-{h}] {line_text}")
+            v = "top" if avg_ty < img_h * 0.30 else ("bottom" if avg_ty > img_h * 0.70 else "middle")
+            h = "left" if avg_cx < img_w * 0.33 else ("right" if avg_cx > img_w * 0.67 else "center")
+            result.append(f"  [{v}-{h}] {line_text}")
 
-    result.append("]")
-    return "\n".join(result)
+        result.append("]")
+        return "\n".join(result)
+
+    return _cached_ocr_text(b64_data, _compute)
 
 
 
@@ -413,7 +467,8 @@ def _images_to_text(images: list[dict[str, str]]) -> str:
                     "— OCR applied automatically when installed]"
                 )
             continue
-        ocr_text = _try_ocr_base64(img.get("data", ""))
+        img_data = img.get("data", "")
+        ocr_text = _cached_ocr_text(img_data, lambda b=img_data: _try_ocr_base64(b))
         img["ocr_text"] = ocr_text  # cache for reuse across calls
         if ocr_text:
             parts.append(f"[Image {i} — OCR Extracted Text:\n{ocr_text}\n]")
@@ -747,7 +802,7 @@ class GoogleClient(LLMClient):
                 elif images:
                     # Multimodal: inlineData parts + text
                     # Defensive .get() with defaults — mirrors GoogleClient.chat
-                    # (L437) and the streaming path. image_utils normally fills
+                    # and the streaming path. image_utils normally fills
                     # both keys, but a malformed/foreign image dict must not
                     # KeyError here; it degrades to image/png + "" instead.
                     parts = [{"inlineData": {"mimeType": img.get("media_type", "image/png"), "data": img.get("data", "")}} for img in images]
@@ -939,7 +994,7 @@ class GoogleClient(LLMClient):
             tokens_used = None
 
             try:
-                for ev in iter_sse_data_events(response):
+                for ev in guard_sse_iteration(iter_sse_data_events(response)):
 
                     candidates = ev.get("candidates", [])
                     if candidates:
@@ -973,6 +1028,10 @@ class GoogleClient(LLMClient):
                 ) from e
             except requests.RequestException as e:
                 raise LLMAPIError(f"Google streaming request failed: {e}") from e
+            except LLMClientError:
+                raise
+            except Exception as e:
+                raise_sse_iteration_failure(e)
 
             elapsed_ms = (time.monotonic() - t0) * 1000
             # Gemini returns finishReason="STOP" even when tool_calls are present.
@@ -1275,7 +1334,7 @@ class DeepSeekClient(LLMClient):
             finish_reason = None
             usage: dict[str, Any] = {}
 
-            for chunk in iter_sse_data_events(response):
+            for chunk in guard_sse_iteration(iter_sse_data_events(response)):
 
                 choices = chunk.get("choices", [])
                 if not choices:
@@ -1358,6 +1417,10 @@ class DeepSeekClient(LLMClient):
         except requests.RequestException as e:
             logger.exception("DeepSeek stream request failed: %s", e)
             raise LLMAPIError(f"DeepSeek request failed: {e}") from e
+        except LLMClientError:
+            raise
+        except Exception as e:
+            raise_sse_iteration_failure(e)
         finally:
             if response is not None:
                 response.close()
@@ -1486,7 +1549,7 @@ class DeepSeekClient(LLMClient):
             # Extract reasoning_callback if provided
             reasoning_callback = kwargs.get("reasoning_callback")
 
-            for chunk in iter_sse_data_events(response):
+            for chunk in guard_sse_iteration(iter_sse_data_events(response)):
 
                 choices = chunk.get("choices", [])
                 if not choices:
@@ -1651,6 +1714,10 @@ class DeepSeekClient(LLMClient):
             ) from e
         except requests.RequestException as e:
             raise LLMAPIError(f"DeepSeek request failed: {e}") from e
+        except LLMClientError:
+            raise
+        except Exception as e:
+            raise_sse_iteration_failure(e)
         finally:
             if response is not None:
                 response.close()

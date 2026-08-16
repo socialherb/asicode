@@ -82,18 +82,39 @@ class TriggerPolicy:
     }
 
     # AUTO_FIX rate limit: max N per hour
+    # Allowed model tiers — anything else fails CLOSED to "none" (P0-1)
+    _MODEL_TIERS: ClassVar[frozenset] = frozenset({"none", "small", "strong"})
+
+    # Longest cooldown window across file/kind gates — entries older than this
+    # can never gate a decision again and are pruned at stamp time (P0-5)
+    _MAX_COOLDOWN: ClassVar[float] = max(_FILE_COOLDOWN, max(_KIND_COOLDOWN.values()))
+
     _AUTO_FIX_PER_HOUR = 10
 
     def __init__(self, model_tier: str = "small", enabled_features: Optional[set] = None):
-        self.model_tier = model_tier   # "none" | "small" | "strong"
+        self._lock = threading.Lock()
+        # model_tier is a normalized property: unknown tiers fail CLOSED to
+        # "none" (P0-1) — the setter runs under _lock, so create it first.
+        self.model_tier = model_tier
         # Per-feature on/off — default all enabled
         self.enabled_features: set = (
             set(enabled_features) if enabled_features is not None else set(self._ALL_FEATURES)
         )
-        self._lock = threading.Lock()
-        self._file_last: dict[str, float] = {}      # source_file → last emit time
-        self._kind_last: dict[str, float] = {}      # event_kind  → last emit time
-        self._auto_fix_ts: list[float] = []         # timestamps of recent AUTO_FIX decisions
+        self._file_last: dict[tuple[str, str], float] = {}  # (source_file, kind) → last emit
+        self._kind_last: dict[str, float] = {}              # kind → last emit
+        self._auto_fix_ts: list[float] = []                 # recent AUTO_FIX decision times
+
+    @property
+    def model_tier(self) -> str:
+        """Normalized model tier — "none" | "small" | "strong" (fail-closed)."""
+        return self._model_tier
+
+    @model_tier.setter
+    def model_tier(self, value: str) -> None:
+        tier = str(value).strip().lower() if value else "none"
+        normalized = tier if tier in self._MODEL_TIERS else "none"
+        with self._lock:
+            self._model_tier = normalized
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -113,13 +134,20 @@ class TriggerPolicy:
         if _feature and _feature not in self.enabled_features:
             return ActionDecision(kind=ActionKind.IGNORE)
 
-        # Per-file cooldown
-        if event.source_file and now - self._file_last.get(event.source_file, 0) < self._FILE_COOLDOWN:
-            return ActionDecision(kind=ActionKind.IGNORE)
+        # Per-file cooldown — keyed by (source_file, kind) so a save followed by
+        # an import error / test failure (the primary workflow) is NOT swallowed
+        # by the earlier FILE_MODIFIED stamp (P0-3). `None` sentinel: monotonic's
+        # origin is boot time, so a 0 sentinel would drop the first event on a
+        # freshly booted host (P0-2).
+        if event.source_file:
+            _file_last = self._file_last.get((event.source_file, kind_str))
+            if _file_last is not None and now - _file_last < self._FILE_COOLDOWN:
+                return ActionDecision(kind=ActionKind.IGNORE)
 
         # Per-kind cooldown
         cooldown = self._KIND_COOLDOWN.get(kind_str, 10.0)
-        if now - self._kind_last.get(kind_str, 0) < cooldown:
+        _kind_last = self._kind_last.get(kind_str)
+        if _kind_last is not None and now - _kind_last < cooldown:
             return ActionDecision(kind=ActionKind.IGNORE)
 
         # Route
@@ -154,6 +182,10 @@ class TriggerPolicy:
         if decision.kind == ActionKind.AUTO_FIX:
             self._auto_fix_ts = [t for t in self._auto_fix_ts if now - t < 3600]
             if len(self._auto_fix_ts) >= self._AUTO_FIX_PER_HOUR:
+                # Rate-limited NOTIFY still consumes cooldowns (P0-4): without
+                # the stamp every post-cap event re-enters this branch and emits
+                # another NOTIFY — a per-event notification storm.
+                self._stamp_cooldowns(event, kind_str, now)
                 return ActionDecision(
                     kind=ActionKind.NOTIFY,
                     message="[Rate limited] AUTO_FIX per-hour cap exceeded. Will retry next hour.",
@@ -161,13 +193,27 @@ class TriggerPolicy:
                 )
             self._auto_fix_ts.append(now)
 
-        # Update last-trigger timestamps (AFTER all checks, so rate-limited
-        # events don't consume cooldown for the next eligible event)
-        if event.source_file:
-            self._file_last[event.source_file] = now
-        self._kind_last[kind_str] = now
+        # Update last-trigger timestamps AFTER all checks (rate-limited events
+        # now DO consume cooldowns — see above) and prune entries that can no
+        # longer gate any decision (P0-5: bounded memory for daemon lifetime).
+        self._stamp_cooldowns(event, kind_str, now)
 
         return decision
+
+    def _stamp_cooldowns(self, event: TriggerEvent, kind_str: str, now: float) -> None:
+        """Record emission time and prune entries older than the longest window.
+
+        Called for every emitted decision — including the rate-limited NOTIFY —
+        so post-cap events are throttled to one NOTIFY per cooldown window, and
+        the two timestamp dicts stay bounded (keys are file paths / kinds and
+        the daemon lives for the whole session).
+        """
+        if event.source_file:
+            self._file_last[(event.source_file, kind_str)] = now
+        self._kind_last[kind_str] = now
+        cutoff = now - self._MAX_COOLDOWN
+        self._file_last = {k: v for k, v in self._file_last.items() if v >= cutoff}
+        self._kind_last = {k: v for k, v in self._kind_last.items() if v >= cutoff}
 
     def _route(self, event: TriggerEvent) -> ActionDecision:
         k = event.kind

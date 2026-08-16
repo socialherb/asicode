@@ -123,12 +123,11 @@ def _parse_python_imports(text: str, rel_path: str | None = None) -> list[str]:
 
     def _normalize_one_module(mod0: str) -> str:
         mod = (mod0 or "").strip()
-        if not mod:
+        if not mod:  # pragma: no cover — defensive; both callers pre-filter non-empty
             return ""
-        # drop trailing "as alias"
+        # drop trailing "as alias" ("a as b" -> "a"). split()[0] of a
+        # non-empty stripped string is always non-empty, so no re-check.
         mod = mod.split()[0].strip()
-        if not mod:
-            return ""
 
         # Resolve relative module prefixes (e.g., .foo, ..bar, .)
         if mod.startswith(".") and base_dir is not None:

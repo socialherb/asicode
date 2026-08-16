@@ -288,87 +288,102 @@ def _call_shape(call_node: ast.Call) -> Optional[str]:
     return None
 
 
-def _collect_calls(body: list[ast.stmt]) -> list[str]:
-    shapes = []
-    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
-        if isinstance(node, ast.Call):
-            s = _call_shape(node)
-            if s:
-                shapes.append(s)
-    return shapes
+def _walk_function_features(
+    func_node: ast.FunctionDef,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Collect the four per-function feature sets in a single tree walk.
 
+    Fuses what used to be four separate ``ast.walk`` traversals per function
+    (``_collect_calls`` / ``_exit_shapes`` / ``_extract_result_keys`` over the
+    body, ``_ident_tokens`` over the whole node) into one stack-based pass.
+    Scope semantics are preserved exactly:
 
-def _exit_shapes(body: list[ast.stmt]) -> list[str]:
-    exits = []
-    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
-        if isinstance(node, ast.Return):
-            exits.append("return")
-        elif isinstance(node, ast.Raise):
-            exits.append("raise")
-        elif isinstance(node, (ast.Yield, ast.YieldFrom)):
-            exits.append("yield")
-    return list(dict.fromkeys(exits))
+    * ident tokens cover the *whole* FunctionDef — decorators, parameter
+      annotations and defaults included;
+    * call shapes / exit shapes / result keys are body-only, matching the old
+      ``ast.walk(ast.Module(body=body))`` scope (nested defs inside the body
+      are included — ``ast.walk`` never stopped at them).
 
+    An ``in_body`` flag inherited down the stack marks the body subtree; the
+    root's other fields (name/args/decorator_list/returns) seed with False.
+    Every consumer of these four fields goes through ``_set_similarity`` or
+    sorted normalisation, so walk order is irrelevant; the set-valued outputs
+    are returned sorted for determinism.
 
-def _extract_result_keys(body: list[ast.stmt], var_name: str = "result") -> list[str]:
-    """Extract string keys accessed on a dict parameter named var_name.
+    Token semantics (from the former ``_ident_tokens``): attribute accesses,
+    referenced non-builtin names, keyword-arg names, and string constants ≥3
+    chars — the function's semantic domain.  Parameter names are excluded
+    (measured separately by ``_param_role_similarity``) so duplicates whose
+    params were renamed at copy time are not penalised.
 
-    Captures result.get("key") and result["key"] patterns — both read and write.
-    Used as a shadow signal for semantic domain overlap between two functions.
-    """
-    keys: set = set()
-    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
-        # result.get("key") pattern
-        if (isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == var_name
-                and node.func.attr == "get"
-                and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str)):
-            keys.add(node.args[0].value)
-        # result["key"] subscript (read or assignment target)
-        if (isinstance(node, ast.Subscript)
-                and isinstance(node.value, ast.Name)
-                and node.value.id == var_name
-                and isinstance(node.slice, ast.Constant)
-                and isinstance(node.slice.value, str)):
-            keys.add(node.slice.value)
-    return sorted(keys)
-
-
-def _ident_tokens(func_node: ast.FunctionDef) -> list[str]:
-    """Distinctive identifier/constant tokens of a function — its semantic domain.
-
-    The structural metrics (skeleton/stmt_seq/call_shapes) alpha-normalise
-    aggressively, so two functions in unrelated domains can score high on
-    coincidental shape alone.  This token set keeps the *names*: attribute
-    accesses, referenced non-builtin names, keyword-arg names, and string
-    constants.  Genuine copy-paste duplicates call the same functions and
-    touch the same attributes, so their token Jaccard stays high; pairs that
-    merely share control-flow shape diverge sharply.
-
-    Parameter names are excluded — they are measured separately by
-    _param_role_similarity, and duplicates whose params were renamed at
-    copy time should not be penalised here.
+    Returns ``(call_shapes, exit_shapes, result_keys, ident_tokens)``.
     """
     args = func_node.args
     params = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
-    toks: set = set()
-    for n in ast.walk(func_node):
-        if isinstance(n, ast.Attribute) and n.attr not in _BUILTINS:
-            toks.add(f"attr:{n.attr}")
-        elif isinstance(n, ast.Name):
-            if n.id in params or n.id in _BUILTINS or n.id in ("self", "cls"):
-                continue
-            toks.add(f"name:{n.id}")
-        elif (isinstance(n, ast.Constant)
-                and isinstance(n.value, str) and len(n.value) >= 3):
-            toks.add(f"str:{n.value[:30]}")
-        elif isinstance(n, ast.keyword) and n.arg:
-            toks.add(f"kw:{n.arg}")
-    return sorted(toks)
+    calls: list[str] = []
+    exits: set[str] = set()
+    result_keys: set[str] = set()
+    toks: set[str] = set()
+
+    stack: list[tuple[ast.AST, bool]] = []
+    for fname, fval in ast.iter_fields(func_node):
+        if fname == "body":
+            stack.extend((stmt, True) for stmt in fval)
+        elif isinstance(fval, ast.AST):
+            stack.append((fval, False))
+        elif isinstance(fval, list):
+            stack.extend((item, False) for item in fval if isinstance(item, ast.AST))
+
+    while stack:
+        node, in_body = stack.pop()
+
+        # — ident tokens (whole function, incl. signature scope) —
+        if isinstance(node, ast.Attribute):
+            if node.attr not in _BUILTINS:
+                toks.add(f"attr:{node.attr}")
+        elif isinstance(node, ast.Name):
+            if node.id not in params and node.id not in _BUILTINS and node.id not in ("self", "cls"):
+                toks.add(f"name:{node.id}")
+        elif isinstance(node, ast.Constant):
+            if isinstance(node.value, str) and len(node.value) >= 3:
+                toks.add(f"str:{node.value[:30]}")
+        elif isinstance(node, ast.keyword) and node.arg:
+            toks.add(f"kw:{node.arg}")
+
+        # — body-only features —
+        if in_body:
+            if isinstance(node, ast.Call):
+                shape = _call_shape(node)
+                if shape:
+                    calls.append(shape)
+                # result.get("key") pattern
+                func = node.func
+                if (isinstance(func, ast.Attribute)
+                        and isinstance(func.value, ast.Name)
+                        and func.value.id == "result"
+                        and func.attr == "get"
+                        and node.args
+                        and isinstance(node.args[0], ast.Constant)
+                        and isinstance(node.args[0].value, str)):
+                    result_keys.add(node.args[0].value)
+            elif isinstance(node, ast.Return):
+                exits.add("return")
+            elif isinstance(node, ast.Raise):
+                exits.add("raise")
+            elif isinstance(node, (ast.Yield, ast.YieldFrom)):
+                exits.add("yield")
+            if isinstance(node, ast.Subscript):
+                # result["key"] subscript (read or assignment target)
+                value = node.value
+                if (isinstance(value, ast.Name) and value.id == "result"
+                        and isinstance(node.slice, ast.Constant)
+                        and isinstance(node.slice.value, str)):
+                    result_keys.add(node.slice.value)
+
+        for child in ast.iter_child_nodes(node):
+            stack.append((child, in_body))
+
+    return calls, sorted(exits), sorted(result_keys), sorted(toks)
 
 
 def _guard_count(body: list[ast.stmt]) -> int:
@@ -460,15 +475,13 @@ def normalise_function(
     body = func_node.body
     skeleton = [type(s).__name__ for s in body]
     stmt_seq = [_norm_stmt(s) for s in body]
-    calls = _collect_calls(body)
-    exits = _exit_shapes(body)
+    calls, exits, result_keys, ident_tokens = _walk_function_features(func_node)
     assigns = sum(1 for s in body if isinstance(s, (ast.Assign, ast.AugAssign, ast.AnnAssign)))
     total = len(body) or 1
     guard_c = _guard_count(body)
     has_try = any(isinstance(s, ast.Try) for s in body)
     line_count = (getattr(func_node, "end_lineno", func_node.lineno) - func_node.lineno + 1)
     fps, texts = _extract_ast_anchors(body)
-    result_keys = _extract_result_keys(body)
 
     return NormalisedSymbol(
         qualname=qualname,
@@ -484,7 +497,7 @@ def normalise_function(
         anchor_fps=fps,
         anchor_texts=texts,
         result_keys=result_keys,
-        ident_tokens=_ident_tokens(func_node),
+        ident_tokens=ident_tokens,
     )
 
 
@@ -809,6 +822,10 @@ def scan_similarity_candidates(
         if len(entries) < 2:
             continue
 
+        # Trivial-body verdicts are per-symbol facts; computing them once here
+        # avoids re-walking both bodies for every O(n²) pair below.
+        trivial_bodies = [_is_trivial_function_body(e.node.body) for e in entries]
+
         file_candidates: list[SimilarityCandidate] = []
         for i in range(len(normed)):
             for j in range(i + 1, len(normed)):
@@ -823,8 +840,7 @@ def scan_similarity_candidates(
 
                 # Skip pairs where BOTH symbols are trivial stubs —
                 # they score high on structure but aren't semantically related.
-                if (_is_trivial_function_body(entries[i].node.body)
-                        and _is_trivial_function_body(entries[j].node.body)):
+                if trivial_bodies[i] and trivial_bodies[j]:
                     continue
 
                 # Role gate: structural metrics alpha-normalise names away, so

@@ -124,10 +124,12 @@ class TestResolveContextLimit:
         assert _resolve_context_limit("deepseek-chat") == _DEFAULT_CONTEXT_LIMIT
 
     def test_glm_5_2_returns_1m(self):
-        # GLM-5.2 is the DEFAULT_MODEL; 1M context is verified (Z.ai docs) and now
-        # listed explicitly in _CONTEXT_LIMITS — NOT a fallback. Asserts the literal
-        # value so this is independent of any future _DEFAULT_CONTEXT_LIMIT change.
+        # glm-5.3 (the DEFAULT_MODEL since 2026-08-16) and glm-5.2 are 1M, verified
+        # (Z.ai docs) and listed explicitly in _CONTEXT_LIMITS — NOT a fallback.
+        # Asserts the literal value so this is independent of any future
+        # _DEFAULT_CONTEXT_LIMIT change.
         assert _resolve_context_limit("glm-5.2") == 1_000_000
+        assert _resolve_context_limit("glm-5.3") == 1_000_000
 
     def test_glm_5_1_returns_200k(self):
         assert _resolve_context_limit("glm-5.1") == 200_000
@@ -993,7 +995,7 @@ class TestOverrideEndToEndWiring:
     """Verify the full pipeline: override → resolve → cap computation.
 
     Ensures that an override recorded by _record_context_overflow propagates
-    through _resolve_context_limit to affect the cap that drives preemptive_trim.
+    through _resolve_context_limit to affect the cap used by the pre-flight guards.
     """
 
     def teardown_method(self):
@@ -1797,90 +1799,6 @@ class TestP1TooSmallPattern:
         assert _is_context_length_error(Exception("context window is too small"))
 
 
-class TestP2PreemptiveTrimFallback:
-    """P2 regression: fallback must not duplicate single message."""
-
-    def teardown_method(self):
-        _clear_overrides()
-
-    def test_single_message_no_duplicate(self):
-        """Single huge message must not appear twice in preemptive_trim fallback."""
-        from external_llm.agent._shared_utils import preemptive_trim
-        msg = make_msg("user", "x" * 100_000)
-        result = preemptive_trim([msg], max_tokens=1000, preserve_last=2, tag="test")
-        assert len(result) == 1, f"Expected 1 message, got {len(result)}"
-        assert result[0] is msg, "Object identity must be preserved (no copy)"
-
-    def test_two_messages_not_affected(self):
-        """Two messages should still produce [system, last] fallback."""
-        from external_llm.agent._shared_utils import preemptive_trim
-        m1 = make_msg("system", "be helpful")
-        m2 = make_msg("user", "x" * 100_000)
-        result = preemptive_trim([m1, m2], max_tokens=1000, preserve_last=2, tag="test")
-        assert len(result) == 2, f"Expected 2 messages, got {len(result)}"
-        assert result[0] is m1
-        assert result[1] is m2
-
-
-class TestPreemptiveTrimPreservesLastUser:
-    """Regression: trim must never drop the most recent user message.
-
-    The design-chat context builder appends trailing ``system`` messages after
-    the current request (``[CURRENT REQUEST]`` marker, mode notice, model-switch
-    notice), so the literal last message is often a ``system`` message. The old
-    fallback ``messages[:1] + messages[-1:]`` then kept ``[system, system]`` and
-    dropped the request entirely — breaking strict chat templates that require at
-    least one user message (Qwen3 / ``bonsai27b``:
-    ``raise_exception('No user query found in messages.')``).
-    """
-
-    def test_trailing_system_messages_keep_user_query(self):
-        """[sys, sys, ..., user, sys_marker, sys_mode] must retain the user turn."""
-        from external_llm.agent._shared_utils import preemptive_trim
-        msgs = [
-            make_msg("system", "S" * 50_000),          # huge system → forces trim
-            make_msg("system", "divider"),
-            make_msg("assistant", "prev answer"),
-            make_msg("user", "what is 1+1?"),
-            make_msg("system", "[CURRENT REQUEST] ..."),
-            make_msg("system", "[MODE: General Chat] ..."),
-        ]
-        result = preemptive_trim(msgs, max_tokens=1000, preserve_last=2, tag="test")
-        roles = [m.role for m in result]
-        assert "user" in roles, f"User query dropped! roles={roles}"
-        # The preserved user message must be the actual request (identity kept).
-        assert make_msg("user", "what is 1+1?").content in [m.content for m in result if m.role == "user"]
-        # First message (system prompt) is still preserved when present.
-        assert result[0].role == "system"
-
-    def test_progressive_trim_keeps_user_when_near_tail(self):
-        """Even small preserve_last values must include the last user message."""
-        from external_llm.agent._shared_utils import preemptive_trim
-        msgs = [
-            make_msg("system", "S" * 50_000),
-            make_msg("user", "old question"),
-            make_msg("assistant", "old answer"),
-            make_msg("user", "current question"),
-            make_msg("system", "[CURRENT REQUEST] ..."),
-        ]
-        result = preemptive_trim(msgs, max_tokens=1000, preserve_last=2, tag="test")
-        contents = [m.content for m in result if m.role == "user"]
-        assert "current question" in contents, f"Current query dropped: {contents}"
-
-    def test_no_duplicate_when_user_is_first(self):
-        """When the user message is messages[0], fallback must not duplicate it."""
-        from external_llm.agent._shared_utils import preemptive_trim
-        msgs = [
-            make_msg("user", "x" * 100_000),
-            make_msg("assistant", "y" * 100_000),
-        ]
-        result = preemptive_trim(msgs, max_tokens=1000, preserve_last=2, tag="test")
-        # User is first and must not be duplicated; result keeps the user turn.
-        assert any(m.role == "user" for m in result)
-        user_count = sum(1 for m in result if m.role == "user")
-        assert user_count == 1, f"User message duplicated: {user_count}"
-
-
 class TestP3TTLResetInOverflow:
     """P3 regression: TTL-reset in _record_context_overflow must clear
     _context_window_overrides too (not just _override_meta)."""
@@ -2348,3 +2266,222 @@ class TestOverrideCacheCrossProcessSafety:
         monkeypatch.setattr(cb, "_resolve_base_context_limit", _fake_base)
         _record_context_overflow("gpt-4o")
         assert seen == [None]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RED→GREEN: 오버라이드 캐시 예외/ollama num_ctx/에러코드/repair 시퀀스 잔여
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestOverrideCacheFailurePaths:
+    """_read_override_cache/_save_override_cache의 best-effort 예외 브랜치."""
+
+    def teardown_method(self):
+        _clear_overrides()
+
+    def test_unreadable_file_returns_empty(self, tmp_path, monkeypatch):
+        import external_llm.agent.context_budget as cb
+
+        # 디렉터리를 가리키면 open()이 IsADirectoryError → {} (best-effort)
+        d = tmp_path / "cache_dir"
+        d.mkdir()
+        monkeypatch.setattr(cb, "_OVERRIDE_CACHE_FILE", str(d))
+        assert cb._read_override_cache() == {}
+
+    def test_non_dict_entry_skipped(self, tmp_path, monkeypatch):
+        import json
+
+        import external_llm.agent.context_budget as cb
+
+        f = tmp_path / "cache.json"
+        f.write_text(json.dumps({"m1": "not-a-dict"}))
+        monkeypatch.setattr(cb, "_OVERRIDE_CACHE_FILE", str(f))
+        assert cb._read_override_cache() == {}
+
+    def test_corrupt_entry_ts_typeerror_skipped(self, tmp_path, monkeypatch):
+        import json
+
+        import external_llm.agent.context_budget as cb
+
+        f = tmp_path / "cache.json"
+        # ts가 문자열 → _now - ts TypeError → 개별 항목 스킵 (나머지는 보존)
+        f.write_text(json.dumps({
+            "bad": {"limit": 1000, "ts": "yesterday"},
+            "good": {"limit": 2000, "ts": time.time()},
+        }))
+        monkeypatch.setattr(cb, "_OVERRIDE_CACHE_FILE", str(f))
+        out = cb._read_override_cache()
+        assert "bad" not in out
+        assert "good" in out
+
+    def test_save_failure_remarks_dirty_and_cleans_tmp(self, tmp_path, monkeypatch):
+        import external_llm.agent.context_budget as cb
+
+        f = tmp_path / "cache.json"
+        monkeypatch.setattr(cb, "_OVERRIDE_CACHE_FILE", str(f))
+        cb._override_dirty = True
+        cb._override_meta["m"] = {"limit": 1000, "ts": time.time()}
+
+        def boom_replace(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(cb.os, "replace", boom_replace)
+        cb._save_override_cache(force=True)
+        assert cb._override_dirty is True  # 실패 후 재시도 가능 상태 유지
+        leftovers = [p for p in tmp_path.iterdir() if ".tmp." in p.name]
+        assert leftovers == []  # tmp 파일 정리됨
+        cb._override_meta.clear()
+
+    def test_save_makedirs_failure_no_crash(self, tmp_path, monkeypatch):
+        import external_llm.agent.context_budget as cb
+
+        monkeypatch.setattr(cb, "_OVERRIDE_CACHE_FILE", str(tmp_path / "x" / "cache.json"))
+        cb._override_dirty = True
+
+        def boom_makedirs(path, exist_ok=False):
+            raise PermissionError("read-only fs")
+
+        monkeypatch.setattr(cb.os, "makedirs", boom_makedirs)
+        cb._save_override_cache(force=True)  # 예외 삼킴 — 크래시 없음
+        assert cb._override_dirty is True
+        cb._override_dirty = False
+
+
+class TestOllamaNumCtxPath:
+    def test_native_ollama_tag_queries_api(self, monkeypatch):
+        import external_llm.agent.context_budget as cb
+
+        calls = []
+
+        def fake_query(model, base_url_hint=None):
+            calls.append((model, base_url_hint))
+            return 8192
+
+        monkeypatch.setattr("external_llm.ollama_api.query_ollama_num_ctx", fake_query)
+        assert cb._resolve_base_context_limit("llama3:8b", base_url="http://localhost:11434") == 8192
+        assert calls == [("llama3:8b", "http://localhost:11434")]
+
+
+class TestIsContextLengthErrorCodePath:
+    def test_non_numeric_error_code_ignored(self):
+        from external_llm.agent.context_budget import _is_context_length_error
+
+        exc = type("Exc", (Exception,), {"error_code": "not-a-number"})("some message")
+        assert _is_context_length_error(exc) is False
+
+    def test_glm_1305_with_context_terms_true(self):
+        from external_llm.agent.context_budget import _is_context_length_error
+
+        exc = type("Exc", (Exception,), {"error_code": 1305})("context window is too small")
+        assert _is_context_length_error(exc) is True
+
+    def test_glm_1305_without_context_terms_false(self):
+        from external_llm.agent.context_budget import _is_context_length_error
+
+        exc = type("Exc", (Exception,), {"error_code": 1305})("server overloaded")
+        assert _is_context_length_error(exc) is False
+
+
+class TestFitMessagesToolSchemasFallback:
+    def test_tool_schema_tokens_computed_when_empty(self):
+        """_tool_schema_tokens가 비어 있으면 fit_messages가 추정을 재계산한다."""
+        mgr = make_manager()
+        assert mgr._tool_schema_tokens == 0
+        msgs = [make_msg("user", "hello")]
+        out = mgr.fit_messages(msgs, tool_schemas=[{"type": "function", "function": {"name": "f"}}])
+        assert out is msgs
+
+
+class TestRepairAnthropicRemaining:
+    """repair_tool_message_sequence의 Anthropic raw_content 브랜치."""
+
+    def test_orphan_anthropic_tool_result_text_blocks_preserved(self):
+        msgs = [
+            make_msg("user", "task"),
+            make_msg("user", "", raw_content=[
+                {"type": "tool_result", "tool_use_id": "tu1", "content": "out"},
+                {"type": "text", "text": "keep me"},
+            ]),
+            make_msg("assistant", "done"),
+        ]
+        result = repair_tool_message_sequence(msgs)
+        assert len(result) == 3  # tool_result 블록만 제거, 텍스트 블록 보존
+        kept = result[1]
+        assert kept.raw_content == [{"type": "text", "text": "keep me"}]
+        assert kept.tool_call_id is None
+        assert kept.name is None
+
+    def test_orphan_anthropic_tool_result_without_text_dropped(self):
+        msgs = [
+            make_msg("user", "task"),
+            make_msg("user", "", raw_content=[
+                {"type": "tool_result", "tool_use_id": "tu1", "content": "out"},
+            ]),
+        ]
+        result = repair_tool_message_sequence(msgs)
+        assert len(result) == 1
+        assert result[0].content == "task"
+
+    def test_tool_call_id_mismatch_with_raw_content_blocks_drops_group(self, caplog):
+        import logging
+
+        msgs = [
+            make_msg("assistant", "", tool_calls=[{"id": "tc1"}], raw_content=[
+                {"type": "tool_use", "id": "tc2", "name": "read_file"},
+            ]),
+            make_msg("tool", "r1", tool_call_id="tc1", raw_content=[
+                {"type": "tool_result", "tool_use_id": "tc3", "content": "x"},
+            ]),
+            make_msg("user", "follow-up"),
+        ]
+        with caplog.at_level(logging.WARNING):
+            result = repair_tool_message_sequence(msgs)
+        # expected {tc1, tc2} vs actual {tc1, tc3} → 그룹 드롭
+        assert len(result) == 1
+        assert result[0].content == "follow-up"
+        assert "tool_call_id mismatch" in caplog.text
+
+    def test_expected_ids_from_raw_content_tool_use_blocks(self):
+        # 표준 tool_calls + Anthropic tool_use 블록이 모두 expected에 포함
+        msgs = [
+            make_msg("assistant", "", tool_calls=[{"id": "tc1"}], raw_content=[
+                {"type": "tool_use", "id": "tu1", "name": "bash"},
+            ]),
+            make_msg("tool", "r1", tool_call_id="tc1"),
+            make_msg("tool", "r2", tool_call_id="tu1"),
+        ]
+        result = repair_tool_message_sequence(msgs)
+        assert len(result) == 3  # 모든 id가 매칭 — 보존
+
+
+class TestEnsureOverrideCacheLoaded:
+    """_ensure_override_cache_loaded가 디스크 스냅샷을 메모리로 로드."""
+
+    def teardown_method(self):
+        _clear_overrides()
+
+    def test_loads_valid_entries_into_overrides(self, tmp_path, monkeypatch):
+        import json
+
+        import external_llm.agent.context_budget as cb
+
+        f = tmp_path / "cache.json"
+        f.write_text(json.dumps({
+            "m1": {"limit": 12345, "ts": time.time()},
+        }))
+        monkeypatch.setattr(cb, "_OVERRIDE_CACHE_FILE", str(f))
+        _clear_overrides()
+        cb._ensure_override_cache_loaded()
+        assert cb._context_window_overrides["m1"] == 12345
+        assert cb._override_meta["m1"]["limit"] == 12345
+
+
+class TestContextLengthErrorCodeOnly:
+    """1305 에러코드 백스톱: 좁은 패턴에 걸리지 않는 메시지에서만 발동."""
+
+    def test_1305_with_context_term_not_in_narrow_patterns(self):
+        from external_llm.agent.context_budget import _is_context_length_error
+
+        # "window"는 컨텍스트 용어지만 "context window" 조합이 아니어서
+        # 좁은 패턴(548행)을 통과 → 1305 코드 백스톱(563행)이 판정
+        exc = type("Exc", (Exception,), {"error_code": 1305})("the window size is limited")
+        assert _is_context_length_error(exc) is True

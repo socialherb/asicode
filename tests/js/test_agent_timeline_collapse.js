@@ -133,6 +133,11 @@ globalThis.MutationObserver = class {
 
 // Boot-time stale-key sweep (P9-5) — no-op stub; storage fixture is empty.
 globalThis._tlSweepStale = () => {};
+// G1 live-DOM prune — wired into the MutationObserver callback alongside
+// _agentUpdateTimelineMeta; no-op stub here (this harness exercises collapse
+// behavior below the cap, where pruning is a no-op anyway). See
+// test_agent_timeline_prune.js for the prune contract.
+globalThis._tlPruneLiveTimeline = () => {};
 
 // Compile the real functions in global scope so free variables resolve
 // against the stubs.

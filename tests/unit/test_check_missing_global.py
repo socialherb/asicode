@@ -19,6 +19,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "check_missing_global.py"
 _spec = importlib.util.spec_from_file_location("check_missing_global", _SCRIPT)
 g = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
@@ -218,6 +220,7 @@ def test_main_skips_vendored_and_cache_dirs(tmp_path, monkeypatch):
     assert g.main() == 0
 
 
+@pytest.mark.slow
 def test_repo_is_at_zero():
     """The gate has no baseline — the whole repo must be clean."""
     monkey_argv = sys.argv

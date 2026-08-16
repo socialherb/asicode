@@ -1227,6 +1227,41 @@ class TestApplyPatchText:
         assert "CONTENT LOSS WARNING" in r.content
         assert "content_ratio_warning" in (r.metadata or {})
 
+    def test_wipe_via_synthesize_path_warns(self, tmp_path):
+        # P26-1: the content-loss guard must fire on the LIVE synthesize path
+        # too (non-diff input + path). The applied diff lives in
+        # synthesize_and_apply's metadata["patch"]; the guard must score THAT,
+        # because the raw non-diff input has no hunks. The parallel session's
+        # abandoned stash carried this guard, but the committed P26-1 wiring
+        # never reached this branch.
+        import subprocess as sp
+        import unittest.mock as um
+        from types import SimpleNamespace
+
+        n = 1000
+        h = self._git_repo(tmp_path)
+        (tmp_path / "big.txt").write_text(
+            "".join(f"line{i}\n" for i in range(n)), encoding="utf-8"
+        )
+        sp.run(["git", "-C", str(tmp_path), "add", "big.txt"], check=True)
+        sp.run(["git", "-C", str(tmp_path), "commit", "-qm", "add big"], check=True)
+
+        fake = SimpleNamespace(
+            success=True,
+            error=None,
+            patch_applied="applied (synthesized)",
+            metadata={"patch": _wipe_patch("big.txt", n, keep=5)},
+        )
+        with um.patch.object(
+            write_tools_patch_mixin.PatchEngine,
+            "synthesize_and_apply",
+            return_value=fake,
+        ):
+            r = h._tool_apply_patch({"patch": "replace the whole file body", "path": "big.txt"})
+        assert r.ok, r.error
+        assert "CONTENT LOSS WARNING" in r.content
+        assert "content_ratio_warning" in (r.metadata or {})
+
 
 # ── _append_applied_patch (shared guarded-append SSOT) ──────────────────────
 
@@ -1599,3 +1634,67 @@ def test_enrich_plan_error_closest_match_streams(tmp_path, monkeypatch):
 
     assert "Closest match" in out
     assert "similar_fn" in out
+
+
+# ── WP-B1 regression: content lines starting with '--'/'++' must survive ─────
+
+class TestDoubleMarkerContentLines:
+    """WP-B1: bare '---'/'+++' prefix checks dropped real content lines whose
+    *content* starts with '--' (removed) or '++' (added). Unified-diff headers
+    always carry a space after the marker ('--- a/x', '+++ /dev/null'); body
+    lines never do — '---x'/'+++x' are therefore always content.
+    """
+
+    def test_removed_and_added_double_marker_lines_preserved(self, harness):
+        patch = (
+            "diff --git a/f.py b/f.py\n"
+            "--- a/f.py\n"
+            "+++ b/f.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " keep\n"
+            "---comment\n"   # removed line whose content is '--comment'
+            "+++line\n"      # added line whose content is '++line'
+        )
+        files = harness._parse_unified_diff_files(patch)
+        assert len(files) == 1
+        assert files[0]["hunks"][0]["lines"] == [
+            (" ", "keep"), ("-", "--comment"), ("+", "++line"),
+        ]
+
+    def test_dev_null_header_still_skipped(self, harness):
+        # Regression guard: header markers (marker + space) must keep being
+        # recognized as headers, not content, after the fix.
+        patch = (
+            "diff --git a/n b/n\n"
+            "--- /dev/null\n"
+            "+++ b/n\n"
+            "@@ -0,0 +1 @@\n"
+            "+x\n"
+        )
+        files = harness._parse_unified_diff_files(patch)
+        assert [f["file"] for f in files] == ["n"]
+        assert files[0]["hunks"][0]["lines"] == [("+", "x")]
+
+    def test_new_file_content_starting_with_double_plus_preserved(self, harness):
+        patch = (
+            "--- /dev/null\n"
+            "+++ b/new.txt\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+a\n"
+            "+++tail\n"    # added line whose content is '++tail'
+            "+c\n"
+        )
+        out = harness._extract_new_file_target(patch, None)
+        assert out == {"file_path": "new.txt", "content": "a\n++tail\nc\n"}
+
+    def test_new_file_removed_line_disqualifies_not_fabricates(self, harness):
+        # A '-' content line starting with '--' must DISQUALIFY the creation
+        # (conservative bail), not be silently dropped so content is fabricated.
+        patch = (
+            "--- /dev/null\n"
+            "+++ b/new.txt\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+a\n"
+            "---gone\n"    # removed line — not a pure creation
+        )
+        assert harness._extract_new_file_target(patch, None) is None

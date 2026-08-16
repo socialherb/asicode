@@ -7,6 +7,8 @@ tests pin the NEW fail-fast contract (internal errors propagate instead of
 silently degrading) and the preserved graceful-degradation contracts
 (parse failures, out-of-range anchors, unavailable tree-sitter).
 """
+import json
+
 import pytest
 
 from external_llm.agent.tool_handlers import write_tools_core as core
@@ -269,3 +271,190 @@ def test_find_block_end_line_brace_fallback_delegates_to_base_ssot(monkeypatch):
     end = core._find_block_end_line(content, "kotlin", 0, lines)
     assert end == 3
     assert calls, "brace fallback did not delegate to find_brace_block_end"
+
+
+# ── RED→GREEN gap coverage: edge branches not hit by the above ──────────────
+
+def test_find_block_end_line_out_of_range_and_blank_anchor():
+    """Out-of-range and blank anchors degrade to None (bounds/blank guards)."""
+    assert core._find_block_end_line("x = 1\n", "python", -1, ["x = 1\n"]) is None
+    assert core._find_block_end_line("x = 1\n", "python", 5, ["x = 1\n"]) is None
+    assert core._find_block_end_line("", "python", 0, ["", "x = 1\n"]) is None
+    assert core._find_block_end_line("", "python", 0, ["   \n"]) is None
+
+
+def test_find_block_end_line_python_fallback_blank_line_and_eof(monkeypatch):
+    """Indent fallback: blank interior lines are skipped; EOF-terminated
+    blocks return the last line index."""
+    monkeypatch.setattr(core, "_HAS_TS", False)
+    content = "def f():\n    x = 1\n\n    y = 2\nz = 3\n"
+    lines = content.splitlines(True)
+    assert core._find_block_end_line(content, "python", 0, lines) == 3
+    content2 = "def f():\n    x = 1\n"
+    lines2 = content2.splitlines(True)
+    assert core._find_block_end_line(content2, "python", 0, lines2) == 1
+
+
+def test_detect_file_unit_empty_content_returns_none():
+    """Empty content is undetectable → None (documented degrade)."""
+    assert core._detect_file_unit("") is None
+
+
+def test_fragment_dup_snippet_comment_and_trivial_lines():
+    """Snippet lines that are code+comment (289), comment-only (288), blank
+    (283) or trivial (291) are excluded from the duplication judgement."""
+    file_lines = ["a = 1\n", "b = 2\n", "c = 3\n"]
+    snippet = "x = 9  # trailing note\nreturn\n\n# pure comment\nz = 8\n"
+    out = core._detect_fragment_duplication(file_lines, 1, snippet)
+    # non-trivial unique lines: x = 9, z = 8 → below the 3-line minimum → None
+    assert out is None
+
+
+def test_fragment_dup_file_window_comment_blank_and_trailing():
+    """Window lines that are blank (303), comment-only (306-307) or carry a
+    trailing comment (305, 308) are normalised identically to snippet lines."""
+    file_lines = ["a = 1\n", "\n", "# comment\n", "b = 2  # trailing\n", "c = 3\n"]
+    snippet = "b = 2\nc = 3\nd = 4\n"
+    out = core._detect_fragment_duplication(file_lines, 2, snippet)
+    assert out is not None
+    assert out["ratio"] >= 0.5
+
+
+def test_detect_enclosing_scope_skips_blank_lines():
+    """Blank lines between the anchor and the enclosing header are skipped."""
+    file_lines = ["def f():", "", "    pass"]
+    out = core._detect_enclosing_scope(file_lines, 2)
+    assert out["innermost"] == ("function", "f", 0)
+    assert out["top_level"] == ("function", "f", 0)
+
+
+class TestExtractTruncatedOpPathGaps:
+    """RED→GREEN: the truncation scanner's remaining edge branches."""
+
+    def test_truncated_mid_path_value_marked_partial(self):
+        raw = '{"ops":[{"op":"create_file","path":"src/fo'
+        hint = core._extract_truncated_op_path(raw)
+        assert hint == "op=create_file path=src/fo…"
+
+    def test_whitespace_between_key_and_colon(self):
+        raw = '{"op"    :"create_file"}'
+        hint = core._extract_truncated_op_path(raw)
+        assert hint == "op=create_file"
+
+    def test_path_without_any_op(self):
+        raw = '{"path":"foo.py"}'
+        hint = core._extract_truncated_op_path(raw)
+        assert hint == "path=foo.py"
+
+    def test_op_with_empty_path_value(self):
+        raw = '{"op":"create_file","path":""}'
+        hint = core._extract_truncated_op_path(raw)
+        assert hint == "op=create_file"
+
+
+class TestRepairPlanJsonGaps:
+    """RED→GREEN: remaining repair branches — markdown fences, raw newlines/
+    CRs inside values, escape sequences, and single-quoted values."""
+
+    def test_markdown_fence_extraction(self):
+        text = "```json\n{\"a\": 1, \"b\": [1, 2]}\n```"
+        out = core._repair_plan_json(text)
+        assert json.loads(out) == {"a": 1, "b": [1, 2]}
+
+    def test_raw_newline_inside_string_value_escaped(self):
+        text = '{"msg": "line1\nline2", "n": 1}'
+        out = core._repair_plan_json(text)
+        assert json.loads(out) == {"msg": "line1\nline2", "n": 1}
+
+    def test_raw_cr_inside_string_value_escaped(self):
+        text = '{"msg": "a\rb", "n": 1}'
+        out = core._repair_plan_json(text)
+        assert json.loads(out) == {"msg": "a\rb", "n": 1}
+
+    def test_escaped_sequence_inside_string_preserved(self):
+        text = '{"a": "x\\ny", "b": 2}'
+        out = core._repair_plan_json(text)
+        assert json.loads(out) == {"a": "x\ny", "b": 2}
+
+    def test_single_quoted_values_with_escapes(self):
+        text = "{'a': 'x\\ny', 'b': 2}"
+        out = core._repair_plan_json(text)
+        assert json.loads(out) == {"a": "x\ny", "b": 2}
+
+    def test_single_quoted_value_containing_double_quotes(self):
+        text = "{'a': 'say \"hi\"', 'b': 1}"
+        out = core._repair_plan_json(text)
+        assert json.loads(out) == {"a": 'say "hi"', "b": 1}
+
+
+# ── RED→GREEN gap coverage: final edge branches (round 32-7) ────────────────
+
+def test_find_block_end_line_unknown_language_returns_none():
+    """A language outside the python/brace families degrades to None
+    (grammar-less fallback contract: nothing to scan)."""
+    assert core._find_block_end_line("x = 1\n", "text", 0, ["x = 1\n"]) is None
+    assert core._find_block_end_line("x = 1\n", "markdown", 0, ["x = 1\n"]) is None
+
+
+def test_leading_indent_width_blank_text_returns_zero():
+    """Empty / whitespace-only text has no first content line → width 0."""
+    assert core._leading_indent_width("") == 0
+    assert core._leading_indent_width("  \n\t\n") == 0
+
+
+def test_leading_indent_width_first_content_line_wins():
+    """Width is taken from the FIRST non-blank line; tabs count as width 1."""
+    assert core._leading_indent_width("    x = 1\n") == 4
+    assert core._leading_indent_width("\n\tx = 1\n") == 1
+
+
+def test_fragment_dup_file_window_trivial_lines_skipped():
+    """Trivial window lines (return / } / …) carry no structural identity and
+    are excluded from the comparison set (L309-310)."""
+    file_lines = ["a = 1\n", "return\n", "}\n", "b = 2\n"]
+    snippet = "x = 9\ny = 8\nz = 7\n"
+    out = core._detect_fragment_duplication(file_lines, 1, snippet)
+    assert out is None  # nothing matched — no duplication reported
+
+
+def test_fragment_dup_ratio_below_threshold_returns_none():
+    """≥3 unique snippet lines but overlap below the 0.5 ratio → None
+    (the dict-return guard at L326 is not reached)."""
+    file_lines = ["a = 1\n", "b = 2\n", "c = 3\n"]
+    snippet = "a = 1\nx = 9\ny = 8\n"  # 1/3 matched = 0.33 < 0.5
+    assert core._detect_fragment_duplication(file_lines, 0, snippet) is None
+
+
+def test_block_introducer_nesting_catches_swallowed_trailing_code():
+    """A def/class whose body extends past the inserted range swallowed
+    pre-existing trailing code — the second violation kind (L485)."""
+    new_content = "def f():\n    x = 1\n    y = 2\n"
+    err = core._check_block_introducer_nesting(new_content, 0, 1)
+    assert err is not None
+    assert "swallowed pre-existing code" in err
+
+
+class TestExtractTruncatedOpPathEscapes:
+    """RED→GREEN: escape handling inside string values of the truncation
+    scanner — a backslash must not be skipped, and an escaped quote must not
+    terminate the literal (L537-539)."""
+
+    def test_escaped_quote_inside_path_value(self):
+        raw = '{"op":"create_file","path":"src/fo\\"o'
+        hint = core._extract_truncated_op_path(raw)
+        assert hint is not None
+        assert hint.startswith("op=create_file")
+        # The escaped quote does NOT terminate the literal — the scanner keeps
+        # the raw text (it only tracks string state, it does not unescape).
+        assert 'src/fo\\"o' in hint
+
+    def test_backslash_escape_roundtrip_in_value(self):
+        raw = '{"op":"create_file","path":"a\\\\b'
+        hint = core._extract_truncated_op_path(raw)
+        assert hint is not None
+        assert "a\\\\b" in hint.replace("…", "")
+
+    def test_nothing_identifiable_returns_none(self):
+        """No op/path key and no snapshot before the cut point → None."""
+        assert core._extract_truncated_op_path('{"foo": 1}') is None
+        assert core._extract_truncated_op_path("") is None

@@ -132,3 +132,84 @@ class TestTryParseJsonFenceProse:
 
 # ── _parse_json delegation parity (planner candidate entrypoint) ─────────
 
+
+
+# ── repair_truncated_json: 남은 브랜치 ────────────────────────────────────
+
+
+class TestRepairTruncatedJsonRemaining:
+    def test_operations_marker_without_array_opener_returns_none(self):
+        from external_llm.agent.json_repair import repair_truncated_json
+
+        # '"operations"' 뒤에 '['가 없음 → 회복 불가
+        assert repair_truncated_json('{"operations": "not-an-array"}') is None
+
+    def test_closed_empty_array_returns_none(self):
+        from external_llm.agent.json_repair import repair_truncated_json
+
+        # 완전한 빈 배열 — 잘림 아님 (마지막 완결 객체도, 열린 배열도 없음)
+        assert repair_truncated_json('{"operations": []}') is None
+
+    def test_escaped_backslash_inside_string_scan(self):
+        from external_llm.agent.json_repair import repair_truncated_json
+
+        # 문자열 내 이스케이프된 백슬래시(\\, 4바이트)가 스캐너를 깨뜨리지 않아야 함
+        text = '{"operations": [{"path": "a\\\\b"'
+        out = repair_truncated_json(text)
+        assert out is not None
+        assert out.endswith("]}")
+
+    def test_repaired_output_is_balanced_json(self):
+        import json
+
+        from external_llm.agent.json_repair import repair_truncated_json
+
+        text = '{"operations": [{"tool": "read_file", "args": {"path": "x"}}'
+        out = repair_truncated_json(text)
+        assert out is not None
+        parsed = json.loads(out)
+        assert parsed["operations"][0]["tool"] == "read_file"
+
+
+# ── repair_json_brackets: escape/배열/미종결 문자열 ───────────────────────
+
+
+class TestRepairJsonBracketsRemaining:
+    def test_escaped_quote_inside_string_preserved(self):
+        from external_llm.agent.json_repair import repair_json_brackets
+
+        text = '{"s": "he said \\"hi\\""}'
+        assert repair_json_brackets(text) == text
+
+    def test_escaped_backslash_inside_string_preserved(self):
+        from external_llm.agent.json_repair import repair_json_brackets
+
+        text = r'{"path": "a\\b\\c"}'
+        assert repair_json_brackets(text) == text
+
+    def test_balanced_array_popped(self):
+        from external_llm.agent.json_repair import repair_json_brackets
+
+        assert repair_json_brackets('{"a": [1, 2]}') == '{"a": [1, 2]}'
+
+    def test_unterminated_string_closed(self):
+        from external_llm.agent.json_repair import repair_json_brackets
+
+        assert repair_json_brackets('{"a": "trunc') == '{"a": "trunc"}'
+
+    def test_unmatched_close_bracket_skipped(self):
+        from external_llm.agent.json_repair import repair_json_brackets
+
+        assert repair_json_brackets('{"a": 1]}') == '{"a": 1}'
+
+
+class TestRepairTruncatedJsonNoOpsMarker:
+    def test_no_operations_marker_returns_none(self):
+        from external_llm.agent.json_repair import repair_truncated_json
+
+        assert repair_truncated_json('{"other": 1}') is None
+
+    def test_already_properly_closed_returns_none(self):
+        from external_llm.agent.json_repair import repair_truncated_json
+
+        assert repair_truncated_json('{"operations": [{"a": 1}]}') is None

@@ -108,10 +108,12 @@ def _reset_ocr_cache():
     providers_module._OCR_RESOLVED_LANG = None
     providers_module._OCR_AVAILABLE_LANGS = None
     providers_module._OCR_LANG_PROBE_FAILED = False
+    providers_module._OCRTextCacheAccess.clear()
     yield
     providers_module._OCR_RESOLVED_LANG = None
     providers_module._OCR_AVAILABLE_LANGS = None
     providers_module._OCR_LANG_PROBE_FAILED = False
+    providers_module._OCRTextCacheAccess.clear()
 
 
 _B64 = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()

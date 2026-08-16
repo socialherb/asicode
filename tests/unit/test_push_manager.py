@@ -9,6 +9,7 @@ drive it via asyncio.run + async for / aclose.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import threading
 import time
@@ -251,6 +252,156 @@ class TestPushManagerRoundtrip:
         assert pm.push(client_id, "noop", {}) is False
         # The orphaned queue object is inert — nothing else references it.
         assert q is not None
+
+    # ── RED→GREEN: uncovered branches ────────────────────────────────────
+
+    def test_broadcast_drops_event_on_full_queue(self) -> None:
+        """broadcast() must not raise when a client queue is full; the event
+        is dropped for that client and it is not counted (L151-152)."""
+        import queue as _q
+        pm = self.pm
+        client_id = "full-broadcast"
+        q = pm.register(client_id)
+        while True:
+            try:
+                q.put_nowait(("noop", {"i": 0}))
+            except _q.Full:
+                break
+        assert q.full()
+        assert pm.broadcast("dropped", {"x": 1}) == 0
+
+    def test_push_returns_false_on_full_queue(self) -> None:
+        """push() returns False when the client queue is full (L176-177)."""
+        import queue as _q
+        pm = self.pm
+        client_id = "full-push"
+        q = pm.register(client_id)
+        while True:
+            try:
+                q.put_nowait(("noop", {"i": 0}))
+            except _q.Full:
+                break
+        assert q.full()
+        assert pm.push(client_id, "dropped", {"x": 1}) is False
+
+    def test_generator_keepalive_and_spurious_wake(self, monkeypatch) -> None:
+        """The slow path covers both branches of the wake wait: a wake with an
+        empty queue loops back silently (spurious), and the 15s timeout yields
+        ': keepalive' (L257-269)."""
+        calls = {"n": 0}
+
+        async def _fake_wait_for(awaitable, timeout=None):
+            calls["n"] += 1
+            # The generator parks on a Task (P-E fix), so close() doesn't
+            # apply — cancel it and await the CancelledError instead of
+            # leaving it suspended (RuntimeWarning: never awaited).
+            awaitable.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await awaitable
+            if calls["n"] == 1:
+                return  # simulate wake with nothing enqueued → spurious
+            raise asyncio.TimeoutError()
+
+        monkeypatch.setattr(
+            "external_llm.editor.agent.autonomous.push_manager.asyncio.wait_for",
+            _fake_wait_for,
+        )
+        pm = self.pm
+        client_id = "keepalive-client"
+
+        async def _go():
+            gen = pm.make_sse_generator(client_id)
+            try:
+                first = await gen.__anext__()
+                assert "proactive_connected" in first
+                # __anext__ #2: spurious wake (wait_for #1 returns) → loop →
+                # keepalive (wait_for #2 times out)
+                second = await gen.__anext__()
+                assert second == ": keepalive\n\n"
+                # __anext__ #3: resumes after the keepalive yield, running the
+                # `continue` and timing out again (L259).
+                third = await gen.__anext__()
+                assert third == ": keepalive\n\n"
+            finally:
+                await gen.aclose()
+
+        asyncio.run(_go())
+        assert calls["n"] == 3
+
+    def test_cancel_while_parked_does_not_strand_wake_coroutine(self) -> None:
+        """Regression (P-E): cancelling the consumer while the generator parks
+        on wake_event.wait() must not strand the park awaitable.
+
+        asyncio.wait_for (3.12+, timeouts-based) does not cancel its inner
+        awaitable on cancellation, so the park must be a Task that the
+        generator cancels explicitly before propagating. A bare coroutine
+        would stay suspended inside Event.wait()'s waiter list and warn
+        "coroutine 'Event.wait' was never awaited" at GC.
+        """
+        import gc
+        import warnings
+
+        async def _go():
+            gen = self.pm.make_sse_generator("park-close")
+            first = await gen.__anext__()
+            assert "proactive_connected" in first
+            # Second __anext__ parks on the wake event (empty queue).
+            waiter = asyncio.create_task(gen.__anext__())
+            await asyncio.sleep(0.05)  # let the waiter reach the parked await
+            waiter.cancel()  # client disconnect: CancelledError at the park
+            with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                await waiter
+            await asyncio.sleep(0.05)  # let the cancelled park task settle
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            asyncio.run(_go())
+            gc.collect()
+
+        leaked = [str(w.message) for w in caught if "never awaited" in str(w.message)]
+        assert leaked == [], f"leaked coroutines: {leaked}"
+
+    def test_generator_exits_on_shutdown_sentinel(self) -> None:
+        """With a non-full queue, shutdown_all's sentinel ends the generator
+        and the finally block unregisters the client (L272)."""
+        pm = self.pm
+        client_id = "shutdown-client"
+
+        async def _go():
+            gen = pm.make_sse_generator(client_id)
+            try:
+                first = await gen.__anext__()
+                assert "proactive_connected" in first
+                pm.shutdown_all()
+                with pytest.raises(StopAsyncIteration):
+                    await gen.__anext__()
+                assert client_id not in pm._clients
+            finally:
+                await gen.aclose()
+
+        asyncio.run(_go())
+
+    def test_generator_serialization_error_fallback(self) -> None:
+        """Un-serializable data (circular reference) falls back to a
+        serialization_error event instead of crashing the generator
+        (L277-278)."""
+        pm = self.pm
+        client_id = "serde-client"
+
+        async def _go():
+            gen = pm.make_sse_generator(client_id)
+            try:
+                first = await gen.__anext__()
+                assert "proactive_connected" in first
+                circular: dict = {}
+                circular["self"] = circular
+                assert pm.push(client_id, "circular", circular) is True
+                ev = await gen.__anext__()
+                assert 'data: {"error": "serialization_error"}' in ev
+            finally:
+                await gen.aclose()
+
+        asyncio.run(_go())
 
 
 

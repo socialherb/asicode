@@ -253,10 +253,22 @@ class PushManager:
                         item = q.get_nowait()
                     except queue.Empty:
                         try:
-                            await asyncio.wait_for(wake_event.wait(), timeout=15.0)
+                            # Park on the wake event with a keepalive timeout.
+                            # Event.wait() is wrapped in a Task: asyncio.wait_for
+                            # (3.12+, timeouts-based) does NOT cancel its inner
+                            # awaitable on timeout/cancellation, so a bare
+                            # coroutine would be stranded suspended inside
+                            # Event.wait()'s waiter list on every disconnect.
+                            # Cancel the task explicitly on every exit path.
+                            park_task = asyncio.create_task(wake_event.wait())
+                            await asyncio.wait_for(park_task, timeout=15.0)
                         except asyncio.TimeoutError:
+                            park_task.cancel()
                             yield ": keepalive\n\n"
                             continue
+                        except (GeneratorExit, asyncio.CancelledError):
+                            park_task.cancel()
+                            raise
                         # Woken — drain whatever landed
                         try:
                             item = q.get_nowait()

@@ -38,6 +38,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
+from external_llm.agent.config.thresholds import config as _cfg
+
 from ..client import interruptible_sleep
 
 logger = logging.getLogger(__name__)
@@ -55,7 +57,7 @@ class SubagentTask:
     original_request: str = ""
     priority: int = 0
     dependencies: list[str] = field(default_factory=list)
-    max_turns: int = 12
+    max_turns: int = _cfg.counts.AGENT_MAX_TURNS_DEFAULT
     # Provider/model override for THIS sub-agent (overrides CLI defaults)
     provider: str = ""
     model: str = ""

@@ -27,6 +27,9 @@ snapshot: the contract has to hold in the wheel, not just the private tree.
 
 from __future__ import annotations
 
+import json
+import urllib.request
+
 import pytest
 
 from external_llm.agent.context_budget import (
@@ -68,6 +71,7 @@ def _reset_context_overrides():
         _context_window_overrides,
         _override_meta,
     )
+
     _context_window_overrides.clear()
     _override_meta.clear()
     yield
@@ -81,12 +85,13 @@ def test_every_catalog_model_has_a_decided_context_window():
     it". ``_FALLBACK_IS_CORRECT`` is where the former is recorded; anything in
     neither is the latter.
     """
-    undecided = sorted({
-        f"{model} (catalog: {provider})"
-        for provider, model in _catalog_entries()
-        if bare_model_name(model) not in _CONTEXT_LIMITS
-        and bare_model_name(model) not in _FALLBACK_IS_CORRECT
-    })
+    undecided = sorted(
+        {
+            f"{model} (catalog: {provider})"
+            for provider, model in _catalog_entries()
+            if bare_model_name(model) not in _CONTEXT_LIMITS and bare_model_name(model) not in _FALLBACK_IS_CORRECT
+        }
+    )
     assert not undecided, (
         "catalog models with no context-window decision — add each to "
         "_CONTEXT_LIMITS with its real window, or to _FALLBACK_IS_CORRECT if "
@@ -153,8 +158,7 @@ def test_native_provider_catalog_models_are_routable():
     misrouted = {
         model: detect_cloud_provider(model)
         for provider, model in _catalog_entries()
-        if provider in _NATIVE_PROVIDER_TIERS
-        and detect_cloud_provider(model) != provider
+        if provider in _NATIVE_PROVIDER_TIERS and detect_cloud_provider(model) != provider
     }
     assert not misrouted, f"catalog models routed to the wrong provider: {misrouted}"
 
@@ -192,3 +196,133 @@ def test_allowlisted_models_really_take_the_fallback():
         assert _resolve_base_context_limit(model) == _DEFAULT_CONTEXT_LIMIT, (
             f"{model} is allowlisted as taking the 1M fallback but does not"
         )
+
+
+def test_opencode_catalog_is_up_to_date_with_live_api():
+    """The opencode tier must track what the live API actually serves.
+
+    The catalog is hand-curated from ``https://opencode.ai/zen/go/v1/models``;
+    this pins the glue so a new model shipped upstream (or one removed) breaks
+    the gate instead of silently starring a stale picker.
+
+    Live model ids are fetched at test time (26 ids on 2026-08-14), so the
+    gate self-updates as the API evolves.
+    """
+    # Any request shape works for this endpoint; a dummy auth is fine because
+    # the models list is served before auth is enforced.
+    req = urllib.request.Request(
+        "https://opencode.ai/zen/go/v1/models",
+        headers={
+            "Authorization": "Bearer dummy-key",
+            # The endpoint 403s the urllib default User-Agent; curl's is fine.
+            "User-Agent": "curl/8.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        payload = json.load(resp)
+    live_ids = {m["id"] for m in payload["data"]}
+
+    catalog = set(KNOWN_MODELS["opencode"])
+    # hy3-preview is deliberately omitted (MODEL_ALIASES → hy3), so it is
+    # expected to appear on the live API but not in the catalog.
+    expected_missing_from_catalog = {"hy3-preview"}
+    assert catalog <= live_ids, (
+        f"opencode catalog names a model the live API no longer serves: {sorted(catalog - live_ids)}"
+    )
+    newly_served = live_ids - catalog - expected_missing_from_catalog
+    assert not newly_served, (
+        "live opencode API serves models the catalog is missing — add them to "
+        "KNOWN_MODELS['opencode'] and give each a context-window decision "
+        f"in context_budget.py: {sorted(newly_served)}"
+    )
+
+
+def test_openrouter_catalog_slugs_all_resolve_on_live_api():
+    """The openrouter tier must only name slugs the live API actually serves.
+
+    Mirror of ``test_opencode_catalog_is_up_to_date_with_live_api`` for the
+    openrouter gateway. Three openrouter slugs had drifted off the live API
+    (2026-08-14): ``zai/glm-5.2`` (vendor prefix is ``z-ai`` today),
+    ``anthropic/claude-sonnet-4-6`` (live slug uses the dot spelling
+    ``claude-sonnet-4.6``), and ``qwen/qwen3.6`` (replaced by the served
+    ``qwen/qwen3.6-plus``). This pins the glue so the next upstream rename or
+    removal breaks the gate instead of silently poisoning the picker.
+
+    Unlike the opencode tier, openrouter is an open gateway serving hundreds
+    of models, and our catalog is a curated subset — so only the catalog→live
+    direction is gated (a stale slug is a hard 404). Live model ids are
+    fetched at test time; OpenRouter's endpoints are public, no auth needed.
+    """
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/models",
+        headers={"User-Agent": "curl/8.0"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        payload = json.load(resp)
+    live_slugs = {m["id"] for m in payload["data"]}
+
+    catalog = set(KNOWN_MODELS["openrouter"])
+    assert catalog <= live_slugs, (
+        f"openrouter catalog names a slug the live API no longer serves: {sorted(catalog - live_slugs)}"
+    )
+
+
+def test_provider_default_models_have_a_context_decision():
+    """Every client-class DEFAULT_MODEL must resolve without the 1M fallback warning.
+
+    ``ExternalLLMService._PROVIDER_DEFAULT_MODELS["ollama"]`` is ``""`` — the
+    effective ollama default lives in ``OllamaClient.DEFAULT_MODEL``
+    (``qwen2.5-coder:3b``), which was **not** in ``_CONTEXT_LIMITS``,
+    ``_FAMILY_PREFIX_LIMITS``, or ``_FALLBACK_IS_CORRECT``. It therefore resolved
+    to the 1M fallback and emitted the unknown-model warning on every first use
+    of the default provider (the server is unreachable / no num_ctx in the
+    Modelfile → the dynamic /api/show query returns None). Worse, the pre-flight
+    cap in agent_loop scales to the 1M figment while ``_num_ctx_for_model``
+    actually serves 8K-128K — a 122x over-allocation that left the cap inert.
+
+    The catalog-parity tests only see catalog models, and ollama has no catalog
+    tier (it is a local serving layer, not a cloud vendor), so the default-model
+    contract had to be pinned separately. This walks every client class in
+    ``providers.py`` and asserts its ``DEFAULT_MODEL`` resolves without the
+    unknown-model warning — i.e. it is either explicitly tabled
+    (``_CONTEXT_LIMITS`` / ``_FAMILY_PREFIX_LIMITS``) or allowlisted as a real 1M
+    model (``_FALLBACK_IS_CORRECT``).
+    """
+    import ast
+    import inspect
+
+    import external_llm.providers as providers_mod
+    from external_llm.agent.context_budget import (
+        _resolve_base_context_limit,
+        _warned_unknown_models,
+    )
+
+    tree = ast.parse(inspect.getsource(providers_mod))
+    default_models: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for stmt in node.body:
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "DEFAULT_MODEL" for t in stmt.targets)
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, str)
+                ):
+                    default_models.append(stmt.value.value)
+
+    assert default_models, "no DEFAULT_MODEL constants found in providers.py (AST walk broken)"
+    warned: list[tuple[str, str]] = []
+    for model in default_models:
+        _warned_unknown_models.clear()
+        try:
+            _resolve_base_context_limit(model)
+        except Exception as exc:  # pragma: no cover - unexpected resolver failure
+            warned.append((model, f"resolver raised: {exc!r}"))
+            continue
+        if model in _warned_unknown_models:
+            warned.append((model, "reached the 1M unknown-model fallback"))
+    assert not warned, (
+        "provider DEFAULT_MODEL with no context-window decision — add each to "
+        "_CONTEXT_LIMITS (real window), _FAMILY_PREFIX_LIMITS (family), or "
+        "_FALLBACK_IS_CORRECT (verified 1M):\n  " + "\n  ".join(f"{m}: {why}" for m, why in warned)
+    )

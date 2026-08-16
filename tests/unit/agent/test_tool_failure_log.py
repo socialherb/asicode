@@ -483,11 +483,36 @@ def test_classify_modify_symbol_syntax_blocked_detail():
 
 def test_classify_all_strategies_failed_unwrapped():
     """Direct callers of symbol_modify_tool (not via the write_tools handler)
-    see the raw 'All strategies failed' string without the wrapper."""
+    see the raw 'All strategies failed' string without the wrapper.
+
+    Legacy wording (pre-2026-08-13). Kept because a persisted failure log can
+    still hold it; the current wording is covered by the test below.
+    """
     assert _classify_from_error(
         "modify_symbol",
         "All strategies failed - could not locate or replace symbol",
     ) == "modify_failed"
+
+
+def test_classify_locate_failure_with_reason_unwrapped():
+    """The locate-failure text now names a reason, and must still classify.
+
+    Regression: replacing the generic 'All strategies failed' with a diagnosing
+    message (wrong ``Class.`` qualifier / unparseable file) dropped the only
+    substring the unwrapped path matched on, silently demoting these to
+    'unclassified'.
+    """
+    for detail in (
+        "this file defines no class named 'GoProvider'. Did you mean 'GoSyntaxProvider'?",
+        "the file does not currently parse (line 71: '(' was never closed), so the "
+        "symbol index is unavailable — repair the syntax error first, or use edit_text "
+        "to fix it by exact string match",
+        "no such symbol in this file",
+    ):
+        assert _classify_from_error(
+            "modify_symbol",
+            f"modify_symbol could not locate symbol 'X.y' in src/foo.py: {detail}",
+        ) == "modify_failed", detail
 
 
 def test_classify_modify_symbol_missing_arg_still_invalid_args():
@@ -1014,3 +1039,207 @@ def test_reset_suggestion_counts_returns_snapshot(tmp_path, monkeypatch):
                           "auto_retried": 0, "auto_retry_success": 0}
     finally:
         rec.cleanup()
+
+
+# ── RED→GREEN gap coverage: remaining edge branches (round 32-7) ────────────
+
+class _BrokenStr:
+    """An object whose str() raises — for the redaction fallbacks."""
+
+    def __str__(self):
+        raise RuntimeError("cannot stringify")
+
+
+class _RaisingTR:
+    """A ToolResult-like object whose attribute access raises."""
+
+    @property
+    def ok(self):
+        raise RuntimeError("attribute access boom")
+
+
+def _boom(*a, **k):
+    raise OSError("simulated append failure")
+
+
+def test_log_path_defaults_to_home_when_env_unset(monkeypatch):
+    """Without the env override the log lives under ~/.asicode/learning/."""
+    monkeypatch.delenv("ASICODE_WRITE_TOOL_FAILURE_LOG", raising=False)
+    assert tfl._log_path() == os.path.join(
+        os.path.expanduser("~"), ".asicode", "learning", "write_tool_failures.jsonl"
+    )
+
+
+def test_git_sha_snapshot_raise_returns_unknown(monkeypatch, tmp_path):
+    """get_git_snapshot raising must not block failure logging — _git_sha
+    degrades to 'unknown' (transient repo-state failures are non-critical)."""
+    def _snapshot_boom(*a, **k):
+        raise RuntimeError("snapshot unavailable")
+
+    monkeypatch.setattr(
+        "external_llm.agent.agent_context_manager.get_git_snapshot", _snapshot_boom
+    )
+    assert _git_sha(str(tmp_path)) == "unknown"
+
+
+def test_classify_only_tool_restriction_skips_other_tools(monkeypatch):
+    """A pattern scoped to one tool must not fire for another. Defensive
+    branch: no live pattern uses only_tool today, so it is exercised via a
+    synthetic pattern."""
+    monkeypatch.setattr(
+        tfl,
+        "_ERROR_PATTERNS",
+        (("pattern not found", "anchor_miss", "anchor_edit", None),),
+    )
+    assert tfl._classify_from_error("edit_text", "pattern not found") == "unclassified"
+    assert tfl._classify_from_error("anchor_edit", "pattern not found") == "anchor_miss"
+
+
+def test_summarize_args_truncate_keys_kept_bounded():
+    """old_string/new_string are kept TRUNCATED (leading indentation is
+    diagnostic), never dropped: short values verbatim, long ones with a
+    size hint."""
+    out = tfl._summarize_args({"old_string": "ab" * 100, "new_string": "cd"})
+    assert out["new_string"] == "cd"
+    assert out["old_string"].startswith("ab" * 40)
+    assert "+120 chars>" in out["old_string"]
+
+
+def test_summarize_args_truncate_key_str_failure_placeholder():
+    """A truncate-key value whose str() raises degrades to <?>."""
+    assert tfl._summarize_args({"old_string": _BrokenStr()}) == {"old_string": "<?>"}
+
+
+def test_summarize_args_drop_key_str_failure_placeholder():
+    """A drop-key value whose str() raises degrades to <?>."""
+    assert tfl._summarize_args({"patch": _BrokenStr()}) == {"patch": "<?>"}
+
+
+def test_summarize_args_circular_value_rendered_via_str():
+    """json.dumps refuses circular references; the str() fallback must
+    produce the hint instead of raising."""
+    d = {}
+    d["self"] = d
+    out = tfl._summarize_args({"extra": d})
+    assert "self" in out["extra"]
+
+
+def test_summarize_args_unserializable_summary_key():
+    """Non-string dict keys survive the per-value loop but break the final
+    json.dumps → documented _summary_error degrade (never raises)."""
+    out = tfl._summarize_args({("op", "create_file"): "x"})
+    assert out == {"_summary_error": "unserializable"}
+
+
+def test_append_record_failure_is_swallowed(tmp_path, monkeypatch):
+    """A failing append (permission/disk) must never break the write-tool
+    call path — the record is dropped, the caller continues."""
+    rec = _Recorder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tfl, "_append_record", _boom)
+    try:
+        record_write_tool_failure(
+            tool="edit_text", ok=False, error="old_string not found",
+            metadata=None, args={}, repo_root=str(tmp_path),
+        )
+        assert rec.records() == []
+    finally:
+        rec.cleanup()
+
+
+def test_compaction_rewrite_failure_is_swallowed(tmp_path, monkeypatch):
+    """atomic_write_jsonl failing during compaction must not propagate —
+    the log simply keeps its pre-compaction content."""
+    path = str(tmp_path / "log.jsonl")
+    with open(path, "w", encoding="utf-8") as fh:
+        for i in range(10):
+            fh.write(f'{{"tool":"a","failure_class":"x","i":{i}}}\n')
+    monkeypatch.setattr(tfl, "_MAX_FAILURE_LOG_RECORDS", 3)
+    monkeypatch.setattr(tfl, "_append_counter", tfl._COMPACT_CHECK_EVERY - 1)
+    monkeypatch.setattr("external_llm.common.atomic_io.atomic_write_jsonl", _boom)
+    tfl._maybe_compact_log(path)  # must not raise
+    with open(path, encoding="utf-8") as fh:
+        assert len(fh.readlines()) == 10  # untouched
+
+
+def test_suggestion_pending_bounded_at_limit(monkeypatch):
+    """The pending-marker map is bounded; the OLDEST markers are evicted
+    first (popitem(last=False))."""
+    monkeypatch.setattr(tfl, "_PENDING_SUGGEST_LIMIT", 8)
+    tfl._pending_suggest.clear()
+    try:
+        for i in range(12):
+            tfl._record_suggestion_fired(f"session-{i}")
+        assert len(tfl._pending_suggest) == 8
+        assert "session-0" not in tfl._pending_suggest  # oldest evicted
+        assert "session-11" in tfl._pending_suggest
+    finally:
+        tfl._pending_suggest.clear()
+
+
+def test_wrapper_attribute_extraction_failure_is_swallowed(tmp_path, monkeypatch):
+    """A ToolResult whose attribute access raises must not break the caller —
+    the wrapper degrades to a no-op."""
+    rec = _Recorder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    try:
+        record_write_tool_failure_from_tr(tool="edit_text", tr=_RaisingTR(), args={})
+        assert rec.records() == []
+    finally:
+        rec.cleanup()
+
+
+def test_wrapper_auto_retry_count_failure_swallowed(tmp_path, monkeypatch):
+    """The auto-retry counter path is best-effort: _suggest_inc failing must
+    not prevent the failure record itself from being written."""
+    rec = _Recorder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def _counter_boom(key):
+        raise RuntimeError("counter boom")
+
+    monkeypatch.setattr(tfl, "_suggest_inc", _counter_boom)
+    try:
+        tr = ToolResult(
+            ok=False, error="x",
+            metadata={"reread_retried": True, "reread_retry_success": True},
+        )
+        record_write_tool_failure_from_tr(tool="edit_text", tr=tr, args={})
+        assert len(rec.records()) == 1  # record still written
+    finally:
+        rec.cleanup()
+
+
+def test_summarize_log_skips_blank_and_corrupt_lines(tmp_path):
+    """Blank lines and unparseable lines are skipped; valid records still
+    aggregate."""
+    path = tmp_path / "log.jsonl"
+    path.write_text(
+        '{"tool": "apply_patch", "failure_class": "patch_apply_failed"}\n'
+        "\n"
+        "this is not json\n"
+        '{"tool": "edit_text", "failure_class": "search_string_mismatch"}\n'
+    )
+    out = summarize_log(str(path))
+    assert out["total"] == 2
+    assert out["by_tool"] == {"edit_text": 1, "apply_patch": 1}
+
+
+def test_main_cli_prints_summary(tmp_path, monkeypatch, capsys):
+    """python -m external_llm.agent.tool_failure_log prints the summary
+    breakdown including the most recent failure and its error text."""
+    path = tmp_path / "log.jsonl"
+    path.write_text(
+        '{"timestamp_iso": "2026-08-16T00:00:00", "tool": "apply_patch", '
+        '"failure_class": "patch_apply_failed", "file_path": "src/a.py", '
+        '"error": "patch failed: hunk 1"}\n'
+    )
+    monkeypatch.setenv("ASICODE_WRITE_TOOL_FAILURE_LOG", str(path))
+    tfl._main()
+    out = capsys.readouterr().out
+    assert "Total failures: 1" in out
+    assert "apply_patch" in out
+    assert "patch_apply_failed" in out
+    assert "Most recent failure:" in out
+    assert "src/a.py" in out
+    assert "patch failed: hunk 1" in out

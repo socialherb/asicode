@@ -246,7 +246,9 @@ def _run_mcp(args: argparse.Namespace) -> None:
         print("-" * 60)
         for t in tools:
             params = t.get("parameters", {}).get("properties", {})
-            param_str = ", ".join(params.keys()) if params else "(no params)"
+            # Note: the f-string below already wraps param_str in parens, so the
+            # empty-params fallback must NOT carry its own parens.
+            param_str = ", ".join(params.keys()) if params else "no params"
             print(f"  {t['name']}({param_str})")
             print(f"    {t['description'][:100]}")
             print()

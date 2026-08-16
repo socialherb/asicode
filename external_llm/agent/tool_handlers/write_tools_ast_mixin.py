@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any
 
+from ...common.atomic_io import atomic_write_bytes
 from ...common.text_reading import read_text_with_encoding_fallback
 from ...languages import LanguageId
 from .._shared_utils import compile_quiet
@@ -68,6 +69,11 @@ class WriteToolsAstMixin:
         # Normalize to relative for output
         rel_path = os.path.relpath(abs_path, self.repo_root)
         file_path = rel_path
+
+        # F1 cross-process edit-lease guard.
+        _lease_refused = self._refuse_foreign_leased([abs_path])
+        if _lease_refused is not None:
+            return _lease_refused
 
         # Read the file — strict UTF-8 first, then latin-1 (lossless 1:1 byte
         # round-trip when written back with the same encoding). The previous
@@ -208,11 +214,14 @@ class WriteToolsAstMixin:
             )
 
         # Write the file — same encoding it was read with (see read fallback
-        # above). Encode before opening so an encode failure can't truncate.
+        # above). Encode BEFORE any file I/O: the atomic bytes writer opens its
+        # temp file only after encoding succeeds, so an encode failure never
+        # touches the target (a plain open("wb") would truncate first). The
+        # atomic funnel (atomic_write_bytes -> invalidate_for_written_path)
+        # keeps cached consumers fresh, same as every other write tool.
         try:
             _encoded_source = new_source.encode(_read_encoding)
-            with open(abs_path, "wb") as f:
-                f.write(_encoded_source)
+            atomic_write_bytes(abs_path, _encoded_source)
         except (OSError, UnicodeEncodeError) as e:
             return self._make_result(
                 ok=False, content="",

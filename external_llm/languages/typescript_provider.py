@@ -18,9 +18,11 @@ from .base import (
     SyntaxProvider,
     _replace_last_cmd_path,
     _tempfile_for_content,
+    build_line_index,
     detect_project_root,
     find_brace_block_end,
     find_brace_block_end_offset,
+    line_at_offset,
     resolve_tool_path,
     tree_sitter_syntax_fallback,
 )
@@ -406,11 +408,10 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                     continue
                 # Only semantic (2xxx) band: syntax (1xxx) is handled by
                 # validate_syntax, config (5xxx) and implicit-any (7xxx) are noise.
-                try:
-                    num = int(_code[2:])
-                except ValueError:
-                    logger.debug("tsc diagnostic code not numeric: %r", _code)
-                    continue
+                # NOTE: no try/except around int(_code[2:]) — _TSC_ERROR_RE
+                # captures `TS\d+` only, so the digits are guaranteed (a
+                # ValueError guard here would be an unreachable branch).
+                num = int(_code[2:])
                 if not (2000 <= num <= 2999):
                     continue
                 collected[owner].append(SyntaxError_(
@@ -620,14 +621,16 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         return self._find_symbol_regex(symbol_name, content)
 
     @staticmethod
-    def _find_block_end(content: str, offset: int) -> int:
+    def _find_block_end(content: str, offset: int, nl: list[int] | None = None) -> int:
         """Heuristic: find the matching closing brace from *offset*.
 
         Delegates to the shared :func:`find_brace_block_end` (C-family SSOT)
         which skips string/char/template literals and ``//`` / ``/* */``
         comments so braces inside them do not corrupt the depth counter.
+        *nl* is an optional precomputed line index (see ``base.build_line_index``)
+        that keeps the internal line queries O(log n) in hot loops.
         """
-        return find_brace_block_end(content, offset)
+        return find_brace_block_end(content, offset, nl)
 
     # ── Definition keywords ───────────────────────────────────────────────
 
@@ -638,6 +641,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
     ) -> list[tuple[str, str, int, int]]:
         """Regex fallback: find all top-level TS/JS definitions via pattern + brace counting."""
         results: list[tuple[str, str, int, int]] = []
+        nl = build_line_index(content)
         # Functions: function Name( / async function Name( / generator
         # function* Name( (the * is optional — a generator declaration was
         # previously invisible to the fallback).
@@ -645,25 +649,29 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
             r'^(?:export\s+)?(?:async\s+)?function\s*\*?\s+(\w+)\s*\(',
             content, re.MULTILINE,
         ):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "function", start_line, end_line))
         # Classes
         for m in re.finditer(r'^(?:export\s+)?(?:abstract\s+)?class\s+(\w+)', content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "class", start_line, end_line))
         # Interfaces
         for m in re.finditer(r'^(?:export\s+)?interface\s+(\w+)', content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "interface", start_line, end_line))
         # Type aliases
         for m in re.finditer(r'^(?:export\s+)?type\s+(\w+)\s*=', content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
-            # Type aliases end at semicolon or newline, not brace
+            start_line = line_at_offset(nl, m.start())
+            # Type aliases end at semicolon or newline, not brace. Use the
+            # 1-based line_at_offset for the end too — the previous code
+            # compared a 0-based line_index_at_offset against the 1-based
+            # start_line, under-reporting end_line by one whenever the
+            # semicolon sat two or more lines below the `type` keyword.
             semi = content.find(";", m.start())
-            end_line = content[:len(content) if semi == -1 else semi + 1].count("\n")
+            end_line = line_at_offset(nl, len(content) if semi == -1 else semi + 1)
             if end_line <= start_line:
                 end_line = start_line + 1
             results.append((m.group(1), "type", start_line, end_line))
@@ -684,6 +692,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
     ) -> list[tuple[str, int, int]]:
         """Regex fallback: find methods inside a TS/JS class body."""
         results: list[tuple[str, int, int]] = []
+        nl = build_line_index(content)
         esc = re.escape(class_name)
         # Find class definition
         pat = r'(?:export\s+)?(?:abstract\s+)?class\s+' + esc + r'\s*(?:extends|implements|<|\{|[^{]+?\{)'
@@ -703,8 +712,8 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 if not _name or _name in ("if", "for", "while", "switch", "catch"):
                     continue
                 method_start = class_body_start + mm.start()
-                method_line = content[:method_start].count("\n") + 1
-                method_end = self._find_block_end(content, method_start)
+                method_line = line_at_offset(nl, method_start)
+                method_end = self._find_block_end(content, method_start, nl)
                 results.append((_name, method_line, method_end))
         return results
 

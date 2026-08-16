@@ -1760,3 +1760,29 @@ def test_poll_for_task_cancel_mid_wait_returns_promptly(tmp_path):
     assert task is None
     elapsed = time.monotonic() - t0
     assert elapsed < 5.0, f"cancel took {elapsed:.2f}s — sleep not interruptible"
+
+
+class TestSubagentTaskMaxTurnsSSOT:
+    """E3: SubagentTask's default turn budget must track the SSOT.
+
+    Previously a magic ``12`` sat in the dataclass default while
+    ``AGENT_MAX_TURNS_DEFAULT`` (500) governed tool_registry / agent_stream /
+    asi — a task.json written without ``max_turns`` silently shrank the
+    worker's budget. The default now reads the SSOT directly.
+    """
+
+    def test_default_aligns_with_ssot(self):
+        from external_llm.agent.config.thresholds import config as _cfg
+
+        task = SubagentTask(task_id="t1", title="x", description="d")
+        assert task.max_turns == _cfg.counts.AGENT_MAX_TURNS_DEFAULT
+        # Pin the SSOT itself so a drift back to a magic 12 is visible here.
+        assert _cfg.counts.AGENT_MAX_TURNS_DEFAULT == 500
+
+    def test_explicit_max_turns_survives_dict_roundtrip(self):
+        task = SubagentTask(task_id="t1", title="x", description="d", max_turns=7)
+        restored = SubagentTask.from_dict(task.to_dict())
+        assert restored.max_turns == 7
+        # The SSOT default also survives the roundtrip (to_dict materializes it).
+        default = SubagentTask(task_id="t2", title="y", description="d")
+        assert SubagentTask.from_dict(default.to_dict()).max_turns == default.max_turns

@@ -148,3 +148,62 @@ def test_invalidate_files_batches_vector_cache_adds(tmp_path: Path):
     added = mock_mgr.add_documents.call_args.args[0]
     assert {p for p, _t in added} == {"a.py", "b.py"}
     mock_mgr.add_document.assert_not_called()
+
+
+def test_invalidate_files_mixed_batch_keeps_arrays_aligned(tmp_path: Path):
+    """P2: a single incremental batch mixing updates, removals and appends must
+    keep every parallel array in lockstep.  Removals are deferred and applied
+    in descending index order, so a snapshot-based path→idx lookup stays valid
+    for the whole loop and the mirror matches the arrays afterwards."""
+    for i in range(4):
+        (tmp_path / f"f{i}.py").write_text(
+            f"def f{i}():\n    return {i}\n", encoding="utf-8"
+        )
+    searcher = RAGSearcher(str(tmp_path), vector_cache_enabled=False)
+    searcher._ensure_index()
+    assert searcher._rel_paths == ["f0.py", "f1.py", "f2.py", "f3.py"]
+
+    # One batch: update f1, delete f0 + f2 (unlinked), add f4.
+    (tmp_path / "f1.py").write_text("def f1():\n    return 10\n", encoding="utf-8")
+    (tmp_path / "f0.py").unlink()
+    (tmp_path / "f2.py").unlink()
+    (tmp_path / "f4.py").write_text("def f4():\n    return 4\n", encoding="utf-8")
+    searcher.invalidate_files(["f0.py", "f1.py", "f2.py", "f4.py"])
+
+    assert searcher._rel_paths == ["f1.py", "f3.py", "f4.py"]
+    assert len(searcher._doc_token_counts) == len(searcher._rel_paths)
+    assert len(searcher._doc_lengths) == len(searcher._rel_paths)
+    assert len(searcher._doc_texts) == len(searcher._rel_paths)
+    assert searcher._n_docs == len(searcher._rel_paths)
+    assert "10" in searcher._doc_texts[0], "updated f1 must survive at its shifted index"
+    assert "4" in searcher._doc_texts[2], "appended f4 must be present"
+    # Mirror rebuilt to match the mutated arrays.
+    assert searcher._rel_path_to_idx == {p: i for i, p in enumerate(searcher._rel_paths)}
+
+
+def test_invalidate_files_removal_frees_cap_slot_in_same_batch(tmp_path: Path):
+    """P2: with the index at the cap, deleting one file and adding a new one in
+    the SAME batch must admit the newcomer — deferred removals must not shrink
+    the effective capacity mid-batch (the old in-loop pop-then-append
+    semantics)."""
+    import external_llm.agent.rag_searcher as rs
+
+    (tmp_path / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("def b():\n    return 2\n", encoding="utf-8")
+    (tmp_path / "c.py").write_text("def c():\n    return 3\n", encoding="utf-8")
+    searcher = RAGSearcher(str(tmp_path), vector_cache_enabled=False)
+    orig = rs._MAX_FILES
+    rs._MAX_FILES = 3
+    try:
+        searcher._ensure_index()
+        assert searcher._n_docs == 3
+        # Delete b.py (unlinked) and add d.py in the same batch.
+        (tmp_path / "b.py").unlink()
+        (tmp_path / "d.py").write_text("def d():\n    return 4\n", encoding="utf-8")
+        searcher.invalidate_files(["b.py", "d.py"])
+    finally:
+        rs._MAX_FILES = orig
+
+    assert searcher._n_docs == 3, "the removal must free the slot for the append"
+    assert searcher._rel_paths == ["a.py", "c.py", "d.py"]
+    assert searcher._rel_path_to_idx == {p: i for i, p in enumerate(searcher._rel_paths)}

@@ -35,7 +35,9 @@ from .base import (
     _filter_genuine_syntax_errors,
     _replace_last_cmd_path,
     _tempfile_for_content,
+    build_line_index,
     find_brace_block_end,
+    line_at_offset,
     tree_sitter_syntax_fallback,
 )
 from .models import (
@@ -198,11 +200,14 @@ def _extract_include_flags(entry: dict) -> list[str]:
     if base_dir:
         resolved: list[str] = []
         for flag in flags:
-            if flag.startswith("-I") and len(flag) > 2:
-                path = flag[2:]
-                if path and not os.path.isabs(path):
-                    resolved.append(f"-I{os.path.normpath(os.path.join(base_dir, path))}")
-                    continue
+            # _collect_I_flags only yields "-I<dir>" tokens (combined form
+            # requires len > 2, the pair form always joins a non-empty next
+            # token), so the prefix/length guards would be dead branches —
+            # the isabs check is the only live one.
+            path = flag[2:]
+            if not os.path.isabs(path):
+                resolved.append(f"-I{os.path.normpath(os.path.join(base_dir, path))}")
+                continue
             resolved.append(flag)
         return resolved
     return flags
@@ -537,14 +542,16 @@ class _CFamilySyntaxProvider(SyntaxProvider):
     _LINE_BASED_KINDS = frozenset({"macro", "typedef"})
 
     @staticmethod
-    def _find_block_end(content: str, offset: int) -> int:
+    def _find_block_end(content: str, offset: int, nl: list[int] | None = None) -> int:
         """Heuristic: find the matching closing brace from *offset*.
 
         Delegates to the shared :func:`find_brace_block_end` (C-family SSOT)
         which skips string/char literals and ``//`` / ``/* */`` comments so
         braces inside them do not corrupt the depth counter.
+        *nl* is an optional precomputed line index (see ``base.build_line_index``)
+        that keeps the internal line queries O(log n) in hot loops.
         """
-        return find_brace_block_end(content, offset)
+        return find_brace_block_end(content, offset, nl)
 
     # ── Regex fallback for structural queries ─────────────────────────────
 
@@ -552,29 +559,30 @@ class _CFamilySyntaxProvider(SyntaxProvider):
         self, content: str,
     ) -> list[tuple[str, str, int, int]]:
         results: list[tuple[str, str, int, int]] = []
+        nl = build_line_index(content)
         # functions: <type tokens> name( ... ) {
         for m in re.finditer(
             r"^[ \t]*[\w][\w\s\*]*?\b(\w+)\s*\(", content, re.MULTILINE,
         ):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "function", start_line, end_line))
         for m in re.finditer(
             r"\b(?:struct|union)\s+(\w+)\s*\{", content, re.MULTILINE,
         ):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "struct", start_line, end_line))
         for m in re.finditer(r"\benum\s+(\w+)\b", content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
-            end_line = self._find_block_end(content, m.start())
+            start_line = line_at_offset(nl, m.start())
+            end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "enum", start_line, end_line))
         for m in re.finditer(r"^#define\s+(\w+)\b", content, re.MULTILINE):
-            start_line = content[:m.start()].count("\n") + 1
+            start_line = line_at_offset(nl, m.start())
             end_pos = content.find("\n", m.end())
             if end_pos == -1:
                 end_pos = len(content)
-            end_line = content[:end_pos].count("\n") + 1
+            end_line = line_at_offset(nl, end_pos)
             results.append((m.group(1), "macro", start_line, end_line))
         return results
 

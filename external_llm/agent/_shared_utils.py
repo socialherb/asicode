@@ -1180,11 +1180,7 @@ def load_project_context_md(repo_root: str) -> str:
         return ""
 
 
-# ── Token estimation & context trimming (shared by AgentLoop and DesignChatLoop) ──
-
-MAX_SAFE_TOKENS: int = 80000
-"""Conservative safety margin below typical 128k-200k model limits."""
-
+# ── Token estimation (shared by AgentLoop and DesignChatLoop) ──
 
 def _cjk_aware_tokens(text: str) -> int:
     """Estimate tokens via ``utf8_bytes // 2`` (conservative upper bound).
@@ -1195,7 +1191,7 @@ def _cjk_aware_tokens(text: str) -> int:
     Returns 0 for empty/None text.
 
     This is the single canonical token estimator for message content across
-    the guard path (``estimate_tokens_from_msgs``, ``preemptive_trim``).
+    the guard path (``estimate_tokens_from_msgs``).
     """
     if not text:
         return 0
@@ -1863,108 +1859,6 @@ def context_message_cap(ctx_limit: int, safety_margin: int,
                 MIN_USABLE_MESSAGE_BUDGET,
             )
     return max(512, _raw)
-
-
-def _msg_role(m) -> str:
-    """Return the role of a message that may be an LLMMessage or a plain dict."""
-    if isinstance(m, dict):
-        return (m.get("role") or "")
-    return (getattr(m, "role", "") or "")
-
-
-def preemptive_trim(
-    messages: list,
-    max_tokens: int = MAX_SAFE_TOKENS,
-    preserve_last: int = 2,
-    tag: str = "PREEMPTIVE_TRIM",
-) -> list:
-    """Preemptively trim conversation history to stay within token limits.
-
-    Preserves the system prompt (first message) + a recent tail, shrinking the
-    tail until under cap. Returns trimmed list (or original if under limit).
-
-    Uses CJK-aware estimation (``estimate_tokens_from_msgs``) so CJK-heavy
-    conversations are not underestimated and do not provoke HTTP 400.
-    Prefer ``_evict_consumed_tool_results`` (context-smart) over this blunt
-    front-trim when the goal is gentle eviction.
-
-    The preserved tail is anchored on the most recent **user** message, not the
-    literal last message. The context builder appends trailing ``system``
-    messages after the current request (``[CURRENT REQUEST]`` marker, mode
-    notice, model-switch notice), so the literal last message is frequently a
-    ``system`` message. Anchoring on the last user turn guarantees the request
-    itself always survives trimming — dropping it would make every downstream
-    LLM call meaningless and breaks strict chat templates that require at least
-    one user message (e.g. Qwen3 / ``bonsai27b``:
-    ``raise_exception('No user query found in messages.')``).
-
-    Args:
-        messages: List of LLMMessage or dict message objects.
-        max_tokens: Maximum allowed estimated tokens (default: MAX_SAFE_TOKENS).
-        preserve_last: Initial number of recent messages to preserve (default: 2).
-        tag: Log prefix for debugging (e.g. "DESIGN_CHAT_PREEMPTIVE_TRIM").
-    """
-    if not messages:
-        return messages
-
-    _est_tokens = estimate_tokens_from_msgs(messages)
-    if _est_tokens <= max_tokens:
-        return messages
-
-    # Index of the most recent user message — the current request. It MUST be
-    # preserved; everything else here is about fitting around it.
-    _last_user_idx = -1
-    for _i in range(len(messages) - 1, -1, -1):
-        if _msg_role(messages[_i]) == "user":
-            _last_user_idx = _i
-            break
-    # When no user turn exists (unusual), fall back to the literal tail.
-    _tail_anchor = _last_user_idx if _last_user_idx >= 0 else len(messages) - 1
-
-    # Progressive trim: keep first (system) + a tail that always includes the
-    # last user message (plus any trailing system markers after it).
-    _n = preserve_last
-    while _n >= 0 and len(messages) > 1:
-        _natural_start = max(1, len(messages) - _n - 1)
-        _tail_start = min(_natural_start, _tail_anchor)
-        # Avoid duplicating messages[0] when the tail starts at index 0 (the
-        # first message is itself the user turn — no system to keep).
-        _head = messages[:1] if _tail_start >= 1 else []
-        _raw = _head + messages[_tail_start:]
-        _kept_est = estimate_tokens_from_msgs(_raw)
-        if _kept_est <= max_tokens:
-            logger.warning(
-                "[%s] %d->%d estimated tokens (%d->%d messages, preserve_last=%d->%d)",
-                tag, _est_tokens, _kept_est, len(messages), len(_raw),
-                preserve_last, _n,
-            )
-            return _raw
-        if _n == 0:
-            # Still over limit even with system + last user turn → fall through
-            # to the last-user fallback (keeps the request; may be oversized).
-            break
-        _n -= 1
-
-    # Last resort: keep the system message + the last user message and anything
-    # trailing after it. A request without the current user query is useless and
-    # is rejected by strict templates, so we never drop it — the (possibly
-    # oversized) request is let through and the provider's own limit / overflow
-    # backstop handle final enforcement. When there is genuinely no user
-    # message, keep system + the literal last message.
-    if _last_user_idx >= 1:
-        _fallback = messages[:1] + messages[_last_user_idx:]
-    elif _last_user_idx == 0:
-        # User message is first (no system prompt); nothing safe to drop.
-        _fallback = list(messages)
-    else:
-        _fallback = messages[:1] if len(messages) <= 1 else messages[:1] + messages[-1:]
-    _fallback_est = estimate_tokens_from_msgs(_fallback)
-    logger.warning(
-        "[%s] last resort: %d->%d tokens (%d->%d messages)",
-        tag, _est_tokens, _fallback_est,
-        len(messages), len(_fallback),
-    )
-    return _fallback
 
 
 def render_file_diagnostics_block(diags: Any) -> str:

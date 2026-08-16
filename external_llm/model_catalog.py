@@ -57,6 +57,9 @@ KNOWN_MODELS: dict[str, list[str]] = {
         "gemini-2.5-flash",
     ],
     "zai": [
+        # GLM-5.3 (Z.ai, released 2026-08-14, 1M ctx) — native zai provider.
+        # Matches the opencode tier and context_budget._CONTEXT_LIMITS.
+        "glm-5.3",
         "glm-5.2",
         "glm-5.1",
         "glm-5-turbo",
@@ -68,19 +71,21 @@ KNOWN_MODELS: dict[str, list[str]] = {
         "deepseek/deepseek-v4-pro",
         "anthropic/claude-fable-5",
         "anthropic/claude-sonnet-5",
-        "anthropic/claude-sonnet-4-6",
+        "anthropic/claude-sonnet-4.6",
         "google/gemini-3.6-flash",
         "google/gemini-2.5-pro",
         "moonshotai/kimi-k3",
         "minimax/minimax-m3",
-        "zai/glm-5.2",
+        # OpenRouter uses the ``z-ai`` vendor prefix for Zhipu GLM models.
+        "z-ai/glm-5.2",
         "qwen/qwen3.7-max",
-        "qwen/qwen3.6",
+        "qwen/qwen3.6-plus",
     ],
     "opencode": [
         # Curated list from https://opencode.ai/zen/go/v1/models.
-        # Verified 2026-08-04 against the live API (25 ids returned). hy3-preview
+        # Verified 2026-08-14 against the live API (26 ids returned). hy3-preview
         # is served but handled via MODEL_ALIASES (→ hy3), so it is omitted here.
+        "glm-5.3",
         "glm-5.2",
         "glm-5.1",
         "glm-5",

@@ -27,6 +27,15 @@ from common import normalize_rel_path_fast
 logger = logging.getLogger(__name__)
 
 
+_LANG_TAG_RE = re.compile(r"^[^\s(={\[:;'\"/]+$")
+
+
+def _fence_tail_is_lang_tag(tail: str) -> bool:
+    """True when a fence line's remainder is a language tag ("```python")
+    rather than code sharing the fence line ("```x = 1", "```def f():")."""
+    return bool(_LANG_TAG_RE.match(tail))
+
+
 class EnhancedOutputParser:
     # fenced blocks: ```diff ... ```
     DIFF_FENCE_RE = re.compile(
@@ -59,10 +68,16 @@ class EnhancedOutputParser:
     # only once per gobble. That let code2 swallow all subsequent FILE blocks
     # into the first one (silent data loss: later files "disappeared"). Keeping
     # '.*' line-bounded via 'im' (no 's') restores the per-line stop guard.
+    # Fence alternatives, in order:
+    #   1. content on the fence line itself: "```x = 1\n```" (fencetail1)
+    #   2. standard block: "```[lang]\n<body>\n```" (fencetail2 + code1)
+    # ``fencetail*`` may be a language tag ("```python", dropped) or the
+    # block's first code line ("```def f():", prepended to the body).
     FILE_BLOCK_RE = re.compile(
         r"(?im)"
         r"(?:^|\n)\s*(?:FILE|Path|Target file)\s*:\s*(?P<path>[^\n\r]+?)\s*\r?\n"
-        r"(?:```[^\n\r]*\r?\n(?P<code1>[\s\S]*?)\r?\n```|"
+        r"(?:```(?P<fencetail1>[^\n\r]+)\r?\n```|"
+        r"```(?P<fencetail2>[^\n\r]*)\r?\n(?P<code1>[\s\S]*?)\r?\n```|"
         r"(?P<code2>(?:(?!^\s*(?:FILE|Path|Target file)\s*:).*\r?\n)*))?"
     )
 
@@ -715,6 +730,15 @@ class EnhancedOutputParser:
             if code is None:
                 code = ""
             code = str(code).replace("\r\n", "\n").rstrip("\n") + "\n"
+            # Fence-swallow repair: "```x = 1" puts the first code line on the
+            # fence line (the old pattern consumed it, truncating the block).
+            # A tail that is a plain language tag ("```python") stays dropped.
+            tail = m.group("fencetail2")
+            if tail is None:
+                tail = m.group("fencetail1")
+            tail = (tail or "").strip()
+            if tail and not _fence_tail_is_lang_tag(tail):
+                code = tail + "\n" + code
 
             logger.debug("Found FILE block: path='%s', code length=%s", path, len(code))
             if path:

@@ -1,6 +1,6 @@
 [project]
 name = "asicode"
-version = "0.2.19"
+version = "0.2.20"
 description = "Autonomous Software Improvement — AST-precise code editing agent with verification gates (CLI + MCP server)"
 readme = "README.md"
 license = "MIT"
@@ -27,7 +27,7 @@ requires-python = ">=3.10"
 dependencies = [
   "pydantic>=2.0",
   "requests>=2.31",
-  "rich>=13.7",
+  "rich>=13.7,<15",  # <15: rich 15 changes PTY output routing (_MarginIO→capture), breaking pty-driven input/truncation tests on CI
   "libcst>=1.4",  # format-preserving CST transformations for Python
   "prompt-toolkit>=3.0",  # terminal input handling (IME/wide-char/paste)
   "httpx>=0.27",  # web_search_tools HTTP client
@@ -122,6 +122,7 @@ dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.6",
     "pytest-timeout>=2.3",  # Prevent hung tests from blocking CI (300s default timeout)
+    "coverage>=7.4",        # scripts/cov.sh measurement + CI coverage gate (a1_coverage.pth uses process_startup(slug=...))
     "pre-commit>=4.0",
 ]
 
@@ -193,6 +194,30 @@ concurrency = ["multiprocessing"]
 parallel = true
 
 [tool.coverage.report]
+# Coverage ratchet (P-6): enforced by scripts/cov.sh in lint.yml's unit job
+# (`tests/unit -q -m "not slow"`). Baseline 93% measured 2026-08-16 (macOS,
+# 62885 stmts, ~15690 passed / 1 flaky failure).
+#
+# First observation run (this commit, macOS, coverage 7.14.3): TOTAL 91.945%
+# (62883 stmts, 5065 missing) via the exact CI command
+# `./scripts/cov.sh tests/unit -q -m "not slow"` (15686 passed / 9 failed /
+# 2 skipped / 4 xfailed; all 9 failures were parallel-session WIP races in
+# pty/stage3 files — they pass in isolation). There is no CI remote yet, so
+# this local CI-parity run is the gate's first observation.
+# Ratchet at 90: the 8-point margin was for the pre-first-observation
+# uncertainty; now that the number is seen, ~2pp guards ubuntu-vs-macOS
+# drift, run-to-run flake and subprocess data files that fail to combine.
+# Tighten further after a few green CI runs. COV_FAIL_UNDER=0 (release.yml)
+# disables the gate for report-only runs.
+# P-I re-measurement (2026-08-16, post-P-3): TOTAL 95% (62883 stmts,
+# 3262 missing) via `./scripts/cov.sh tests/unit -q` (15717 passed / 3
+# failed / 2 skipped / 4 xfailed / 598s; the 3 failures were parallel-session
+# WIP races in test_repl_stage3_auto_collab_red_green.py, pass in isolation).
+# Run-to-run variance observed 88-95%: pty/subprocess data that fails to
+# combine and flaky collab scenarios dominate the swing. Failures of the
+# pty tests also drag the total down when they abort early (xdist worker
+# data loss), so the ratchet stays at 90 until CI is green consistently.
+fail_under = 90
 exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",
@@ -203,13 +228,19 @@ exclude_lines = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# pytest 9.0+ importlib mode (#11475) imports test modules via the standard
+# import mechanism WITHOUT touching sys.path. The editable install maps only
+# the shipped packages (external_llm, config, ...), NOT webapp, so any test
+# file with a top-level `import webapp` failed collection. pythonpath is the
+# documented mechanism to put the repo root on sys.path in all modes/workers.
+pythonpath = ["."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 markers = [
     "integration: integration tests (require external resources)",
     "unit: unit tests (isolated, fast)",
-    "slow: slow tests (skip in CI)",
+    "slow: slow tests (deselected by default; PR/lint jobs skip, release runs them)",
     "network: tests that require network access",
 ]
 addopts = [
@@ -227,11 +258,20 @@ addopts = [
     "-n",
     "auto",
 ]
+# Coverage measurement: `coverage run -m pytest` is WRONG under -n auto —
+# xdist workers are separate interpreters, so it records only the main
+# process (~0%, measured 2026-08-16). Always measure via scripts/cov.sh:
+# it sets COVERAGE_PROCESS_START (a1_coverage.pth injects every process) +
+# a private COVERAGE_FILE, then combine+report.
 # ASICODE_SHOW_WARNINGS=1: show all Python warnings (default: only errors shown via filterwarnings)
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::PendingDeprecationWarning",
 ]
+# pytest-timeout: make the "prevent hung tests from blocking CI" dependency
+# actually active — the plugin has NO default without this ini/flag. 300s per
+# test is far above any legitimate test here (slowest measured: ~47s).
+timeout = 300
 
 [tool.ruff]
 target-version = "py310"

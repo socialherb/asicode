@@ -612,20 +612,16 @@ def _check_tools_with_state(
 
     # 4. Interactive install loop — prompt only for tools that are still
     #    missing AND not previously dismissed.
+    # NOTE: no `if t.skipped: continue` guard here — `missing` was built above
+    # excluding skipped tools, so the guard's complement is always False (dead
+    # branch). Likewise no post-prompt re-check: `_prompt_and_install` always
+    # ends with the tool found or skipped, so `not found and not skipped` is
+    # unreachable afterwards. Both were removed (A262 pattern).
     print()
     for t in missing:
-        if t.skipped:
-            continue
         _prompt_and_install(t)
 
-    # 5. Re-check after installs (npx-aware)
-    for t in wanted:
-        if not t.found and not t.skipped and _resolve_tool(t):
-            t.found = True
-            if not t.use_npx:
-                t.version = _detect_version(t.cmd)
-
-    # 6. Persist dismissal decisions (incl. new ones from the prompt loop).
+    # 5. Persist dismissal decisions (incl. new ones from the prompt loop).
     _sync_tool_state(wanted, persisted)
 
     return wanted
@@ -682,18 +678,13 @@ def check_and_install_all(
         return {t.cmd: t.found for t in tools}
 
     # 3. Interactive install loop
+    # NOTE: no `if t.skipped: continue` guard and no post-prompt re-check —
+    # nothing sets `skipped` before this loop, and `_prompt_and_install` always
+    # ends with the tool found or skipped, so both are dead branches (A262
+    # pattern; removed).
     print()
     for t in missing:
-        if t.skipped:
-            continue
         _prompt_and_install(t)
-
-    # 4. Re-check after installs (npx-aware)
-    for t in tools:
-        if not t.found and not t.skipped and _resolve_tool(t):
-            t.found = True
-            if not t.use_npx:
-                t.version = _detect_version(t.cmd)
 
     return {t.cmd: t.found for t in tools}
 
@@ -753,12 +744,9 @@ def _prompt_and_install(t: _Tool) -> None:
 
     # Try each method in order
     for _method_name, pkg, kind in methods:
-        if kind == "npm":
-            ok = _npm_install(pkg)
-        elif kind == "pip":
-            ok = _pip_install(pkg)
-        else:
-            continue
+        # kind is always "npm" or "pip" — both are appended above, so there is
+        # no third branch to handle (dead `else: continue` removed, A262).
+        ok = _npm_install(pkg) if kind == "npm" else _pip_install(pkg)
         if ok:
             t.found = True
             return

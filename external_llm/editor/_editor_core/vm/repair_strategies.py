@@ -748,7 +748,10 @@ def go_repair_argument_mismatch(
                 if _tidx < len(_want_types):
                     _fill_args.append(_go_zero_value(_want_types[_tidx]))
                 else:
-                    _fill_args.append("nil")
+                    # Unreachable: _missing_count = len(_want_types) - len(_existing),
+                    # so _tidx = len(_existing) + i < len(_want_types) for all
+                    # i in range(_missing_count). Kept as a defensive guard.
+                    _fill_args.append("nil")  # pragma: no cover
             new_inner = ", ".join(_existing + _fill_args) if _existing else ", ".join(_fill_args)
         # Fallback: add zero value for the missing arg type
         # (can't use nil for value types like time.Time)
@@ -841,7 +844,7 @@ def go_repair_type_mismatch(
     #   current: "cannot use t (variable of struct type time.Time) as string value in ..."
     #            "cannot use nil as time.Time value in ..."
     #   legacy:  "cannot use t (type time.Time) as type string in ..."
-    # Search the *original* message (like go_repair_argument_mismatch, L774) so
+    # Search the *original* message (like `go_repair_argument_mismatch`) so
     # qualified type names keep their casing ("time.Time", "sql.NullString").
     m = re.search(
         r'cannot use\s+(?P<expr>nil|\S+?)'

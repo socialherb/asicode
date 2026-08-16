@@ -34,13 +34,13 @@ from external_llm.graph.repository_graph import (
 def isolated_names_cache():
     """Save/restore the process-wide names cache and gc rate-limit."""
     saved = dict(_names_cache)
-    saved_deficit = rg_module._names_cache_gc_deficit
+    saved_deficit = _names_cache._gc_deficit
     _names_cache.clear()
-    rg_module._names_cache_gc_deficit = 0
+    _names_cache._gc_deficit = 0
     yield
     _names_cache.clear()
     _names_cache.update(saved)
-    rg_module._names_cache_gc_deficit = saved_deficit
+    _names_cache._gc_deficit = saved_deficit
 
 
 def _make_repo(tmp_path, files: dict) -> str:
@@ -82,12 +82,12 @@ def test_gc_rate_limits_sweeps(tmp_path, monkeypatch):
 
     _gc_names_cache()  # deficit 0 -> full sweep
     assert (str(tmp_path), str(dead)) not in _names_cache
-    assert rg_module._names_cache_gc_deficit == 8
+    assert _names_cache._gc_deficit == 8
 
     _names_cache[(str(tmp_path), str(dead))] = (1, 1, {"dead"})
     _gc_names_cache()  # deficit > 0 -> skipped (no stat work)
     assert (str(tmp_path), str(dead)) in _names_cache, "sweep must be skipped while deficit > 0"
-    assert rg_module._names_cache_gc_deficit == 7
+    assert _names_cache._gc_deficit == 7
 
 
 def test_compute_tier_insert_refused_when_full(tmp_path, monkeypatch):

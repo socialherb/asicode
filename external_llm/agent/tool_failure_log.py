@@ -155,10 +155,15 @@ _ERROR_PATTERNS: tuple = (
     #    substring catches every modify_symbol outcome not already classed above
     #    (arg errors like "'code' is required" are returned unwrapped by the
     #    handler's own validation, so they still hit "is required" → invalid_args
-    #    below). The specific "all strategies failed" pattern also covers direct
-    #    callers of symbol_modify_tool that emit it unwrapped. ──
+    #    below). The specific locate-failure patterns also cover direct callers
+    #    of symbol_modify_tool that emit the inner text unwrapped: "all
+    #    strategies failed" is the pre-2026-08-13 wording, "could not locate
+    #    symbol" the current one (which now carries a reason — wrong Class.
+    #    qualifier vs unparseable file). Both stay listed: the old string can
+    #    still arrive from a persisted failure log written before the change. ──
     ("modify_symbol failed for", "modify_failed", None, None),
     ("all strategies failed", "modify_failed", None, None),
+    ("could not locate symbol", "modify_failed", None, None),
     # ── Validation: missing/required args ──
     ("is required", "invalid_args", None, None),
 )

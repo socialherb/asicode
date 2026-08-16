@@ -1,4 +1,5 @@
 """Analysis and exploration tool handlers for ToolRegistry."""
+
 from __future__ import annotations
 
 import contextlib
@@ -22,6 +23,7 @@ class AnalysisToolsMixin:
     def _tool_get_project_info(self, args: dict[str, Any]) -> "ToolResult":
         try:
             from external_llm.project_analyzer import ProjectAnalyzer
+
             analyzer = ProjectAnalyzer(self.repo_root)
             structure = analyzer.analyze()
 
@@ -49,7 +51,7 @@ class AnalysisToolsMixin:
                     # Show more entries for the catch-all 'other' bucket so real
                     # packages (e.g. webapp/, docs/) aren't hidden behind the
                     # first three noise dirs.
-                    shown = paths[:8] if purpose == 'other' else paths[:3]
+                    shown = paths[:8] if purpose == "other" else paths[:3]
                     dir_summary.append(f"  {purpose}: {', '.join(str(p) for p in shown)}")
                 info_parts.append("Directories:\n" + "\n".join(dir_summary))
 
@@ -84,6 +86,7 @@ class AnalysisToolsMixin:
         if file_path:
             with contextlib.suppress(ValueError, TypeError):  # path outside root / non-str
                 from pathlib import Path as _Path
+
                 fp = _Path(file_path)
                 if fp.is_absolute():
                     file_path = str(fp.relative_to(self.repo_root))
@@ -141,7 +144,9 @@ class AnalysisToolsMixin:
             # 3. Importers (reverse dependencies)
             if include_importers:
                 # Get the file where this symbol is defined
-                sym_file = self._call_graph.get_symbol_file(symbol) if hasattr(self._call_graph, 'get_symbol_file') else None
+                sym_file = (
+                    self._call_graph.get_symbol_file(symbol) if hasattr(self._call_graph, "get_symbol_file") else None
+                )
                 if not sym_file and file_path:
                     sym_file = file_path
                 if sym_file:
@@ -168,8 +173,14 @@ class AnalysisToolsMixin:
                         lines.extend(f"  - `{d.imported}` ({d.import_type})" for d in deps[:limit])
 
             # 5. Summary
-            total_files = len(metadata.get("caller_files", [])) + len(metadata.get("callee_files", [])) + len(metadata.get("importer_files", []))
-            lines.append(f"\n---\n**Summary**: {metadata.get('caller_count', 0)} callers, {metadata.get('callee_count', 0)} callees, ~{total_files} affected files")
+            total_files = (
+                len(metadata.get("caller_files", []))
+                + len(metadata.get("callee_files", []))
+                + len(metadata.get("importer_files", []))
+            )
+            lines.append(
+                f"\n---\n**Summary**: {metadata.get('caller_count', 0)} callers, {metadata.get('callee_count', 0)} callees, ~{total_files} affected files"
+            )
 
             metadata["depth"] = depth
             metadata["direction"] = direction
@@ -195,7 +206,8 @@ class AnalysisToolsMixin:
         if len(out) >= SCAN_FILE_CAP:
             logger.warning(
                 "[STRUCTURAL_SCAN] file cap %d reached under %s — truncating",
-                SCAN_FILE_CAP, root,
+                SCAN_FILE_CAP,
+                root,
             )
         return out
 
@@ -212,7 +224,8 @@ class AnalysisToolsMixin:
         _ce = getattr(getattr(self, "config", None), "cancel_event", None)
         if _ce is not None and _ce.is_set():
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error="Operation cancelled before structural scan",
                 retryable=False,
             )
@@ -238,10 +251,7 @@ class AnalysisToolsMixin:
         # reload fall through to the restart warning.
         _stale_modules: list[str] = []
         try:
-            _stale_modules = [
-                os.path.relpath(p, self.repo_root)
-                for p in registry.verify_loaded_sources()
-            ]
+            _stale_modules = [os.path.relpath(p, self.repo_root) for p in registry.verify_loaded_sources()]
         except Exception:
             logger.debug(
                 "[STRUCTURAL_SCAN] scanner freshness check unavailable",
@@ -258,18 +268,12 @@ class AnalysisToolsMixin:
                 )
             if _reloaded:
                 logger.info(
-                    "[STRUCTURAL_SCAN] auto-reloaded %d stale scanner "
-                    "module(s): %s",
+                    "[STRUCTURAL_SCAN] auto-reloaded %d stale scanner module(s): %s",
                     len(_reloaded),
-                    ", ".join(sorted(
-                        os.path.relpath(p, self.repo_root) for p in _reloaded
-                    )),
+                    ", ".join(sorted(os.path.relpath(p, self.repo_root) for p in _reloaded)),
                 )
             try:
-                _stale_modules = [
-                    os.path.relpath(p, self.repo_root)
-                    for p in registry.verify_loaded_sources()
-                ]
+                _stale_modules = [os.path.relpath(p, self.repo_root) for p in registry.verify_loaded_sources()]
             except Exception:
                 _stale_modules = []
         if _stale_modules:
@@ -281,16 +285,14 @@ class AnalysisToolsMixin:
 
         if not scanner_name or scanner_name == "all":
             scanners_to_run = [
-                n for n in registry.list_names()
-                if not getattr(registry.get_spec(n), "skip_in_all_mode", False)
+                n for n in registry.list_names() if not getattr(registry.get_spec(n), "skip_in_all_mode", False)
             ]
         else:
             spec = registry.get_spec(scanner_name)
             if spec is None:
                 available = ", ".join(sorted(registry.list_names()))
                 return self._make_result(
-                    ok=False, content="",
-                    error=f"Unknown scanner: {scanner_name!r}. Available: {available}"
+                    ok=False, content="", error=f"Unknown scanner: {scanner_name!r}. Available: {available}"
                 )
             scanners_to_run = [scanner_name]
 
@@ -320,18 +322,19 @@ class AnalysisToolsMixin:
         # beyond the cap would otherwise judge that symbol dead — the same
         # soundness union the structural gate applies (2026-08-11).  Absent
         # graph or empty py list → plain scan list (standalone behavior).
-        _cross_refs: "Optional[set]" = None
+        _cross_refs: Optional[set] = None
         try:
             from external_llm.analysis.cross_file_refs import (
                 compute_cross_file_referenced_names_light,
             )
+
             _graph = getattr(self, "_call_graph", None)
             _py_files = getattr(_graph, "py_files", []) if _graph is not None else []
-            _ref_input = (
-                sorted(set(file_paths) | set(_py_files)) if _py_files else file_paths
-            )
+            _ref_input = sorted(set(file_paths) | set(_py_files)) if _py_files else file_paths
             _cross_refs = compute_cross_file_referenced_names_light(
-                _graph, self.repo_root, _ref_input,
+                _graph,
+                self.repo_root,
+                _ref_input,
             )
         except Exception:
             logger.debug("[STRUCTURAL_SCAN] cross-file refs unavailable — conservative mode", exc_info=True)
@@ -365,14 +368,9 @@ class AnalysisToolsMixin:
             # run() re-checks per-file regardless, so this is a UX/efficiency
             # fast-path, not a correctness gate.
             if _spec_n is not None and _spec_n.supported_languages is not None:
-                _has_supported_file = any(
-                    LanguageId.from_path(p) in _spec_n.supported_languages
-                    for p in file_paths
-                )
+                _has_supported_file = any(LanguageId.from_path(p) in _spec_n.supported_languages for p in file_paths)
                 if not _has_supported_file:
-                    _present_langs = sorted({
-                        LanguageId.from_path(p).value for p in file_paths
-                    }) or ["none"]
+                    _present_langs = sorted({LanguageId.from_path(p).value for p in file_paths}) or ["none"]
                     all_lines.append(
                         f"\n## {name}\n"
                         f"Description: {_spec_n.description}\n"
@@ -380,11 +378,14 @@ class AnalysisToolsMixin:
                         f"{sorted(_item_.value for _item_ in _spec_n.supported_languages)} "
                         f"but scan set only contains {_present_langs}"
                     )
-                    per_scanner.append({
-                        "scanner": name, "skipped_language_mismatch": True,
-                        "supported": sorted(_item_.value for _item_ in _spec_n.supported_languages),
-                        "present": _present_langs,
-                    })
+                    per_scanner.append(
+                        {
+                            "scanner": name,
+                            "skipped_language_mismatch": True,
+                            "supported": sorted(_item_.value for _item_ in _spec_n.supported_languages),
+                            "present": _present_langs,
+                        }
+                    )
                     continue
 
             # ── Graph-required scanner skip ─────────────────────────────────
@@ -396,24 +397,32 @@ class AnalysisToolsMixin:
             # (vulture also has requires_graph=True but degrades gracefully when the
             # graph is absent, so it does NOT set graph_required_for_results and is
             # never skipped here.)
-            if (_spec_n is not None
-                    and getattr(_spec_n, "requires_graph", False)
-                    and getattr(_spec_n, "graph_required_for_results", False)
-                    and getattr(self, "_call_graph", None) is None):
+            if (
+                _spec_n is not None
+                and getattr(_spec_n, "requires_graph", False)
+                and getattr(_spec_n, "graph_required_for_results", False)
+                and getattr(self, "_call_graph", None) is None
+            ):
                 all_lines.append(
                     f"\n## {name}\n"
                     f"Description: {_spec_n.description}\n"
                     f"Skipped: scanner requires the call graph which is unavailable "
                     f"(standalone scan has no live graph)"
                 )
-                per_scanner.append({
-                    "scanner": name, "skipped_requires_graph": True,
-                })
+                per_scanner.append(
+                    {
+                        "scanner": name,
+                        "skipped_requires_graph": True,
+                    }
+                )
                 continue
 
             _kwargs: dict = {}
-            if (_cross_refs is not None and _spec_n is not None
-                    and "cross_file_referenced_names" in (_spec_n.input_schema or {})):
+            if (
+                _cross_refs is not None
+                and _spec_n is not None
+                and "cross_file_referenced_names" in (_spec_n.input_schema or {})
+            ):
                 _kwargs["cross_file_referenced_names"] = _cross_refs
             # Scanners that need the live graph object (e.g. vulture's hub/leaf
             # scope decision) receive it via repo_graph. Unlike cross-file refs,
@@ -422,7 +431,9 @@ class AnalysisToolsMixin:
             if _spec_n is not None and getattr(_spec_n, "requires_graph", False):
                 _kwargs["repo_graph"] = getattr(self, "_call_graph", None)
             try:
-                result = registry.run(name, repo_root=self.repo_root, file_paths=file_paths, cancel_event=_ce, **_kwargs)
+                result = registry.run(
+                    name, repo_root=self.repo_root, file_paths=file_paths, cancel_event=_ce, **_kwargs
+                )
             except Exception as e:
                 logger.warning("Scanner %s failed: %s", name, e)
                 all_lines.append(f"  - {name}: ERROR — {e}")
@@ -444,12 +455,14 @@ class AnalysisToolsMixin:
                     occ = c["occurrences"]
                     c_line = str(occ[0][0]) if occ else "?"
                 else:
-                    c_line = str(c.get("lineno") or c.get("line") or c.get("start_line") or c.get("cluster_start") or "?")
+                    c_line = str(
+                        c.get("lineno") or c.get("line") or c.get("start_line") or c.get("cluster_start") or "?"
+                    )
                 # Extract symbol name: handle name, symbol, symbol_name, symbol_a/symbol_b, members
                 if c.get("members"):
                     c_name = c["members"][0].get("name", "?")
                 elif c.get("symbol_a") or c.get("symbol_b"):
-                    c_name = f"{c.get('symbol_a','?')} ↔ {c.get('symbol_b','?')}"
+                    c_name = f"{c.get('symbol_a', '?')} ↔ {c.get('symbol_b', '?')}"
                 else:
                     c_name = c.get("name") or c.get("symbol") or c.get("symbol_name") or ""
                 # Extract description: handle description, reason, detail, message, suggested_action, import_line_text
@@ -477,17 +490,19 @@ class AnalysisToolsMixin:
                     f"in test files — test candidates often false positives)"
                 )
 
-            per_scanner.append({
-                "name": name,
-                "total_candidates": result.total_candidates,
-                "affected_files": len(result.affected_files),
-                "reported": len(candidates),
-                "test_file_candidates": len(_test_candidates),
-            })
+            per_scanner.append(
+                {
+                    "name": name,
+                    "total_candidates": result.total_candidates,
+                    "affected_files": len(result.affected_files),
+                    "reported": len(candidates),
+                    "test_file_candidates": len(_test_candidates),
+                }
+            )
 
-        if not all_lines:
-            all_lines.append("No scanners returned results.")
-
+        # NOTE: `all_lines` is seeded with "Scanned N file(s)." above, so it can
+        # never be empty here — the old `if not all_lines:` fallback was
+        # unreachable dead code and was removed (no behavior change).
         header = f"Structural scan: {len(scanners_to_run)} scanner(s)"
         if scan_path:
             header += f" on {scan_path}"
@@ -534,36 +549,31 @@ class AnalysisToolsMixin:
             file_path = source  # source is file_path in subgraph mode
             if not file_path:
                 return self._make_result(
-                    ok=False, content="",
-                    error="'source' (file path) is required for subgraph mode"
+                    ok=False, content="", error="'source' (file path) is required for subgraph mode"
                 )
             return self._query_subgraph(file_path, limit)
         if mode == "importers":
             if not source:
                 return self._make_result(
-                    ok=False, content="",
-                    error="'source' (file path) is required for importers mode"
+                    ok=False, content="", error="'source' (file path) is required for importers mode"
                 )
             return self._query_transitive_importers(source, max_depth, limit)
         if mode == "reachable":
             if not source:
                 return self._make_result(
-                    ok=False, content="",
-                    error="'source' (symbol name) is required for reachable mode"
+                    ok=False, content="", error="'source' (symbol name) is required for reachable mode"
                 )
             direction = str(args.get("direction", "downstream")).strip().lower()
             return self._query_reachable(source, direction, max_depth, limit)
         if mode == "path":
             if not source or not target:
                 return self._make_result(
-                    ok=False, content="",
-                    error="Both 'source' and 'target' (symbol names) are required for path mode"
+                    ok=False, content="", error="Both 'source' and 'target' (symbol names) are required for path mode"
                 )
             direction = str(args.get("direction", "downstream")).strip().lower()
             return self._query_symbol_path(source, target, direction, max_depth, limit)
         return self._make_result(
-            ok=False, content="",
-            error=f"Unknown mode: {mode}. Supported: importers, path, reachable, subgraph"
+            ok=False, content="", error=f"Unknown mode: {mode}. Supported: importers, path, reachable, subgraph"
         )
 
     def _query_subgraph(self, file_path: str, limit: int) -> "ToolResult":
@@ -574,6 +584,7 @@ class AnalysisToolsMixin:
         with contextlib.suppress(ValueError, TypeError):  # path outside root / non-str
             # Normalize path
             from pathlib import Path as _Path
+
             fp = _Path(file_path)
             if fp.is_absolute():
                 file_path = str(fp.relative_to(self.repo_root))
@@ -590,13 +601,20 @@ class AnalysisToolsMixin:
 
         lines.append(f"\n**Symbols** ({len(symbols)}):")
         for sym in symbols[:limit]:
-            kind = sym.kind if hasattr(sym, 'kind') else "?"
+            kind = sym.kind if hasattr(sym, "kind") else "?"
             sig = ""
-            if hasattr(sym, 'signature') and sym.signature:
+            if hasattr(sym, "signature") and sym.signature:
                 sig = f" — `{sym.signature}`"
             lines.append(f"  - {kind} `{sym.name}` ({sym.start_line}-{sym.end_line}){sig}")
-        metadata["symbols"] = [{"name": s.name, "kind": s.kind if hasattr(s, 'kind') else "",
-                                "start_line": s.start_line, "end_line": s.end_line} for s in symbols[:limit]]
+        metadata["symbols"] = [
+            {
+                "name": s.name,
+                "kind": s.kind if hasattr(s, "kind") else "",
+                "start_line": s.start_line,
+                "end_line": s.end_line,
+            }
+            for s in symbols[:limit]
+        ]
         metadata["symbol_count"] = len(symbols)
 
         # Edges between symbols in this file
@@ -638,6 +656,7 @@ class AnalysisToolsMixin:
 
         with contextlib.suppress(ValueError, TypeError):  # path outside root / non-str
             from pathlib import Path as _Path
+
             fp = _Path(file_path)
             if fp.is_absolute():
                 file_path = str(fp.relative_to(self.repo_root))
@@ -681,8 +700,10 @@ class AnalysisToolsMixin:
         dir_label = "upstream (callers)" if direction == "upstream" else "downstream (callees)"
         lines: list[str] = [f"## Reachable symbols from `{source_symbol}` ({dir_label})"]
         metadata: dict[str, Any] = {
-            "mode": "reachable", "source": source_symbol,
-            "direction": direction, "max_depth": max_depth,
+            "mode": "reachable",
+            "source": source_symbol,
+            "direction": direction,
+            "max_depth": max_depth,
         }
 
         visited: set[str] = {source_symbol}
@@ -717,12 +738,16 @@ class AnalysisToolsMixin:
                 if neighbor in visited:
                     continue
                 visited.add(neighbor)
-                reachable.append({
-                    "symbol": neighbor,
-                    "depth": depth + 1,
-                    "via": current,
-                    "file": edge.caller_file if direction == "upstream" else edge.callee_file or edge.caller_file or "",
-                })
+                reachable.append(
+                    {
+                        "symbol": neighbor,
+                        "depth": depth + 1,
+                        "via": current,
+                        "file": edge.caller_file
+                        if direction == "upstream"
+                        else edge.callee_file or edge.caller_file or "",
+                    }
+                )
                 queue.append((neighbor, origin, depth + 1))
 
         if reachable:
@@ -737,12 +762,17 @@ class AnalysisToolsMixin:
 
         return self._make_result(ok=True, content="\n".join(lines), metadata=metadata)
 
-    def _query_symbol_path(self, source_sym: str, target_sym: str, direction: str, max_depth: int, limit: int) -> "ToolResult":
+    def _query_symbol_path(
+        self, source_sym: str, target_sym: str, direction: str, max_depth: int, limit: int
+    ) -> "ToolResult":
         """BFS shortest-path between two symbols."""
         lines: list[str] = [f"## Path from `{source_sym}` → `{target_sym}`"]
         metadata: dict[str, Any] = {
-            "mode": "path", "source": source_sym, "target": target_sym,
-            "direction": direction, "max_depth": max_depth,
+            "mode": "path",
+            "source": source_sym,
+            "target": target_sym,
+            "direction": direction,
+            "max_depth": max_depth,
         }
 
         if direction in ("downstream", "both"):
@@ -769,7 +799,7 @@ class AnalysisToolsMixin:
                         metadata["path"] = full_path
                         metadata["path_length"] = len(full_path) - 1
                         metadata["direction"] = "downstream"
-                        lines.append(f"\nPath found (depth={len(full_path)-1} via callees):")
+                        lines.append(f"\nPath found (depth={len(full_path) - 1} via callees):")
                         for i, sym in enumerate(full_path):
                             prefix = "→" if i > 0 else " "
                             lines.append(f"  {prefix} `{sym}`")
@@ -803,7 +833,7 @@ class AnalysisToolsMixin:
                         metadata["path"] = full_path
                         metadata["path_length"] = len(full_path) - 1
                         metadata["direction"] = "upstream"
-                        lines.append(f"\nPath found (depth={len(full_path)-1} via callers):")
+                        lines.append(f"\nPath found (depth={len(full_path) - 1} via callers):")
                         for i, sym in enumerate(full_path):
                             prefix = "←" if i > 0 else " "
                             lines.append(f"  {prefix} `{sym}`")

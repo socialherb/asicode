@@ -9,6 +9,7 @@ Supports multiple LLM providers:
 
 All clients return standardized response format for consistent processing.
 """
+
 from __future__ import annotations
 
 import json
@@ -19,7 +20,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -40,6 +41,7 @@ OLLAMA_LLM_TIMEOUT = 600
 @dataclass
 class LLMMessage:
     """Standard message format for all LLM providers"""
+
     role: str  # "system", "user", "assistant", "tool"
     content: str
     # Optional fields for tool-calling (OpenAI-compatible providers)
@@ -78,6 +80,7 @@ class LLMResponse:
         finish_reason: Why generation stopped
         raw_response: Original API response for debugging
     """
+
     content: str
     model: str
     provider: str
@@ -88,7 +91,7 @@ class LLMResponse:
     # expose usage detail on the plain chat() path too (e.g. DeepSeek), so that
     # non-tool callers (the planner) can account cache savings. ToolCallResponse
     # redeclares these for backward compat; the defaults match.
-    prompt_tokens: Optional[int] = None      # input tokens
+    prompt_tokens: Optional[int] = None  # input tokens
     completion_tokens: Optional[int] = None  # output tokens
     cache_read_input_tokens: Optional[int] = None
     reasoning_tokens: Optional[int] = None
@@ -97,6 +100,7 @@ class LLMResponse:
 @dataclass
 class ToolCallRequest:
     """Represents a single tool call requested by the LLM."""
+
     call_id: str
     name: str
     args: dict[str, Any]
@@ -110,11 +114,12 @@ class ToolCallResponse(LLMResponse):
     Extends LLMResponse with tool_calls list.
     is_final=True means the LLM gave a final answer (no more tool calls needed).
     """
+
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     is_final: bool = False
     # Separated token counts (input/output) for cost estimation.
     # tokens_used (from LLMResponse) = prompt_tokens + completion_tokens.
-    prompt_tokens: Optional[int] = None     # input tokens
+    prompt_tokens: Optional[int] = None  # input tokens
     completion_tokens: Optional[int] = None  # output tokens
     # Prompt caching fields (populated by providers that support them, e.g. Anthropic).
     cache_read_input_tokens: Optional[int] = None
@@ -148,6 +153,8 @@ def effective_content(response) -> str:
             if rc:
                 return rc
     return content if isinstance(content, str) else ""
+
+
 # Upper bound on a single Retry-After wait (seconds). Guards against absurdly
 # large server values (e.g. far-future HTTP-dates) that would stall the agent.
 RETRY_AFTER_MAX_WAIT = 60
@@ -172,6 +179,7 @@ def parse_retry_after(headers: "Any") -> Optional[int]:
         import time as _time
         from datetime import timezone
         from email.utils import parsedate_to_datetime
+
         retry_time = parsedate_to_datetime(str(raw).strip())
         if retry_time.tzinfo is None:
             # RFC 7231 HTTP-date is GMT; a timezone-less parse must not be read
@@ -242,7 +250,14 @@ def _parse_sse_line(line: bytes) -> Optional[dict[str, Any]]:
         line = line[:-1]
     if not line:
         return None
-    line_str = line.decode("utf-8")
+    try:
+        line_str = line.decode("utf-8")
+    except UnicodeDecodeError:
+        # B2: a line that never formed valid UTF-8 (EOF cut mid-character,
+        # proxy error pages in another encoding) must NOT raise out of the
+        # framing loop — decode lossy and let the JSON check below decide.
+        line_str = line.decode("utf-8", errors="replace")
+        logger.debug("SSE line contained undecodable bytes (replaced): %.120s", line_str)
     if not line_str.startswith("data:"):
         return None
     data_str = line_str[5:].strip()
@@ -260,7 +275,7 @@ def iter_sse_data_events(response: "Any") -> Iterator[dict[str, Any]]:
 
     Shared SSE framing used by the OpenAI-, DeepSeek-, Gemini- and
     Anthropic-compatible clients: consumes ``response.iter_bytes()`` and
-    splits chunks on ``\\n`` itself (``iter_lines()`` buffers a whole line
+    splits chunks on ``\n`` itself (``iter_lines()`` buffers a whole line
     before yielding — unbounded memory on a line that never terminates).
     A line exceeding ``_SSE_MAX_LINE_BYTES`` aborts the stream with a warning
     instead of buffering it.  Skips blank keep-alive lines, decodes bytes
@@ -268,49 +283,101 @@ def iter_sse_data_events(response: "Any") -> Iterator[dict[str, Any]]:
     skips malformed JSON events (logged at debug level).  The caller retains
     ownership of ``response`` (including ``close()``); status handling and
     event-type dispatch stay in the per-client loop.
+
+    Framing is linear in the stream size: a ``scanned`` watermark records how
+    far ``find`` has already searched, so a long newline-free stretch (or a
+    huge single chunk of small lines) is never re-scanned, and the consumed
+    prefix is compacted once per chunk — the naive per-line re-slice
+    (``buf = buf[idx + 1:]``) copied the whole remainder for every line
+    (O(n^2) on a large single chunk).
     """
-    buf = b""
+    buf = bytearray()
+    line_start = 0  # start of the current (partial) line within buf
+    scanned = 0  # watermark: buf[:scanned] contains no unprocessed ``\n``
     for chunk in response.iter_bytes():
         if not chunk:
             continue
-        buf += chunk
+        buf.extend(chunk)
         while True:
-            idx = buf.find(b"\n")
+            idx = buf.find(b"\n", scanned)
             if idx < 0:
+                scanned = len(buf)  # everything scanned; no newline yet
                 break
-            line, buf = buf[:idx], buf[idx + 1:]
+            line = bytes(buf[line_start:idx])
+            line_start = idx + 1
+            scanned = idx + 1
             if len(line) > _SSE_MAX_LINE_BYTES:
                 logger.warning(
-                    "SSE stream line exceeds %d bytes (%d) — aborting stream "
-                    "(runaway/oversized frame)",
-                    _SSE_MAX_LINE_BYTES, len(line),
+                    "SSE stream line exceeds %d bytes (%d) — aborting stream (runaway/oversized frame)",
+                    _SSE_MAX_LINE_BYTES,
+                    len(line),
                 )
                 return
             event = _parse_sse_line(line)
             if event is not None:
                 yield event
-            if len(buf) > _SSE_MAX_LINE_BYTES:
-                logger.warning(
-                    "SSE stream line exceeds %d bytes (%d) — aborting stream "
-                    "(runaway/oversized frame)",
-                    _SSE_MAX_LINE_BYTES, len(buf),
-                )
-                return
+        if line_start:
+            # Consumed lines are compacted once per chunk (an offset scan
+            # avoids re-copying the whole remainder for every line).
+            del buf[:line_start]
+            scanned -= line_start
+            line_start = 0
         # No newline in the remainder: it is a (partial) line.  If it already
         # exceeds the cap there is no legitimate completion — abort now
         # instead of buffering the rest of it.
         if len(buf) > _SSE_MAX_LINE_BYTES:
             logger.warning(
-                "SSE stream line exceeds %d bytes (%d) — aborting stream "
-                "(runaway/oversized frame)",
-                _SSE_MAX_LINE_BYTES, len(buf),
+                "SSE stream line exceeds %d bytes (%d) — aborting stream (runaway/oversized frame)",
+                _SSE_MAX_LINE_BYTES,
+                len(buf),
             )
             return
     # Tail after EOF without a trailing newline (iter_lines() also yields it).
-    if buf:
-        event = _parse_sse_line(buf)
+    if line_start < len(buf):
+        event = _parse_sse_line(bytes(buf[line_start:]))
         if event is not None:
             yield event
+
+
+def raise_sse_iteration_failure(exc: Exception) -> NoReturn:
+    """Convert an unexpected stream failure into a typed ``LLMAPIError``.
+
+    Shared by ``guard_sse_iteration`` and the per-loop ``except Exception``
+    clause at every provider call site, so the failure surface is uniform:
+    a turn sees ``LLMAPIError`` (diagnosable via ``logger.exception``),
+    never a raw exception escaping the streaming layer.
+    """
+    logger.exception("SSE stream iteration failed: %s", exc)
+    raise LLMAPIError(f"SSE stream iteration failed: {exc}") from exc
+
+
+def guard_sse_iteration(events: Iterator[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    """Defensive wrapper around a parsed SSE event stream.
+
+    ``iter_sse_data_events`` never raises for malformed input, but a
+    transport quirk (e.g. a non-requests failure inside
+    ``response.iter_bytes()``) or a framing bug must not escape the
+    consuming loop as a raw exception and kill the whole turn.  Typed
+    ``LLMClientError`` s and ``requests`` exceptions keep their semantics —
+    call sites map those to retryable/fatal outcomes — while anything else
+    becomes an ``LLMAPIError`` with full diagnostics.
+
+    Note: exceptions raised by the *consumer loop body* never enter this
+    generator (Python semantics — a ``raise`` in the ``for`` body
+    propagates up the consumer's stack, not into the suspended generator),
+    so every call site pairs this wrapper with an ``except Exception``
+    clause that funnels body failures through ``raise_sse_iteration_failure``
+    as well.  Wrap the iterator at the call site::
+
+        for ev in guard_sse_iteration(iter_sse_data_events(response)):
+            ...
+    """
+    try:
+        yield from events
+    except (LLMClientError, requests.RequestException):
+        raise
+    except Exception as e:
+        raise_sse_iteration_failure(e)
 
 
 class LLMClientError(Exception):
@@ -333,8 +400,7 @@ class LLMRateLimitError(LLMClientError):
     instead of a fixed backoff. ``None`` means the server gave no hint.
     """
 
-    def __init__(self, *args: object, retry_after: "Optional[int]" = None,
-                 error_code: "Optional[int]" = None) -> None:
+    def __init__(self, *args: object, retry_after: "Optional[int]" = None, error_code: "Optional[int]" = None) -> None:
         super().__init__(*args)
         # Clamp at construction so every consumer sees a bounded hint. The
         # header parser (parse_retry_after) already clamps to
@@ -437,7 +503,7 @@ class LLMClient(ABC):
         model: str,
         temperature: float = 0.0,
         max_tokens: Optional[int] = None,
-        **kwargs
+        **kwargs,
     ) -> LLMResponse:
         """
         Send chat completion request to LLM
@@ -464,11 +530,7 @@ class LLMClient(ABC):
         """Return provider name (e.g., 'openai', 'anthropic')"""
 
     def chat_with_tools(
-        self,
-        messages: list[LLMMessage],
-        tools: list[dict[str, Any]],
-        model: str = "",
-        **kwargs
+        self, messages: list[LLMMessage], tools: list[dict[str, Any]], model: str = "", **kwargs
     ) -> "ToolCallResponse":
         """
         Chat with tool calling support.
@@ -499,10 +561,11 @@ class LLMClient(ABC):
 
     def close(self) -> None:
         """Close the HTTP session, releasing connection pool resources."""
-        session = getattr(self, '_session', None)
+        session = getattr(self, "_session", None)
         if session is not None:
             session.close()
             logger.debug("LLMClient session closed for %s", self.get_provider_name())
+
 
 def resolve_provider_base_url(provider: str) -> Optional[str]:
     """Resolve the base URL override for ``provider`` in a provider-scoped way.
@@ -573,34 +636,42 @@ def create_llm_client(
 
     if provider_lower == "openai":
         from .openai_client import OpenAIClient
+
         return OpenAIClient(api_key, base_url, timeout)
 
     if provider_lower == "anthropic":
         from .anthropic_client import AnthropicClient
+
         return AnthropicClient(api_key, base_url, timeout)
 
     if provider_lower == "google":
         from .providers import GoogleClient
+
         return GoogleClient(api_key, base_url, timeout)
 
     if provider_lower == "deepseek":
         from .providers import DeepSeekClient
+
         return DeepSeekClient(api_key, base_url, timeout)
 
     if provider_lower == "ollama":
         from .providers import OllamaClient
+
         return OllamaClient(api_key, base_url, timeout)
 
     if provider_lower in ("zai",):
         from .anthropic_client import ZAIAnthropicClient
+
         return ZAIAnthropicClient(api_key, base_url, timeout)
 
     if provider_lower == "openrouter":
         from .openai_client import OpenRouterClient
+
         return OpenRouterClient(api_key, base_url, timeout)
 
     if provider_lower == "opencode":
         from .openai_client import OpenAIClient
+
         if not base_url:
             base_url = "https://opencode.ai/zen/go/v1"  # default for OpenCode Go
         return OpenAIClient(api_key, base_url, timeout)

@@ -178,7 +178,15 @@ class SemanticPatchEngine:
         symbol: str,
         kind: str,
     ) -> SemanticPatchResult:
-        start = node.lineno - 1
+        # node.lineno points at the `def`/`class` line — decorators live ABOVE
+        # it and are NOT covered by lineno. Slicing at `lineno - 1` would leave
+        # the original decorators in `lines[:start]`, and since the LLM emits a
+        # complete symbol (decorators included) as new_code, they would be
+        # re-introduced and applied twice (silently wrong for side-effecting
+        # decorators like @property / @lru_cache / @app.route). Start the
+        # replacement at the topmost decorator when one is present.
+        decorator_list = getattr(node, "decorator_list", []) or []
+        start = (min(d.lineno for d in decorator_list) - 1) if decorator_list else (node.lineno - 1)
         end = node.end_lineno
 
         lines = source.splitlines()

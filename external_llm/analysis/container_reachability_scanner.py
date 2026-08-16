@@ -21,12 +21,14 @@ reserved for cases where intra-class constant-domain propagation is complete.
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from external_llm.agent.config.thresholds import config as _cfg
+from external_llm.common.atomic_io import atomic_write_json
 
 from . import parse_cache
 
@@ -35,13 +37,15 @@ logger = logging.getLogger(__name__)
 
 # ── Candidate model ────────────────────────────────────────────────────────────
 
+
 @dataclass
 class ContainerReadSite:
     """One call site that reads from a container."""
-    access_kind: str        # "get" | "subscript"
-    key_expr_kind: str      # "literal" | "name" | "call" | "other"
-    key_expr_text: str      # e.g. "intent" or '"general"'
-    in_method: str          # enclosing method name (empty = module-level)
+
+    access_kind: str  # "get" | "subscript"
+    key_expr_kind: str  # "literal" | "name" | "call" | "other"
+    key_expr_text: str  # e.g. "intent" or '"general"'
+    in_method: str  # enclosing method name (empty = module-level)
     lineno: int
 
     def to_dict(self) -> dict[str, Any]:
@@ -57,19 +61,20 @@ class ContainerReadSite:
 @dataclass
 class ContainerReachabilityCandidate:
     """Reachability analysis result for one dict literal."""
+
     file: str
-    container_symbol: str   # bare name, e.g. ``_INTENT_STRATEGIES``
-    qualified_name: str     # qualified, e.g. ``AgentLoop._INTENT_STRATEGIES``
+    container_symbol: str  # bare name, e.g. ``_INTENT_STRATEGIES``
+    qualified_name: str  # qualified, e.g. ``AgentLoop._INTENT_STRATEGIES``
     enclosing_class: Optional[str]
-    container_kind: str     # always "dict_literal" in this version
+    container_kind: str  # always "dict_literal" in this version
     lineno: int
     end_lineno: int
     all_keys: list[str]
-    keys_unreachable: list[str]          # structurally_unreachable
+    keys_unreachable: list[str]  # structurally_unreachable
     keys_possibly_unreachable: list[str]
     keys_reachable: list[str]
     read_sites: list[dict[str, Any]]
-    key_domain: Optional[list[str]]      # inferred domain; None = unknown
+    key_domain: Optional[list[str]]  # inferred domain; None = unknown
     confidence: float
     evidence: list[str]
 
@@ -115,11 +120,30 @@ def _reachability_reason(cand: "ContainerReachabilityCandidate") -> str:
     if not parts:
         parts.append(f"all {total} key(s) reachable" if total else "no keys")
     return "; ".join(parts)
+
+
 # ── AST helpers ───────────────────────────────────────────────────────────────
+
 
 def _is_private_name(name: str) -> bool:
     """True for ``_foo`` but not ``__foo__`` dunders."""
     return name.startswith("_") and not (name.startswith("__") and name.endswith("__"))
+
+
+def _candidate_allowed(
+    name: str,
+    cross_file_referenced_names: Optional[set],
+) -> bool:
+    """Cross-file / privacy filter for one candidate container name.
+
+    Mirrors the original ``_collect_dict_literals`` semantics exactly:
+    with a cross-file set (even an EMPTY one — graph mode with nothing
+    referenced), only names IN the set are skipped (private or not); with
+    None (no graph data), only private names are analyzed.
+    """
+    if cross_file_referenced_names is not None:
+        return name not in cross_file_referenced_names
+    return _is_private_name(name)
 
 
 def _extract_string_keys(dict_node: ast.Dict) -> Optional[list[str]]:
@@ -183,11 +207,7 @@ def _classify_key_expr(node: ast.expr) -> tuple:
     if isinstance(node, ast.Name):
         return ("name", node.id)
     # self.ATTR / cls.ATTR — may be an enum-like class constant
-    if (
-        isinstance(node, ast.Attribute)
-        and isinstance(node.value, ast.Name)
-        and node.value.id in ("self", "cls")
-    ):
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
         return ("attr_const", node.attr)
     if isinstance(node, ast.Call):
         try:
@@ -222,6 +242,8 @@ def _is_container_ref(
 def _collect_dict_literals(
     tree: ast.Module,
     cross_file_referenced_names: Optional[set] = None,
+    *,
+    include_all: bool = False,
 ) -> list[tuple]:
     """Collect class-level and module-level dict literals for reachability scan.
 
@@ -229,6 +251,10 @@ def _collect_dict_literals(
     literals whose names are NOT in the set (i.e., not externally referenced).
 
     Without graph data (conservative): only private (``_``-prefixed) dicts.
+
+    With ``include_all=True`` (cache extraction): returns the UNFILTERED
+    superset of every class/module-level string-keyed dict literal — the
+    caller (scan loop) applies ``_candidate_allowed`` afterwards.
 
     Returns list of (name, enclosing_class, lineno, end_lineno, keys).
     Only includes dicts where every key is a string constant.
@@ -250,10 +276,8 @@ def _collect_dict_literals(
                     # Cross-file referenced names are skipped regardless of
                     # privacy — private dicts get imported across modules too
                     # (e.g. `from .config.thresholds import config`).
-                    if cross_file_referenced_names and name in cross_file_referenced_names:
+                    if not include_all and not _candidate_allowed(name, cross_file_referenced_names):
                         continue
-                    if not _is_private_name(name) and cross_file_referenced_names is None:
-                        continue  # conservative: private only
                     if not isinstance(value, ast.Dict):
                         continue
                     keys = _extract_string_keys(value)
@@ -266,10 +290,8 @@ def _collect_dict_literals(
                 if not isinstance(node.target, ast.Name):
                     continue
                 name = node.target.id
-                if cross_file_referenced_names and name in cross_file_referenced_names:
-                    continue  # externally referenced (incl. imported private names)
-                if not _is_private_name(name) and cross_file_referenced_names is None:
-                    continue  # conservative: private only
+                if not include_all and not _candidate_allowed(name, cross_file_referenced_names):
+                    continue
                 if node.value is None or not isinstance(node.value, ast.Dict):
                     continue
                 keys = _extract_string_keys(node.value)
@@ -312,30 +334,32 @@ def _collect_read_sites(
         ):
             consumed.add(id(node.func.value))
             key_kind, key_text = _classify_key_expr(node.args[0])
-            sites.append(ContainerReadSite(
-                access_kind="get",
-                key_expr_kind=key_kind,
-                key_expr_text=key_text,
-                in_method=lineno_to_method.get(ln, ""),
-                lineno=ln,
-            ))
+            sites.append(
+                ContainerReadSite(
+                    access_kind="get",
+                    key_expr_kind=key_kind,
+                    key_expr_text=key_text,
+                    in_method=lineno_to_method.get(ln, ""),
+                    lineno=ln,
+                )
+            )
 
         # Pattern B: <container>[key]
-        elif isinstance(node, ast.Subscript) and _is_container_ref(
-            node.value, container_name, enclosing_class
-        ):
+        elif isinstance(node, ast.Subscript) and _is_container_ref(node.value, container_name, enclosing_class):
             consumed.add(id(node.value))
             slice_node = node.slice
             if isinstance(slice_node, ast.Index):  # Python 3.8 compat
                 slice_node = slice_node.value  # type: ignore[attr-defined]
             key_kind, key_text = _classify_key_expr(slice_node)
-            sites.append(ContainerReadSite(
-                access_kind="subscript",
-                key_expr_kind=key_kind,
-                key_expr_text=key_text,
-                in_method=lineno_to_method.get(ln, ""),
-                lineno=ln,
-            ))
+            sites.append(
+                ContainerReadSite(
+                    access_kind="subscript",
+                    key_expr_kind=key_kind,
+                    key_expr_text=key_text,
+                    in_method=lineno_to_method.get(ln, ""),
+                    lineno=ln,
+                )
+            )
 
     has_dynamic_use = False
     for node in ast.walk(tree):
@@ -488,14 +512,8 @@ def _infer_key_domain_for_var(
     domains: list[set[str]] = []
     for stmt in ast.walk(method_node):
         if isinstance(stmt, ast.Assign):
-            simple_hit = any(
-                isinstance(t, ast.Name) and t.id == var_name for t in stmt.targets
-            )
-            complex_hit = any(
-                _binds_name(t, var_name)
-                for t in stmt.targets
-                if not isinstance(t, ast.Name)
-            )
+            simple_hit = any(isinstance(t, ast.Name) and t.id == var_name for t in stmt.targets)
+            complex_hit = any(_binds_name(t, var_name) for t in stmt.targets if not isinstance(t, ast.Name))
             if complex_hit:
                 return None  # tuple unpack etc. — value unknown
             if simple_hit and stmt.lineno <= target_lineno:
@@ -566,14 +584,10 @@ def _compute_reachability(
                 inferred_domains.append(None)
                 evidence.append(f"key_domain:unknown_method:{method_name}")
                 continue
-            domain = _infer_key_domain_for_var(
-                tree, method_node, var, enclosing_class, site.lineno
-            )
+            domain = _infer_key_domain_for_var(tree, method_node, var, enclosing_class, site.lineno)
             inferred_domains.append(domain)
             if domain is not None:
-                evidence.append(
-                    f"key_domain:{var}:{{{','.join(sorted(domain))}}}"
-                )
+                evidence.append(f"key_domain:{var}:{{{','.join(sorted(domain))}}}")
             else:
                 evidence.append(f"key_domain:{var}:unknown")
         elif site.key_expr_kind == "attr_const":
@@ -584,9 +598,7 @@ def _compute_reachability(
                     const_val = _resolve_class_constant(class_node, attr_name)
                     if const_val is not None:
                         inferred_domains.append({const_val})
-                        evidence.append(
-                            f"key_domain:class_const:{attr_name}={const_val!r}"
-                        )
+                        evidence.append(f"key_domain:class_const:{attr_name}={const_val!r}")
                         continue
             inferred_domains.append(None)
             evidence.append(f"key_domain:attr_const:unresolved:{attr_name}")
@@ -608,9 +620,7 @@ def _compute_reachability(
             if d is not None:
                 partial_domain |= d
         if partial_domain:
-            evidence.append(
-                f"key_domain:partial:{{{','.join(sorted(partial_domain))}}}"
-            )
+            evidence.append(f"key_domain:partial:{{{','.join(sorted(partial_domain))}}}")
 
     # Classify keys
     keys_unreachable: list[str] = []
@@ -642,7 +652,141 @@ def _compute_reachability(
     return keys_unreachable, keys_possibly_unreachable, keys_reachable, domain_out, evidence
 
 
+# ── Per-file extraction cache ─────────────────────────────────────────────────
+#
+# The per-file analysis (parse + lineno→method index + read-site collection +
+# reachability) is a pure function of file content, so the gate process can
+# reuse it across runs via a (mtime_ns, size) fingerprint disk cache — same
+# pattern as dead-block extraction (2026-08-16, commit 786ffcdc).  Measured
+# hot spot: ``_build_lineno_to_method`` (8.2s) + parse (4.4s) +
+# ``_collect_read_sites`` (3.9s) of ~25s total (2026-08-16 profile).
+#
+# The cached payload is a cross-file-set-INDEPENDENT superset: every
+# class/module-level string-keyed dict literal (public AND private), with the
+# per-container read-site/reachability analysis.  The scan loop applies
+# ``_candidate_allowed`` afterwards, so one cache serves both graph and
+# no-graph invocations.  Cache-file version: bump ``_CRX_CACHE_VERSION`` when
+# collector semantics change.  Corruption / version mismatch / read-write
+# errors all fail OPEN to a full extraction (never wrong results).
+_CRX_CACHE_VERSION = 1
+
+
+def _crx_cache_path(repo_root: str) -> str:
+    return parse_cache.cache_file_path(repo_root, f"container_reachability_v{_CRX_CACHE_VERSION}.json")
+
+
+def _crx_load(repo_root: str) -> tuple[dict, bool]:
+    """Load the extraction cache for *repo_root*; returns ``(cache, dirty=False)``.
+
+    Fail-open: any read/parse error or version mismatch returns an empty
+    cache — the caller recomputes everything and rewrites the file.  Keys are
+    ``rel_path -> (fingerprint, payload)`` where ``payload`` is None for a
+    persisted "unparseable file" decision and otherwise the serialized
+    ``{"dicts": [...]}`` extraction.
+
+    An empty *repo_root* (unit-test convention) bypasses the cache entirely —
+    the cache file would otherwise land in the CWD and grow with throwaway
+    temp files.
+    """
+    if not repo_root:
+        return {}, False
+    cache_path = _crx_cache_path(repo_root)  # outside try: CachePathError must propagate
+    try:
+        with open(cache_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if payload.get("format") != _CRX_CACHE_VERSION:
+            return {}, False
+        cache: dict = {}
+        for path, entry in (payload.get("files") or {}).items():
+            if not isinstance(entry, dict) or not isinstance(entry.get("fp"), list):
+                continue
+            cache[path] = (tuple(entry["fp"]), entry.get("payload"))
+    except (OSError, ValueError, TypeError):
+        logger.debug("container-reachability cache unreadable — full extraction", exc_info=True)
+        return {}, False
+    return cache, False
+
+
+def _crx_save(repo_root: str, cache: dict) -> None:
+    """Persist *cache* to disk (best-effort; failure costs a re-extraction).
+
+    Empty *repo_root* skips the write (see ``_crx_load``).
+    """
+    if not repo_root:
+        return
+    try:
+        cache_path = _crx_cache_path(repo_root)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        files = {path: {"fp": list(fp), "payload": pl} for path, (fp, pl) in cache.items()}
+        atomic_write_json(
+            cache_path,
+            {"format": _CRX_CACHE_VERSION, "files": files},
+            indent=None,
+            ensure_ascii=True,
+        )
+    except (OSError, TypeError, ValueError):
+        logger.debug("container-reachability cache write failed", exc_info=True)
+
+
+def _crx_stat(abs_path: str) -> Optional[tuple[int, int]]:
+    """(st_mtime_ns, st_size) — delegates to the canonical parse_cache helper
+    (single stat code path; order contract documented there, B1)."""
+    return parse_cache.stat_fingerprint(abs_path)
+
+
+def _extract_container_file(abs_path: str) -> Optional[dict]:
+    """Full per-file container analysis — a pure function of file content.
+
+    Returns the cross-file-set-independent superset payload (see cache
+    comment above) or None for unparseable files.  On cache hit this whole
+    function is skipped, which removes parse + lineno→method index +
+    read-site walks + reachability for unchanged files.
+    """
+    tree = parse_cache.parse_ast(abs_path)
+    if tree is None:
+        return None
+
+    lineno_to_method = _build_lineno_to_method(tree)
+
+    # method_nodes: qualified_name → FunctionDef (reachability domain inference)
+    method_nodes: dict[str, ast.FunctionDef] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            qual_name = lineno_to_method.get(node.lineno, node.name)
+            method_nodes[qual_name] = node
+
+    dicts: list[dict] = []
+    for name, enclosing_class, lineno, end_lineno, keys in _collect_dict_literals(tree, None, include_all=True):
+        read_sites, has_dynamic_use = _collect_read_sites(
+            tree,
+            name,
+            lineno_to_method,
+            enclosing_class,
+        )
+        keys_unreachable, keys_possibly, keys_reachable, domain, evidence = _compute_reachability(
+            keys, read_sites, tree, enclosing_class, method_nodes
+        )
+        dicts.append(
+            {
+                "name": name,
+                "class": enclosing_class,
+                "lineno": lineno,
+                "end": end_lineno,
+                "keys": list(keys),
+                "sites": [s.to_dict() for s in read_sites],
+                "dynamic": has_dynamic_use,
+                "unreachable": keys_unreachable,
+                "possibly": keys_possibly,
+                "reachable": keys_reachable,
+                "domain": domain,
+                "evidence": evidence,
+            }
+        )
+    return {"dicts": dicts}
+
+
 # ── Public scan API ───────────────────────────────────────────────────────────
+
 
 def scan_container_reachability(
     *,
@@ -671,64 +815,68 @@ def scan_container_reachability(
     candidates: list[ContainerReachabilityCandidate] = []
     _truncated_total = 0  # containers dropped by max_per_file
 
+    # Per-file extraction cache (see _crx_* helpers above).  The cached
+    # payload is a cross-file-set-independent superset, so the privacy /
+    # cross-reference filter is applied HERE in the loop — never in the
+    # cached extraction — keeping one cache valid for every invocation.
+    cache, _ = _crx_load(repo_root)
+    dirty = False
+
     for rel_path in file_paths or []:
-        abs_path = (
-            rel_path if os.path.isabs(rel_path)
-            else os.path.join(repo_root or "", rel_path)
-        )
-        tree = parse_cache.parse_ast(abs_path)
-        if tree is None:
+        abs_path = rel_path if os.path.isabs(rel_path) else os.path.join(repo_root or "", rel_path)
+        fp = _crx_stat(abs_path)
+        entry = cache.get(rel_path) if fp is not None else None
+        if entry is not None and entry[0] == fp:
+            payload = entry[1]
+        else:
+            payload = _extract_container_file(abs_path)
+            if fp is not None:
+                cache[rel_path] = (fp, payload)
+                dirty = True
+        if payload is None:
             continue
 
-        lineno_to_method = _build_lineno_to_method(tree)
-
-        # Build method_nodes map: qualified_name → FunctionDef
-        method_nodes: dict[str, ast.FunctionDef] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                qual_name = lineno_to_method.get(node.lineno, node.name)
-                method_nodes[qual_name] = node
-
-        dict_literals = _collect_dict_literals(tree, cross_file_referenced_names)
-
         per_file_count = 0
-        for (sym_name, enclosing_class, lineno, end_lineno, keys) in dict_literals:
+        dicts = payload["dicts"]
+        for idx, d in enumerate(dicts):
+            sym_name = d["name"]
+            # Cross-file / privacy filter (was applied at collection time
+            # before the cache; identical semantics via _candidate_allowed).
+            if not _candidate_allowed(sym_name, cross_file_referenced_names):
+                continue
             if per_file_count >= max_per_file:
-                _truncated_total += len(dict_literals) - per_file_count
+                remaining = sum(1 for e in dicts[idx:] if _candidate_allowed(e["name"], cross_file_referenced_names))
+                _truncated_total += remaining
                 logger.warning(
                     "[CONTAINER_REACH] %s: hit max_per_file=%d, truncating %d remaining container(s)",
-                    rel_path, max_per_file, len(dict_literals) - per_file_count,
+                    rel_path,
+                    max_per_file,
+                    remaining,
                 )
                 break
+
+            keys = d["keys"]
             if not keys:
                 continue
 
-            qualified = (
-                f"{enclosing_class}.{sym_name}" if enclosing_class else sym_name
-            )
+            enclosing_class = d["class"]
+            qualified = f"{enclosing_class}.{sym_name}" if enclosing_class else sym_name
 
-            read_sites, has_dynamic_use = _collect_read_sites(
-                tree, sym_name, lineno_to_method, enclosing_class,
-            )
-            if has_dynamic_use:
+            if d["dynamic"]:
                 # Iteration / containment / whole-dict pass-through — every key
                 # may be consumed dynamically; per-key verdicts would be unsound.
                 logger.debug(
                     "[CONTAINER_REACH] %s: %s has dynamic (non-keyed) use — skipping",
-                    rel_path, qualified,
+                    rel_path,
+                    qualified,
                 )
                 continue
 
-            (
-                keys_unreachable,
-                keys_possibly_unreachable,
-                keys_reachable,
-                domain_out,
-                reach_evidence,
-            ) = _compute_reachability(
-                keys, read_sites, tree, enclosing_class,
-                method_nodes,
-            )
+            keys_unreachable = d["unreachable"]
+            keys_possibly_unreachable = d["possibly"]
+            keys_reachable = d["reachable"]
+            domain_out = d["domain"]
+            reach_evidence = d["evidence"]
 
             # Skip if nothing interesting (caller can lower min_unreachable_keys=0)
             total_actionable = len(keys_unreachable) + len(keys_possibly_unreachable)
@@ -743,41 +891,44 @@ def scan_container_reachability(
             else:
                 confidence = 0.30  # evidence-only, all reachable
 
+            read_sites = [ContainerReadSite(**s) for s in d["sites"]]
             evidence: list[str] = [
                 f"container:dict_literal:{qualified}",
                 f"keys_total:{len(keys)}",
                 f"read_sites:{len(read_sites)}",
             ]
             if keys_unreachable:
-                evidence.append(
-                    f"structurally_unreachable:{{{','.join(keys_unreachable)}}}"
-                )
+                evidence.append(f"structurally_unreachable:{{{','.join(keys_unreachable)}}}")
             evidence.extend(reach_evidence)
 
-            candidates.append(ContainerReachabilityCandidate(
-                file=rel_path,
-                container_symbol=sym_name,
-                qualified_name=qualified,
-                enclosing_class=enclosing_class,
-                container_kind="dict_literal",
-                lineno=lineno,
-                end_lineno=end_lineno,
-                all_keys=list(keys),
-                keys_unreachable=keys_unreachable,
-                keys_possibly_unreachable=keys_possibly_unreachable,
-                keys_reachable=keys_reachable,
-                read_sites=[s.to_dict() for s in read_sites],
-                key_domain=domain_out,
-                confidence=confidence,
-                evidence=evidence,
-            ))
+            candidates.append(
+                ContainerReachabilityCandidate(
+                    file=rel_path,
+                    container_symbol=sym_name,
+                    qualified_name=qualified,
+                    enclosing_class=enclosing_class,
+                    container_kind="dict_literal",
+                    lineno=d["lineno"],
+                    end_lineno=d["end"],
+                    all_keys=list(keys),
+                    keys_unreachable=keys_unreachable,
+                    keys_possibly_unreachable=keys_possibly_unreachable,
+                    keys_reachable=keys_reachable,
+                    read_sites=[s.to_dict() for s in read_sites],
+                    key_domain=domain_out,
+                    confidence=confidence,
+                    evidence=evidence,
+                )
+            )
             per_file_count += 1
+
+    if dirty:
+        _crx_save(repo_root, cache)
 
     if candidates:
         unreachable_count = sum(len(c.keys_unreachable) for c in candidates)
         logger.info(
-            "[CONTAINER_REACH] %d container(s) across %d file(s); "
-            "structurally_unreachable keys=%d",
+            "[CONTAINER_REACH] %d container(s) across %d file(s); structurally_unreachable keys=%d",
             len(candidates),
             len({c.file for c in candidates}),
             unreachable_count,

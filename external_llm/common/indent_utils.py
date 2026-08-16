@@ -410,7 +410,7 @@ def _match_site_unit(
         if line.strip() and i not in cont
     }
     if len(depths) > 1:
-        # Reuse the cont set computed above (line 372) instead of letting
+        # Reuse the `cont` set computed above instead of letting
         # ``indent_unit`` re-scan ``actual_before`` for continuation rows.
         return indent_unit(actual_before, actual_base[0] if actual_base else " ", cont) or file_unit or after_unit or 1
     # Flat site (single depth): unit undetectable from the site alone.

@@ -17,6 +17,7 @@ from .client import (
     LLMAPIError,
     LLMAuthenticationError,
     LLMClient,
+    LLMClientError,
     LLMConnectionError,
     LLMMessage,
     LLMQuotaExceededError,
@@ -25,9 +26,11 @@ from .client import (
     LLMServerUnavailableError,
     ToolCallRequest,
     ToolCallResponse,
+    guard_sse_iteration,
     is_balance_quota_signal,
     iter_sse_data_events,
     parse_retry_after,
+    raise_sse_iteration_failure,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,6 +54,19 @@ def _parse_glm_error_code(response: requests.Response) -> Optional[int]:
             if isinstance(code, str) and code.strip().isdigit():
                 return int(code.strip())
     return None
+
+
+def _msg_field(msg: Any, is_dict: bool, name: str) -> Any:
+    """Read an optional message field from either an LLMMessage or its dict form.
+
+    The chat()/chat_with_tools() message loops accept both LLMMessage objects
+    and plain dicts for role/content. Every optional field (tool_call_id,
+    tool_calls, raw_content, images, ...) must be read through THIS helper —
+    a bare ``getattr(msg, ...)`` silently returns None for dict-form messages,
+    dropping tool metadata and producing orphaned tool_result blocks (the
+    Anthropic API then rejects the whole request with HTTP 400).
+    """
+    return msg.get(name) if is_dict else getattr(msg, name, None)
 
 
 def _is_always_thinking_glm(model: str) -> bool:
@@ -166,14 +182,13 @@ class AnthropicClient(LLMClient):
     Anthropic API client for Claude models
 
     Supported models:
-    - claude-3-5-sonnet-20241022
-    - claude-3-opus-20240229
-    - claude-3-sonnet-20240229
-    - claude-3-haiku-20240307
+    - claude-sonnet-5, claude-sonnet-4-6, claude-sonnet-4-5
+    - claude-opus-5, claude-opus-4-8, claude-fable-5
+    - claude-haiku-4-5-20251001
     """
 
     DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
-    DEFAULT_MODEL = "claude-3-5-sonnet-20241022"
+    DEFAULT_MODEL = "claude-sonnet-5"
     API_VERSION = "2023-06-01"
 
     # Minimum system text length to apply prompt caching (avoid overhead for tiny prompts)
@@ -455,7 +470,7 @@ class AnthropicClient(LLMClient):
         # summary (plain chat() call, no tools) stream incrementally instead of
         # blocking until the whole response is buffered — which would leave the
         # "thinking" ticker as the only visible UI for the entire call duration.
-        # Mirrors chat_with_tools() L631-634 streaming gate. The parser is a
+        # Mirrors the `chat_with_tools()` streaming gate. The parser is a
         # simplified version of _chat_with_tools_streaming (no tool_use blocks).
         if token_callback is not None:
             return self._chat_streaming(url, headers, payload, model, token_callback)
@@ -601,12 +616,12 @@ class AnthropicClient(LLMClient):
                 system_content = _content if system_content is None else system_content + "\n\n" + _content
             elif _role == "tool":
                 # Single tool result: wrap in tool_result content block
-                tool_use_id = getattr(msg, "tool_call_id", None) or ""
+                tool_use_id = _msg_field(msg, _dict, "tool_call_id") or ""
                 api_messages.append({
                     "role": "user",
                     "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": _content}],
                 })
-            elif _role == "assistant" and (tc_list := getattr(msg, "tool_calls", None)):
+            elif _role == "assistant" and (tc_list := _msg_field(msg, _dict, "tool_calls")):
                 # Prefer provider-native content blocks when available — these
                 # include the `thinking` block (with signature) that Anthropic
                 # extended-thinking requires to be echoed back on the next turn.
@@ -637,8 +652,8 @@ class AnthropicClient(LLMClient):
                     })
                 api_messages.append({"role": "assistant", "content": content_blocks})
             else:
-                raw_content = getattr(msg, "raw_content", None)
-                images = getattr(msg, "images", None)
+                raw_content = _msg_field(msg, _dict, "raw_content")
+                images = _msg_field(msg, _dict, "images")
                 if raw_content:
                     # Preserve native Anthropic content blocks (tool_use / tool_result)
                     api_messages.append({"role": _role, "content": raw_content})
@@ -843,7 +858,7 @@ class AnthropicClient(LLMClient):
             _thinking_blocks: list[dict[str, Any]] = []
             _current_thinking: Optional[dict[str, Any]] = None
 
-            for ev in iter_sse_data_events(response):
+            for ev in guard_sse_iteration(iter_sse_data_events(response)):
 
                 ev_type = ev.get("type", "")
 
@@ -912,6 +927,10 @@ class AnthropicClient(LLMClient):
 
         except requests.RequestException as e:
             raise LLMAPIError(f"{self._provider_label} streaming request failed: {e}") from e
+        except LLMClientError:
+            raise
+        except Exception as e:
+            raise_sse_iteration_failure(e)
         finally:
             response.close()
 
@@ -1040,7 +1059,7 @@ class AnthropicClient(LLMClient):
             _thinking_blocks: list[dict[str, Any]] = []
             _current_thinking: Optional[dict[str, Any]] = None  # {thinking: str, signature: str}
 
-            for ev in iter_sse_data_events(response):
+            for ev in guard_sse_iteration(iter_sse_data_events(response)):
 
                 ev_type = ev.get("type", "")
 
@@ -1137,6 +1156,10 @@ class AnthropicClient(LLMClient):
             raise LLMConnectionError(f"{self._provider_label} streaming timed out: {e}") from e
         except requests.RequestException as e:
             raise LLMAPIError(f"{self._provider_label} streaming request failed: {e}") from e
+        except LLMClientError:
+            raise
+        except Exception as e:
+            raise_sse_iteration_failure(e)
         finally:
             response.close()
 
@@ -1200,15 +1223,15 @@ class ZAIAnthropicClient(AnthropicClient):
     This allows compatibility with tools that speak Anthropic protocol (e.g. Claude Code).
 
     Supported models:
-    - glm-5.2
-    - glm-5.1, glm-5, glm-5-turbo
+    - glm-5.3
+    - glm-5.2, glm-5.1, glm-5, glm-5-turbo
     - glm-4.7, glm-4.6, glm-4.5, etc.
 
     Thinking/reasoning mode:
     GLM-5.2+ thinks by default. To disable: pass thinking_mode=False.
     """
     DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic/v1"
-    DEFAULT_MODEL = "glm-5.2"
+    DEFAULT_MODEL = "glm-5.3"
     _provider_label = "Z.AI"
 
     def get_provider_name(self) -> str:

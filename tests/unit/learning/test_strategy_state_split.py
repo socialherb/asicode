@@ -249,3 +249,72 @@ class TestCorruption:
             assert ss.batch_write_namespaces({"adaptive_hub": {"a": 1}}) is False
         assert p.read_text(encoding="utf-8") == "{not json"
         assert any("corrupt JSON" in r.message for r in caplog.records)
+
+
+# ── RED→GREEN: uncovered branches ────────────────────────────────────────────
+
+
+def test_get_path_returns_configured_path(state_dir: Path):
+    """get_path() reflects the redirected state file (L70)."""
+    assert ss.get_path() == str(state_dir / "strategy_state.json")
+
+
+def test_read_top_level_non_object_warns_corrupt(state_dir: Path, caplog):
+    """A JSON array at the top level is corruption, not data (L124)."""
+    (state_dir / "strategy_state.json").write_text("[1, 2, 3]", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="external_llm.editor.learning.strategy_state"):
+        assert ss.read_namespace("adaptive_hub") is None
+    assert any("corrupt" in r.message for r in caplog.records)
+
+
+def test_read_routed_namespace_falls_back_to_consolidated(state_dir: Path):
+    """Pre-split install: a routed namespace still readable from the shared
+    file when its sidecar does not exist yet (L186-187)."""
+    (state_dir / "strategy_state.json").write_text(
+        json.dumps({"experience_store": [{"r": 1}]}), encoding="utf-8"
+    )
+    assert ss.read_namespace("experience_store") == [{"r": 1}]
+
+
+def test_read_other_exception_returns_none(state_dir: Path, monkeypatch):
+    """Non-JSON read failures are swallowed into None (L220-222)."""
+    def _boom(_path):
+        raise RuntimeError("io exploded")
+
+    monkeypatch.setattr(ss, "_read_json_dict", _boom)
+    assert ss.read_namespace("adaptive_hub") is None
+
+
+def test_write_other_exception_returns_false(state_dir: Path, monkeypatch):
+    """Non-JSON write failures return False (L252-254)."""
+    def _boom(*_a, **_k):
+        raise RuntimeError("lock exploded")
+
+    monkeypatch.setattr(ss, "write_namespace_json", _boom)
+    assert ss.write_namespace("adaptive_hub", {"a": 1}) is False
+
+
+def test_batch_write_other_exception_returns_false(state_dir: Path, monkeypatch):
+    """Non-JSON batch write failures return False (L303-305)."""
+    def _boom(*_a, **_k):
+        raise RuntimeError("write exploded")
+
+    monkeypatch.setattr(ss, "atomic_write_json", _boom)
+    assert ss.batch_write_namespaces({"adaptive_hub": {"a": 1}}) is False
+
+
+def test_migration_failure_is_logged_and_swallowed(state_dir: Path, monkeypatch, caplog):
+    """A failed split migration degrades gracefully: the write continues and
+    the failure is logged, never propagated (L186-187)."""
+    (state_dir / "strategy_state.json").write_text(
+        json.dumps({"experience_store": [{"r": 1}], "adaptive_hub": {"a": 1}}),
+        encoding="utf-8",
+    )
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("migration exploded")
+
+    monkeypatch.setattr(ss, "atomic_write_json", _boom)
+    with caplog.at_level(logging.DEBUG, logger="external_llm.editor.learning.strategy_state"):
+        assert ss.write_namespace("adaptive_hub", {"a": 2}) is True
+    assert any("split migration failed" in r.message for r in caplog.records)

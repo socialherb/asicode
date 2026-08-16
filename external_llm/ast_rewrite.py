@@ -5,6 +5,8 @@ import difflib
 from dataclasses import dataclass
 from pathlib import Path
 
+from common import EDIT_TARGET_MAX_BYTES
+
 # -------------------------------------------------------------
 # Result container
 # -------------------------------------------------------------
@@ -30,7 +32,10 @@ class ASTRewriter:
     # P21-3: same policy as the P19-4 rewrite guard (webapp) — refuse before
     # the full read so a multi-hundred-MB target cannot OOM the AST fallback
     # path (read_text + ast.parse would otherwise load it entirely).
-    _MAX_EDIT_BYTES = 64 * 1024 * 1024  # 64 MiB
+    # P9-2: value flows from the shared SSOT (external_llm/common); the class
+    # attribute keeps its name for existing callers but is no longer a local
+    # hardcoded copy.
+    _MAX_EDIT_BYTES = EDIT_TARGET_MAX_BYTES  # 64 MiB (SSOT: external_llm/common)
 
     # ---------------------------------------------------------
     # public API
@@ -130,14 +135,14 @@ class ASTRewriter:
             result.new_text.splitlines(True),
             fromfile=f"a/{rel}",
             tofile=f"b/{rel}",
-            lineterm=""
+            lineterm="\n"
         )
 
-        # difflib emits only the control lines (---/+++/@@) with lineterm;
-        # body lines already carry their newlines via splitlines(True).
-        # Joining with "\n" keeps the header pair on separate lines — a bare
-        # "".join here produced "--- a/x+++ b/x@@ …" (corrupt for git apply).
-        body = "\n".join(diff)
+        # lineterm="\n" gives the control lines (---/+++/@@) their newline so a
+        # bare "".join is well-formed. (lineterm="" + "\n".join double-newlined
+        # every body line — body lines keep their newline from splitlines(True)
+        # — producing a patch git apply rejects as corrupt.)
+        body = "".join(diff)
         if body:
             body += "\n"
 
@@ -173,8 +178,16 @@ class ASTRewriter:
         new_code: str,
         symbol: str
     ) -> RewriteResult:
-
-        start = node.lineno - 1
+        # node.lineno points at the `def`/`class` line — decorators live ABOVE
+        # it and are NOT covered by lineno. Slicing at `lineno - 1` would leave
+        # the original decorators in `lines[:start]`, and since new_code carries
+        # a complete symbol (decorators included), they would be re-introduced
+        # and applied twice (silently wrong for side-effecting decorators like
+        # @property / @lru_cache / @app.route). Start the replacement at the
+        # topmost decorator when one is present. Same policy as semantic_patch.py
+        # and symbol_modify_tool.py.
+        decorator_list = getattr(node, "decorator_list", []) or []
+        start = (min(d.lineno for d in decorator_list) - 1) if decorator_list else (node.lineno - 1)
         end = node.end_lineno
 
         lines = source.splitlines()

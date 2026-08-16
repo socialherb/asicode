@@ -513,3 +513,299 @@ def test_run_streamable_server_wires_shared_handler_and_clean_shutdown(monkeypat
     assert captured["handle"] is mcp_server_mod._handle_jsonrpc
     assert (captured["host"], captured["port"]) == ("127.0.0.1", 9999)
     assert captured["shutdown"] is True
+
+
+# ── RED→GREEN: uncovered branches ────────────────────────────────────────────
+
+
+def test_post_wrong_path_404(streamable_server):
+    """POST to a non-/mcp path answers 404 (L243-244)."""
+    conn = HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
+    conn.request("POST", "/wrong", body=b"{}", headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    assert resp.status == 404
+    resp.read()
+    conn.close()
+
+
+def test_post_invalid_content_length_400(streamable_server):
+    """A non-numeric Content-Length answers 400 (L180-182)."""
+    conn = HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
+    conn.request(
+        "POST", "/mcp", body=b"{}",
+        headers={"Content-Type": "application/json", "Content-Length": "abc"},
+    )
+    resp = conn.getresponse()
+    assert resp.status == 400
+    resp.read()
+    conn.close()
+
+
+def test_post_body_too_large_413(streamable_server):
+    """A body over the size cap answers 413 (L184-188)."""
+    # Send only the headers with an oversized Content-Length; the server must
+    # answer 413 without us shipping the (1 MiB+) body.
+    import socket as _socket
+
+    from external_llm.editor.agent.mcp._session_queue import _MAX_MESSAGE_BODY_BYTES
+
+    sock = _socket.create_connection(("127.0.0.1", streamable_server.port), timeout=5)
+    sock.sendall(
+        f"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: "
+        f"application/json\r\nContent-Length: {_MAX_MESSAGE_BODY_BYTES + 1}\r\n\r\n".encode()
+    )
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    assert b" 413 " in buf.split(b"\r\n")[0], buf
+    sock.close()
+
+
+def test_post_parse_error_returns_200_jsonrpc_error(streamable_server):
+    """An unparseable body answers 200 with a JSON-RPC parse error payload
+    (L192-207)."""
+    conn = HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
+    conn.request("POST", "/mcp", body=b"not json", headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    assert resp.status == 200
+    payload = json.loads(resp.read())
+    assert payload["error"]["code"] == -32700
+    conn.close()
+
+
+def test_options_preflight(streamable_server):
+    """OPTIONS answers 204 with CORS headers (L236-239)."""
+    conn = HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
+    conn.request("OPTIONS", "/mcp")
+    resp = conn.getresponse()
+    assert resp.status == 204
+    assert resp.getheader("Access-Control-Allow-Origin") == "*"
+    resp.read()
+    conn.close()
+
+
+def test_json_notification_with_session_id_header(streamable_server):
+    """A JSON-mode notification echoing a Mcp-Session-Id header answers 202
+    with that header (L321)."""
+    status, _, hdrs, body = _post(
+        streamable_server,
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        session_id="echo-session",
+    )
+    assert status == 202
+    assert hdrs.get("Mcp-Session-Id") == "echo-session"
+    assert body == b""
+
+
+def test_json_response_with_session_id_header(streamable_server):
+    """A JSON-mode id'd response echoes a Mcp-Session-Id header (L330)."""
+    status, _, hdrs, body = _post(streamable_server, _initialize(), session_id="echo-session")
+    assert status == 200
+    assert hdrs.get("Mcp-Session-Id") == "echo-session"
+    assert json.loads(body)["id"] == 1
+
+
+def test_get_wrong_path_404(streamable_server):
+    """GET to a non-/mcp path answers 404 (L337-339)."""
+    conn = HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
+    conn.request("GET", "/wrong")
+    resp = conn.getresponse()
+    assert resp.status == 404
+    resp.read()
+    conn.close()
+
+
+def test_get_unknown_session_404(streamable_server):
+    """GET resume for an unknown session answers 404 (L340-344)."""
+    conn = HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
+    conn.request("GET", "/mcp?session_id=nope")
+    resp = conn.getresponse()
+    assert resp.status == 404
+    resp.read()
+    conn.close()
+
+
+def test_get_resume_stream(streamable_server):
+    """GET /mcp?session_id=<id> resumes an existing session's stream
+    (L345-351)."""
+    import socket as _socket
+
+    sid, _q = streamable_server._new_session()
+    try:
+        sock = _socket.create_connection(("127.0.0.1", streamable_server.port), timeout=5)
+        try:
+            sock.sendall(
+                f"GET /mcp?session_id={sid} HTTP/1.1\r\nHost: localhost\r\n"
+                "Accept: text/event-stream\r\n\r\n".encode()
+            )
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += sock.recv(4096)
+            head = buf.split(b"\r\n")[0]
+            assert b" 200 " in head
+            assert b"text/event-stream" in buf
+        finally:
+            sock.close()
+    finally:
+        streamable_server._close_session(sid)
+
+
+def test_delete_wrong_path_404(streamable_server):
+    """DELETE to a non-/mcp path answers 404 (L355-356)."""
+    conn = HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
+    conn.request("DELETE", "/wrong")
+    resp = conn.getresponse()
+    assert resp.status == 404
+    resp.read()
+    conn.close()
+
+
+def test_stream_loop_client_disconnect_logged(streamable_server, caplog):
+    """A client that vanishes mid-stream logs 'disconnected' on the next
+    write (L220-221)."""
+    import logging
+    import socket as _socket
+    import struct
+
+    sid, q = streamable_server._new_session()
+    sock = _socket.create_connection(("127.0.0.1", streamable_server.port), timeout=5)
+    sock.sendall(
+        f"GET /mcp?session_id={sid} HTTP/1.1\r\nHost: localhost\r\n"
+        "Accept: text/event-stream\r\n\r\n".encode()
+    )
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        buf += sock.recv(4096)
+    assert b" 200 " in buf.split(b"\r\n")[0]
+    # RST the connection so the server's next write fails hard.
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_LINGER, struct.pack("ii", 1, 0))
+    sock.close()
+    with caplog.at_level(logging.DEBUG, logger="external_llm.editor.agent.mcp.streamable_server"):
+        q.put(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}))
+        assert _wait_until(
+            lambda: any("client disconnected" in r.message for r in caplog.records)
+        )
+
+
+def test_sse_new_session_concurrency_503():
+    """A new SSE session over the concurrency cap answers 503 and drops the
+    just-created session (L262-264)."""
+    import http.client
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_handle(registry, request):
+        entered.set()
+        release.wait(timeout=5)
+        return {"jsonrpc": "2.0", "id": request["id"], "result": {}}
+
+    server, thread = _start_server(handle=slow_handle, max_concurrent=1)
+    try:
+        t = threading.Thread(target=lambda: _post(server, _initialize(1)))
+        t.start()
+        assert entered.wait(timeout=5), "first request should occupy the cap slot"
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+        conn.request(
+            "POST", "/mcp", body=json.dumps(_initialize(2)),
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        )
+        resp = conn.getresponse()
+        assert resp.status == 503
+        assert b"concurrency" in resp.read().lower()
+        conn.close()
+    finally:
+        release.set()
+        t.join(timeout=5)
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_sse_existing_session_concurrency_503():
+    """A POST to an existing SSE session over the cap answers 503 (L286-287)."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_handle(registry, request):
+        entered.set()
+        release.wait(timeout=5)
+        return {"jsonrpc": "2.0", "id": request["id"], "result": {}}
+
+    server, thread = _start_server(handle=slow_handle, max_concurrent=1)
+    sid, _q = server._new_session()  # existing session, no consumer
+    try:
+        t = threading.Thread(target=lambda: _post(server, _initialize(1)))
+        t.start()
+        assert entered.wait(timeout=5), "first request should occupy the cap slot"
+        status, _, _, body = _post(
+            server,
+            {"jsonrpc": "2.0", "id": 3, "method": "mcp.ping", "params": {}},
+            accept="application/json, text/event-stream",
+            session_id=sid,
+        )
+        assert status == 503, f"expected 503, got {status}: {body!r}"
+    finally:
+        release.set()
+        t.join(timeout=5)
+        server._close_session(sid)
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_sse_existing_session_queue_full_503(streamable_server):
+    """A POST to a session whose backlog is full answers 503 (L301-305)."""
+    import queue as _q
+
+    sid, q = streamable_server._new_session()  # no consumer on purpose
+    try:
+        filled = 0
+        while True:
+            try:
+                q.put_nowait("filler")
+                filled += 1
+            except _q.Full:
+                break
+        status, _, _, body = _post(
+            streamable_server,
+            {"jsonrpc": "2.0", "id": 5, "method": "mcp.ping", "params": {}},
+            accept="application/json, text/event-stream",
+            session_id=sid,
+        )
+        assert status == 503, f"expected 503, got {status}: {body!r}"
+        assert b"queue full" in body.lower()
+    finally:
+        streamable_server._close_session(sid)
+
+
+def test_sse_session_start_write_failure_drops_session(streamable_server):
+    """A failure between _new_session and the stream loop drops the session
+    and re-raises (L277-281)."""
+    import socket as _socket
+    import struct
+
+    body = json.dumps(_initialize()).encode()
+    sock = _socket.create_connection(("127.0.0.1", streamable_server.port), timeout=5)
+    sock.sendall(
+        f"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+        f"Accept: text/event-stream\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+    )
+    # Kill the connection before the server writes the first event.
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_LINGER, struct.pack("ii", 1, 0))
+    sock.close()
+    # The failure path must not leave the just-created session behind.
+    assert _wait_until(lambda: len(streamable_server._sessions) == 0)
+
+
+def test_handle_request_without_handler():
+    """_SessionQueueMixin._handle_request without a handler answers an
+    explicit -32000 error (L201)."""
+    from external_llm.editor.agent.mcp._session_queue import _SessionQueueMixin
+
+    mixin = _SessionQueueMixin()
+    mixin._handle = None  # direct construction without a handler
+    resp = mixin._handle_request({"id": 1, "method": "mcp.ping"})
+    assert resp is not None
+    assert "-32000" in resp

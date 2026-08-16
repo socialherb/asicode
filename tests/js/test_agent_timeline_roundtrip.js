@@ -202,6 +202,11 @@ globalThis._agentEnsureTimelineHeader = () => {};
 globalThis._agentScrollBottom = () => {};
 globalThis._pipelineReset = () => {};
 globalThis._agentSetStatus = () => {};
+// F1 (pending tool card orphan): _agentClearPanel now clears the pending map.
+// The real declaration lives at module scope in agent-panel.js and is not
+// compiled into this harness — provide an isolated Map (slice-harness
+// free-variable rule).
+globalThis._pendingToolCards = new Map();
 
 let designClears = 0;
 

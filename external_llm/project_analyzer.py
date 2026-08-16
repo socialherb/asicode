@@ -627,6 +627,12 @@ class ProjectAnalyzer:
                             logger.debug("project_analyzer: cannot read %s — skipping marker scan", src_file)
                             continue
 
+                else:
+                    # Unknown marker type — a typo'd marker would otherwise be
+                    # silently ignored. Log so a bad FRAMEWORK_MARKERS entry
+                    # (this class or a subclass) is observable instead.
+                    logger.debug("project_analyzer: unknown marker type %r — ignored", marker_type)
+
         # Drop frameworks that never cleared the minimum-evidence bar.
         scores = {fw: sc for fw, sc in scores.items() if sc >= self.MIN_FRAMEWORK_SCORE}
         if not scores:
@@ -910,7 +916,9 @@ class ProjectAnalyzer:
         # with CLI patterns.
         if any(fw in cli_frameworks for fw in frameworks):
             types.append('cli')
-        elif 'cli' not in types:
+        # NOTE: plain `else` — 'cli' can only be added by the branch above, so
+        # `elif 'cli' not in types:` was always True here (dead condition).
+        else:
             # Python fallback: a __main__ guard wired to argv/argparse, or a
             # direct stdlib CLI module import (argparse is no longer in the
             # framework list but still signals a CLI).
@@ -1081,8 +1089,11 @@ class ProjectAnalyzer:
                             # parts[1] like '.x' splits to '' and would pollute counts.
                             if len(parts) >= 2 and not parts[1].startswith('.'):
                                 module = parts[1].split('.')[0]
-                                if module:
-                                    import_counts[module] += 1
+                                # NOTE: `module` is never empty here — parts[1]
+                                # is a non-empty token not starting with '.', so
+                                # its first dot-split part is non-empty too. The
+                                # former `if module:` guard was dead (A262).
+                                import_counts[module] += 1
                 except Exception:
                     logger.debug("project_analyzer: cannot read %s — skipping import scan", py_file)
                     continue

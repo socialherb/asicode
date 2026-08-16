@@ -61,7 +61,7 @@ def _collect_f821_protected_from_source(source: str) -> set[str]:
         # Extract names from the import statement (before the comment)
         _import_part = _line_stripped[:_comment_start].strip()
         if not _import_part.startswith('from typing import '):
-            continue
+            continue  # pragma: no cover — L52 already guaranteed this prefix; defensive
         _rest = _import_part[len('from typing import '):]
         for _name in _rest.split(','):
             _name = _name.strip()
@@ -284,7 +284,7 @@ def normalize_typing_imports(file_path: str) -> bool:
         return False
 
     if not needed and not existing_names:
-        return False
+        return False  # pragma: no cover — needed == existing_names == set() is caught above
 
     logger.info(
         "normalize_typing_imports %s: existing=%s needed=%s",
@@ -349,7 +349,7 @@ def normalize_typing_imports(file_path: str) -> bool:
         return False
 
     if new_source == source:
-        return False
+        return False  # pragma: no cover — any rewrite replaces/inserts/blanks a line, output always differs
 
     try:
         atomic_write_text(file_path, new_source)

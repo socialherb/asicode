@@ -588,9 +588,9 @@ class IntelligentLLMService:
         elif output_mode == OutputMode.FULL_FILE:
             # Already in FULL_FILE mode, just try it once then fallback
             modes_to_try = [OutputMode.FULL_FILE]
-        else:
-            # Other modes (ASICODE_BLOCK, TARGETED_BLOCK, PLAN_JSON)
-            modes_to_try = [output_mode]
+        # No else branch: _determine_output_mode only ever returns UNIFIED_DIFF
+        # or FULL_FILE (other OutputModes are unreachable here — the multi-file
+        # path handles them via force_output_mode).
 
         result = None
         last_error = None
@@ -673,9 +673,6 @@ class IntelligentLLMService:
         # If all modes failed, use fallback template
         if not result or not result.get("success"):
             logger.info("All output modes failed for %s, using fallback template", target_file)
-            # Ensure result dict exists
-            if not result:
-                result = {}
             # Record failure reason and metadata
             result["failure_reason"] = failure_reason or self._extract_failure_reason(last_error) if last_error else "unknown"
             result["output_mode"] = used_output_mode.value if used_output_mode else output_mode.value
@@ -834,11 +831,16 @@ class IntelligentLLMService:
         all_success = True
 
         for i, operation in enumerate(plan.operations):
-            if progress_callback:
-                progress_callback("executing_operation",
-                                  f"Processing {operation.file_path} ({operation.operation})...",
-                                  i + 1,
-                                  len(plan.operations))
+            # Route through _emit_progress (not a raw callback): a failing
+            # progress callback must never abort the multi-file run — same
+            # contract as every other progress emission in this class.
+            self._emit_progress(
+                progress_callback,
+                "executing_operation",
+                f"Processing {operation.file_path} ({operation.operation})...",
+                i + 1,
+                len(plan.operations),
+            )
             logger.info(
                 "Executing operation %s/%s: %s %s",
                 i + 1,
@@ -965,9 +967,6 @@ class IntelligentLLMService:
 
             # If all modes failed, use fallback template (for create operations)
             if not result or not result.get("success"):
-                # Ensure result dict exists
-                if not result:
-                    result = {}
                 # Record failure reason and metadata
                 result["failure_reason"] = failure_reason or self._extract_failure_reason(last_error) if last_error else "unknown"
                 result["output_mode"] = used_output_mode.value if used_output_mode else output_mode.value
