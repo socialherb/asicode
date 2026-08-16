@@ -5,6 +5,8 @@
 .coverage
 .coverage.*
 *.cover
+cov_stash/
+coverage.json
 
 # Python
 __pycache__/
@@ -84,10 +86,6 @@ prompt_toolkit/
 # Go binaries
 playground/go-cli-todo/go-cli-todo
 *.log
-
-# Personal scripts (NOT project source — contain plaintext credentials)
-/radio.py
-radio_config.json
 
 # Editor/MCP agent local configs (NOT project source)
 .agents/

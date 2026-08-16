@@ -104,7 +104,6 @@ _SCAN_ROOTS = ("external_llm", "services", "webapp")
 # Root-level production modules (imported by the agent/webapp/services or the
 # CLI itself).  These sit outside the tree roots above, so they are enumerated
 # explicitly — same protection as the trees, no blind spot for root files.
-# radio.py is excluded: it is not imported by any production code.
 _ROOT_FILES = (
     "asi.py",
     "common.py",

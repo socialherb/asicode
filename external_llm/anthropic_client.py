@@ -541,8 +541,13 @@ class AnthropicClient(LLMClient):
 
             # Extract token usage
             usage = data.get("usage", {})
-            input_tokens = usage.get("input_tokens", 0)
-            output_tokens = usage.get("output_tokens", 0)
+            # None-safe: some non-tool responses carry an empty/partial usage
+            # block with explicit nulls, which would TypeError on the naive
+            # addition. The `or 0` also preserves the previous "missing keys
+            # → 0" behavior, so tokens_used stays an int here (downstream
+            # accounting treats 0 and None differently).
+            input_tokens = usage.get("input_tokens", 0) or 0
+            output_tokens = usage.get("output_tokens", 0) or 0
             tokens_used = input_tokens + output_tokens
 
             logger.info(
@@ -773,7 +778,9 @@ class AnthropicClient(LLMClient):
 
             is_final = stop_reason == "end_turn" or not tool_calls
             logger.info(
-                "%s %s (tools): %.0fms, tok=%d, stop=%s (%d)", self._provider_label,
+                # tok=%s (not %d): tokens_used is intentionally None when the
+                # response carries no usage block — %d would TypeError.
+                "%s %s (tools): %.0fms, tok=%s, stop=%s (%d)", self._provider_label,
                 model, elapsed_ms, tokens_used, stop_reason, len(tool_calls),
             )
             return ToolCallResponse(

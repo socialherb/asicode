@@ -3,8 +3,8 @@
 
 Covers text-mode ``open()`` and ``Path.read_text()``/``Path.write_text()`` —
 the twins were the follow-up gap: the original sweep fixed the 44 ``open()``
-sites while 30 ``read_text``/``write_text`` sites kept decoding (and, in
-radio.py's case, ENCODING Korean config) with the process locale.
+sites while 30 ``read_text``/``write_text`` sites kept decoding (e.g. Korean
+config) with the process locale.
 
 Like check_f823_none.py this gate has **no baseline**: the 44 pre-existing
 sites were all fixed when it was introduced, so any hit is new. Keep it that

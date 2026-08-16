@@ -40,9 +40,9 @@ ordinal; that is acceptable churn absorbed by re-running ``--write-baseline``.
 
 Scope: production code only — the ``external_llm/``, ``services/`` and
 ``webapp/`` trees plus EVERY root-level ``*.py``.  Root modules are covered as
-a group rather than by naming ``asi.py``: all nine of them (``common.py``,
-``config.py``, ``path_security.py``, ``radio.py``, …) ship in the public wheel
-exactly like ``asi.py`` does, so singling one out left the other eight able to
+a group rather than by naming ``asi.py``: all eight of them (``common.py``,
+``config.py``, ``path_security.py``, …) ship in the public wheel exactly like
+``asi.py`` does, so singling one out left the other seven able to
 introduce an unguarded call unblocked.  ``scripts/`` (these very gate scripts
 call ruff/git unguarded — meaningless to guard under CI where they are
 guaranteed present) and ``tests/`` are excluded.

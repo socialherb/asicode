@@ -144,13 +144,6 @@ def _check_import(module: str, importer: str, tracked: set[str], errors: list[st
     errors.append(f"{module} (imported by {importer}) → not tracked by git")
 
 
-# Root-level ignored .py files that are known personal/dev-only scripts. Root
-# .py files ship (asi.py, config.py, ...), so an ignored root module is the
-# same wheel-vanishing hazard as an ignored module under a shipping package —
-# except these, which have zero shipping references (verified 2026-07-30).
-_IGNORED_ROOT_ALLOWLIST = frozenset({"radio.py"})
-
-
 def _ignored_shipping_py(ignored_lines: list[str], shipped: list[str]) -> list[str]:
     """Return gitignored ``.py`` files that would silently vanish from the wheel.
 
@@ -159,7 +152,7 @@ def _ignored_shipping_py(ignored_lines: list[str], shipped: list[str]) -> list[s
     copies tracked files only) — the 0.2.6 ``version_check`` class of bug. The
     hazard scope is: any ignored ``.py`` under a top-level directory that
     contains shipped ``.py`` files, plus any ignored root-level ``.py`` (root
-    modules ship too), minus the documented allowlist.
+    modules ship too).
     """
     shipped_dirs = {rel.split("/", 1)[0] for rel in shipped if "/" in rel and rel.endswith(".py")}
     bad: list[str] = []
@@ -173,9 +166,8 @@ def _ignored_shipping_py(ignored_lines: list[str], shipped: list[str]) -> list[s
         if "/" in rel:
             if rel.split("/", 1)[0] in shipped_dirs:
                 bad.append(rel)
-        elif rel not in _IGNORED_ROOT_ALLOWLIST:
-            # Root .py files ship too; any ignored root module is suspicious
-            # except the documented personal-script allowlist.
+        else:
+            # Root .py files ship too; any ignored root module is suspicious.
             bad.append(rel)
     return bad
 
@@ -195,8 +187,7 @@ def _check_ignored_shipping_py(shipped: list[str]) -> bool:
             + "".join(f"  {rel}\n" for rel in sorted(bad))
             + "  These are silently absent from the wheel (export copies tracked files\n"
             "  only). Fix with: git check-ignore -v <file> → remove the rule and\n"
-            "  git add <file>, or delete the file. Known-benign root allowlist: "
-            + ", ".join(sorted(_IGNORED_ROOT_ALLOWLIST)),
+            "  git add <file>, or delete the file.",
             file=sys.stderr,
         )
         return False

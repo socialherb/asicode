@@ -282,7 +282,7 @@ def test_scope_covers_every_shipped_root_module():
     """All root-level *.py must be scanned, not just asi.py.
 
     They ship in the wheel exactly like asi.py, so scanning one by name left the
-    other eight (common.py, config.py, path_security.py, radio.py, ...) free to
+    other seven (common.py, config.py, path_security.py, ...) free to
     introduce an unguarded call unblocked.
     """
     scanned = {p.resolve() for p in g._iter_repo_py()}
@@ -309,7 +309,7 @@ def test_root_module_unguarded_call_is_flagged(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "_SCAN_ROOTS", ())
     monkeypatch.setattr(g, "BASELINE", tmp_path / "b.txt")
     (tmp_path / "b.txt").write_text("")
-    (tmp_path / "radio_like.py").write_text(
+    (tmp_path / "root_like.py").write_text(
         "import subprocess\n"
         "def probe():\n"
         "    try:\n"

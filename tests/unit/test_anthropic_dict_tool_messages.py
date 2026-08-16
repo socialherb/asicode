@@ -166,3 +166,51 @@ def test_object_raw_content_and_images_still_work(monkeypatch):
     )
     blocks = _api_msgs(cap2)[0]["content"]
     assert [b for b in blocks if b.get("type") == "image"]
+
+
+# ── Null / partial usage → None-safe token accounting ──────────────────────
+# The plain chat() path once used usage.get(key, 0), which TypeErrors on
+# `"input_tokens": null` (explicit-null usage blocks), while the tools path
+# already used the `or 0` idiom. These pin that the plain chat path is
+# None-safe too and keeps tokens_used an int (downstream accounting treats
+# int 0 and None differently).
+
+_NULL_USAGE = {
+    "content": [{"type": "text", "text": "done"}],
+    "stop_reason": "end_turn",
+    "usage": {"input_tokens": None, "output_tokens": None},
+}
+
+_MISSING_USAGE = {
+    "content": [{"type": "text", "text": "done"}],
+    "stop_reason": "end_turn",
+}
+
+
+def _chat_client_with_response(monkeypatch, data):
+    client = AnthropicClient(api_key="test")
+    cap = _Capture(_FakeJsonResponse(data))
+    monkeypatch.setattr(client._session, "post", cap)
+    return client
+
+
+def test_chat_null_usage_tokens_never_typeerror(monkeypatch):
+    """Plain chat() with explicit-null usage must not crash (was TypeError)."""
+    client = _chat_client_with_response(monkeypatch, _NULL_USAGE)
+    resp = client.chat([LLMMessage(role="user", content="hi")])
+    assert resp.tokens_used == 0
+    assert resp.content == "done"
+
+
+def test_chat_missing_usage_keeps_zero_tokens(monkeypatch):
+    """No usage block at all stays 0 (prior behavior preserved)."""
+    client = _chat_client_with_response(monkeypatch, _MISSING_USAGE)
+    assert client.chat([LLMMessage(role="user", content="hi")]).tokens_used == 0
+
+
+def test_chat_positive_usage_still_summed(monkeypatch):
+    """Normal usage keeps summing input+output."""
+    ok = dict(_NULL_USAGE)
+    ok["usage"] = {"input_tokens": 5, "output_tokens": 3}
+    client = _chat_client_with_response(monkeypatch, ok)
+    assert client.chat([LLMMessage(role="user", content="hi")]).tokens_used == 8
