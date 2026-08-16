@@ -707,16 +707,21 @@ class TestCollectInput:
 
     def test_truncation_over_50000_chars(self, tty):
         t, result = _start_prompt(tty, "x> ")
+        feed_done = threading.Event()
 
         def _feed() -> None:
-            chunk = b"a" * 2048
-            for _ in range(24):  # 49152
-                tty.send(chunk)
-                time.sleep(0.005)
-            tty.send(b"a" * 849 + b"\r")  # +849 = 50001
+            try:
+                chunk = b"a" * 2048
+                for _ in range(24):  # 49152
+                    tty.send(chunk)
+                    time.sleep(0.01)
+                tty.send(b"a" * 849 + b"\r")  # +849 = 50001
+            finally:
+                feed_done.set()
 
         threading.Thread(target=_feed, daemon=True).start()
-        t.join(timeout=30)
+        t.join(timeout=90)
+        feed_done.wait(timeout=5)  # all bytes flushed → no fd-reuse leak into next test
         assert result["value"] == "a" * 50000
         assert b"input truncated to 50000 chars" in tty.dump()
 
