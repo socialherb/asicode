@@ -162,6 +162,13 @@ def test_log_cache_handles_various_inputs(caplog):
     })
 
 
+def test_log_cache_usage_null_is_treated_as_missing(caplog):
+    """{"usage": null} must not AttributeError on None.get(...) — a JSON null
+    is not the same as a missing key, so the ``.get("usage", {})`` default
+    does not apply."""
+    OpenRouterClient._log_cache({"usage": None})
+
+
 # ── Cost estimation ──────────────────────────────────────────────────────────
 
 def test_openrouter_slug_gets_openrouter_pricing():

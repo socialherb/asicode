@@ -1589,6 +1589,23 @@ class TestProgressPrinterCall:
         )
         assert len(plain) == 1
 
+    def test_token_usage_null_fields_coerce_to_zero(self, printer, plain):
+        # A malformed stream (or a direct handler call) may carry explicit nulls
+        # on every token/cost field — the handler must coerce them to 0 rather
+        # than TypeError the `+=` accumulation / f-string cost display.
+        printer(
+            "token_usage",
+            {
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_prompt_tokens": None,
+                "total_completion_tokens": None,
+                "total_cost_usd": None,
+                "provider": "",
+            },
+        )
+        assert any("tok ↑0 ↓0" in t for t, _ in plain)
+
     def test_token_usage_cache_hit_exception(self, printer, plain, monkeypatch):
         import external_llm.agent._shared_utils as _su
 

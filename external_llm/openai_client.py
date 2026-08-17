@@ -1446,7 +1446,13 @@ class OpenRouterClient(OpenAIClient):
         """Log the cached-token fraction from OpenRouter usage details."""
         if not raw_response:
             return
-        usage = raw_response.get("usage", {})
+        # A JSON null usage block is not the same as a missing key — the
+        # .get("usage", {}) default does not cover it, and None.get(...)
+        # would AttributeError. Mirrors the isinstance guard in
+        # anthropic_client's cache diagnostics.
+        usage = raw_response.get("usage") or {}
+        if not isinstance(usage, dict):
+            return
         ptd = usage.get("prompt_tokens_details")
         if not (ptd and isinstance(ptd, dict)):
             return

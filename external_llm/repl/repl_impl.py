@@ -1200,11 +1200,15 @@ class _ProgressPrinter:
                 return
 
             if event_name == "token_usage":
-                pt = data.get("prompt_tokens", 0)
-                ct = data.get("completion_tokens", 0)
-                tpt = data.get("total_prompt_tokens", 0)
-                tct = data.get("total_completion_tokens", 0)
-                tcost = data.get("total_cost_usd", 0)
+                # Coerce None -> 0 for every token/cost field: the emit side
+                # (agent_turn_pipeline) sends ints, but a malformed stream or a
+                # direct handler call must not TypeError the `+=` accumulation /
+                # f-string formatting below (parity with the cache-read fields).
+                pt = data.get("prompt_tokens", 0) or 0
+                ct = data.get("completion_tokens", 0) or 0
+                tpt = data.get("total_prompt_tokens", 0) or 0
+                tct = data.get("total_completion_tokens", 0) or 0
+                tcost = data.get("total_cost_usd", 0) or 0
                 # Cache-read tokens — this turn + session cumulative
                 crt = data.get("cache_read_tokens", 0) or 0
                 tcrt = data.get("total_cache_read_tokens", 0) or 0
