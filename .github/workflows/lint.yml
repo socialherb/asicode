@@ -132,6 +132,15 @@ jobs:
         # tests had to carry a manual `import asi  # noqa: F401` guard to work
         # around it. --index-only: scan the HEAD+index snapshot (what the
         # commit ships), same semantics as the pre-commit hook.
+        # v0.2.24: two checker defects made this step red in CI while local
+        # runs stayed green. (1) --index-only materialized ONLY the scan
+        # roots, so root-level siblings in-scope modules import (common.py,
+        # utils/, ...) were absent from the tmp copy — fixed by materializing
+        # the full tracked tree via one `git checkout-index` pass. (2) this
+        # job installs only ruff, so ~50 modules failed on requests/rich —
+        # dependency PRESENCE is now an env-skip (reported, never failed or
+        # baselined); first-party misses and every other import error still
+        # fail. The gate's contract is first-party import ORDER.
         run: python scripts/check_standalone_imports.py --index-only
 
       - name: Check no NEW first-party ImportError fallbacks vs baseline

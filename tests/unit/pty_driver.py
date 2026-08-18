@@ -46,6 +46,41 @@ import threading
 import time
 
 
+def _pump_master_until_quiet(
+    master_fd: int,
+    buf: bytearray,
+    lock: threading.Lock,
+    *,
+    timeout: float,
+    quiet: float,
+    on_data=None,
+) -> None:
+    """Read *master_fd* until it stays silent for ``quiet`` seconds.
+
+    Bounded by ``timeout``; every chunk is appended to *buf* under *lock*
+    (safe to run while the background drain thread is also reading — each
+    byte is consumed exactly once by whichever reader gets it).
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            r, _, _ = select.select([master_fd], [], [], quiet)
+        except OSError:
+            break
+        if not r:
+            break  # quiet window: no new bytes arrived; snapshot is settled
+        try:
+            data = os.read(master_fd, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        with lock:
+            buf.extend(data)
+        if on_data is not None:
+            on_data(data)
+
+
 class PtySession:
     """Redirect ``sys.stdin`` (and optionally ``sys.stdout``) onto a pty slave.
 
@@ -136,10 +171,29 @@ class PtySession:
             f"timed out after {timeout}s waiting for {needle!r} in pty output; "
             f"last {len(last)} bytes: {last[-400:]!r}")
 
-    def dump(self) -> bytes:
-        """All output drained so far (not consumed)."""
+    def dump(self, timeout: float = 5.0, quiet: float = 0.05) -> bytes:
+        """All output drained so far (not consumed).
+
+        Pumps the master fd until it stays silent for ``quiet`` seconds
+        (bounded by ``timeout``) before snapshotting: the background drain
+        thread only reads *eventually*, and on a loaded 2-core CI runner it
+        can lag behind the app's final flushed writes — a bare buffer
+        snapshot then misses bytes that had already left the process by the
+        time the test's join() returned (the v0.2.24
+        test_truncation_over_50000_chars flake: the value assertion passed,
+        the just-printed truncation notice did not).
+        """
+        _pump_master_until_quiet(
+            self._master, self._buf, self._lock,
+            timeout=timeout, quiet=quiet,
+            on_data=self._maybe_answer_cpr,
+        )
         with self._lock:
             return bytes(self._buf)
+
+    def _maybe_answer_cpr(self, data: bytes) -> None:
+        if b"\x1b[6n" in data:
+            self._answer_cpr()
 
     def clear(self) -> None:
         with self._lock:
@@ -238,7 +292,23 @@ class SpawnPtySession:
             f"timed out after {timeout or self.timeout}s waiting for {needle!r} "
             f"in pty output; last {len(last)} bytes: {last[-400:]!r}")
 
-    def dump(self) -> bytes:
+    def dump(self, timeout: float = 5.0, quiet: float = 0.05) -> bytes:
+        """All output drained so far (not consumed) — pumps until quiet.
+
+        Same rationale as :meth:`PtySession.dump`: the child's final writes
+        can sit unread in the kernel master queue while the drain thread is
+        starved; the caller (which usually just waited for the child) must
+        not observe a snapshot that predates them.
+        """
+        def _answer_cpr(data: bytes) -> None:
+            if b"\x1b[6n" in data:
+                with contextlib.suppress(OSError):
+                    os.write(self._master, b"\x1b[1;1R")
+
+        _pump_master_until_quiet(
+            self._master, self._buf, self._lock,
+            timeout=timeout, quiet=quiet, on_data=_answer_cpr,
+        )
         with self._lock:
             return bytes(self._buf)
 

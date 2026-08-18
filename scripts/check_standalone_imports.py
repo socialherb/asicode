@@ -34,9 +34,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import re
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -78,6 +80,23 @@ def _module_name(rel: str) -> str | None:
     return ".".join(parts)
 
 
+def _iter_modules_under(root: Path) -> list[str]:
+    """In-scope module names for a tree rooted at *root* (repo or tmp copy)."""
+    mods: list[str] = []
+    for scan in _SCAN_ROOTS:
+        d = root / scan
+        if d.is_dir():
+            for p in d.rglob("*.py"):
+                if _should_skip(p):
+                    continue
+                name = _module_name(str(p.relative_to(root)))
+                if name:
+                    mods.append(name)
+    if (root / "asi.py").exists():
+        mods.append("asi")
+    return sorted(set(mods))
+
+
 def _iter_worktree_modules(paths: list[str] | None = None) -> list[str]:
     mods: list[str] = []
     if paths is not None:
@@ -87,53 +106,87 @@ def _iter_worktree_modules(paths: list[str] | None = None) -> list[str]:
                 if name:
                     mods.append(name)
         return mods
-    for root in _SCAN_ROOTS:
-        d = REPO / root
-        if d.is_dir():
-            for p in d.rglob("*.py"):
-                if _should_skip(p):
-                    continue
-                name = _module_name(str(p.relative_to(REPO)))
-                if name:
-                    mods.append(name)
-    if (REPO / "asi.py").exists():
-        mods.append("asi")
-    return sorted(set(mods))
+    return _iter_modules_under(REPO)
 
 
 def _materialize_index(tmp: Path) -> list[str] | None:
-    """Copy tracked in-scope .py files from the index into *tmp*; return module
-    names. None on git failure (caller falls back to the working tree)."""
+    """Materialize the git INDEX (what a commit would ship) under *tmp* via a
+    single ``git checkout-index`` pass; return in-scope module names. None on
+    git failure (caller falls back to the working tree).
+
+    The FULL tracked tree is copied, not just the scan roots: in-scope modules
+    import root-level siblings (common.py, utils/, context_collector.py,
+    path_security.py, ...) that sit OUTSIDE _SCAN_ROOTS. Copying only the
+    scan roots phantom-failed those imports in --index-only mode — lint.yml
+    has been red on exactly this since v0.2.21 (56 ``No module named
+    'common'`` style failures that never reproduce in the working tree,
+    where the siblings are present by construction). checkout-index is one
+    subprocess for ~930 tracked .py files; the old per-file ``git show``
+    loop would have been ~930 subprocesses.
+    """
     try:
         proc = subprocess.run(
-            ["git", "-C", str(REPO), "ls-files", "-z"],
-            capture_output=True, timeout=30, check=False,
+            ["git", "-C", str(REPO), "checkout-index", "-a", "-f",
+             f"--prefix={tmp}/"],
+            capture_output=True, timeout=120, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
         return None
-    mods: list[str] = []
+    return _iter_modules_under(tmp)
+
+
+def _tracked_first_party_tops() -> set[str]:
+    """Top-level import names the repo itself ships (tracked .py files).
+
+    ``common.py`` -> ``common``, ``utils/string_helper.py`` -> ``utils``.
+    Used to tell a missing FIRST-PARTY module (real standalone failure)
+    from a missing third-party dependency (environment artifact).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO), "ls-files", "-z", "--", "*.py"],
+            capture_output=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if proc.returncode != 0:
+        return set()
+    tops: set[str] = set()
     for rel in proc.stdout.decode("utf-8", errors="replace").split("\0"):
-        if not rel or not _in_scope(rel):
+        if not rel:
             continue
-        name = _module_name(rel)
-        if not name:
-            continue
-        try:
-            blob = subprocess.run(
-                ["git", "-C", str(REPO), "show", f":{rel}"],
-                capture_output=True, timeout=30, check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if blob.returncode != 0:
-            continue
-        dest = tmp / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(blob.stdout)
-        mods.append(name)
-    return mods
+        stem = Path(rel).parts[0]
+        stem = Path(stem).stem
+        if stem.isidentifier():
+            tops.add(stem)
+    return tops
+
+
+_MISSING_DEP_RE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
+
+
+def _third_party_only_missing(
+    err_text: str, first_party: set[str],
+) -> set[str] | None:
+    """Missing THIRD-PARTY top-level names if the failure is only that; else None.
+
+    The gate's contract is first-party import ORDER — whether a third-party
+    dependency happens to be *installed* is environment policy (lint.yml's
+    baseline-diff job installs only ruff, so ~50 modules fail on
+    requests/rich there while passing everywhere the package is installed).
+    A plain missing-dependency ModuleNotFoundError is therefore skipped,
+    not failed and not baselined. Anything else — a cycle, cannot-import-name,
+    a missing FIRST-PARTY module — is a real failure in every environment.
+    """
+    missing = _MISSING_DEP_RE.findall(err_text)
+    if not missing:
+        return None
+    tops = {name.split(".")[0] for name in missing}
+    if tops & first_party:
+        return None  # a first-party module failed to import — real failure
+    return tops
 
 
 def _try_import(module: str, cwd: Path) -> str:
@@ -221,23 +274,43 @@ def main() -> int:
         modules = _iter_worktree_modules()
         failures = _check(modules, REPO)
 
+    first_party = _tracked_first_party_tops()
+    real: dict[str, str] = {}
+    env_skipped: dict[str, set[str]] = {}
+    for module, err in failures.items():
+        dep_tops = _third_party_only_missing(err, first_party)
+        if dep_tops is not None:
+            env_skipped[module] = dep_tops
+        else:
+            real[module] = err
+
     if write_baseline:
-        _write_baseline(set(failures))
+        _write_baseline(set(real))
         src = "HEAD+index" if index_only else ("given files" if args else "working tree")
-        print(f"✅ Baseline written: {BASELINE} ({len(failures)} entries, from {src})")
+        print(f"✅ Baseline written: {BASELINE} ({len(real)} entries, from {src})")
         return 0
 
+    if env_skipped:
+        counts = Counter(
+            dep for tops in env_skipped.values() for dep in sorted(tops))
+        detail = ", ".join(f"{dep} x{n}" for dep, n in counts.most_common())
+        print(f"⏭ {len(env_skipped)} module(s) skipped: third-party import(s) "
+              f"missing in this environment ({detail}) — dependency "
+              f"presence is the unit-test job's contract, not import order.")
+
     baseline = _load_baseline()
-    new_failures = {m: e for m, e in failures.items() if m not in baseline}
-    stale = sorted(baseline - set(failures))
+    new_failures = {m: e for m, e in real.items() if m not in baseline}
+    stale = sorted(baseline - set(real))
 
     if stale:
         print(f"Note: {len(stale)} stale baseline entr{'y' if len(stale) == 1 else 'ies'} "
               f"(importing fine now): {', '.join(stale)} — re-run --write-baseline")
 
     if not new_failures:
+        skipped_note = f", {len(env_skipped)} env-skipped" if env_skipped else ""
         print(f"✅ All {len(modules)} modules import standalone "
-              f"({len(failures)} baselined failure{'s' if len(failures) != 1 else ''})")
+              f"({len(real)} baselined failure{'s' if len(real) != 1 else ''}"
+              f"{skipped_note})")
         return 0
 
     print(f"❌ {len(new_failures)} module(s) FAIL standalone import (not in baseline):\n")

@@ -732,3 +732,23 @@ class TestCollectInput:
         t.join(timeout=12)
         assert result == {"value": "task"}
         assert b"\xe2\x94\x80" in tty.dump()  # "---" rule emitted after submit
+
+
+class TestPtyDriverDumpDrainsPendingBytes:
+    """dump() must pump the master fd itself, not just snapshot the buffer.
+
+    v0.2.24 CI flake class: test_truncation_over_50000_chars failed only on
+    the 2-core runner with the value assertion passing but the just-printed
+    truncation notice missing from the dump — the background drain thread
+    only reads *eventually*, and under xdist load it lagged behind the app's
+    final flushed writes, so the bare buffer snapshot predates them.
+    Deterministic repro: stop the drain thread first, then write, then dump.
+    """
+
+    def test_dump_pumps_bytes_the_starved_drain_thread_has_not_read(self, tty):
+        tty.activate()  # re-bind sys.stdout to the pty slave (pytest rewraps it)
+        tty._stop.set()
+        tty._drain.join(timeout=1.0)  # simulate a starved/stalled drain thread
+        sys.stdout.write("drain-proof-trailer\n")
+        sys.stdout.flush()  # bytes now sit unread in the kernel master queue
+        assert b"drain-proof-trailer" in tty.dump()
