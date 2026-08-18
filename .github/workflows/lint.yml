@@ -193,19 +193,25 @@ jobs:
         run: python scripts/check_lint_full.py
 
       - name: Check ZERO deterministic structural scanner candidates
-        # Zero-tolerance, NO baseline: contradictory_logic / duplicate_definition
-        # / unused_import were at zero repo-wide when gated (2026-08-07), so any
-        # candidate is a regression by construction. The four graph-dependent
-        # scanners were promoted 2026-08-08: the gate script now builds the
-        # call graph ONCE (~5s; get_callers is an O(1) reverse index since
-        # fa857800) and injects cross_file_referenced_names + repo_graph, which
-        # eliminated the cross-file false positives (dead_block 43 /
-        # public_dead_code 43) that kept them out of the gate; broken_contract
-        # (graph-required) previously always skipped standalone — a silent
-        # no-op — and vulture's 36 framework-dispatch false positives (enum
-        # members, pydantic/dataclass fields, http.server protocol methods,
-        # foreign-object attribute assignments) are suppressed structurally in
-        # vulture_scanner._framework_live_for_file. ast_similarity is gated at
+        # Zero-tolerance with ONE scoped exception: the five REFERENCE-DEPENDENT
+        # scanners (dead_block / public_dead_code / vulture / broken_contract /
+        # container_reachability) judge "is this symbol referenced?", a fact that
+        # depends on WHICH FILES EXIST in the scanned tree. This public repo is
+        # an exported SUBSET (scripts/export_public.py), so symbols whose only
+        # consumers live in excluded files (webapp/, tools/, excluded tests)
+        # would false-positive here: measured v0.2.25, 24 such candidates, every
+        # one referenced only from excluded files. The export regenerates
+        # scripts/structural_scanner_baseline.txt at every release (each entry
+        # machine-verified to be referenced from an excluded file) and the gate
+        # suppresses exactly those. The other four scanners (contradictory_logic
+        # / duplicate_definition / unused_import / ast_similarity exact-1.0)
+        # judge single-file facts that exclusion cannot fabricate — zero
+        # tolerance, no baseline, a baseline entry naming them FAILS the gate.
+        # The gate also fails closed when an optional scanner dependency is
+        # absent: vulture_dead_code_scanner silently returns [] without the
+        # vulture package, and v0.2.21–v0.2.25 this step installed only the
+        # base package, so the vulture arm never actually judged here — hence
+        # the [vulture] extra below. ast_similarity is gated at
         # the exact-duplicate (similarity 1.0, non-test source) contract — the
         # ranked near-duplicate set is not an enumeration contract. See
         # scripts/check_structural_scanners.py.
@@ -215,9 +221,10 @@ jobs:
         # report every push. Run the no-flag form manually/weekly for
         # report-only drift checks.
         # Package install needed: the script imports external_llm's registry
-        # (tree-sitter-language-pack is a core dependency).
+        # (tree-sitter-language-pack is a core dependency; vulture is the
+        # optional [vulture] extra).
         run: |
-          python -m pip install -e . --quiet
+          python -m pip install -e ".[vulture]" --quiet
           python scripts/check_structural_scanners.py --gate-only
 
       - name: PLR2004 magic-value drift observation (report-only, never gates)

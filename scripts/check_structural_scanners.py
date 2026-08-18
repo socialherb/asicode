@@ -26,11 +26,23 @@ repo-wide, so a candidate from them is a regression by construction:
                         1.0 (identical normalised structure) in
                         non-test source
 
-  These nine ARE the gate: any candidate fails the build.  No baseline — zero
-  is the floor (same contract as scripts/check_lint_full.py).  ast_similarity is
-  gated at a narrower contract than the others (only exact-1.0 non-test pairs;
-  see GATE_SCANNERS note) — the ranked near-duplicate set is not an enumeration
-  contract and stays report-only.
+  These nine ARE the gate: any candidate fails the build.  The floor is zero —
+  with ONE scoped exception (2026-08-19): the five REFERENCE-DEPENDENT
+  scanners (see BASELINE_ALLOWED_SCANNERS) judge "is this symbol referenced?",
+  a fact that depends on WHICH FILES EXIST in the scanned tree.  The public
+  snapshot (scripts/export_public.py) ships a strict subset, so symbols whose
+  only consumers live in excluded files (webapp/, tools/, tasks/,
+  webapp-coupled tests) become "unreferenced" there while the full tree keeps
+  them live.  An exported tree therefore carries
+  scripts/structural_scanner_baseline.txt — machine-generated at export,
+  every entry verified to be referenced from an excluded file — and those
+  entries are suppressed, never hand-written.  The other four scanners judge
+  single-file facts (contradictory_logic / duplicate_definition /
+  unused_import) or intra-tree pair identity (ast_similarity exact-1.0) that
+  file exclusion cannot fabricate: zero tolerance, no baseline, in every
+  tree.  ast_similarity is gated at a narrower contract than the others (only
+  exact-1.0 non-test pairs; see GATE_SCANNERS note) — the ranked
+  near-duplicate set is not an enumeration contract and stays report-only.
 
 Why the four graph-dependent scanners were promoted (2026-08-08): the gate
 script previously ran WITHOUT a call graph, so dead_block / public_dead_code
@@ -48,9 +60,18 @@ Usage:
     python scripts/check_structural_scanners.py
     python scripts/check_structural_scanners.py <file>.py ...  # check only given files
     python scripts/check_structural_scanners.py --gate-only   # full repo, gate scanners only
+    python scripts/check_structural_scanners.py --gate-only \
+        --dump-candidates out.json  # write every gate-scanner candidate as JSON,
+                                    # exit 0 on candidates (export-time baseline
+                                    # generation — scripts/export_public.py)
 
-The ONLY flag is ``--gate-only``; any other ``--*`` argument fails with exit 1
-(no silent ignore — a typo must not degrade into a ~35s full scan).
+    The flags are ``--gate-only`` and the value-flag ``--dump-candidates
+    <path>``; any other ``--*`` argument fails with exit 1 (no silent ignore —
+    a typo must not degrade into a ~35s full scan).  ``--dump-candidates``
+    runs the identical pipeline but RECORDS the raw pre-baseline identity of
+    every candidate instead of failing on them — judgment belongs to the
+    caller (export_public.py baseline generation, tests); machinery failures
+    still exit 1 because an incomplete dump must never be consumed.
 
 Explicit file args (pre-commit per-file mode) scan only those files and skip
 report-only scanners (they are whole-repo signals).  Since 2026-08-16 (P-2)
@@ -138,6 +159,29 @@ GATE_SCANNERS: tuple[str, ...] = (
 # arrange/act/assert similarity), which are not regressions.  That ranked set
 # remains report-only; only the exact-1.0 subset is gated.
 REPORT_ONLY_SCANNERS: tuple[str, ...] = ()
+
+# ── Export-artifact baseline (reference-dependent scanners only) ───────────
+# These five judge symbol LIVENESS — "does any file reference this name?" —
+# which is a function of WHICH FILES EXIST in the scanned tree.  The public
+# snapshot excludes 170+ tracked files (webapp/, tools/, tasks/ and
+# webapp-coupled tests); a symbol whose only consumers live there is live in
+# the full tree yet "unreferenced" in the shipped subset.  Measured v0.2.25:
+# private 991 files → 0 candidates, exported 814 files → 24 (dead_block 1,
+# public_dead_code 12, vulture 11), every single one referenced only from
+# excluded files.  scripts/export_public.py regenerates
+# scripts/structural_scanner_baseline.txt at every export after
+# machine-verifying each entry that way; a baseline entry naming any OTHER
+# gate scanner fails the gate (_load_baseline) — their facts are single-file
+# or intra-tree and cannot be fabricated by exclusion, so baselining them
+# could only mask real regressions.
+BASELINE_ALLOWED_SCANNERS: tuple[str, ...] = (
+    "dead_block_scanner",
+    "public_dead_code_scanner",
+    "vulture_dead_code_scanner",
+    "broken_contract_scanner",
+    "container_reachability_scanner",
+)
+_BASELINE_PATH = REPO / "scripts" / "structural_scanner_baseline.txt"
 
 # The extension tuple / cap / walk are the scan-walk SINGLE SOURCE
 # (external_llm/analysis/scan_walk.py): the _SCAN_* names below are identity
@@ -359,20 +403,131 @@ def _unjudged_languages(file_paths: list[str]) -> list[tuple[str, list[str]]]:
     ]
 
 
-def _run_scanner(registry, name: str, file_paths: list[str], **kwargs) -> int:
-    """Run one scanner, print its outcome, return candidate count."""
+def _candidate_file(cand: dict) -> str:
+    """Repo-relative file of one candidate ('' when the shape lacks one)."""
+    v = cand.get("file") or cand.get("path")
+    return v if isinstance(v, str) else ""
+
+
+def _candidate_names(cand: dict) -> list[str]:
+    """Identity symbol names of one candidate (order-preserving, deduped).
+
+    Covers every gate-scanner candidate shape: dead_block / public_dead_code /
+    broken_contract carry ``members: [{name, ...}]``, vulture a top-level
+    ``name``, container_reachability ``container_symbol``, broken_contract
+    additionally ``core_name`` / ``orphan_name``.  A candidate whose shape
+    yields NO name cannot be keyed into the baseline and therefore always
+    fails the gate — suppression must never rest on a guess (fail-closed).
+    """
+    names: list[str] = []
+    members = cand.get("members")
+    if isinstance(members, list):
+        for m in members:
+            if isinstance(m, dict) and isinstance(m.get("name"), str) and m["name"]:
+                names.append(m["name"])
+    for key in ("name", "symbol", "symbol_name", "container_symbol", "core_name", "orphan_name"):
+        v = cand.get(key)
+        if isinstance(v, str) and v:
+            names.append(v)
+    return list(dict.fromkeys(names))
+
+
+def _load_baseline() -> tuple[set[tuple[str, str, str]], list[str]] | None:
+    """Parse scripts/structural_scanner_baseline.txt; None when absent.
+
+    The private tree never carries the file (zero tolerance, no baseline);
+    the public snapshot carries the export-generated one.  Any problem — a
+    malformed line, an empty field, or an entry naming a scanner outside
+    BASELINE_ALLOWED_SCANNERS — is returned as a human-readable problem for
+    main() to FAIL on: a hand-edited drift into the zero-tolerance scanners
+    must not quietly weaken them.
+    """
+    if not _BASELINE_PATH.is_file():
+        return None
+    entries: set[tuple[str, str, str]] = set()
+    problems: list[str] = []
+    for lineno, raw in enumerate(_BASELINE_PATH.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("::", 2)
+        if len(parts) != 3 or not all(p.strip() for p in parts):
+            problems.append(f"line {lineno}: malformed entry (expected <scanner>::<file>::<symbol>)")
+            continue
+        scanner, rel, symbol = (p.strip() for p in parts)
+        if scanner not in BASELINE_ALLOWED_SCANNERS:
+            problems.append(
+                f"line {lineno}: {scanner} is zero-tolerance — baseline entries are only "
+                f"allowed for: {', '.join(BASELINE_ALLOWED_SCANNERS)}"
+            )
+            continue
+        entries.add((scanner, rel, symbol))
+    return entries, problems
+
+
+def _missing_scanner_deps() -> list[str]:
+    """Optional third-party deps a gate scanner silently degrades without.
+
+    vulture_dead_code_scanner returns [] when ``import vulture.core`` fails
+    (optional extra ``asicode[vulture]``) — with the package absent it prints
+    "0 candidates" WITHOUT having judged anything, the same soundness class
+    as a missing tree-sitter grammar.  Live case: v0.2.21-v0.2.25 public CI
+    installed only the base package before this step, so the vulture arm of
+    this gate never actually judged there.  main() fails when this is
+    non-empty (fail-closed), same contract as _unjudged_languages.
+    """
+    missing: list[str] = []
+    try:
+        import vulture.core  # noqa: F401
+    except ImportError:
+        missing.append(
+            "vulture_dead_code_scanner — install the optional extra: pip install 'asicode[vulture]'"
+        )
+    return missing
+
+
+def _run_scanner(registry, name: str, file_paths: list[str], baseline=None, collect=None, **kwargs):
+    """Run one scanner, print its outcome, return ``(failing, suppressed)``.
+
+    ``baseline`` (the entry set from _load_baseline) suppresses candidates of
+    BASELINE_ALLOWED_SCANNERS whose identity — (scanner, file, EVERY name) —
+    is baselined: an export artifact.  A candidate only PARTLY covered stays
+    failing (a hand-pruned baseline must not half-hide a cluster), and a
+    candidate whose shape yields no file/names can never be suppressed.
+
+    ``collect`` (export-time --dump-candidates mode) receives the RAW
+    pre-baseline identity of every candidate as ``(scanner, file, names)``
+    tuples — the dump must describe the tree, not the baseline.
+    """
     try:
         result = registry.run(name, repo_root=str(REPO), file_paths=file_paths, **kwargs)
     except Exception as exc:  # fail-closed: a broken scanner is not a pass
         print(f"❌ {name}: SCANNER ERROR — {exc!r}")
-        return -1
-    total = result.total_candidates
-    print(f"  {name}: {total} candidate(s) across {len(result.affected_files)} file(s)")
-    for c in result.candidates_raw[:10]:
+        return -1, 0
+    raw = list(result.candidates_raw)
+    if collect is not None:
+        for c in raw:
+            collect.append((name, _candidate_file(c), _candidate_names(c)))
+    suppressed = 0
+    failing = raw
+    if baseline and name in BASELINE_ALLOWED_SCANNERS:
+
+        def _is_artifact(cand: dict) -> bool:
+            names = _candidate_names(cand)
+            rel = _candidate_file(cand)
+            return bool(names) and bool(rel) and all((name, rel, n) in baseline for n in names)
+
+        suppressed = sum(1 for c in raw if _is_artifact(c))
+        failing = [c for c in raw if not _is_artifact(c)]
+    total = len(failing)
+    files = {c.get("file") for c in failing if isinstance(c, dict) and c.get("file")}
+    note = f" ({suppressed} baseline-suppressed export artifact(s))" if suppressed else ""
+    print(f"  {name}: {total} candidate(s) across {len(files)} file(s){note}")
+    for c in failing[:10]:
         print(f"      {str(c)[:220]}")
     if total > 10:
         print(f"      … and {total - 10} more")
-    return total
+    return total, suppressed
 
 
 def _run_ast_similarity_gate(registry, file_paths: list[str]) -> int:
@@ -482,6 +637,20 @@ def _compute_cross_refs(graph, file_paths, imported_names=None):
 def main() -> int:
     argv = sys.argv[1:]
     known_flags = ("--gate-only",)
+    # --dump-candidates <path> is the one VALUE flag: it runs the identical
+    # pipeline but records the raw pre-baseline identity of every candidate
+    # and exits 0 on candidates — the judgment belongs to the caller
+    # (scripts/export_public.py baseline generation; tests).  Machinery
+    # failures still exit 1: an incomplete dump must never be consumed.
+    dump_path: str | None = None
+    if "--dump-candidates" in argv:
+        i = argv.index("--dump-candidates")
+        if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+            print("❌ --dump-candidates requires a path argument")
+            print("   usage: [--gate-only] [--dump-candidates <path>] [file paths]")
+            return 1
+        dump_path = argv[i + 1]
+        del argv[i : i + 2]
     # Fail-closed on unknown flags (2026-08-11): an unknown --flag was
     # previously ignored, so a typo like ``--gate-onyl`` silently ran the FULL
     # ~35s scan and dropped the gate-only intent — the report-only section was
@@ -490,7 +659,7 @@ def main() -> int:
     unknown = [a for a in argv if a.startswith("--") and a not in known_flags]
     if unknown:
         print("❌ unknown flag(s): " + ", ".join(unknown))
-        print("   supported: " + ", ".join(known_flags) + "  (file paths are positional)")
+        print("   supported: " + ", ".join(known_flags) + ", --dump-candidates <path>  (file paths are positional)")
         return 1
     gate_only = "--gate-only" in argv
     args = [a for a in argv if not a.startswith("--")]
@@ -541,6 +710,20 @@ def main() -> int:
             print("   fix: raise SCAN_FILE_CAP in external_llm/analysis/scan_walk.py or share one uncapped walk")
             return 1
 
+    # ── Export-artifact baseline (reference-dependent scanners, fail-closed) ─
+    # Loaded BEFORE the registry/graph: baseline problems are an input-contract
+    # violation (like an unknown flag) — fail before any heavy work.
+    baseline_state = _load_baseline()
+    baseline_entries: set[tuple[str, str, str]] = set()
+    if baseline_state is not None:
+        baseline_entries, baseline_problems = baseline_state
+        scanners = ", ".join(sorted({s for s, _, _ in baseline_entries})) or "none"
+        print(f"  [baseline] {len(baseline_entries)} export-artifact entries ({scanners})")
+        for p in baseline_problems:
+            print(f"❌ baseline {p}")
+        if baseline_problems:
+            return 1
+
     registry = _load_registry()
     if registry is None:
         return 1
@@ -548,6 +731,19 @@ def main() -> int:
     failed = False
     mode = f"{'gate-only ' if gate_only else ''}{'full repo' if full_scan else f'{len(file_paths)} file(s)'}"
     print(f"Structural scanner gate — {mode} ({len(file_paths)} files scanned)")
+
+    # ── Optional scanner dependencies (fail-closed) ────────────────────────
+    # Same soundness class as the grammar gap below: a scanner that silently
+    # degrades to [] without an optional dependency would pass the floor
+    # UNJUDGED (live case: v0.2.21-v0.2.25 public CI never judged vulture).
+    missing_deps = _missing_scanner_deps()
+    if missing_deps:
+        for m in missing_deps:
+            print(f"❌ optional scanner dependency missing — {m}")
+        print("   fail-closed: a scanner that cannot run must not pass the zero-candidate floor.")
+        failed = True
+    else:
+        print("  [deps] optional scanner dependencies present (vulture)")
 
     # ── Grammar availability (fail-closed) ──────────────────────────────────
     # The non-Python zero-candidate floor is conditional on the tree-sitter
@@ -630,6 +826,8 @@ def main() -> int:
             print(f"❌ call graph build failed — {exc!r}")
             return 1
 
+    dump_collect: list[tuple[str, str, list[str]]] = []
+    suppressed_total = 0
     for name in GATE_SCANNERS:
         spec = registry.get_spec(name)
         if spec is None:
@@ -646,7 +844,12 @@ def main() -> int:
                 print("  ast_similarity_scanner: skipped in per-file mode (whole-repo pair signal)")
                 continue
             count = _run_ast_similarity_gate(registry, file_paths)
-            if count > 0 or count < 0:
+            if count > 0:
+                if dump_path:
+                    print("❌ ast_similarity_scanner: exact duplicate(s) present — never baselined;")
+                    print("   the dump cannot cover them, so it fails instead of lying by omission")
+                failed = True
+            if count < 0:
                 failed = True
             continue
         kwargs: dict = {}
@@ -654,9 +857,14 @@ def main() -> int:
             kwargs["cross_file_referenced_names"] = cross_refs
         if getattr(spec, "requires_graph", False):
             kwargs["repo_graph"] = graph
-        count = _run_scanner(registry, name, file_paths, **kwargs)
-        if count > 0 or count < 0:
+        count, suppressed = _run_scanner(
+            registry, name, file_paths, baseline=baseline_entries, collect=dump_collect, **kwargs
+        )
+        suppressed_total += suppressed
+        if count > 0 and not dump_path:
             failed = True
+        if count < 0:
+            failed = True  # machinery failure — fails dump mode too (incomplete dump)
 
     if full_scan and not gate_only:
         print("Report-only scanners (currently none — ast_similarity is gated at the exact-1.0 contract):")
@@ -665,6 +873,22 @@ def main() -> int:
                 print(f"  {name}: not available")
                 continue
             _run_scanner(registry, name, file_paths)
+
+    if dump_path is not None:
+        import json
+
+        payload = {
+            "candidates": sorted(
+                ({"scanner": s, "file": f, "names": sorted(ns)} for s, f, ns in dump_collect),
+                key=lambda e: (e["scanner"], e["file"], tuple(e["names"])),
+            )
+        }
+        Path(dump_path).write_text(json.dumps(payload, indent=1, sort_keys=True), encoding="utf-8")
+        print(f"\n📦 dumped {len(payload['candidates'])} gate-scanner candidate(s) → {dump_path}")
+        if failed:
+            print("❌ dump incomplete — see the failures above (a partial dump must not be consumed)")
+            return 1
+        return 0
 
     if failed:
         if unjudged:
@@ -675,10 +899,17 @@ def main() -> int:
         else:
             print(
                 "\n❌ Deterministic structural scanner(s) found candidates — this is a "
-                "regression. Fix the code; do NOT add a baseline."
+                "regression. Fix the code; the export-artifact baseline is machine-generated "
+                "by scripts/export_public.py and only covers reference-dependent scanners."
             )
         return 1
-    print("\n✅ deterministic structural scanners: 0 candidates (no baseline)")
+    if baseline_state is not None:
+        print(
+            f"\n✅ deterministic structural scanners: 0 failing candidates "
+            f"({suppressed_total} export-artifact baseline-suppressed)"
+        )
+    else:
+        print("\n✅ deterministic structural scanners: 0 candidates (no baseline)")
     return 0
 
 

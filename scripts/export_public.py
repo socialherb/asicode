@@ -19,6 +19,16 @@ entry keyed by ``<path>::...`` whose path is itself excluded from the
 export (e.g. a webapp/ module, or a coupled test) is dropped, so the public
 snapshot's baseline never references or names a file that isn't there.
 
+The structural-scanner baseline is REGENERATED, not copied: the five
+reference-dependent gate scanners (dead_block / public_dead_code / vulture /
+broken_contract / container_reachability) judge symbol liveness, which depends
+on WHICH FILES EXIST in the tree — a symbol whose only consumers are excluded
+here becomes "unreferenced" in the snapshot. After copying,
+``_generate_structural_baseline`` runs the snapshot's own gate in dump mode
+and writes scripts/structural_scanner_baseline.txt, machine-verifying every
+entry to be referenced from an excluded file; the public CI gate suppresses
+exactly those (see scripts/check_structural_scanners.py).
+
 Usage:
     python3 scripts/export_public.py <target-dir>          # export
     python3 scripts/export_public.py <target-dir> --list   # dry-run listing
@@ -26,10 +36,14 @@ Usage:
 from __future__ import annotations
 
 import ast
+import importlib.util
+import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from functools import cache
 from pathlib import Path
 
@@ -319,6 +333,135 @@ def prune_baseline_files(target: Path, shipped: list[str]) -> None:
             print(f"pruned {dropped} excluded-path entries from {rel}", file=sys.stderr)
 
 
+def _generate_structural_baseline(target: Path, excluded_paths: list[str]) -> bool:
+    """Regenerate scripts/structural_scanner_baseline.txt inside *target*.
+
+    Runs the SNAPSHOT's own structural gate in --dump-candidates mode (its
+    copy of scripts/check_structural_scanners.py resolves REPO to *target*,
+    so the scan judges exactly the shipped tree, in this interpreter where
+    the optional scanner deps — vulture — are installed), then keeps only
+    reference-dependent-scanner candidates and verifies EVERY candidate name
+    is referenced (word boundary) from at least one EXCLUDED tracked file:
+    proof the candidate is an artifact of tree composition — its consumers
+    were not shipped — and not dead code in the shipped subset.
+
+    Anything else FAILS the export. The private tree's gate is green (0
+    candidates, enforced by pre-commit/CI before any release), so a dumped
+    candidate from a zero-tolerance scanner, or a name with no excluded-file
+    reference, means a true regression or scanner drift — both need a human,
+    never a silent baseline entry.
+    """
+    # The policy set is read from the sibling gate script (this file lives in
+    # scripts/ too) — NOT from REPO, so tests that point REPO at a tmp tree
+    # still get the real BASELINE_ALLOWED_SCANNERS single source.
+    spec = importlib.util.spec_from_file_location(
+        "check_structural_scanners", Path(__file__).resolve().parent / "check_structural_scanners.py"
+    )
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    allowed = set(gate.BASELINE_ALLOWED_SCANNERS)
+
+    fd, dump_path = tempfile.mkstemp(suffix=".json", prefix="structural-dump-")
+    os.close(fd)
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "scripts/check_structural_scanners.py",
+                "--gate-only",
+                "--dump-candidates",
+                dump_path,
+            ],
+            cwd=str(target),
+            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,  # returncode is judged below (dump mode exits 0 on candidates)
+        )
+        if proc.returncode != 0:
+            print(
+                f"error: structural-scanner dump on the snapshot failed (exit {proc.returncode})",
+                file=sys.stderr,
+            )
+            if proc.stdout:
+                print("\n".join(proc.stdout.splitlines()[-30:]), file=sys.stderr)
+            if proc.stderr:
+                print(proc.stderr[-2000:], file=sys.stderr)
+            return False
+        payload = json.loads(Path(dump_path).read_text(encoding="utf-8"))
+    finally:
+        Path(dump_path).unlink(missing_ok=True)
+        # The dump run warms snapshot-local analyzer caches (.cache/) and
+        # __pycache__ dirs; the snapshot must ship clean.
+        shutil.rmtree(target / ".cache", ignore_errors=True)
+
+    excluded_texts: list[str] = []
+    for rel in excluded_paths:
+        try:
+            excluded_texts.append((REPO / rel).read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            continue
+
+    def referenced_from_excluded(name: str) -> bool:
+        pat = re.compile(rf"\b{re.escape(name)}\b")
+        return any(pat.search(t) for t in excluded_texts)
+
+    entries: set[tuple[str, str, str]] = set()
+    violations: list[str] = []
+    for cand in payload.get("candidates", []):
+        scanner = str(cand.get("scanner") or "")
+        rel = str(cand.get("file") or "")
+        names = [str(n) for n in (cand.get("names") or []) if n]
+        label = f"{scanner}::{rel}::{','.join(names) or '?'}"
+        if scanner not in allowed:
+            violations.append(f"{label} — zero-tolerance scanner has candidates in the shipped tree")
+            continue
+        if not rel or not names:
+            violations.append(f"{label} — unkeyable candidate shape (empty file/names)")
+            continue
+        for n in names:
+            if referenced_from_excluded(n):
+                entries.add((scanner, rel, n))
+            else:
+                violations.append(
+                    f"{scanner}::{rel}::{n} — no reference from any excluded file "
+                    "(true dead code in the shipped subset, or scanner drift)"
+                )
+    if violations:
+        for v in violations:
+            print(f"error: structural baseline: {v}", file=sys.stderr)
+        return False
+
+    lines = [
+        "# asicode structural-scanner export-artifact baseline — MACHINE-GENERATED.",
+        "#",
+        "# Regenerated by scripts/export_public.py at every export; DO NOT hand-edit.",
+        "# Entries are reference-dependent-scanner candidates that exist ONLY because",
+        "# this tree is a filtered snapshot: each symbol's consumers live in files the",
+        "# export excludes (webapp/, tools/, tasks/, coupled tests), so the shipped",
+        "# subset reports them as unreferenced while the full private tree keeps them",
+        "# live. Every entry was verified at generation time to be referenced from at",
+        "# least one excluded file. Zero-tolerance scanners (contradictory_logic,",
+        "# duplicate_definition, unused_import, ast_similarity) never appear here —",
+        "# a baseline entry naming them fails the gate.",
+        "# Format: <scanner>::<file>::<symbol>",
+    ]
+    lines += sorted(f"{s}::{rel}::{n}" for s, rel, n in entries)
+    (target / "scripts" / "structural_scanner_baseline.txt").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+    per_scanner = ", ".join(
+        f"{s}x{sum(1 for e in entries if e[0] == s)}" for s in sorted({e[0] for e in entries})
+    ) or "none"
+    print(
+        f"structural baseline: {len(entries)} verified export-artifact entries ({per_scanner}) "
+        "-> scripts/structural_scanner_baseline.txt",
+        file=sys.stderr,
+    )
+    return True
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print(__doc__)
@@ -328,10 +471,12 @@ def main() -> int:
 
     shipped: list[str] = []
     excluded: dict[str, int] = {}
+    excluded_paths: list[str] = []
     for rel in tracked_files():
         reason = is_excluded(rel)
         if reason:
             excluded[reason] = excluded.get(reason, 0) + 1
+            excluded_paths.append(rel)
         else:
             shipped.append(rel)
 
@@ -347,6 +492,8 @@ def main() -> int:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / rel, dst)
         prune_baseline_files(target, shipped)
+        if not _generate_structural_baseline(target, excluded_paths):
+            return 1
 
     print(f"\nshipped: {len(shipped)} files -> {target}", file=sys.stderr)
     for reason, n in sorted(excluded.items(), key=lambda kv: -kv[1]):
