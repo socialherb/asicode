@@ -257,6 +257,11 @@ jobs:
         # scripts — the real files measure 0% regardless of execution.
         # Node is preinstalled on ubuntu-latest; the preload uses only
         # stable Proxy/Reflect/spawnSync APIs (works on Node >= 18).
+        # Tree-shape guard: this gate inventories webapp/ui/static JS
+        # (agent-panel.js, design-chat.js). The public snapshot is a filtered
+        # subset WITHOUT webapp/, so the gate is a no-op-by-ENOENT there —
+        # skip when the inventoried files are absent rather than crash.
+        if: hashFiles('webapp/ui/static/**/*.js') != ''
         run: node tests/js/run_coverage_gate.js
 
   # ── Unit-test gate ─────────────────────────────────────────────────────────

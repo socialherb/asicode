@@ -399,7 +399,7 @@ def _generate_structural_baseline(target: Path, excluded_paths: list[str]) -> bo
     excluded_texts: list[str] = []
     for rel in excluded_paths:
         try:
-            excluded_texts.append((REPO / rel).read_text(encoding="utf-8", errors="ignore"))
+            excluded_texts.append((REPO / rel).read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
 
