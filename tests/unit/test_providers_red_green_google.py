@@ -387,3 +387,20 @@ def test_streaming_iteration_failures() -> None:
             [LLMMessage(role="user", content="x")], tools=[], model="gemini-2.5-flash",
             token_callback=lambda _c: None,
         )
+
+
+# ── P4: Gemini's documented-nullable candidate.content ──────────────────────
+
+
+def test_streaming_null_candidate_content_is_skipped() -> None:
+    # candidate.content is nullable per the Gemini API (SAFETY / RECITATION
+    # and other blocked finish reasons) — the parser must skip, not crash.
+    chunks = [
+        "data: " + __import__("json").dumps({"candidates": [{"content": None, "finishReason": "SAFETY"}]}) + "\n\n",
+    ]
+    c = _stream_client([ch.encode() for ch in chunks])
+    r = c.chat_with_tools(
+        [LLMMessage(role="user", content="x")], tools=[], model="gemini-2.5-flash",
+        token_callback=lambda _c: None,
+    )
+    assert r.content == ""

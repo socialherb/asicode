@@ -270,12 +270,35 @@ def _parse_sse_line(line: bytes) -> Optional[dict[str, Any]]:
         return None
 
 
+def _iter_response_chunks(response: "Any") -> Iterator[bytes]:
+    """Yield raw byte chunks from a streaming HTTP response, transport-agnostic.
+
+    Every LLM client builds its HTTP layer with ``requests.Session``
+    (``LLMClient.__init__``), so the real streaming responses are
+    ``requests.Response`` objects — whose byte-chunk API is ``iter_content()``,
+    NOT ``iter_bytes()`` (that is httpx's).  P28-1 called ``iter_bytes()``
+    unconditionally, which raised AttributeError on every production stream
+    while the ``iter_bytes``-shaped test fakes stayed green.  Prefer
+    ``iter_bytes`` when present (httpx-shaped transports/fakes) and fall back
+    to ``iter_content`` (requests).
+
+    ``iter_content(chunk_size=512)`` mirrors the historical ``iter_lines``
+    transport behavior (requests' own ``ITER_CHUNK_SIZE``); ``chunk_size=None``
+    would block until EOF on the urllib3 path, so it is deliberately NOT used.
+    """
+    if hasattr(response, "iter_bytes"):
+        yield from response.iter_bytes()
+        return
+    yield from response.iter_content(chunk_size=512, decode_unicode=False)
+
+
 def iter_sse_data_events(response: "Any") -> Iterator[dict[str, Any]]:
     """Yield parsed JSON events from an SSE ``data:`` stream.
 
     Shared SSE framing used by the OpenAI-, DeepSeek-, Gemini- and
-    Anthropic-compatible clients: consumes ``response.iter_bytes()`` and
-    splits chunks on ``\n`` itself (``iter_lines()`` buffers a whole line
+    Anthropic-compatible clients: consumes raw byte chunks via
+    ``_iter_response_chunks`` (requests ``iter_content`` / httpx ``iter_bytes``)
+    and splits chunks on ``\n`` itself (``iter_lines()`` buffers a whole line
     before yielding — unbounded memory on a line that never terminates).
     A line exceeding ``_SSE_MAX_LINE_BYTES`` aborts the stream with a warning
     instead of buffering it.  Skips blank keep-alive lines, decodes bytes
@@ -294,7 +317,7 @@ def iter_sse_data_events(response: "Any") -> Iterator[dict[str, Any]]:
     buf = bytearray()
     line_start = 0  # start of the current (partial) line within buf
     scanned = 0  # watermark: buf[:scanned] contains no unprocessed ``\n``
-    for chunk in response.iter_bytes():
+    for chunk in _iter_response_chunks(response):
         if not chunk:
             continue
         buf.extend(chunk)
@@ -356,7 +379,7 @@ def guard_sse_iteration(events: Iterator[dict[str, Any]]) -> Iterator[dict[str, 
 
     ``iter_sse_data_events`` never raises for malformed input, but a
     transport quirk (e.g. a non-requests failure inside
-    ``response.iter_bytes()``) or a framing bug must not escape the
+    ``_iter_response_chunks``) or a framing bug must not escape the
     consuming loop as a raw exception and kill the whole turn.  Typed
     ``LLMClientError`` s and ``requests`` exceptions keep their semantics —
     call sites map those to retryable/fatal outcomes — while anything else

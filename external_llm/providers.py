@@ -7,7 +7,7 @@ import json as _json
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any, Optional
 
 import requests
@@ -1000,7 +1000,7 @@ class GoogleClient(LLMClient):
                     if candidates:
                         candidate = candidates[0]
                         finish_reason = _normalize_gemini_finish_reason(candidate.get("finishReason")) or finish_reason
-                        parts = candidate.get("content", {}).get("parts", [])
+                        parts = (candidate.get("content") or {}).get("parts") or []
                         for part in parts:
                             if "text" in part:
                                 chunk = part["text"]
@@ -1055,6 +1055,36 @@ class GoogleClient(LLMClient):
             )
         finally:
             response.close()
+
+
+def _deepseek_non_stream_events(response: Any) -> Iterator[dict[str, Any]]:
+    """Normalize a single-shot OpenAI-compatible JSON body into the chunk
+    shape the chat_with_tools streaming loop consumes (delta accumulation,
+    finish_reason capture, usage pickup), so callback-less callers share the
+    exact same aggregation/truncation logic without SSE transport."""
+    data = response.json()
+    _choices = data.get("choices") or []
+    _choice = _choices[0] if _choices else {}
+    _message = _choice.get("message") or {}
+    delta: dict[str, Any] = {}
+    if _message.get("content"):
+        delta["content"] = _message["content"]
+    if _message.get("reasoning_content"):
+        delta["reasoning_content"] = _message["reasoning_content"]
+    if _message.get("tool_calls"):
+        # Final-form tool_calls → index-based deltas understood by the loop.
+        delta["tool_calls"] = [
+            {"index": i, **tc} for i, tc in enumerate(_message["tool_calls"])
+        ]
+    chunk: dict[str, Any] = {
+        "choices": [{
+            "delta": delta,
+            "finish_reason": _choice.get("finish_reason"),
+        }],
+    }
+    if data.get("usage"):
+        chunk["usage"] = data["usage"]
+    yield chunk
 
 
 class DeepSeekClient(LLMClient):
@@ -1338,8 +1368,9 @@ class DeepSeekClient(LLMClient):
 
                 choices = chunk.get("choices", [])
                 if not choices:
-                    if "usage" in chunk:
-                        usage = chunk["usage"]
+                    _usage = chunk.get("usage")
+                    if _usage:  # explicit null until the final include_usage chunk
+                        usage = _usage
                     continue
 
                 delta = choices[0].get("delta", {})
@@ -1355,8 +1386,9 @@ class DeepSeekClient(LLMClient):
                 fr = choices[0].get("finish_reason")
                 if fr:
                     finish_reason = fr
-                if "usage" in chunk:
-                    usage = chunk["usage"]
+                _usage = chunk.get("usage")
+                if _usage:  # explicit null until the final include_usage chunk
+                    usage = _usage
 
             elapsed_ms = (time.monotonic() - t0) * 1000
 
@@ -1487,11 +1519,12 @@ class DeepSeekClient(LLMClient):
         payload: dict[str, Any] = {
             "model": model,
             "messages": api_messages,
-            "tools": openai_tools,
-            "tool_choice": "auto",
-            "stream": True,
-            "stream_options": {"include_usage": True},
         }
+        if openai_tools:
+            # Empty "tools": [] 400s on some OpenAI-compatible backends —
+            # omit both keys (same contract as GoogleClient's gemini_tools).
+            payload["tools"] = openai_tools
+            payload["tool_choice"] = "auto"
         # thinking_mode → reasoning suppression (shared logic with reasoning_ab_kwargs)
         _thinking_mode = kwargs.pop("thinking_mode", None)
         _reasoning_effort = kwargs.pop("reasoning_effort", None)
@@ -1508,10 +1541,23 @@ class DeepSeekClient(LLMClient):
                 # DeepSeek v4: thinking depth ("high" default / "max")
                 payload["reasoning_effort"] = _reasoning_effort
 
+        # ── Streaming gate (OllamaClient.chat_with_tools parity) ──────────────
+        # Stream only when a live consumer exists — token_callback (UI text
+        # streaming) or reasoning_callback (reasoning panel). Callback-less
+        # callers (e.g. intent_resolver) otherwise pay SSE parsing overhead
+        # and the streaming failure surface for a single-shot JSON response.
+        # Placed AFTER payload.update(kwargs) so the gate always wins.
+        use_stream = callable(kwargs.get("token_callback")) or callable(
+            kwargs.get("reasoning_callback")
+        )
+        if use_stream:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+
         t0 = time.monotonic()
         response = None
         try:
-            response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout, stream=True)
+            response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout, stream=use_stream)
 
             if response.status_code == 401:
                 raise LLMAuthenticationError("Invalid DeepSeek API key.")
@@ -1549,13 +1595,22 @@ class DeepSeekClient(LLMClient):
             # Extract reasoning_callback if provided
             reasoning_callback = kwargs.get("reasoning_callback")
 
-            for chunk in guard_sse_iteration(iter_sse_data_events(response)):
+            # Streaming gate: callback-less callers consume the single-shot
+            # JSON body normalized into the same chunk shape the SSE loop
+            # expects, so accumulation/truncation logic below is shared as-is.
+            _events = (
+                iter_sse_data_events(response)
+                if use_stream
+                else _deepseek_non_stream_events(response)
+            )
+            for chunk in guard_sse_iteration(_events):
 
                 choices = chunk.get("choices", [])
                 if not choices:
                     # Usage may come in the final chunk (separate from choices)
-                    if "usage" in chunk:
-                        usage = chunk["usage"]
+                    _usage = chunk.get("usage")
+                    if _usage:  # explicit null until the final include_usage chunk
+                        usage = _usage
                     continue
 
                 delta = choices[0].get("delta", {})
@@ -1581,7 +1636,7 @@ class DeepSeekClient(LLMClient):
                         full_tool_calls_raw.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
                     if tc_delta.get("id"):
                         full_tool_calls_raw[idx]["id"] = tc_delta["id"]
-                    func_delta = tc_delta.get("function", {})
+                    func_delta = tc_delta.get("function") or {}
                     if func_delta.get("name"):
                         full_tool_calls_raw[idx]["function"]["name"] = func_delta["name"]
                     if func_delta.get("arguments"):
@@ -1593,8 +1648,9 @@ class DeepSeekClient(LLMClient):
                     finish_reason = fr
 
                 # Usage in streaming may come in delta or in chunk
-                if "usage" in chunk:
-                    usage = chunk["usage"]
+                _usage = chunk.get("usage")
+                if _usage:  # explicit null until the final include_usage chunk
+                    usage = _usage
 
             # ── Response completeness validation ──────────────────────────────────
             # Streaming content can be silently truncated even when finish_reason='stop'
@@ -1628,7 +1684,7 @@ class DeepSeekClient(LLMClient):
             if finish_reason == "tool_calls" and full_tool_calls_raw:
                 _tc_truncated = False
                 for _tc_idx, _tc in enumerate(full_tool_calls_raw):
-                    _args = _tc.get("function", {}).get("arguments", "")
+                    _args = (_tc.get("function") or {}).get("arguments", "")
                     if not _args or not _args.strip():
                         continue
                     _trimmed = _args.strip()
@@ -1636,7 +1692,7 @@ class DeepSeekClient(LLMClient):
                     _dc = _count_delimiters(_trimmed)
                     if _dc["open_curly"] > _dc["close_curly"]:
                         _tc_truncated = True
-                        _tc_name = _tc.get("function", {}).get("name", f"tool_call[{_tc_idx}]")
+                        _tc_name = (_tc.get("function") or {}).get("name", f"tool_call[{_tc_idx}]")
                         logger.warning(
                             "Tool call '%s' arguments appear truncated: %d unclosed braces "
                             "in %d chars (finish_reason='tool_calls' may be misleading)",
@@ -1654,7 +1710,7 @@ class DeepSeekClient(LLMClient):
             prompt_tokens = usage.get("prompt_tokens")
             completion_tokens = usage.get("completion_tokens")
             reasoning_tokens = (
-                usage.get("completion_tokens_details", {}).get("reasoning_tokens")
+                (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
                 if isinstance(usage, dict) else None
             )
             cache_read_input_tokens = usage.get("prompt_cache_hit_tokens")
@@ -1686,7 +1742,7 @@ class DeepSeekClient(LLMClient):
             reconstructed_raw: dict[str, Any] = {
                 "choices": [{"message": reconstructed_message, "finish_reason": finish_reason}],
                 "usage": usage,
-                "streamed": True,
+                "streamed": use_stream,
             }
 
             return ToolCallResponse(
@@ -2204,10 +2260,13 @@ class OllamaClient(LLMClient):
         payload: dict[str, Any] = {
             "model": model,
             "messages": ollama_messages,
-            "tools": ollama_tools,
             "stream": False,
             "options": {"temperature": temperature},
         }
+        if ollama_tools:
+            # Empty "tools": [] is rejected by some OpenAI-compat Ollama
+            # frontends; omit it when no tools are requested.
+            payload["tools"] = ollama_tools
         if max_tokens:
             payload["options"]["num_predict"] = max_tokens
 

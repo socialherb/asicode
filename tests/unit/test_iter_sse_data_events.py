@@ -3,16 +3,21 @@ extracted from the OpenAI/DeepSeek/Gemini/Anthropic streaming clients.
 
 Pins the framing contract so future per-client stream loops can rely on it:
 ``data:``-only dispatch, chunk-split line assembly (P28-1: the parser
-consumes ``iter_bytes()`` and splits on ``\n`` itself — ``iter_lines()``
-buffered a whole line before yielding), a per-line size cap that aborts the
-stream instead of buffering an oversized frame, ``[DONE]`` as a skippable
-sentinel (NOT a terminator), silent malformed-JSON skip, and order-preserving
-yields.  A live ``_FakeStreamResponse`` never reaches this code path — every
-caller passes a real streaming response — so a plain iterable stand-in is
-sufficient.
+consumes raw byte chunks via ``_iter_response_chunks`` — requests
+``iter_content`` / httpx ``iter_bytes`` — and splits on ``\n`` itself;
+``iter_lines()`` buffered a whole line before yielding), a per-line size cap
+that aborts the stream instead of buffering an oversized frame, ``[DONE]`` as
+a skippable sentinel (NOT a terminator), silent malformed-JSON skip, and
+order-preserving yields.  Two stand-ins are used: ``_FakeChunks``
+(``iter_bytes``-shaped) and ``_requests_response`` — a REAL
+``requests.Response``, which is the shape every production LLM client
+actually passes (P28-1 called ``iter_bytes()`` unconditionally and raised
+AttributeError on it).
 """
+
 from __future__ import annotations
 
+import io
 import json
 import logging
 
@@ -32,8 +37,36 @@ class _FakeChunks:
         return iter(self._chunks)
 
 
+def _requests_response(payload: bytes) -> requests.Response:
+    """Build a REAL ``requests.Response`` whose body streams from a file-like.
+
+    Every LLM client creates its HTTP layer with ``requests.Session``
+    (``client.LLMClient.__init__``), so a production streaming response is a
+    ``requests.Response`` — whose byte-chunk API is ``iter_content()``, NOT
+    ``iter_bytes()`` (httpx's).  This helper pins that production shape so a
+    transport-drift regression is caught at the parser level.
+    """
+    resp = requests.Response()
+    resp.status_code = 200
+    resp.raw = io.BytesIO(payload)  # file-like without .stream → requests fallback read path
+    resp.encoding = "utf-8"
+    return resp
+
+
 def _collect(*chunks: bytes) -> list:
     return list(iter_sse_data_events(_FakeChunks(chunks)))
+
+
+def test_real_requests_response_consumed_via_iter_content():
+    # P28-1 regression: the parser called response.iter_bytes() (httpx API)
+    # on a requests.Response and raised AttributeError for EVERY production
+    # stream, while the iter_bytes-shaped fakes kept the tests green.
+    payload = b'data: {"a": 1}\r\n\ndata: {"b": 2}\r\ndata: [DONE]\r\ndata: {"c": 3}\r\n'
+    assert list(iter_sse_data_events(_requests_response(payload))) == [
+        {"a": 1},
+        {"b": 2},
+        {"c": 3},
+    ]
 
 
 def test_parses_data_frames_in_order():
@@ -145,9 +178,7 @@ def test_oversized_line_spanning_many_chunks_aborts(caplog):
     # buffer the whole line first (that would re-create the unbounded-memory
     # bug at chunk granularity).
     n = _SSE_MAX_LINE_BYTES // 64 + 2
-    events = list(
-        iter_sse_data_events(_FakeChunks([b"data: x"] + [b"y" * 64] * n))
-    )
+    events = list(iter_sse_data_events(_FakeChunks([b"data: x"] + [b"y" * 64] * n)))
     assert events == []
     assert any("aborting stream" in r.message for r in caplog.records)
 
@@ -229,15 +260,15 @@ class _BoomChunks(_FakeChunks):
 
 def test_guard_passthrough_normal_stream():
     from external_llm.client import guard_sse_iteration
-    events = list(guard_sse_iteration(iter_sse_data_events(
-        _FakeChunks([b'data: {"a": 1}\n', b'data: {"b": 2}\n']))))
+
+    events = list(guard_sse_iteration(iter_sse_data_events(_FakeChunks([b'data: {"a": 1}\n', b'data: {"b": 2}\n']))))
     assert events == [{"a": 1}, {"b": 2}]
 
 
 def test_guard_converts_plain_iteration_exception_to_llm_api_error():
     from external_llm.client import LLMAPIError, guard_sse_iteration
-    gen = guard_sse_iteration(iter_sse_data_events(
-        _BoomChunks([b'data: {"a": 1}\n'], RuntimeError("proxy exploded"))))
+
+    gen = guard_sse_iteration(iter_sse_data_events(_BoomChunks([b'data: {"a": 1}\n'], RuntimeError("proxy exploded"))))
     assert next(gen) == {"a": 1}  # events delivered before the failure survive
     with pytest.raises(LLMAPIError, match="SSE stream iteration failed: proxy exploded"):
         next(gen)
@@ -248,9 +279,10 @@ def test_guard_preserves_requests_exceptions():
     # ChunkedEncodingError to retryable outcomes, so the guard must not
     # reclassify them.
     from external_llm.client import guard_sse_iteration
-    gen = guard_sse_iteration(iter_sse_data_events(
-        _BoomChunks([b'data: {"a": 1}\n'],
-                    requests.exceptions.ChunkedEncodingError("aborted"))))
+
+    gen = guard_sse_iteration(
+        iter_sse_data_events(_BoomChunks([b'data: {"a": 1}\n'], requests.exceptions.ChunkedEncodingError("aborted")))
+    )
     assert next(gen) == {"a": 1}
     with pytest.raises(requests.exceptions.ChunkedEncodingError):
         next(gen)
@@ -260,8 +292,8 @@ def test_guard_preserves_typed_llm_errors():
     # LLMCancelled (and friends) must propagate untouched — cancellation
     # semantics depend on it.
     from external_llm.client import LLMCancelled, guard_sse_iteration
-    gen = guard_sse_iteration(iter_sse_data_events(
-        _BoomChunks([b'data: {"a": 1}\n'], LLMCancelled())))
+
+    gen = guard_sse_iteration(iter_sse_data_events(_BoomChunks([b'data: {"a": 1}\n'], LLMCancelled())))
     assert next(gen) == {"a": 1}
     with pytest.raises(LLMCancelled):
         next(gen)
@@ -274,7 +306,7 @@ def test_guard_does_not_absorb_consumer_side_exception():
     # every call site pairs the guard with its own ``except Exception``
     # clause funneling body failures through raise_sse_iteration_failure.
     from external_llm.client import guard_sse_iteration
+
     with pytest.raises(TypeError):
-        for _ev in guard_sse_iteration(iter_sse_data_events(
-                _FakeChunks([b'data: {"candidates": 42}\n']))):
+        for _ev in guard_sse_iteration(iter_sse_data_events(_FakeChunks([b'data: {"candidates": 42}\n']))):
             _ = _ev["candidates"][0]  # TypeError propagates untouched

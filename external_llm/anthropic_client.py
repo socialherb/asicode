@@ -702,8 +702,11 @@ class AnthropicClient(LLMClient):
             "model": model,
             "max_tokens": max_tokens,
             "messages": api_messages,
-            "tools": anthropic_tools,
         }
+        if anthropic_tools:
+            # Anthropic rejects an empty "tools": [] with invalid_request_error —
+            # omit the key entirely when the caller passes no tools.
+            payload["tools"] = anthropic_tools
         if system_content:
             payload["system"] = self._split_system_with_caching(system_content)
         # reasoning_callback intentionally NOT consumed — see the chat() note.
@@ -870,7 +873,7 @@ class AnthropicClient(LLMClient):
                 ev_type = ev.get("type", "")
 
                 if ev_type == "content_block_start":
-                    block = ev.get("content_block", {})
+                    block = ev.get("content_block") or {}
                     _current_block_type = block.get("type")
                     if _current_block_type == "text":
                         _is_streaming_text = True
@@ -881,7 +884,7 @@ class AnthropicClient(LLMClient):
                         _is_streaming_text = False
 
                 elif ev_type == "content_block_delta":
-                    delta = ev.get("delta", {})
+                    delta = ev.get("delta") or {}
                     delta_type = delta.get("type", "")
                     if delta_type == "text_delta":
                         chunk = delta.get("text", "")
@@ -907,10 +910,10 @@ class AnthropicClient(LLMClient):
                     _is_streaming_text = False
 
                 elif ev_type == "message_delta":
-                    delta = ev.get("delta", {})
+                    delta = ev.get("delta") or {}
                     if delta.get("stop_reason"):
                         stop_reason = _normalize_anthropic_stop_reason(delta.get("stop_reason"))
-                    usage = ev.get("usage", {})
+                    usage = ev.get("usage") or {}
                     if usage:
                         if usage.get("input_tokens"):
                             prompt_tokens = usage.get("input_tokens")
@@ -922,7 +925,7 @@ class AnthropicClient(LLMClient):
                             cache_creation_input_tokens = usage.get("cache_creation_input_tokens")
 
                 elif ev_type == "message_start":
-                    msg = ev.get("message", {})
+                    msg = ev.get("message") or {}
                     usage = msg.get("usage", {})
                     if usage:
                         if usage.get("input_tokens"):
@@ -1071,7 +1074,7 @@ class AnthropicClient(LLMClient):
                 ev_type = ev.get("type", "")
 
                 if ev_type == "content_block_start":
-                    block = ev.get("content_block", {})
+                    block = ev.get("content_block") or {}
                     _current_block_type = block.get("type")
                     if _current_block_type == "tool_use":
                         _current_tool = {
@@ -1087,7 +1090,7 @@ class AnthropicClient(LLMClient):
                         _is_streaming_text = False
 
                 elif ev_type == "content_block_delta":
-                    delta = ev.get("delta", {})
+                    delta = ev.get("delta") or {}
                     delta_type = delta.get("type", "")
                     if delta_type == "text_delta":
                         chunk = delta.get("text", "")
@@ -1145,14 +1148,14 @@ class AnthropicClient(LLMClient):
 
                 elif ev_type == "message_delta":
                     stop_reason = _normalize_anthropic_stop_reason(
-                        ev.get("delta", {}).get("stop_reason")
+                        (ev.get("delta") or {}).get("stop_reason")
                     ) or stop_reason
-                    usage = ev.get("usage", {})
+                    usage = ev.get("usage") or {}
                     if usage.get("output_tokens"):
                         completion_tokens = usage["output_tokens"]
 
                 elif ev_type == "message_start":
-                    usage = ev.get("message", {}).get("usage", {})
+                    usage = (ev.get("message") or {}).get("usage") or {}
                     prompt_tokens = usage.get("input_tokens")
                     cache_read_input_tokens = usage.get("cache_read_input_tokens")
                     cache_creation_input_tokens = usage.get("cache_creation_input_tokens")

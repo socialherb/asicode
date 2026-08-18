@@ -3327,3 +3327,42 @@ def test_search_web_propagates_agent_cancelled(monkeypatch):
     monkeypatch.setattr(host, "_search_startpage_browser", lambda *a, **k: [])
     with pytest.raises(wst.AgentCancelled):
         host._tool_search_web({"query": "python asyncio"})
+
+
+# ── P4: explicit-null JSON fields from search backends ──────────────────────
+
+
+class _JsonGetClient:
+    """httpx.Client stub answering GET with a canned JSON body (search backends)."""
+
+    def __init__(self, body: str):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, params=None, headers=None):
+        return httpx.Response(
+            200, request=httpx.Request("GET", url),
+            headers={"content-type": "application/json"}, text=self._body,
+        )
+
+
+def test_search_brave_null_web_returns_empty(monkeypatch):
+    """Brave answers {"web": null} when nothing matched — must yield []."""
+    monkeypatch.setattr(wst.httpx, "Client", lambda *a, **k: _JsonGetClient('{"web": null}'))
+    host = _Host()
+    assert host._search_brave("nothing matched", 5, "key") == []
+
+
+def test_search_searxng_null_results_returns_empty(monkeypatch):
+    """SearXNG "results": null must yield [] (empty unresponsive → not infra)."""
+    monkeypatch.setattr(
+        wst.httpx, "Client",
+        lambda *a, **k: _JsonGetClient('{"results": null, "unresponsive_engines": []}'),
+    )
+    host = _Host()
+    assert host._search_searxng("q", 5, "http://localhost:8080") == []

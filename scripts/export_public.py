@@ -82,8 +82,17 @@ _COUPLED_TEST_PAT = re.compile(
     r"(^\s*from webapp|^\s*import webapp\b|from webapp import|from webapp\."
     r"|^\s*from tools|^\s*import tools\b|from tools import|from tools\."
     # path-string loading of excluded dirs (importlib.spec_from_file_location,
-    # subprocess script invocations): REPO / "tools" / "x.py", "webapp/..." etc.
-    r"|[\"']tools[\"'] */|[\"']webapp[\"'] */|tools/[A-Za-z_]+\.py|webapp/[A-Za-z_]+\.py)",
+    # subprocess script invocations, Path joins that READ an excluded file):
+    # REPO / "tools" / "x.py", _R / "webapp" / "ui" / "ui.html" — any depth of
+    # quoted components, but the join must END in a quoted FILENAME (dot +
+    # extension). A bare quoted token after the slash also occurs in PROSE
+    # (omit "tools"/"tool_choice" keys), and the earlier form
+    # ["']tools["'] */ matched it — silently dropping two provider regression
+    # tests from the 0.2.24 snapshot (caught only as unexpected deletions in
+    # the pre-push release-delta review). Requiring the filename sibling keeps
+    # genuinely webapp-reading gates excluded on principle, not by accident.
+    r"|[\"'](?:tools|webapp)[\"'] */ *(?:[\"'][\w.-]+[\"'] */ *)*[\"'][\w.-]+\.\w+[\"']"
+    r"|tools/[A-Za-z_]+\.py|webapp/[A-Za-z_]+\.py)",
     re.M,
 )
 

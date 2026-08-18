@@ -318,6 +318,22 @@ def test_chat_with_tools_default_model_and_message_shaping(monkeypatch):
     assert captured["tools"][0]["input_schema"] == {"type": "object", "properties": {}}
 
 
+def test_chat_with_tools_empty_tools_omits_keys(monkeypatch):
+    # Anthropic rejects an empty "tools": [] with invalid_request_error —
+    # omit the key entirely when the caller passes no tools.
+    captured = {}
+
+    def _post(url, **kw):
+        captured.update(kw["json"])
+        return _FakeResp(json_value=_ok_content())
+
+    client = _client(monkeypatch, _post)
+    client.chat_with_tools(
+        [LLMMessage(role="user", content="hi")], tools=[], model="claude-3-5-sonnet-20241022"
+    )
+    assert "tools" not in captured
+
+
 def test_chat_with_tools_assistant_bad_args_json(monkeypatch):
     captured = {}
 
@@ -851,3 +867,36 @@ def test_tools_streaming_non_dict_delta_wrapped(monkeypatch):
     with pytest.raises(LLMAPIError, match="SSE stream iteration failed"):
         client.chat_with_tools([LLMMessage(role="user", content="hi")], tools=[],
                                model="m", token_callback=lambda _c: None)
+
+
+# ── P4: explicit-null SSE fields in both streaming loops ────────────────────
+
+
+_NULL_FIELD_EVENTS = [
+    {"type": "message_start", "message": None},
+    {"type": "content_block_start", "index": 0, "content_block": None},
+    {"type": "content_block_delta", "index": 0, "delta": None},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_delta", "delta": None, "usage": None},
+]
+
+
+def test_chat_streaming_null_fields_hardened(monkeypatch):
+    # Anthropic-compatible backends (ZAI et al.) may emit explicit nulls for
+    # optional event objects; .get(K, {}) only defaults on key ABSENCE, so a
+    # present-but-null value crashed with AttributeError (wrapped by the SSE
+    # guard into a whole-turn LLMAPIError).
+    resp = _StreamResp(_sse(*_NULL_FIELD_EVENTS))
+    client = _client(monkeypatch, lambda *a, **k: resp)
+    out = client.chat([LLMMessage(role="user", content="hi")], model="claude-3-5-sonnet-20241022",
+                      token_callback=lambda _c: None)
+    assert out.content == ""
+
+
+def test_tools_streaming_null_fields_hardened(monkeypatch):
+    resp = _StreamResp(_sse(*_NULL_FIELD_EVENTS))
+    client = _client(monkeypatch, lambda *a, **k: resp)
+    out = client.chat_with_tools([LLMMessage(role="user", content="hi")], tools=[],
+                                 model="claude-3-5-sonnet-20241022",
+                                 token_callback=lambda _c: None)
+    assert out.content == ""

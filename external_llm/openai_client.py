@@ -727,9 +727,12 @@ class OpenAIClient(LLMClient):
         payload: dict[str, Any] = {
             "model": model,
             "messages": api_messages,
-            "tools": openai_tools,
-            "tool_choice": "auto",
         }
+        if openai_tools:
+            # Empty "tools": [] 400s on some OpenAI-compatible backends —
+            # omit both keys (same contract as GoogleClient's gemini_tools).
+            payload["tools"] = openai_tools
+            payload["tool_choice"] = "auto"
         # reasoning_callback intentionally NOT consumed — see the chat() note.
         kwargs.pop("reasoning_callback", None)
         thinking_mode = kwargs.pop("thinking_mode", None)

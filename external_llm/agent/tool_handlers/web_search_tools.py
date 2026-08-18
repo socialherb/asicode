@@ -2668,7 +2668,7 @@ class WebSearchToolsMixin:
                     "title": item.get("title", ""),
                     "url": item.get("url", ""),
                     "snippet": item.get("description", ""),
-                } for item in data.get("web", {}).get("results", [])]
+                } for item in (data.get("web") or {}).get("results") or []]
         return results
 
     # ── Naver (browser-rendered, JS-hydrated results) ────────────────
@@ -2769,7 +2769,7 @@ class WebSearchToolsMixin:
             data = resp.json()
 
         results: list[dict[str, str]] = []
-        for item in data.get("results", []):
+        for item in data.get("results") or []:
             if len(results) >= max_results:
                 break
             results.append(

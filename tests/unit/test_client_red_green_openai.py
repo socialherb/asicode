@@ -361,6 +361,21 @@ def test_chat_with_tools_default_model_and_message_shaping(monkeypatch):
     assert captured["tools"][0]["function"]["name"] == "f"
 
 
+def test_chat_with_tools_empty_tools_omits_keys(monkeypatch):
+    # Empty tools must omit "tools"/"tool_choice" — same contract as the
+    # DeepSeek/Google payload guards; an empty array 400s on some backends.
+    captured = {}
+
+    def _post(url, **kw):
+        captured.update(kw["json"])
+        return _FakeResp(json_value=_ok_choices())
+
+    client = _client(monkeypatch, _post)
+    client.chat_with_tools([LLMMessage(role="user", content="hi")], tools=[], model="gpt-4")
+    assert "tools" not in captured
+    assert "tool_choice" not in captured
+
+
 def test_chat_with_tools_401(monkeypatch):
     client = _client(monkeypatch, lambda *a, **k: _FakeResp(401, "nope"))
     with pytest.raises(LLMAuthenticationError, match="401"):

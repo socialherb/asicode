@@ -261,6 +261,7 @@ def test_chat_with_tools_default_model_and_messages() -> None:
         ],
         tools=[{"name": "f", "description": "d", "parameters": {"type": "object"}}],
         model="",
+        token_callback=lambda _t: None,
     )
     sent = c._session.post.call_args
     assert "/chat/completions" in sent.args[0]
@@ -274,11 +275,22 @@ def test_chat_with_tools_default_model_and_messages() -> None:
     assert payload["tools"][0]["function"]["name"] == "f"
 
 
+def test_chat_with_tools_empty_tools_omits_keys() -> None:
+    # Empty tools must omit "tools"/"tool_choice" entirely — OpenAI-compatible
+    # backends (vLLM, gateways, Anthropic-compat shims) 400 on an empty array.
+    # Mirrors GoogleClient's `if gemini_tools:` payload precedent.
+    c = _client(_resp(sse=[_tc_chunk({"content": "ok"}, "stop")]))
+    c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
+    payload = c._session.post.call_args.kwargs["json"]
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
+
+
 def test_chat_with_tools_thinking_and_errors() -> None:
     c = _client(_resp(sse=[_tc_chunk({"content": "ok"}, "stop")]))
     c.chat_with_tools(
         [LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4",
-        thinking_mode=True, reasoning_effort="high",
+        thinking_mode=True, reasoning_effort="high", token_callback=lambda _t: None,
     )
     payload = c._session.post.call_args.kwargs["json"]
     assert payload["thinking"] == {"type": "enabled"}
@@ -291,7 +303,7 @@ def test_chat_with_tools_thinking_and_errors() -> None:
     ]:
         c2 = _client(_resp(status=status, text="e"))
         with pytest.raises(exc):
-            c2.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4")
+            c2.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
 
 
 def test_chat_with_tools_full_stream() -> None:
@@ -321,17 +333,17 @@ def test_chat_with_tools_full_stream() -> None:
 def test_chat_with_tools_content_truncation_detection() -> None:
     # unclosed braces in content → finish_reason rewritten to "truncated"
     c = _client(_resp(sse=[_tc_chunk({"content": '{"a": 1'}, "stop")]))
-    r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4")
+    r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
     assert r.finish_reason == "truncated"
 
     # unclosed brackets
     c2 = _client(_resp(sse=[_tc_chunk({"content": "[1, 2"}, "stop")]))
-    r2 = c2.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4")
+    r2 = c2.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
     assert r2.finish_reason == "truncated"
 
     # balanced content stays "stop"
     c3 = _client(_resp(sse=[_tc_chunk({"content": '{"a": 1}'}, "stop")]))
-    r3 = c3.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4")
+    r3 = c3.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
     assert r3.finish_reason == "stop"
 
 
@@ -340,7 +352,7 @@ def test_chat_with_tools_tool_args_truncation_detection() -> None:
         _tc_chunk({"tool_calls": [{"index": 0, "id": "t", "function": {"name": "f", "arguments": '{"a":'}}]}, "tool_calls"),
     ]
     c = _client(_resp(sse=sse))
-    r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4")
+    r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
     assert r.finish_reason == "truncated"
     assert r.tool_calls == []  # malformed calls cleared for retry
     assert r.is_final is True
@@ -360,11 +372,11 @@ def test_chat_with_tools_iteration_exceptions() -> None:
     ]:
         c = _client(_resp(sse=_boom(exc)))
         with pytest.raises(expected):
-            c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4")
+            c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
 
     c = _client(_resp(sse=_boom(LLMRateLimitError("rl"))))
     with pytest.raises(LLMRateLimitError):
-        c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4")
+        c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
 
 
 # ── remaining branch gaps ────────────────────────────────────────────────────
@@ -385,6 +397,7 @@ def test_chat_with_tools_reasoner_and_thinking_disabled() -> None:
         tools=[],
         model="deepseek-reasoner",
         thinking_mode=False,
+        token_callback=lambda _t: None,
     )
     payload = c._session.post.call_args.kwargs["json"]
     # assistant msg gets empty reasoning_content (reasoner requires it)
@@ -398,7 +411,7 @@ def test_chat_with_tools_usage_only_chunk() -> None:
         _tc_chunk({"content": "ok"}, "stop"),
     ]
     c = _client(_resp(sse=sse))
-    r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4")
+    r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
     assert r.content == "ok"
     assert r.tokens_used == 3
 
@@ -425,7 +438,7 @@ def test_chat_with_tools_empty_args_skipped_in_truncation_check() -> None:
         ]}, "tool_calls"),
     ]
     c = _client(_resp(sse=sse))
-    r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4")
+    r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
     assert r.finish_reason == "tool_calls"
     assert len(r.tool_calls) == 2
     assert r.tool_calls[1].args == {"ok": 1}
@@ -434,4 +447,187 @@ def test_chat_with_tools_empty_args_skipped_in_truncation_check() -> None:
 def test_chat_with_tools_consumer_loop_exception_is_typed() -> None:
     c = _client(_resp(sse=[b'data: {"choices": 42}\n']))
     with pytest.raises(LLMAPIError, match="SSE stream iteration failed"):
-        c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4")
+        c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
+
+
+# ── None-null usage robustness ────────────────────────────────────────────────
+# OpenAI-compatible streams legitimately carry "usage": null in intermediate
+# chunks (until the final include_usage chunk) and usage dicts with explicit
+# "completion_tokens_details": null for non-reasoning models. All consumers
+# must be None-safe (None-null token field bug class — see 4db12e26/bbb7c463).
+
+
+def _raw_event(obj) -> bytes:
+    return ("data: " + json.dumps(obj) + "\n\n").encode()
+
+
+def test_chat_with_tools_null_usage_details_no_crash() -> None:
+    """usage["completion_tokens_details"] = explicit null must not raise
+    (nested .get(K, {}) default only covers key *absence*, not null value)."""
+    sse = [
+        _tc_chunk({"content": "ok"}, None),
+        _tc_chunk(
+            {}, "stop",
+            usage={
+                "total_tokens": 7, "prompt_tokens": 3, "completion_tokens": 4,
+                "completion_tokens_details": None,
+            },
+        ),
+    ]
+    c = _client(_resp(sse=sse))
+    r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
+    assert r.content == "ok"
+    assert r.tokens_used == 7 and r.prompt_tokens == 3 and r.completion_tokens == 4
+
+
+def test_chat_with_tools_null_usage_chunks_no_crash() -> None:
+    """Intermediate chunks with explicit "usage": null (both choices-present
+    and choices-empty shapes) must not clobber a later valid usage object."""
+    sse = [
+        _tc_chunk({"content": "ok"}, None),  # usage key absent
+        _raw_event({"choices": [{"delta": {}}], "usage": None}),
+        _raw_event({"choices": [], "usage": None}),
+        _tc_chunk(
+            {}, "stop",
+            usage={"total_tokens": 9, "prompt_tokens": 4, "completion_tokens": 5},
+        ),
+    ]
+    c = _client(_resp(sse=sse))
+    r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
+    assert r.tokens_used == 9 and r.prompt_tokens == 4 and r.completion_tokens == 5
+
+
+def test_chat_with_tools_stream_ends_after_null_usage() -> None:
+    """Aborted stream whose last usage signal was null → usage falls back to
+    the initial {} → token fields are None, never an AttributeError."""
+    c = _client(_resp(sse=[
+        _tc_chunk({"content": "partial"}, None),
+        _raw_event({"choices": [{"delta": {}}], "usage": None}),
+        _tc_chunk({}, "stop"),
+    ]))
+    r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4", token_callback=lambda _t: None)
+    assert r.content == "partial"
+    assert r.tokens_used is None
+
+
+def test_chat_streaming_null_usage_chunks_no_crash() -> None:
+    """_chat_streaming parity: explicit "usage": null intermediates and null
+    completion_tokens_details must not raise either."""
+    sse = [
+        _raw_event({"choices": [{"delta": {"content": "Hi"}}], "usage": None}),
+        _raw_event({"choices": [], "usage": None}),
+        _raw_event({
+            "choices": [{"delta": {}}],
+            "usage": {
+                "total_tokens": 6, "prompt_tokens": 2, "completion_tokens": 4,
+                "completion_tokens_details": None,
+            },
+        }),
+    ]
+    c = _client(_resp(sse=sse))
+    r = c._chat_streaming("u", {}, {"model": "m"}, "m", token_callback=lambda _c: None)
+    assert r.content == "Hi"
+    assert r.tokens_used == 6
+
+
+# ── chat_with_tools streaming gate (P2) ──────────────────────────────────────
+
+
+def test_chat_with_tools_no_callbacks_uses_non_streaming() -> None:
+    """Calls without token/reasoning callbacks must skip SSE entirely: no
+    "stream"/"stream_options" payload keys, requests stream=False, and the
+    single-shot JSON body is parsed directly (OllamaClient gate parity)."""
+    json_data = {
+        "choices": [{
+            "message": {
+                "content": "done",
+                "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "f", "arguments": "{\"x\": 1}"},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"total_tokens": 12, "prompt_tokens": 8, "completion_tokens": 4},
+    }
+    c = _client(_resp(json_data=json_data))
+    r = c.chat_with_tools(
+        [LLMMessage(role="user", content="x")],
+        tools=[{"name": "f", "description": "d", "parameters": {"type": "object"}}],
+        model="deepseek-v4",
+    )
+    sent = c._session.post.call_args
+    assert "stream" not in sent.kwargs["json"]
+    assert "stream_options" not in sent.kwargs["json"]
+    assert sent.kwargs["stream"] is False
+    c._session.post.return_value.iter_bytes.assert_not_called()
+    assert r.content == "done"
+    assert r.tool_calls[0].name == "f"
+    assert r.tool_calls[0].args == {"x": 1}
+    assert r.finish_reason == "tool_calls"
+    assert r.is_final is False
+    assert r.tokens_used == 12 and r.prompt_tokens == 8 and r.completion_tokens == 4
+    assert r.raw_response["streamed"] is False
+
+
+def test_chat_with_tools_token_callback_still_streams() -> None:
+    """token_callback present → SSE path is preserved end-to-end (gate must
+    not regress the streaming contract)."""
+    seen: list[str] = []
+    c = _client(_resp(sse=[
+        _tc_chunk({"content": "he"}, None),
+        _tc_chunk({"content": "y"}, "stop",
+                  usage={"total_tokens": 3, "prompt_tokens": 2, "completion_tokens": 1}),
+    ]))
+    r = c.chat_with_tools(
+        [LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4",
+        token_callback=seen.append,
+    )
+    assert "".join(seen) == "hey"
+    assert r.content == "hey"
+    payload = c._session.post.call_args.kwargs["json"]
+    assert payload["stream"] is True
+    assert payload["stream_options"] == {"include_usage": True}
+    assert c._session.post.call_args.kwargs["stream"] is True
+    assert r.raw_response["streamed"] is True
+
+
+def test_chat_with_tools_reasoning_callback_alone_streams() -> None:
+    """reasoning_callback alone (no token_callback) is also a live stream
+    consumer on DeepSeek — it must keep the SSE path."""
+    seen: list[str] = []
+    c = _client(_resp(sse=[
+        _raw_event({"choices": [{"delta": {"reasoning_content": "think"}}]}),
+        _tc_chunk({"content": "ans"}, "stop"),
+    ]))
+    r = c.chat_with_tools(
+        [LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4",
+        reasoning_callback=seen.append,
+    )
+    assert seen == ["think"]
+    assert r.content == "ans"
+    assert c._session.post.call_args.kwargs["json"]["stream"] is True
+
+
+# ── P4: explicit-null objects in OpenAI-compat tool_call deltas ──────────────
+
+
+def test_chat_with_tools_null_function_in_tool_call_delta() -> None:
+    # Gateways / OpenAI-compat shims may emit "function": null on id-only
+    # tool_call fragments (deepseek keeps a locally-constructed function dict,
+    # so later deltas still merge). .get("function", {}) only defaults on key
+    # ABSENCE — an explicit null crashed the accumulation loop.
+    sse = [
+        _tc_chunk({"tool_calls": [{"index": 0, "id": "tc1", "function": None}]}),
+        _tc_chunk({"tool_calls": [{"index": 0, "function": {"name": "f", "arguments": "{}"}}]}, "tool_calls"),
+    ]
+    c = _client(_resp(sse=sse))
+    r = c.chat_with_tools(
+        [LLMMessage(role="user", content="x")], tools=[], model="deepseek-v4",
+        token_callback=lambda _t: None,
+    )
+    assert len(r.tool_calls) == 1
+    assert r.tool_calls[0].name == "f"
+    assert r.tool_calls[0].args == {}
+    assert r.tool_calls[0].call_id == "tc1"
+    assert r.finish_reason == "tool_calls"

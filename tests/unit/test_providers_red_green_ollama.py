@@ -252,6 +252,15 @@ def test_chat_with_tools_default_model_and_message_kinds() -> None:
     assert len(tcs) == 3
 
 
+def test_chat_with_tools_empty_tools_omits_key() -> None:
+    # "tools": [] is rejected by some OpenAI-compatible Ollama frontends
+    # (LLamaCpp/OpenAI-compat shims); omit it when no tools are requested.
+    c = _client(_resp(lines=[_tc_line(content="ok", done=True, done_reason="stop")]))
+    c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="qwen2.5-coder:3b")
+    payload = c._session.post.call_args.kwargs["json"]
+    assert "tools" not in payload
+
+
 def test_chat_with_tools_status_errors() -> None:
     for status, exc in [
         (404, LLMAPIError), (401, LLMAuthenticationError),
