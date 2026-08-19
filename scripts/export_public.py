@@ -32,9 +32,11 @@ exactly those (see scripts/check_structural_scanners.py).
 Usage:
     python3 scripts/export_public.py <target-dir>          # export
     python3 scripts/export_public.py <target-dir> --list   # dry-run listing
+    python3 scripts/export_public.py --list                # dry-run listing (no target)
 """
 from __future__ import annotations
 
+import argparse
 import ast
 import importlib.util
 import json
@@ -462,12 +464,71 @@ def _generate_structural_baseline(target: Path, excluded_paths: list[str]) -> bo
     return True
 
 
-def main() -> int:
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 2
-    target = Path(sys.argv[1]).resolve()
-    dry_run = "--list" in sys.argv[2:]
+def build_snapshot(target: Path, shipped: list[str], excluded_paths: list[str]) -> bool:
+    """Materialize the shipping snapshot at *target* — the SINGLE sequence
+    shared by this script's ``main()`` and ``release_public.py``.
+
+    (1) copy every shipped tracked file (layout preserved),
+    (2) prune excluded-path entries from the lint baselines,
+    (3) regenerate ``scripts/structural_scanner_baseline.txt`` (the
+        machine-verified export artifact that must NOT exist in the private
+        tree).
+
+    Until 0.2.26, release_public.py hand-rolled (1)+(2) and skipped (3): the
+    next release through it would have DELETED the baseline from the public
+    repo (its sync removes files outside the shipped set) and reddened the
+    structural gate with 24 unsuppressed candidates. Two hand-rolled copies
+    of one sequence is exactly how that drift happened — this function is the
+    fix. Returns False when baseline generation fails (caller must abort).
+    """
+    for rel in shipped:
+        dst = target / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO / rel, dst)
+    prune_baseline_files(target, shipped)
+    return _generate_structural_baseline(target, excluded_paths)
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """CLI contract for the export (argparse, not positional sys.argv parsing).
+
+    Positional-only parsing turned any leading ``--flag`` into a literal
+    TARGET DIRECTORY: ``--help``/``--list`` as argv[1] each materialized an
+    842-file ``./--help/`` / ``./--list/`` tree (twice, during the 0.2.25
+    release) before failing. argparse rejects unknown flags (exit 2) and
+    answers ``--help`` itself (exit 0) before a single filesystem write —
+    and this is the only script under scripts/ that CREATES a directory
+    tree from its first argument, so it is the one that needs the guard.
+    """
+    parser = argparse.ArgumentParser(
+        prog="export_public.py",
+        description=(
+            "Materialize the public (CLI-only) snapshot of this repo "
+            "(exclusion rules: see the module docstring)."
+        ),
+        epilog="The target must not exist, or must be an empty directory.",
+    )
+    parser.add_argument(
+        "target",
+        nargs="?",
+        help="directory to materialize the snapshot into (omit with --list)",
+    )
+    parser.add_argument(
+        "--list",
+        dest="dry_run",
+        action="store_true",
+        help="dry-run: print the shipped file list instead of copying",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+    if not args.dry_run and args.target is None:
+        parser.error("target directory is required (or pass --list for a dry run)")
+    target = Path(args.target).resolve() if args.target else None
+    dry_run = args.dry_run
 
     shipped: list[str] = []
     excluded: dict[str, int] = {}
@@ -487,15 +548,11 @@ def main() -> int:
         if target.exists() and any(target.iterdir()):
             print(f"error: target {target} exists and is not empty", file=sys.stderr)
             return 1
-        for rel in shipped:
-            dst = target / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(REPO / rel, dst)
-        prune_baseline_files(target, shipped)
-        if not _generate_structural_baseline(target, excluded_paths):
+        if not build_snapshot(target, shipped, excluded_paths):
             return 1
 
-    print(f"\nshipped: {len(shipped)} files -> {target}", file=sys.stderr)
+    dest = str(target) if target else "--list (dry run)"
+    print(f"\nshipped: {len(shipped)} files -> {dest}", file=sys.stderr)
     for reason, n in sorted(excluded.items(), key=lambda kv: -kv[1]):
         print(f"excluded [{reason}]: {n} files", file=sys.stderr)
     return 0

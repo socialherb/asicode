@@ -26,17 +26,24 @@ Usage:
                         $ASICODE_PUBLIC_REPO when omitted.
     --tag           tag the release commit v<version> (version from pyproject.toml)
     --push          push branch (and tag, with --tag) to the public repo's origin
+    --verify[=fast|full]
+                    before committing, run the public-CI gate mirror on the
+                    STAGED release inside the public repo (fast: script gates
+                    + tree-policy unit subset; full: + the whole snapshot unit
+                    suite). Any failure aborts BEFORE commit/tag/push.
     --allow-dirty   skip the clean-working-tree check (testing only — a dirty
                     tree means uncommitted edits of tracked files get published)
 """
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -208,10 +215,149 @@ def _changelog_has_version(version: str) -> bool:
     return f"## [{version}]" in cl.read_text(encoding="utf-8", errors="replace")
 
 
-def main() -> int:
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    flags = {a for a in sys.argv[1:] if a.startswith("--")}
-    target_arg = args[0] if args else os.environ.get("ASICODE_PUBLIC_REPO", "")
+# ── --verify: the public-CI gate mirror, run on the STAGED release ─────────
+#
+# Why this exists (v0.2.25 hotfix, first-attempt push): the release flow
+# verified the structural baseline but nothing else about the SNAPSHOT —
+# export_public.py:402 carried errors='ignore', a violation of the P26-3
+# policy unit gate that ships in the public tree, and the failure only
+# surfaced in public CI *after* the push (a second push fixed it). The gates
+# below mirror the public repo's lint job one-to-one: they run with
+# cwd=<public repo> AFTER `git add -A` and BEFORE the commit, so the
+# --index-only forms scan exactly the bytes this release would push — the
+# same content, the same semantics, at the cheapest possible point in the
+# chain (a local abort costs seconds; a CI round-trip after a push costs a
+# red main plus a forced follow-up commit).
+#
+# NOT mirrored here (deliberately):
+#   * PLR2004 / silent-except --observe — report-only steps, exit 0 by design.
+#   * JS coverage suite — tree-shape guarded in CI (no webapp/ in the
+#     snapshot), nothing to gate locally.
+#   * unit/integration jobs — that is what --verify=full (unit) and CI are
+#     for; fast stays in the "seconds per gate" band.
+_VERIFY_GATES: list[tuple[str, list[str]]] = [
+    ("f821-baseline", ["scripts/check_f821_no_new.py"]),
+    ("f401-baseline", ["scripts/check_f401_no_new.py"]),
+    ("f811-baseline", ["scripts/check_f811_no_new.py"]),
+    ("f823-zero", ["scripts/check_f823_none.py"]),
+    ("missing-global-zero", ["scripts/check_missing_global.py"]),
+    ("silent-except-baseline", ["scripts/check_no_new_silent_except.py", "--index-only"]),
+    ("open-encoding-zero", ["scripts/check_open_encoding.py"]),
+    ("unguarded-subprocess-baseline", ["scripts/check_no_new_unguarded_subprocess.py"]),
+    ("standalone-imports-baseline", ["scripts/check_standalone_imports.py", "--index-only"]),
+    ("first-party-fallback-baseline", ["scripts/check_no_new_first_party_import_fallback.py", "--index-only"]),
+    ("discarded-signal-baseline", ["scripts/check_discarded_signal.py"]),
+    ("dead-params-zero", ["scripts/check_dead_params.py"]),
+    ("select-redundant-zero", ["scripts/check_select_not_redundant.py"]),
+    ("ruff-full-zero", ["scripts/check_lint_full.py"]),
+    ("structural-scanners-zero", ["scripts/check_structural_scanners.py", "--gate-only"]),
+]
+
+# Tree-policy unit tests for --verify=fast: tests that statically scan the
+# SHIPPED tree and can therefore fail on the exported subset even when the
+# private tree is green — exactly the v0.2.25 errors='ignore' failure class
+# (test_file_read_errors_ignore_gate). Enumerated policy, like a baseline:
+# extend this list when adding a new tree-scanning policy test.
+#
+# CONSTRAINT (machine-checked in test_release_verify_mode.py): every entry
+# must itself SHIP — is_excluded(path) is None. A coupled-test entry (the
+# sse/tools-git/ui-route gates read webapp/ or tools/, so they are excluded
+# from the snapshot) would make fast mode fail with pytest exit 4 "file not
+# found" on every release: a false red that blocks shipping.
+_FAST_POLICY_TESTS: list[str] = [
+    "tests/unit/test_file_read_errors_ignore_gate.py",
+    "tests/unit/test_network_boundary_get_policy.py",
+    "tests/unit/test_provider_rate_limit_contract.py",
+]
+
+_VERIFY_GATE_TIMEOUT_S = 600    # structural gate cold-boots ~69s; 600 is headroom
+_VERIFY_UNIT_TIMEOUT_S = 2400   # full snapshot unit suite: ~5-6 min in CI
+
+
+def _run_verify_step(args: list[str], cwd: Path, timeout: float) -> tuple[bool, str]:
+    """Run one verify step. Returns (ok, output-tail) — never raises, never
+    sys.exits: the caller decides what an abort looks like."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, *args], cwd=cwd, capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return False, f"timed out after {exc.timeout:.0f}s"
+    if proc.returncode == 0:
+        return True, ""
+    tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-30:])
+    return False, f"exit {proc.returncode}\n{tail}"
+
+
+def _verify_release(public: Path, mode: str) -> bool:
+    """Run the gate mirror on the staged release in *public*. True = green."""
+    steps: list[tuple[str, list[str], float]] = [
+        (name, args, _VERIFY_GATE_TIMEOUT_S) for name, args in _VERIFY_GATES
+    ]
+    if mode == "fast":
+        if _FAST_POLICY_TESTS:
+            steps.append((
+                "policy-unit-subset",
+                ["-m", "pytest", "-q", "-p", "no:cacheprovider", *_FAST_POLICY_TESTS],
+                _VERIFY_UNIT_TIMEOUT_S,
+            ))
+    else:  # full — fast gates plus the whole snapshot unit suite
+        steps.append((
+            "unit-suite-full",
+            ["-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/unit", "-m", "not slow"],
+            _VERIFY_UNIT_TIMEOUT_S,
+        ))
+
+    failed = 0
+    t_start = time.monotonic()
+    for i, (name, args, timeout) in enumerate(steps, 1):
+        print(f"verify [{i}/{len(steps)}] {name}")
+        sys.stdout.flush()
+        ok, detail = _run_verify_step(args, public, timeout)
+        if not ok:
+            failed += 1
+            print(f"    FAILED: {detail}", file=sys.stderr)
+    dt = time.monotonic() - t_start
+    if failed:
+        print(f"verify: {failed}/{len(steps)} step(s) failed in {dt:.0f}s", file=sys.stderr)
+        return False
+    print(f"verify: all {len(steps)} steps green in {dt:.0f}s")
+    return True
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="release_public.py",
+        description="Export the filtered public snapshot and release it into the public git repo.",
+    )
+    parser.add_argument(
+        "public_repo", nargs="?", default=None, metavar="public-repo-path",
+        help="existing git repo (git init it once; defaults to $ASICODE_PUBLIC_REPO)",
+    )
+    parser.add_argument("--tag", action="store_true",
+                        help="tag the release commit v<version> (version from pyproject.toml)")
+    parser.add_argument("--push", action="store_true",
+                        help="push branch (and tag, with --tag) to the public repo's origin")
+    parser.add_argument("--allow-dirty", action="store_true",
+                        help="skip the clean-working-tree check (testing only — a dirty tree "
+                             "means uncommitted edits of tracked files get published)")
+    parser.add_argument(
+        "--verify", nargs="?", const="fast", default=None, choices=("fast", "full"),
+        metavar="{fast,full}",
+        help="run the public-CI gate mirror on the STAGED release before committing "
+             "(fast: script gates + tree-policy unit subset; full: + the whole snapshot "
+             "unit suite). Any failure aborts BEFORE commit/tag/push. Pass the repo path "
+             "BEFORE --verify: '--verify <path>' is rejected as an invalid mode "
+             "(fail-closed, never misparsed).",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+    target_arg = args.public_repo or os.environ.get("ASICODE_PUBLIC_REPO", "")
     if not target_arg:
         print(__doc__)
         return 2
@@ -227,7 +373,7 @@ def main() -> int:
         return 1
 
     dirty = _run(["git", "status", "--porcelain"], REPO).stdout.strip()
-    if dirty and "--allow-dirty" not in flags:
+    if dirty and not args.allow_dirty:
         print("error: private repo has uncommitted changes — the export copies\n"
               "working-tree contents of tracked files, so a dirty tree would\n"
               "publish uncommitted edits. Commit first (or --allow-dirty for tests).",
@@ -266,48 +412,67 @@ def main() -> int:
     # ── 1b) Check: no gitignored .py under a shipping location ──────────────
     # `git status --porcelain` is blind to ignored files; a gitignored module
     # passes the clean-tree check and silently vanishes from the wheel.
-    shipped = [rel for rel in export_public.tracked_files()
-               if export_public.is_excluded(rel) is None]
+    # The same single pass classifies the tracked tree for the export below.
+    shipped: list[str] = []
+    excluded_paths: list[str] = []
+    for rel in export_public.tracked_files():
+        if export_public.is_excluded(rel) is None:
+            shipped.append(rel)
+        else:
+            excluded_paths.append(rel)
     if not _check_ignored_shipping_py(shipped):
         return 1
 
-    # ── 2) Export snapshot to a temp dir ───────────────────────────────────
-    shipped_set = set(shipped)
-
+    # ── 2) Build the snapshot via the SHARED sequence and sync it ───────────
+    # export_public.build_snapshot = copy + baseline-prune + structural-baseline
+    # regeneration. The hand-rolled copy that used to live here skipped the
+    # regeneration: the baseline is a machine-generated export artifact (it
+    # must NOT exist in the private tree), so the next release through this
+    # script would have deleted it from the public repo and reddened the
+    # structural gate. The sync mirrors the BUILT snapshot exactly — whatever
+    # tmp contains is what ships (including generated artifacts).
     with tempfile.TemporaryDirectory(prefix="asicode-release-") as td:
         tmp = Path(td)
-        for rel in shipped:
-            dst = tmp / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(REPO / rel, dst)
+        if not export_public.build_snapshot(tmp, shipped, excluded_paths):
+            print("error: snapshot build failed (structural baseline generation) — "
+                  "release aborted", file=sys.stderr)
+            return 1
+        snapshot = {p.relative_to(tmp).as_posix() for p in tmp.rglob("*") if p.is_file()}
 
-        # Prune excluded-path entries from lint baselines so the public
-        # snapshot stays self-consistent (no dangling references to excluded
-        # modules). Mirrors export_public.main(); without this, baselines
-        # copied verbatim still reference modules that don't ship.
-        export_public.prune_baseline_files(tmp, shipped)
-
-        # ── 3) Sync into public working tree (delete + overwrite) ──────────
         removed = 0
         for p in sorted(public.rglob("*"), reverse=True):
             rel = p.relative_to(public).as_posix()
             if rel == ".git" or rel.startswith(".git/"):
                 continue
-            if p.is_file() and rel not in shipped_set:
+            if p.is_file() and rel not in snapshot:
                 p.unlink()
                 removed += 1
             elif p.is_dir() and not any(p.iterdir()):
                 p.rmdir()
-        for rel in shipped:
+        for rel in sorted(snapshot):
             dst = public / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(tmp / rel, dst)
 
-    # ── 4) Commit (+ tag/push) in the public repo ──────────────────────────
+    # ── 3) Stage → verify the staged bytes → commit (+ tag/push) ────────────
+    # --verify runs between `git add -A` and the commit: the --index-only
+    # gates then scan exactly the content this release would push (same
+    # semantics as the public CI lint job), and a failure aborts before
+    # anything irreversible happens.
     _run(["git", "add", "-A"], public)
     if not _run(["git", "status", "--porcelain"], public).stdout.strip():
         print("nothing to release: public repo already matches the snapshot")
         return 0
+
+    if args.verify and not _verify_release(public, args.verify):
+        print(
+            f"error: --verify={args.verify} failed — release aborted BEFORE commit/tag/push.\n"
+            f"  The staged release is preserved in {public} for inspection:\n"
+            f"    git -C {public} diff --cached --stat   (what would have shipped)\n"
+            f"    git -C {public} reset                  (undo the staging)",
+            file=sys.stderr,
+        )
+        return 1
 
     src_head = _run(["git", "rev-parse", "--short", "HEAD"], REPO).stdout.strip()
     msg = f"release: v{version} (source snapshot {src_head})"
@@ -317,18 +482,18 @@ def main() -> int:
         return 1
     print(f"committed: {msg}  ({len(shipped)} files shipped, {removed} stale files removed)")
 
-    if "--tag" in flags:
+    if args.tag:
         t = _run(["git", "tag", f"v{version}"], public)
         print(f"tagged v{version}" if t.returncode == 0
               else f"tag failed (exists?): {t.stderr.strip()}")
 
-    if "--push" in flags:
+    if args.push:
         branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], public).stdout.strip()
         p = _run(["git", "push", "origin", branch], public)
         if p.returncode != 0:
             print(f"error: push failed:\n{p.stderr}", file=sys.stderr)
             return 1
-        if "--tag" in flags:
+        if args.tag:
             t = _run(["git", "push", "origin", f"v{version}"], public)
             if t.returncode != 0:
                 print(f"error: tag push failed:\n{t.stderr}", file=sys.stderr)

@@ -83,7 +83,7 @@ KNOWN_MODELS: dict[str, list[str]] = {
     ],
     "opencode": [
         # Curated list from https://opencode.ai/zen/go/v1/models.
-        # Verified 2026-08-14 against the live API (26 ids returned). hy3-preview
+        # Verified 2026-08-19 against the live API (28 ids returned). hy3-preview
         # is served but handled via MODEL_ALIASES (→ hy3), so it is omitted here.
         "glm-5.3",
         "glm-5.2",
@@ -110,6 +110,12 @@ KNOWN_MODELS: dict[str, list[str]] = {
         "hy3",
         "gpt-5.6-luna",
         "grok-4.5",
+        # Meta Muse Spark 1.2 (released 2026-08-05; on the gateway since
+        # 2026-08-19). "contributor" is the ~12x cheaper variant whose data is
+        # used for training — a distinct routable id, not an alias. Both share
+        # the 1M (2^20) window; decision recorded in _FALLBACK_IS_CORRECT.
+        "muse-spark-1.2",
+        "muse-spark-1.2-contributor",
     ],
 }
 

@@ -151,6 +151,11 @@ _FALLBACK_IS_CORRECT: frozenset[str] = frozenset({
     "deepseek-v4-flash", "deepseek-v4-pro",
     "deepseek-chat", "deepseek-reasoner",   # aliases of v4-flash thinking/non-thinking
     "kimi-k3",                              # 1,048,576 = 2^20
+    # Meta Muse Spark 1.2 (+contributor) — 1,048,576 = 2^20, carried over from
+    # 1.1 unchanged. Sources: OpenRouter model page (meta/muse-spark-1.2), Meta
+    # research blog 2026-08-05, eesel rate-card table (both variants 1M).
+    # Fallback (1M decimal) slightly under-allocates vs 2^20 — safe direction.
+    "muse-spark-1.2", "muse-spark-1.2-contributor",
     "minimax-m3",
     "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro",
     "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus",
