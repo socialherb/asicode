@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from ...client import interruptible_sleep
 from ..agent_loop_types import AgentCancelled
+from ..cancel_scope import call_cancel_scope, current_cancel_event, effective_cancel
 
 if TYPE_CHECKING:
     import httpx
@@ -1962,6 +1963,12 @@ class WebSearchToolsMixin:
         in-flight HTTP request cannot be interrupted, so its thread finishes on
         its own and its result is simply dropped. That is the price of bounding
         the merge's latency to the deadline instead of the slowest engine.
+        Cooperative cancel still applies, though: each worker re-installs the
+        submitting thread's per-call cancel scope, so a tier abandoned by its
+        CALLER (MCP ``wait_for`` timeout, aborted parallel batch) sees the
+        abandon at its cooperative checkpoints — the retry backoff sleeps
+        abort instead of running out their (capped 30 s) course while the pool
+        slot stays occupied.
         """
         collected: list[tuple[str, list[dict[str, str]]]] = []
         errors: list[str] = []
@@ -1987,8 +1994,22 @@ class WebSearchToolsMixin:
         # finish on its own; its result is simply dropped. (A live HTTP request
         # cannot be cancelled, but it is bounded by _search_http_timeout().)
         pool = ThreadPoolExecutor(max_workers=len(runnable), thread_name_prefix="websearch")
+        # The tier workers are fresh threads and the per-call cancel scope is
+        # thread-local: it does NOT travel with the submitted closure. Capture
+        # it on the submitting thread and re-install inside each worker (the
+        # browser-executor forwarding pattern) — without this, a worker's
+        # ``_live_cancel_event()`` sees only config.cancel_event and an
+        # abandoned tier sleeps out every backoff with no observer.
+        _caller_scope = current_cancel_event()
+
+        def _run_with_scope(fn):
+            def _run():
+                with call_cancel_scope(_caller_scope):
+                    return fn()
+            return _run
+
         try:
-            futures = {pool.submit(fn): name for name, fn in runnable}
+            futures = {pool.submit(_run_with_scope(fn)): name for name, fn in runnable}
             try:
                 for fut in as_completed(futures, timeout=deadline):
                     name = futures[fut]
@@ -2328,12 +2349,21 @@ class WebSearchToolsMixin:
     # ── Shared HTTP retry helper ─────────────────────────────────────
 
     def _live_cancel_event(self) -> Optional[threading.Event]:
-        """The registry's current ``cancel_event`` (None when absent).
+        """The registry's current cancel events as a cooperative-channel source.
+
+        Merges the agent-loop ``config.cancel_event`` (whole-turn ESC) with any
+        per-call scope this dispatch runs under (MCP wait_for timeout / aborted
+        parallel batch) via :func:`effective_cancel` — an abandoned search must
+        also release its retry-backoff sleeps, not just a whole-turn ESC.
+        Returns ``None`` when no source exists; a single source is returned
+        as-is (its plain Event) — no wrapper allocation on the common paths.
 
         Defensive ``getattr``: the mixin is also mounted on duck-typed test
         hosts that carry no ``config`` attribute.
         """
-        return getattr(getattr(self, "config", None), "cancel_event", None)
+        return effective_cancel(
+            getattr(getattr(self, "config", None), "cancel_event", None)
+        )
 
     @staticmethod
     def _http_request_with_retry(

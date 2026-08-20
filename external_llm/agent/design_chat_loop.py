@@ -44,6 +44,7 @@ from ._shared_utils import (
 )
 from .agent_loop_types import AgentCancelled
 from .agent_turn_pipeline import _cache_hit_ratio, _evict_for_loop
+from .bm25 import bm25_idf_pairs, bm25_score_pairs
 from .config.thresholds import config as _cfg
 from .context_budget import (
     _is_context_length_error,
@@ -67,7 +68,7 @@ from .insights_manager import (
 )
 from .performance_metrics import get_global_collector
 from .plan_state import open_items as _plan_open_items
-from .rag_searcher import _TOKENIZER, _bm25_score
+from .rag_searcher import _TOKENIZER
 from .vector_cache import HAS_FAISS, HAS_NUMPY, HAS_SENTENCE_TRANSFORMERS, VectorCacheManager
 
 # vector_cache owns its optional-dependency degradation (HAS_* flags); the
@@ -988,14 +989,15 @@ class _SessionSearcher:
             return []
 
         # ── BM25 ranking ──────────────────────────────────────────────────
+        # IDF is query-only (df/n_docs loop-invariant) — precompute once per
+        # query instead of per doc x token (P9-1; bit-identical scores).
+        q_pairs = bm25_idf_pairs(query_tokens, self._df, self._n_docs)
         bm25_scored: list[tuple[float, int]] = []  # (score, doc_idx)
         for i in range(self._n_docs):
-            score = _bm25_score(
-                query_tokens,
+            score = bm25_score_pairs(
+                q_pairs,
                 self._doc_token_counts[i],
                 self._doc_lengths[i],
-                self._df,
-                self._n_docs,
                 self._avgdl,
             )
             if score > 0.0:

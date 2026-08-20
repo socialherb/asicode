@@ -27,6 +27,9 @@ build/
 
 # asicode runs/artifacts
 .asicode/
+# release_public --verify durations evidence (gitignored: the private clean-tree
+# preflight lists untracked files — see _write_verify_artifact)
+.verify_artifacts/
 *.bak
 *.bak*
 *.bin

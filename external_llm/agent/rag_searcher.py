@@ -15,7 +15,6 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import logging
-import math
 import os
 import threading
 import time
@@ -34,6 +33,8 @@ from ..common.walk_policy import _WALK_SKIP_FILE_SUFFIXES, _walk_dir_sort_key, _
 # documents: _INDEXED_EXTS was a hardcoded subset that silently dropped
 # half-wired languages (.lua/.scala/.css/.html/.json/.pyi/.mjs/.cc/.kts/…).
 from ..languages.models import _EXT_MAP
+from .bm25 import bm25_idf_pairs, bm25_score_pairs
+from .cancel_scope import effective_cancel
 from .config.thresholds import config as _cfg
 from .performance_metrics import get_global_collector
 from .rag_configs import CodeTokenizer
@@ -70,9 +71,9 @@ def _rag_should_skip_dir(d: str) -> bool:
 _MAX_FILES = _cfg.counts.RAG_MAX_FILES
 _MAX_FILE_CHARS = _cfg.lines.RAG_FILE_CHARS
 
-# BM25 tuning
-_K1 = 1.5
-_B = 0.75
+# (BM25 tuning constants ``_K1``/``_B`` and the ``_bm25_score`` core moved to
+# ``agent/bm25.py`` — the single source shared with insights_manager,
+# design_chat_loop, symbol_search and read_tools. P9-1.)
 
 # (Stopwords moved to ``CodeTokenizer`` in ``rag_configs.py`` — removed from
 # this module.)
@@ -170,29 +171,6 @@ def _get_shared_index(repo_root: str) -> _SharedIndex:
 # regex functions and ``_STOP`` frozenset.  Handles CamelCase, snake_case,
 # and stop-word filtering consistently with the rest of the codebase.
 _TOKENIZER = CodeTokenizer()
-
-
-# ── BM25 core ─────────────────────────────────────────────────────────────────
-
-def _bm25_score(
-    query_tokens: list[str],
-    doc_token_counts: dict[str, int],
-    doc_len: int,
-    df: dict[str, int],
-    n_docs: int,
-    avgdl: float,
-) -> float:
-    if doc_len == 0 or avgdl == 0:
-        return 0.0
-    score = 0.0
-    for qt in query_tokens:
-        tf = doc_token_counts.get(qt, 0)
-        if tf == 0:
-            continue
-        idf = math.log((n_docs - df.get(qt, 0) + 0.5) / (df.get(qt, 0) + 0.5) + 1.0)
-        tf_norm = tf * (_K1 + 1) / (tf + _K1 * (1 - _B + _B * doc_len / avgdl))
-        score += idf * tf_norm
-    return score
 
 
 # ── Snippet extraction ────────────────────────────────────────────────────────
@@ -797,17 +775,15 @@ class RAGSearcher:
             doc_tcs = self._doc_token_counts
             doc_lens = self._doc_lengths
             doc_texts = self._doc_texts
+            # IDF is query-only (df/n_docs are loop-invariant here) — compute
+            # it once per query instead of per doc x token, shortening the
+            # lock-held traversal (P9-1; bit-identical scores, sealed by
+            # tests/unit/agent/test_bm25_core.py).
+            q_pairs = bm25_idf_pairs(q_tokens, df, n_docs)
             for i, rel in enumerate(rel_paths):
                 if file_glob and not _match_glob(rel, file_glob):
                     continue
-                s = _bm25_score(
-                    q_tokens,
-                    doc_tcs[i],
-                    doc_lens[i],
-                    df,
-                    n_docs,
-                    avgdl,
-                )
+                s = bm25_score_pairs(q_pairs, doc_tcs[i], doc_lens[i], avgdl)
                 if s > 0:
                     scored.append((s, i))
             scored.sort(reverse=True)
@@ -1022,10 +998,17 @@ class RAGSearcher:
         precedence and is returned as-is.  Returns None when neither is set
         (non-interactive CLI, out-of-process callers) → checkpoints become
         inert no-ops.
+
+        Also merges the innermost per-call cancel scope (MCP ``wait_for``
+        timeout, aborted ``dispatch_parallel`` batch) via :func:`effective_cancel`,
+        so an index build abandoned by ITS caller bails at the next checkpoint
+        with its instance state pristine — ``_build_index`` runs on the calling
+        thread, so the thread-local scope is visible here.  The composite
+        duck-types ``is_set()``, the only method the checkpoints consume.
         """
         if self._cancel_event is not None:
             return self._cancel_event
-        return getattr(self._config, "cancel_event", None)
+        return effective_cancel(getattr(self._config, "cancel_event", None))
 
     def _build_index(self) -> bool:
         """Build the BM25 index. Returns True if completed, False if cancelled.

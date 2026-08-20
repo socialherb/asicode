@@ -43,6 +43,7 @@ from external_llm.pip_env import ensure_user_site_importable, pip_install_flags
 
 from ...client import interruptible_sleep
 from ..agent_loop_types import AgentCancelled
+from ..cancel_scope import call_cancel_scope, current_cancel_event, effective_cancel
 
 if TYPE_CHECKING:
     from ..tool_registry import ToolResult
@@ -242,12 +243,21 @@ class BrowserActionToolsMixin:
     # ── Public dispatch entry point ───────────────────────────────────── #
 
     def _live_cancel_event(self) -> Optional[threading.Event]:
-        """The registry's current ``cancel_event`` (None when absent).
+        """The registry's current cancel events as a cooperative-channel source.
+
+        Merges the agent-loop ``config.cancel_event`` (whole-turn ESC) with any
+        per-call scope this dispatch runs under (MCP wait_for timeout / aborted
+        parallel batch) via :func:`effective_cancel` — a mid-wait abandon must
+        release the browser worker's pool slot too, not just a whole-turn ESC.
+        Returns ``None`` when no source exists (no behavior change on serial
+        dispatch); a single source is returned as-is (its plain Event).
 
         Defensive ``getattr``: the mixin is also mounted on duck-typed test
         hosts that carry no ``config`` attribute.
         """
-        return getattr(getattr(self, "config", None), "cancel_event", None)
+        return effective_cancel(
+            getattr(getattr(self, "config", None), "cancel_event", None)
+        )
 
     def _tool_browser_action(self, args: dict[str, Any]) -> "ToolResult":
         """Browser automation: navigate, click, type, extract, screenshot, evaluate, wait, close."""
@@ -294,9 +304,19 @@ class BrowserActionToolsMixin:
                 error=f"Unknown action: '{action}'. Available: {', '.join(sorted(_ACTIONS))}",
             )
 
+        # Per-call cancel scope capture: this method runs on the calling
+        # (dispatch/executor) thread, but the handler itself runs on the
+        # dedicated browser thread. The cooperative scope is thread-local, so
+        # capture the caller's innermost scope here and re-install it on the
+        # browser thread — an abandoned call (MCP timeout / aborted parallel
+        # batch) must reach a mid-wait interrupt inside _browser_wait, not just
+        # a whole-turn ESC. None when no scope (serial dispatch) → no-op.
+        _caller_scope = current_cancel_event()
+
         def _run() -> "ToolResult":
             try:
-                return handler(args)
+                with call_cancel_scope(_caller_scope):
+                    return handler(args)
             except AgentCancelled:
                 # ESC mid-action must abort the turn, not become a generic
                 # "Browser action failed" ToolResult (B904).

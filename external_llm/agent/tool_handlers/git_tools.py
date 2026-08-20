@@ -24,6 +24,7 @@ from ..background_job_manager import (
     get_global_background_job_manager,
     strip_malloc_noise,
 )
+from ..cancel_scope import effective_cancel
 
 if TYPE_CHECKING:
     from ..tool_registry import ToolResult
@@ -1640,8 +1641,11 @@ class ShellToolsMixin:
                 _pump(min(_CANCEL_POLL_INTERVAL, _remaining))
                 # Read off the LIVE config every poll — the design-chat REPL
                 # swaps config.cancel_event per turn, so a value captured before
-                # the loop goes stale.
-                _cancel = getattr(self.config, "cancel_event", None)
+                # the loop goes stale. effective_cancel additionally merges any
+                # per-call scope (MCP wait_for timeout / aborted parallel
+                # batch): an abandoned bash aborts at the next poll tick
+                # instead of running out the whole budget.
+                _cancel = effective_cancel(getattr(self.config, "cancel_event", None))
                 if _cancel is not None and _cancel.is_set():
                     _close_pipes(proc)
                     return _out, _err, "cancelled"
@@ -1955,7 +1959,11 @@ class ShellToolsMixin:
             }
 
     def _tool_shell_exec(self, args: dict[str, Any]) -> "ToolResult":
-        if self.config.cancel_event and self.config.cancel_event.is_set():
+        # effective_cancel merges the agent-loop ESC event (whole-turn) with
+        # any per-call scope this dispatch runs under (MCP wait_for timeout /
+        # aborted parallel batch) — the dispatch-entry check must observe both.
+        _ce = effective_cancel(getattr(self.config, "cancel_event", None))
+        if _ce is not None and _ce.is_set():
             return self._make_result(
                 ok=False,
                 content="",
@@ -2856,8 +2864,10 @@ class ShellToolsMixin:
         if wait_timeout > 0:
             # Read the LIVE cancel event (the design-chat REPL swaps
             # config.cancel_event per turn, so a value captured earlier goes
-            # stale — same pattern as _capture_bounded's poll loop).
-            _cancel = getattr(self.config, "cancel_event", None)
+            # stale — same pattern as _capture_bounded's poll loop) and merge
+            # any per-call scope: an abandoned job wait returns at the next
+            # poll tick instead of pinning the serial-turn thread.
+            _cancel = effective_cancel(getattr(self.config, "cancel_event", None))
             info = _bg_mgr.wait_for_completion(
                 job_id, timeout=wait_timeout, cancel_event=_cancel
             )

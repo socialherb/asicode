@@ -317,6 +317,49 @@ def test_wait_no_selector_absent_config_sleeps_without_cancel(_real_browser_stat
     assert calls == [(30.0, None)]
 
 
+def test_wait_no_selector_per_call_scope_aborts_immediately(_real_browser_state, monkeypatch):
+    """An abandoned dispatch (its per-call scope set, agent ESC unset) must
+    abort the no-selector wait through the ``_live_cancel_event`` wiring — the
+    MCP-timeout case: the browser worker's pool slot is released instead of
+    sleeping out the clamped timeout."""
+    from external_llm.agent.cancel_scope import call_cancel_scope
+
+    host = _WaitHost(cancel_event=threading.Event())  # agent ESC unset
+    monkeypatch.setattr(BrowserActionToolsMixin, "_get_page", lambda self: object())
+
+    scope_ev = threading.Event()
+    scope_ev.set()  # caller abandoned the call
+    with call_cancel_scope(scope_ev), pytest.raises(AgentCancelled):
+        host._tool_browser_action({"action": "wait", "timeout": 30000})
+
+
+def test_wait_no_selector_scope_plus_config_forces_composite(_real_browser_state, monkeypatch):
+    """With both a per-call scope AND config.cancel_event live, ``_live_cancel_event``
+    yields a composite — a scope set alone must still trip the wait (identity
+    preserved only in the single-source case, pinned by the ESC tests above)."""
+    from external_llm.agent.cancel_scope import call_cancel_scope
+
+    host = _WaitHost(cancel_event=threading.Event())  # unset, live
+    monkeypatch.setattr(BrowserActionToolsMixin, "_get_page", lambda self: object())
+    calls: list[tuple] = []
+
+    def _fake_sleep(seconds, cancel_event):
+        calls.append((seconds, cancel_event))
+        return False  # not cancelled → completes normally
+
+    monkeypatch.setattr(browser_tools, "interruptible_sleep", _fake_sleep)
+
+    scope_ev = threading.Event()
+    with call_cancel_scope(scope_ev):
+        res = host._tool_browser_action({"action": "wait", "timeout": 30000})
+    assert res["ok"], res
+    assert len(calls) == 1 and calls[0][0] == 30.0
+    # Composite: neither identity — but is_set() ORs both sources.
+    ce = calls[0][1]
+    assert ce is not None and ce is not scope_ev
+    assert ce.is_set() is False
+
+
 def test_wait_no_selector_mid_wait_cancel_aborts_quickly(_real_browser_state, monkeypatch):
     """ESC pressed DURING the wait → the real interruptible_sleep is interrupted
     and AgentCancelled propagates through the browser executor (the worker is

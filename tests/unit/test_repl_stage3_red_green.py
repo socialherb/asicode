@@ -419,6 +419,27 @@ class TestSpawnedReplStage3:
         time.sleep(0.15)
         sess.send(b"\r")
 
+    def _send_canonical(self, sess, text):
+            """Answer a CANONICAL-mode product prompt (builtin input()/readline()).
+
+            SpawnPtySession clears ICRNL on the child's tty (CR-submit race seal
+            - see pty_driver._disable_cr_translation), so a bare "\r" no longer
+            completes a canonical line: the kernel holds it untranslated in the
+            input queue and input()/readline() blocks forever. "\n" IS the
+            canonical line terminator - it completes the line directly, exactly
+            as the ICRNL-translated Enter does on a real user's terminal (real
+            terminals keep ICRNL on). Use for: auth-retry key entry
+            (asi._prompt_auth_retry_key), undo/compact y/N confirmations
+            (repl_impl input() sites). NOT for /model key entry or insights
+            prune confirms - those go through _collect_input (prompt_toolkit)
+            and need the "\r" Enter binding.
+            """
+            data = text if isinstance(text, bytes) else text.encode()
+            sess.clear()
+            sess.send(data)
+            sess.wait_for(data, timeout=30)
+            sess.send(b"\n")
+
     def _wait_prompt(self, sess):
         sess.wait_for(b"asicode", timeout=60)
         sess.wait_for(b"Code mode", timeout=30)
@@ -566,7 +587,7 @@ class TestSpawnedReplStage3:
             # exit -> nudge prompt (file > 6000 bytes) -> answer n
             self._send_cmd(sess, "exit")
             sess.wait_for(b"compact now? (y/N)", timeout=30)
-            self._send_cmd(sess, "n")
+            self._send_canonical(sess, "n")
             sess.wait_for(b"session ended.", timeout=30)
             assert sess.wait(timeout=30) == 0
         finally:
@@ -618,7 +639,7 @@ class TestSpawnedReplStage3:
             # baseline undo: list + y -> reverted
             self._send_cmd(sess, "/undo")
             sess.wait_for(b"revert 1 file(s)? (y/N)", timeout=30)
-            self._send_cmd(sess, "y")
+            self._send_canonical(sess, "y")
             sess.wait_for("✓ reverted a.txt".encode(), timeout=30)
             # orchestrate turn with dev slot populated
             self._send_cmd(sess, "/orchestrate")
@@ -665,7 +686,7 @@ class TestSpawnedReplStage3:
             self._send_cmd(sess, "/undo")
             sess.wait_for(b"\xc2\xb7 a.txt", timeout=30)
             sess.wait_for(b"revert 1 file(s)? (y/N)", timeout=30)
-            self._send_cmd(sess, "y")
+            self._send_canonical(sess, "y")
             sess.wait_for("✓ reverted 1 file(s)".encode(), timeout=30)
             # verify on empty file -> nothing to verify
             self._send_cmd(sess, "/insights verify")
@@ -702,7 +723,7 @@ class TestSpawnedReplStage3:
             # auth-error turn: retry prompt accepts a key, retry succeeds
             self._send_cmd(sess, "hello world")
             sess.wait_for(b"API key is expired or invalid.", timeout=30)
-            self._send_cmd(sess, "sk-new-key")
+            self._send_canonical(sess, "sk-new-key")
             sess.wait_for(b"auto-continue: turn ended with an error \xe2\x80\x94 stopped", timeout=30)
             self._send_cmd(sess, "exit")
             sess.wait_for(b"session ended.", timeout=30)
@@ -808,7 +829,7 @@ class TestSpawnedReplStage3:
             # exit -> nudge -> y -> compact runs
             self._send_cmd(sess, "exit")
             sess.wait_for(b"compact now? (y/N)", timeout=30)
-            self._send_cmd(sess, "y")
+            self._send_canonical(sess, "y")
             sess.wait_for(b"session ended.", timeout=30)
             assert sess.wait(timeout=30) == 0
         finally:
@@ -856,7 +877,7 @@ class TestSpawnedReplStage3:
             self._send_cmd(sess, "exit")
             if nudge:
                 sess.wait_for(b"compact now? (y/N)", timeout=30)
-                self._send_cmd(sess, "n")
+                self._send_canonical(sess, "n")
             sess.wait_for(b"session ended.", timeout=30)
             assert sess.wait(timeout=30) == 0
         finally:
@@ -1110,7 +1131,7 @@ class TestSpawnedReplStage3:
             sess.wait_for(b"Here is the plan: done.", timeout=30)
             self._send_cmd(sess, "/undo")
             sess.wait_for(b"revert 1 file(s)? (y/N)", timeout=30)
-            self._send_cmd(sess, "y")
+            self._send_canonical(sess, "y")
             sess.wait_for(b"revert failed", timeout=30)
             self._send_cmd(sess, "exit")
             sess.wait_for(b"session ended.", timeout=30)
@@ -1128,7 +1149,7 @@ class TestSpawnedReplStage3:
             sess.wait_for(b"Here is the plan: done.", timeout=30)
             self._send_cmd(sess, "/undo")
             sess.wait_for(b"revert 1 file(s)? (y/N)", timeout=30)
-            self._send_cmd(sess, "y")
+            self._send_canonical(sess, "y")
             sess.wait_for(b"failed to revert a.txt", timeout=30)
             self._send_cmd(sess, "exit")
             sess.wait_for(b"session ended.", timeout=30)
@@ -1414,7 +1435,7 @@ class TestSpawnedReplStage3:
             sess.wait_for(b"Here is the plan: done.", timeout=30)
             self._send_cmd(sess, "/undo")
             sess.wait_for(b"revert 1 file(s)? (y/N)", timeout=30)
-            self._send_cmd(sess, "n")
+            self._send_canonical(sess, "n")
             sess.wait_for(b"cancelled.", timeout=30)
             self._send_cmd(sess, "exit")
             sess.wait_for(b"session ended.", timeout=30)
@@ -1463,7 +1484,7 @@ class TestSpawnedReplStage3:
             sess.wait_for(b"fake compact LLM crash", timeout=30)
             self._send_cmd(sess, "exit")
             sess.wait_for(b"compact now? (y/N)", timeout=30)
-            self._send_cmd(sess, "n")
+            self._send_canonical(sess, "n")
             sess.wait_for(b"session ended.", timeout=30)
             assert sess.wait(timeout=30) == 0
         finally:
@@ -1516,7 +1537,7 @@ class TestSpawnedReplStage3:
             self._wait_prompt(sess)
             self._send_cmd(sess, "hello")
             sess.wait_for(b"API key is expired or invalid.", timeout=30)
-            self._send_cmd(sess, "sk-fresh")
+            self._send_canonical(sess, "sk-fresh")
             sess.wait_for(b"Here is the plan: done.", timeout=30)
             self._send_cmd(sess, "exit")
             sess.wait_for(b"session ended.", timeout=30)
@@ -1532,7 +1553,7 @@ class TestSpawnedReplStage3:
             self._wait_prompt(sess)
             self._send_cmd(sess, "hello")
             sess.wait_for(b"API key is expired or invalid.", timeout=30)
-            self._send_cmd(sess, "sk-fresh")
+            self._send_canonical(sess, "sk-fresh")
             sess.wait_for(b"retry failed: fake retry crash", timeout=30)
             self._send_cmd(sess, "exit")
             sess.wait_for(b"session ended.", timeout=30)
@@ -1548,7 +1569,7 @@ class TestSpawnedReplStage3:
             self._wait_prompt(sess)
             self._send_cmd(sess, "exit")
             sess.wait_for(b"plain accumulation notice", timeout=30)
-            self._send_cmd(sess, "n")
+            self._send_canonical(sess, "n")
             sess.wait_for(b"session ended.", timeout=30)
             assert sess.wait(timeout=30) == 0
         finally:
@@ -1628,7 +1649,7 @@ class TestSpawnedReplStage3:
             sess.wait_for(b"Here is the plan: done.", timeout=30)
             self._send_cmd(sess, "/undo")
             sess.wait_for(b"revert 1 file(s)? (y/N)", timeout=30)
-            self._send_cmd(sess, "n")
+            self._send_canonical(sess, "n")
             sess.wait_for(b"cancelled.", timeout=30)
             self._send_cmd(sess, "exit")
             sess.wait_for(b"session ended.", timeout=30)

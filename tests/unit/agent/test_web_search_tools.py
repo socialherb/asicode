@@ -21,6 +21,7 @@ import json
 import re
 import threading
 import time
+import types
 
 import httpx
 import pytest
@@ -3243,6 +3244,64 @@ def test_http_retry_cancel_mid_transient_backoff_aborts_retry():
     assert c.calls == 1
 
 
+def test_live_cancel_event_merges_per_call_scope_with_config():
+    """Per-call cooperative scope (MCP abandon setting the call's own event)
+    must be observable through ``_live_cancel_event`` — an abandoned search's
+    backoff waits must release its pool slot, not just a whole-turn ESC.
+
+    Contract asserted: with BOTH sources live, the returned composite's
+    ``is_set()`` ORs them (a scope set alone trips it); with only a fallback,
+    the fallback identity is preserved (no wrapper on the common path).
+    """
+    from external_llm.agent.cancel_scope import call_cancel_scope
+
+    host = _Host()
+    cfg = threading.Event()
+    host.config = types.SimpleNamespace(cancel_event=cfg)
+
+    scope_ev = threading.Event()
+    with call_cancel_scope(scope_ev):
+        merged = host._live_cancel_event()
+        assert merged is not None
+        assert merged is not cfg and merged is not scope_ev  # composite
+        assert merged.is_set() is False
+        scope_ev.set()  # scope alone (caller abandoned the call)
+        assert merged.is_set() is True
+        scope_ev.clear()
+        cfg.set()  # agent ESC alone too
+        assert merged.is_set() is True
+
+    # Outside any scope: identity preserved — the existing absent/present test
+    # pins the single-source case, this pins the no-scope fallback.
+    assert host._live_cancel_event() is cfg
+
+
+def test_http_retry_observes_per_call_scope_through_live_cancel_event():
+    """An abandoned dispatch (its per-call scope set, agent ESC unset) must
+    abort the retry backoff through the ``_live_cancel_event`` wiring — the
+    MCP timeout case the cooperative-cancel root fix targets."""
+    from external_llm.agent.cancel_scope import call_cancel_scope
+
+    class _HostWithRetry(_Host):
+        config = types.SimpleNamespace(cancel_event=threading.Event())  # unset
+
+        def _make_result(self, **kw):
+            raise AssertionError("must not build a result")
+
+    scope_ev = threading.Event()
+    scope_ev.set()  # caller abandoned the call
+
+    client = _SequenceClient([_resp(429, headers={"retry-after": "30"})])
+    with call_cancel_scope(scope_ev), pytest.raises(wst.AgentCancelled):
+        wst.WebSearchToolsMixin._http_request_with_retry(
+            client, "GET", "https://x/",
+            # The production call sites pass self._live_cancel_event(); the
+            # composite it yields under a scope is what must trip the backoff.
+            cancel_event=_HostWithRetry._live_cancel_event(_HostWithRetry),
+        )
+    assert client.calls == 0  # aborted before/at the first backoff, no retry
+
+
 def test_http_retry_no_cancel_event_keeps_legacy_plain_sleep(monkeypatch):
     """Without a cancel_event the helper must keep its exact legacy behavior —
     plain ``time.sleep`` with the same backoff — so non-cancel callers are
@@ -3327,6 +3386,59 @@ def test_search_web_propagates_agent_cancelled(monkeypatch):
     monkeypatch.setattr(host, "_search_startpage_browser", lambda *a, **k: [])
     with pytest.raises(wst.AgentCancelled):
         host._tool_search_web({"query": "python asyncio"})
+
+
+def test_run_tier_parallel_worker_observes_caller_scope():
+    """Tier pool workers must see the submitting thread's per-call scope.
+
+    The scope is thread-local and does not travel with the submitted closure:
+    without explicit forwarding a worker's ``current_cancel_event()`` is None,
+    its ``_live_cancel_event()`` collapses to config-only, and an abandoned
+    tier's backoff sleeps have no observer at all.
+    """
+    from external_llm.agent.cancel_scope import call_cancel_scope, current_cancel_event
+
+    seen = {}
+
+    def _backend():
+        seen["scope"] = current_cancel_event()
+
+    host = _Host()  # no config: the forwarded scope is the only possible source
+    scope_ev = threading.Event()
+    with call_cancel_scope(scope_ev):
+        per_backend, errors, connect_failed = host._run_tier_parallel(
+            [("Fake", _backend)], deadline=5.0
+        )
+
+    assert seen["scope"] is scope_ev
+    # A None-result backend is dropped, not collected — no other observable.
+    assert per_backend == [] and errors == [] and not connect_failed
+
+
+def test_run_tier_parallel_abandoned_scope_aborts_worker_backoff():
+    """A worker already inside a retry backoff when its caller is abandoned
+    (MCP ``wait_for`` timeout, aborted parallel batch) must abort at the
+    cooperative checkpoint — AgentCancelled out of the tier — instead of
+    sleeping the backoff out while the pool slot stays occupied."""
+    from external_llm.agent.cancel_scope import call_cancel_scope
+    from external_llm.client import interruptible_sleep
+
+    host = _Host()  # no config: ONLY the forwarded scope may trip the backoff
+
+    def _backend():
+        # The production backoff shape: a long sleep guarded by the live event.
+        if interruptible_sleep(5.0, host._live_cancel_event()):
+            raise wst.AgentCancelled("tier abandoned by its caller")
+
+    scope_ev = threading.Event()
+    scope_ev.set()  # caller abandoned the call before the tier even started
+    t0 = time.monotonic()
+    with call_cancel_scope(scope_ev), pytest.raises(wst.AgentCancelled):
+        host._run_tier_parallel([("Fake", _backend)], deadline=10.0)
+    assert time.monotonic() - t0 < 4.0, (
+        "abandoned tier worker slept its backoff out — the per-call scope "
+        "never reached the worker thread"
+    )
 
 
 # ── P4: explicit-null JSON fields from search backends ──────────────────────

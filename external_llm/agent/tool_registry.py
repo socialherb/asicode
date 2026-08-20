@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -20,8 +21,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 if TYPE_CHECKING:
-    import threading
-
     from .agent_profile import AgentProfile
 
 import subprocess
@@ -39,6 +38,7 @@ from ._thread_pool import CANCEL_POLL_INTERVAL, shared_pool
 from .agent_loop_types import WRITE_TOOL_NAMES, AgentCancelled
 from .argument_repairer import ArgumentRepairer
 from .call_graph import CallGraphIndexer
+from .cancel_scope import call_cancel_scope, current_cancel_event
 from .config.thresholds import config as _cfg
 from .lint_runner import LintRunner
 from .performance_metrics import get_global_collector
@@ -2395,8 +2395,15 @@ class ToolRegistry(
         #   grep -rhoE "tool_dispatch: \w+" logs/ | sort | uniq -c | sort -rn
         logger.info("tool_dispatch: %s", tool_name)
 
-        # Check for cancellation before any work
-        if self.config.cancel_event and self.config.cancel_event.is_set():
+        # Check for cancellation before any work — the agent-loop ESC event
+        # AND this call's per-call scope. Executor submit sites (MCP adapter,
+        # dispatch_parallel) install the scope; when the caller abandoned the
+        # call while this worker was still QUEUED the event is already set and
+        # the pool slot must free here without running the handler at all.
+        _scope_ce = current_cancel_event()
+        if (
+            self.config.cancel_event is not None and self.config.cancel_event.is_set()
+        ) or (_scope_ce is not None and _scope_ce.is_set()):
             return ToolResult(
                 ok=False,
                 content="",
@@ -2805,12 +2812,17 @@ class ToolRegistry(
         # identical to this (same pool, same ordering, same error wrapping), and
         # it relied on asyncio.get_event_loop_policy(), deprecated since 3.12 and
         # removed in Python 3.16.
+        # Each call runs inside a per-call cancel scope so an aborted batch can
+        # cooperatively free its workers (see cancel_scope module docstring).
         futures = []
+        call_events: list[threading.Event] = []
         for call in tool_calls:
             tool_name = call.get("tool", "")
             args = call.get("args", {})
-            future = shared_pool.submit(self.dispatch, tool_name, args)
+            ev = threading.Event()
+            future = shared_pool.submit(self._dispatch_in_scope, tool_name, args, ev)
             futures.append((future, call))
+            call_events.append(ev)
 
         # Collect results in order. Cancel-aware: poll instead of blocking on a
         # bare future.result() so ESC (cancel_event) is honored while a long tool
@@ -2819,28 +2831,49 @@ class ToolRegistry(
         # running in the pool (threads cannot be killed); its result is discarded.
         results = []
         _ce = self.config.cancel_event
-        for future, _call in futures:
-            try:
-                while True:
-                    try:
-                        result = future.result(timeout=CANCEL_POLL_INTERVAL)
-                        break
-                    except _FutureTimeoutError:
-                        if _ce is not None and _ce.is_set():
-                            raise AgentCancelled("cancelled by user during parallel tool phase") from None
-            except AgentCancelled:
-                # A cancel decided by the tool / the poll above must abort the
-                # batch, NOT be wrapped into a ToolResult error that the caller
-                # would feed back to the LLM as a tool failure.
-                raise
-            except Exception as e:
-                logger.exception("Parallel tool execution failed")
-                result = ToolResult(
-                    ok=False, content="",
-                    error=f"Parallel execution error: {type(e).__name__}: {e}"
-                )
-            results.append(result)
+        try:
+            for future, _call in futures:
+                try:
+                    while True:
+                        try:
+                            result = future.result(timeout=CANCEL_POLL_INTERVAL)
+                            break
+                        except _FutureTimeoutError:
+                            if _ce is not None and _ce.is_set():
+                                raise AgentCancelled("cancelled by user during parallel tool phase") from None
+                except AgentCancelled:
+                    # A cancel decided by the tool / the poll above must abort the
+                    # batch, NOT be wrapped into a ToolResult error that the caller
+                    # would feed back to the LLM as a tool failure.
+                    raise
+                except Exception as e:
+                    logger.exception("Parallel tool execution failed")
+                    result = ToolResult(
+                        ok=False, content="",
+                        error=f"Parallel execution error: {type(e).__name__}: {e}"
+                    )
+                results.append(result)
+        finally:
+            # Cooperative cancellation of whatever is still in flight (batch
+            # aborted above, or this collection raised): set each unfinished
+            # call's scope event so its worker stops at its next checkpoint
+            # (dispatch entry when still queued, scanner boundaries when
+            # running) instead of occupying its pool slot to completion.
+            for (future, _call), ev in zip(futures, call_events, strict=True):
+                if not future.done():
+                    ev.set()
         return results
+
+    def _dispatch_in_scope(
+        self, tool_name: str, args: dict[str, Any], cancel_event: threading.Event
+    ) -> ToolResult:
+        """``dispatch`` + per-call cancel scope (see ``cancel_scope`` docs).
+
+        Executor submit sites that can abandon a call mid-flight route through
+        here so the worker observes the abandonment and frees its slot.
+        """
+        with call_cancel_scope(cancel_event):
+            return self.dispatch(tool_name, args)
 
     @staticmethod
     def _schema_variant_key(

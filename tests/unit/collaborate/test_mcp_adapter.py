@@ -12,6 +12,8 @@ Note: Full MCP server integration requires claude-agent-sdk.
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
@@ -489,3 +491,120 @@ class TestTimeoutOrdering:
 
         monkeypatch.setattr(mod, "CLAUDE_MCP_TOOL_TIMEOUT", 5000)
         assert _resolve_mcp_timeout("bash", {"timeout": 120}) == 5000
+
+
+class TestCooperativeCancellationOnTimeout:
+    """MCP timeout must free the executor worker, not orphan it.
+
+    wait_for only cancels the asyncio Future; without a per-call cancel scope
+    the worker ran to completion, pinning its slot (four hung reads exhausted
+    the dedicated pool and cascaded). The handler now installs a scope and its
+    finally sets the event on EVERY exit — the worker aborts at its next
+    checkpoint (dispatch entry when still queued, scanner boundaries when a
+    scan is running).
+    """
+
+    FULL = 6.0  # un-cancelled worker runtime — tests must finish far sooner
+
+    def _slow_scope_aware_registry(self, done: dict):
+        from external_llm.agent.cancel_scope import current_cancel_event
+        from external_llm.agent.tool_registry import ToolResult
+
+        full = self.FULL  # capture: `self` inside dispatch is the registry
+
+        class _FakeRegistry:
+            def dispatch(self, tool, args):
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < full:
+                    ce = current_cancel_event()
+                    if ce is not None and ce.is_set():
+                        done["observed"] = True
+                        break
+                    time.sleep(0.01)
+                done["t"] = time.monotonic()
+                return ToolResult(ok=True, content="ran-to-end", error="")
+
+        return _FakeRegistry()
+
+    def test_timeout_frees_running_worker_via_scope(self, monkeypatch):
+        import asyncio
+
+        from external_llm.repl.collaborate import asi_mcp_adapter as mod
+
+        done: dict = {}
+        monkeypatch.setattr(mod, "_resolve_mcp_timeout", lambda tool, args: 0.3)
+        handler = mod._make_async_handler(
+            self._slow_scope_aware_registry(done), "run_structural_scan"
+        )
+
+        t0 = time.monotonic()
+        out = asyncio.run(handler({}))
+
+        assert out.get("isError") is True
+        assert "TOOL_TIMEOUT" in out["content"][0]["text"]
+        while "t" not in done and time.monotonic() - t0 < 4.0:
+            time.sleep(0.02)
+        assert "t" in done, (
+            f"worker never exited within {time.monotonic() - t0:.1f}s — "
+            "the scope event was never set (orphaned worker, pool slot pinned)"
+        )
+        assert done.get("observed") is True, (
+            "worker exited without OBSERVING the cancellation — wrong exit path"
+        )
+        assert done["t"] - t0 < self.FULL, "worker ran to completion — no cooperation"
+
+    def test_timeout_while_queued_does_not_pin_the_pool(self, monkeypatch):
+        """Timed out while STILL QUEUED: CPython's wait_for cancellation already
+        reaches a queued-but-unstarted executor job (wrap_future's
+        _call_check_cancel cancels the concurrent future), so the job never
+        runs and the slot serves the next submission immediately. Seals that
+        baseline — the dedicated fast-read pool must never stay pinned behind
+        an abandoned call, from EITHER the queued or the running path."""
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+
+        from external_llm.repl.collaborate import asi_mcp_adapter as mod
+
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="t-mcp")
+        monkeypatch.setattr(mod, "_FAST_READ_EXECUTOR", pool)
+        pool.submit(time.sleep, 0.5)  # saturate the single slot
+
+        ran: list[str] = []
+
+        class _FakeRegistry:
+            def dispatch(self, tool, args):
+                ran.append(tool)
+                return SimpleNamespace(ok=True, content="x", error=None)
+
+        monkeypatch.setattr(mod, "_resolve_mcp_timeout", lambda tool, args: 0.1)
+        handler = mod._make_async_handler(_FakeRegistry(), "read_file")
+        out = asyncio.run(handler({}))
+        assert "TOOL_TIMEOUT" in out["content"][0]["text"]
+        assert ran == [], "a job queued at timeout must be cancelled, never run"
+
+        # Slot must be back for the next caller the moment the blocker ends.
+        t0 = time.monotonic()
+        fut = pool.submit(lambda: "pong")
+        assert fut.result(timeout=5.0) == "pong"
+        assert time.monotonic() - t0 < 4.0, "pool stayed pinned after abandonment"
+        pool.shutdown(wait=True)
+
+    def test_success_path_set_is_inert(self, monkeypatch):
+        """finally sets the event on success too — it must be inert there (the
+        scope popped on completion; pooled threads get a fresh Event)."""
+        import asyncio
+
+        from external_llm.agent.tool_registry import ToolResult
+        from external_llm.repl.collaborate import asi_mcp_adapter as mod
+
+        class _FakeRegistry:
+            def dispatch(self, tool, args):
+                return ToolResult(ok=True, content="all good", error="")
+
+        monkeypatch.setattr(mod, "_resolve_mcp_timeout", lambda tool, args: 5)
+        handler = mod._make_async_handler(_FakeRegistry(), "bash")
+        out = asyncio.run(handler({}))
+
+        assert out.get("isError") is None
+        assert out["content"][0]["text"] == "all good"

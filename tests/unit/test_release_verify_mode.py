@@ -60,6 +60,10 @@ def fake_repos(relpub, tmp_path, monkeypatch) -> tuple[Path, Path]:
         f"# log\n\n## [{VERSION}] — 2026-08-19\n- test release\n", encoding="utf-8"
     )
     (priv / "alpha_shipped.py").write_text("ALPHA = 1\n", encoding="utf-8")
+    # Production fidelity: the real private repo gitignores .verify_artifacts/
+    # (see _write_verify_artifact) — without the rule here, a verify artifact
+    # written on run 1 would dirty the preflight of run 2 in the rerun test.
+    (priv / ".gitignore").write_text(".verify_artifacts/\n", encoding="utf-8")
     _git(priv, "init", "-b", "main")
     _git(priv, "config", "user.email", "t@example.com")
     _git(priv, "config", "user.name", "t")
@@ -142,12 +146,14 @@ def test_parser_verify_before_positional_fails_closed(relpub):
 def test_verify_release_reports_failing_gate(relpub, monkeypatch, tmp_path, capsys):
     _set_gates(monkeypatch, relpub, ok=False)
     monkeypatch.setattr(relpub, "_FAST_POLICY_TESTS", [])
+    monkeypatch.setattr(relpub, "REPO", tmp_path / "artifacts-home")  # hermetic
     assert relpub._verify_release(tmp_path, "fast") is False
     assert "stub-gate" in capsys.readouterr().out
 
 
 def test_verify_release_fast_runs_policy_unit_subset(relpub, monkeypatch, tmp_path):
     _set_gates(monkeypatch, relpub, ok=True)
+    monkeypatch.setattr(relpub, "REPO", tmp_path / "artifacts-home")  # hermetic
     _write_suite_test(
         tmp_path, "test_fake_policy.py", "def test_policy():\n    assert False, 'policy violation'\n"
     )
@@ -161,6 +167,7 @@ def test_verify_release_fast_runs_policy_unit_subset(relpub, monkeypatch, tmp_pa
 
 def test_full_mode_runs_unit_suite_beyond_policy_subset(relpub, monkeypatch, tmp_path):
     _set_gates(monkeypatch, relpub, ok=True)
+    monkeypatch.setattr(relpub, "REPO", tmp_path / "artifacts-home")  # hermetic
     _write_suite_test(
         tmp_path, "test_fake_suite.py", "def test_suite():\n    assert False\n"
     )
@@ -230,6 +237,91 @@ def test_verify_failure_aborts_before_commit(
         ["git", "status", "--porcelain"], cwd=pub, capture_output=True, text=True, check=False
     ).stdout
     assert "alpha_shipped.py" in staged
+
+
+def test_verify_abort_recovery_guidance_unblocks_rerun(
+    fake_repos, relpub, fake_baseline_gen, monkeypatch, capsys
+):
+    """v0.2.26 incident: the abort message recommended a bare ``git reset``,
+    which unstages but leaves the synced snapshot edits in the working tree —
+    the dirty-tree preflight then blocked every retry (3 consecutive aborts
+    mid-release; the actual recovery was ``git stash push -u``). The printed
+    recovery command must actually unblock the next run."""
+    _, pub = fake_repos
+    _git(pub, "commit", "--allow-empty", "-m", "init")  # stash needs a HEAD
+    _set_gates(monkeypatch, relpub, ok=False)
+    monkeypatch.setattr(relpub, "_FAST_POLICY_TESTS", [])
+    assert relpub.main([str(pub), "--verify"]) == 1
+    assert "stash push -u" in capsys.readouterr().err
+
+    # Executing the printed command clears the tree, so the retry gets past
+    # the dirty preflight and fails at verify itself (the same gate stub),
+    # not at the preflight.
+    _git(pub, "stash", "push", "-u")
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=pub, capture_output=True, text=True,
+        check=False,
+    ).stdout.strip() == ""
+    assert relpub.main([str(pub), "--verify"]) == 1
+    assert "uncommitted changes" not in capsys.readouterr().err
+
+
+# ── durations artifact: the measurement basis --verify never had ────────────
+
+def test_verify_writes_durations_artifact_outside_public_tree(
+    relpub, monkeypatch, tmp_path
+):
+    """fast=63s/full=184s had no per-test evidence: ``-p no:cacheprovider``
+    (mandatory — the public tree must not grow a .pytest_cache that the next
+    release would stage) means pytest's own duration cache never exists, so
+    timing regressions were argued from total wall time only. ``--durations``
+    output now persists as an artifact in the PRIVATE repo — it cannot live in
+    *public*: verify runs after ``git add -A``, so a file created there would
+    be swept into the NEXT release's staging and then deleted by the sync."""
+    _set_gates(monkeypatch, relpub, ok=True)
+    home = tmp_path / "artifact-home"
+    monkeypatch.setattr(relpub, "REPO", home)
+    pub = tmp_path / "pub"  # distinct from the artifact home on purpose
+    pub.mkdir()
+    _write_suite_test(
+        pub, "test_fake_slow.py", "import time\n\n\ndef test_slow():\n    time.sleep(0.05)\n"
+    )
+    monkeypatch.setattr(relpub, "_FAST_POLICY_TESTS", ["tests/unit/test_fake_slow.py"])
+
+    # Pre-age the artifact dir past the retention cap: the writer must prune,
+    # not accumulate (a release cadence of years must not grow it unbounded).
+    keep = getattr(relpub, "_VERIFY_ARTIFACT_KEEP", None)
+    assert keep is not None, "release_public must define _VERIFY_ARTIFACT_KEEP"
+    art_dir = home / ".verify_artifacts"
+    art_dir.mkdir(parents=True)
+    for i in range(keep + 3):
+        (art_dir / f"verify-durations-fast-2020010{i % 10}-00000{i}.txt").write_text(
+            "old\n", encoding="utf-8"
+        )
+
+    assert relpub._verify_release(pub, "fast") is True
+
+    arts = sorted(art_dir.glob("verify-durations-fast-*.txt"))
+    assert len(arts) == keep, "retention cap must hold after one new write"
+    body = arts[-1].read_text(encoding="utf-8")
+    assert "policy-unit-subset" in body
+    assert "test_fake_slow" in body, "per-test durations must be recorded"
+
+    # The public tree stays free of the artifact (staged-by-next-release leak).
+    assert not any("verify-durations" in p.name for p in pub.rglob("*"))
+
+
+def test_durations_artifact_dir_is_gitignored(relpub):
+    """The private clean-tree preflight reads ``git status --porcelain``,
+    which lists UNTRACKED files — an un-ignored .verify_artifacts/ would block
+    the NEXT release with 'private repo has uncommitted changes': the same
+    abort-dead-end class as the stash guidance fixed for the public tree."""
+    probe = relpub._VERIFY_ARTIFACT_DIRNAME + "/verify-durations-fast-x.txt"
+    r = subprocess.run(
+        ["git", "check-ignore", "-q", "--", probe],
+        cwd=REPO, capture_output=True, check=False,
+    )
+    assert r.returncode == 0, f".gitignore must cover {probe!r} (got rc={r.returncode})"
 
 
 def test_verify_success_commits_and_ships_generated_baseline(

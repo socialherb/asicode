@@ -13,11 +13,13 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from typing import Any, Optional
 
 from config import CLAUDE_MCP_TOOL_TIMEOUT, CLAUDE_SDK_MAX_TURNS
+from external_llm.agent.cancel_scope import call_cancel_scope
 from external_llm.agent.tool_handlers.shell_policy import (
     SHELL_TIMEOUT_DEFAULT as _SHELL_TIMEOUT_DEFAULT,
 )
@@ -454,12 +456,20 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
         # Dedicated pool for always-fast read tools so they are not queued
         # behind heavy tools saturating the default executor.
         executor = _FAST_READ_EXECUTOR if tool_name in _FAST_READ_TOOLS else None
+        # Per-call cooperative cancellation: when the await below is abandoned
+        # (timeout, outer cancellation, exception), the finally sets this event
+        # and the worker stops at its next checkpoint (dispatch entry when still
+        # queued, scanner boundaries when running) — freeing its executor slot
+        # instead of occupying it to completion.
+        cancel_event = threading.Event()
+
+        def _dispatch_scoped():
+            with call_cancel_scope(cancel_event):
+                return registry.dispatch(tool_name, args)
+
         t0 = time.monotonic()
         try:
-            coro = loop.run_in_executor(
-                executor,
-                lambda: registry.dispatch(tool_name, args),
-            )
+            coro = loop.run_in_executor(executor, _dispatch_scoped)
             if timeout > 0:
                 result = await asyncio.wait_for(coro, timeout=timeout)
             else:
@@ -481,20 +491,22 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
             )
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - t0
-            # CPython cannot forcefully terminate a running thread — wait_for only
-            # cancels the asyncio Future; the run_in_executor-backed registry.dispatch
-            # worker keeps running and occupies its slot. Since _FAST_READ_TOOLS use a
-            # dedicated pool (max_workers=4), if 4 hung reads timeout, the pool is
-            # exhausted and subsequent fast-reads immediately cascade into 60s timeouts.
-            # The root fix is cooperative cancellation points in registry.dispatch, but
-            # that requires registry-level changes — here we only ensure visibility.
+            # CPython cannot forcefully terminate a running thread — wait_for
+            # only cancels the asyncio Future. The worker's per-call scope
+            # event is set in the finally below, so the orphaned dispatch
+            # cooperatively aborts at its next checkpoint (dispatch entry when
+            # still queued behind pool saturation, scanner boundaries when a
+            # scan is running) and frees its slot instead of cascading: with
+            # the dedicated read pool at max_workers=4, four hung reads used
+            # to pin every slot and starve subsequent fast-reads into their
+            # own 60s ceilings.
             # Note: reaching this branch for a tool in _INNER_TIMEOUT_TOOLS now means a
             # genuine inner-layer hang, not the routine expiry it used to mean — the
             # derived ceiling leaves the inner graceful path room to return first.
             pool_note = (
-                " (orphaned worker still running; dedicated read pool may degrade)"
+                " (worker cooperatively cancelling; dedicated read pool recovers)"
                 if tool_name in _FAST_READ_TOOLS
-                else " (orphaned worker may still run on default pool)"
+                else " (orphaned worker cancelling at its next checkpoint)"
             )
             logger.exception(
                 "MCP tool %s timed out after %.1fs (limit %ss)%s",
@@ -533,6 +545,14 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
                 ],
                 "isError": True,
             }
+        finally:
+            # Release the worker on EVERY exit — success, timeout, outer
+            # cancellation (CancelledError propagates through, no except
+            # matches it), handler exception. On completion the scope is
+            # already popped so the set is inert; on abandonment the worker
+            # observes it at its next checkpoint. Pooled threads get a fresh
+            # Event per submission, so nothing leaks into later dispatches.
+            cancel_event.set()
 
     return handler
 

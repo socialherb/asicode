@@ -12,9 +12,10 @@ from ...common.indent_utils import INDENT_GUTTER_BAR, format_numbered_line
 from ...common.subprocess_utils import CANCEL_POLL_INTERVAL as _CANCEL_POLL_INTERVAL
 from ...common.subprocess_utils import cancel_probe as _cancel_probe
 from ...common.text_reading import read_line_window as _read_line_window
+from ..bm25 import bm25_rank
+from ..cancel_scope import current_cancel_event
 from ..config.thresholds import config as _cfg
 from ..rag_configs import CodeTokenizer
-from ..rag_searcher import _bm25_score as _bm25
 
 if TYPE_CHECKING:
     from ..tool_registry import ToolResult
@@ -1102,6 +1103,22 @@ class ReadToolsMixin:
                     logger.debug("search pipe close failed: %s", exc)
         return proc.returncode, lines, counted[0], "".join(err_chunks)
 
+    def _search_cancel_requested(self) -> bool:
+        """Zero-arg cancel predicate for ``_run_search_bounded``'s poll loop.
+
+        Live per-poll observation of BOTH sources: ``config.cancel_event`` is
+        read FRESH each call (the design-chat REPL swaps it per turn — a value
+        captured once goes stale and the poll then watches an event nobody
+        will ever set), OR'd with the innermost per-call cancel scope so a
+        search abandoned by its caller — MCP ``wait_for`` timeout, aborted
+        parallel batch — tears its process group down instead of walking the
+        tree to the 120 s bound unowned. Mirrors test_tools' runner check.
+        """
+        if _cancel_probe(getattr(self, "config", None))():
+            return True
+        _scope = current_cancel_event()
+        return _scope is not None and _scope.is_set()
+
     def _tool_grep(self, args: dict[str, Any]) -> "ToolResult":
         """Search for a pattern across files using grep (or ripgrep if available)."""
         import shutil
@@ -1213,7 +1230,7 @@ class ReadToolsMixin:
             try:
                 _rc, _lines, _total, _stderr = self._run_search_bounded(
                     cmd, self.repo_root, 120, _retain,
-                    cancelled=_cancel_probe(self.config),
+                    cancelled=self._search_cancel_requested,
                     # Redundant for rg (already clamped in the child by
                     # --max-columns) and load-bearing for the system-grep
                     # fallback, which has no equivalent flag.
@@ -1291,7 +1308,6 @@ class ReadToolsMixin:
             # spots (the more context requested, the worse the scramble). Native
             # group order must be preserved. See test_grep_context_* regression.
             if len(lines) > max_results and context == 0:
-                from collections import Counter
                 _tok = CodeTokenizer()
                 _qtokens = _tok.tokenize(pattern)
                 if _qtokens:
@@ -1301,18 +1317,11 @@ class ReadToolsMixin:
                     # order ≅ top N out of K*N) while bounding worst-case time.
                     # (The pre-cut this comment describes now happens while
                     # the output is read — see _run_search_bounded's `retain`.)
-                    _tokenized = [_tok.tokenize(_item_) for _item_ in lines]
-                    _doc_tc: list[dict[str, int]] = [dict(Counter(t)) for t in _tokenized]
-                    _doc_lens = [len(t) for t in _tokenized]
+                    # Ranking itself is single-sourced in agent/bm25.py's
+                    # bm25_rank — this setup used to be a copy of the
+                    # symbol_search twin; scores are bit-identical.
                     _n = len(lines)
-                    _avgdl = sum(_doc_lens) / _n
-                    _df: dict[str, int] = {}
-                    for qt in _qtokens:
-                        _df[qt] = sum(1 for tc in _doc_tc if qt in tc)
-                    _scores = [
-                        _bm25(_qtokens, _doc_tc[i], _doc_lens[i], _df, _n, _avgdl)
-                        for i in range(_n)
-                    ]
+                    _scores = bm25_rank(_qtokens, [_tok.tokenize(_item_) for _item_ in lines])
                     # Select top-N by relevance, then restore file/line order for
                     # readability. Ranking's job is which results survive the cap,
                     # not the display order — BM25-scrambled order within a single

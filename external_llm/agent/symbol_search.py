@@ -73,9 +73,9 @@ from ._shared_utils import (
     _walk_ts_js_files as _shared_walk_ts_js_files,
 )
 from ._thread_pool import shared_pool as _shared_pool
+from .bm25 import bm25_rank
 from .config.thresholds import config as _cfg
 from .rag_configs import CodeTokenizer
-from .rag_searcher import _bm25_score as _bm25
 
 # Cap on how long the speculative non-Python probe (submitted to _shared_pool
 # before the Python scan) may be awaited. The probe runs on the SAME pool a
@@ -1527,26 +1527,17 @@ class SymbolSearcher:
             # against the symbol name — so references with richer surrounding context
             # (more identifier tokens matching the name) rank higher.
             if len(refs) > 1:
-                from collections import Counter
                 global _TOKENIZER
                 if _TOKENIZER is None:
                     _TOKENIZER = CodeTokenizer()
                 _tok = _TOKENIZER
                 _qtokens = _tok.tokenize(name)
                 if _qtokens:
+                    # Pseudo-documents ranked by bm25_rank (single-sourced in
+                    # agent/bm25.py — this setup used to be a copy of the
+                    # read_tools twin; scores are bit-identical).
                     _docs = [f"{r.file}:{r.context}" for r in refs]
-                    _tokenized = [_tok.tokenize(d) for d in _docs]
-                    _doc_tc: list[dict[str, int]] = [dict(Counter(t)) for t in _tokenized]
-                    _doc_lens = [len(t) for t in _tokenized]
-                    _n = len(refs)
-                    _avgdl = sum(_doc_lens) / _n
-                    _df: dict[str, int] = {}
-                    for qt in _qtokens:
-                        _df[qt] = sum(1 for tc in _doc_tc if qt in tc)
-                    _scores = [
-                        _bm25(_qtokens, _doc_tc[i], _doc_lens[i], _df, _n, _avgdl)
-                        for i in range(_n)
-                    ]
+                    _scores = bm25_rank(_qtokens, [_tok.tokenize(d) for d in _docs])
                     # Sort by score only — SymbolRef has no ordering, so a
                     # plain reverse sort would compare SymbolRef on score ties
                     # and raise TypeError ('<' not supported).

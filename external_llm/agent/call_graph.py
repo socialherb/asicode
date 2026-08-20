@@ -41,6 +41,7 @@ from ._shared_utils import (
 from ._shared_utils import (
     _walk_ts_js_files as _shared_walk_ts_js_files,
 )
+from .cancel_scope import effective_cancel
 from .config.thresholds import config as _cfg
 
 logger = logging.getLogger(__name__)
@@ -280,10 +281,18 @@ class CallGraphIndexer:
         precedence and is returned as-is.  Returns None when neither is set
         (non-interactive CLI, out-of-process callers) → checkpoints become
         inert no-ops, matching the pre-cancel behavior.
+
+        Also merges the innermost per-call cancel scope (MCP ``wait_for``
+        timeout, aborted ``dispatch_parallel`` batch) via :func:`effective_cancel`,
+        so a build abandoned by ITS caller discards its partial index at the
+        next file checkpoint instead of walking the whole tree — ``build()``
+        runs on the calling thread, so the thread-local scope is visible
+        here.  The composite duck-types ``is_set()``, the only method the
+        build checkpoints consume.
         """
         if self._cancel_event is not None:
             return self._cancel_event
-        return getattr(self._config, "cancel_event", None)
+        return effective_cancel(getattr(self._config, "cancel_event", None))
 
     def build(self) -> None:
         """Walk repo and build index. Safe to call multiple times (rebuilds).

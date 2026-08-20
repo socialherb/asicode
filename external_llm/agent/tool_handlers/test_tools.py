@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 from external_llm.languages.registry import LanguageRegistry
 from external_llm.testing.symbol_aware_test_finder import SymbolAwareTestFinder
 
+from ..cancel_scope import effective_cancel
+
 if TYPE_CHECKING:
     from ..tool_registry import ToolResult
 class TestToolsMixin:
@@ -26,7 +28,11 @@ class TestToolsMixin:
         return None
 
     def _tool_run_tests(self, args: dict[str, Any]) -> "ToolResult":
-        if self.config.cancel_event and self.config.cancel_event.is_set():
+        # effective_cancel merges the agent-loop ESC event (whole-turn) with any
+        # per-call scope this dispatch runs under (MCP wait_for timeout / aborted
+        # parallel batch) — the dispatch-entry check must observe both.
+        _ce = effective_cancel(getattr(getattr(self, "config", None), "cancel_event", None))
+        if _ce is not None and _ce.is_set():
             return self._make_result(
                 ok=False,
                 content="",
@@ -60,7 +66,10 @@ class TestToolsMixin:
         # runner's poll loop is what lets a cancel reach a run that is ALREADY
         # executing (bash/grep do the same).
         def _cancel_requested() -> bool:
-            _ev = getattr(self.config, "cancel_event", None)
+            # Live per-poll observation of BOTH sources: a scope set mid-run
+            # (caller abandoned the dispatch) must also stop an already-running
+            # test, not just a whole-turn ESC.
+            _ev = effective_cancel(getattr(getattr(self, "config", None), "cancel_event", None))
             return _ev is not None and _ev.is_set()
 
         # Try provider-based test runner for non-Python languages

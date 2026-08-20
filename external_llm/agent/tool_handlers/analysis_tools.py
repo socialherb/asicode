@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ...analysis.scan_walk import SCAN_FILE_CAP, walk_scan_files
 from ...languages import LanguageId
+from ..cancel_scope import effective_cancel
 
 if TYPE_CHECKING:
     from ..tool_registry import ToolResult
@@ -220,8 +221,12 @@ class AnalysisToolsMixin:
         # ── Cooperative cancel pre-check ────────────────────────────────────
         # Mirrors _tool_run_tests / _tool_shell_exec so ESC / Ctrl-C before the
         # scan starts returns immediately instead of entering the (potentially
-        # minutes-long) scanner loop.
-        _ce = getattr(getattr(self, "config", None), "cancel_event", None)
+        # minutes-long) scanner loop. effective_cancel merges the agent-loop
+        # ESC event with this call's per-call scope (set when an executor-side
+        # caller — MCP timeout, aborted parallel batch — abandoned the call),
+        # so the same checkpoints serve both sources; every consumer only
+        # calls is_set(), on either the raw Event or the composite.
+        _ce = effective_cancel(getattr(getattr(self, "config", None), "cancel_event", None))
         if _ce is not None and _ce.is_set():
             return self._make_result(
                 ok=False,

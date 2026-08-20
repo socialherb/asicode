@@ -112,9 +112,10 @@ KNOWN_MODELS: dict[str, list[str]] = {
         "grok-4.5",
         # Meta Muse Spark 1.2 (released 2026-08-05; on the gateway since
         # 2026-08-19). "contributor" is the ~12x cheaper variant whose data is
-        # used for training — a distinct routable id, not an alias. Both share
-        # the 1M (2^20) window; decision recorded in _FALLBACK_IS_CORRECT.
-        "muse-spark-1.2",
+        # used for training — a distinct routable id, not an alias. The base
+        # muse-spark-1.2 was dropped by the gateway on 2026-08-20 (27 ids);
+        # only the contributor variant is served now. 1M (2^20) window;
+        # decision recorded in _FALLBACK_IS_CORRECT.
         "muse-spark-1.2-contributor",
     ],
 }

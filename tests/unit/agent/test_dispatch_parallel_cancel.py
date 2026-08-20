@@ -77,3 +77,59 @@ def test_dispatch_parallel_agent_cancelled_from_tool_propagates():
     reg = _registry(ev, _cancelling_dispatch)
     with pytest.raises(AgentCancelled):
         reg.dispatch_parallel(_two_read_calls())
+
+
+# ── Per-call scope propagation (cooperative cancellation) ──────────────────
+# dispatch_parallel installs a cancel scope per submitted call; when the batch
+# aborts (ESC), the still-running workers must OBSERVE the abandonment at
+# their next checkpoint and free their pool slots — not run to completion.
+
+def test_dispatch_parallel_abort_cancels_in_flight_workers():
+    """ESC mid-batch: AgentCancelled raised AND both workers exit early."""
+    from external_llm.agent.cancel_scope import current_cancel_event
+
+    ev = threading.Event()
+    FULL = 3.0
+    exits: list[float] = []
+    lock = threading.Lock()
+
+    def _scope_aware_dispatch(tool, args):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < FULL:
+            ce = current_cancel_event()
+            if ce is not None and ce.is_set():
+                break  # checkpoint observed — abandon early
+            time.sleep(0.01)
+        with lock:
+            exits.append(time.monotonic())
+        return ToolResult(ok=True, content="ok", error="")
+
+    reg = _registry(ev, _scope_aware_dispatch)
+    out = {}
+
+    def _run():
+        try:
+            reg.dispatch_parallel(_two_read_calls())
+            out["exc"] = None
+        except AgentCancelled as ac:
+            out["exc"] = ac
+
+    t = threading.Thread(target=_run)
+    t0 = time.monotonic()
+    t.start()
+    time.sleep(0.3)  # both workers running in the pool
+    ev.set()         # user presses ESC
+    t.join(timeout=10)
+    assert isinstance(out.get("exc"), AgentCancelled)
+    # Both workers must have exited well before their full duration: the
+    # abort path set their per-call scope events (finally in dispatch_parallel).
+    deadline = t0 + FULL  # when an UNPROPAGATED batch would still be running
+    for _ in range(200):  # wait up to ~2s for cooperative exits
+        with lock:
+            if len(exits) >= 2:
+                break
+        time.sleep(0.01)
+    assert len(exits) == 2, (
+        f"workers did not exit cooperatively ({len(exits)}/2 by "
+        f"{time.monotonic() - t0:.1f}s; full run would end at {FULL:.0f}s)")
+    assert max(exits) < deadline, "a worker ran to completion — scope never set"

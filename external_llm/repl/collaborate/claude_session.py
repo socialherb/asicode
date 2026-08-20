@@ -147,9 +147,29 @@ class ClaudeSession:
             # receive_response() has no internal deadline, so without this a
             # stuck SDK subprocess would block the session forever.
             if self._query_timeout is not None:
-                verdict = await asyncio.wait_for(
-                    self._run_query(prompt), timeout=self._query_timeout
-                )
+                # The exchange runs in an explicit Task: on 3.12+ wait_for
+                # (timeouts-based) does not clean up its inner awaitable on
+                # outer cancellation, and GeneratorExit (async-generator
+                # close, delivered via athrow) bypasses the fut_waiter cancel
+                # path entirely — a bare coroutine would strand the SDK
+                # subprocess running in the background (burning tokens/CPU)
+                # with nothing to interrupt it. Cancel + interrupt explicitly
+                # on every cancellation exit path (pattern sealed in
+                # push_manager's SSE keepalive park).
+                query_task = asyncio.create_task(self._run_query(prompt))
+                try:
+                    verdict = await asyncio.wait_for(
+                        query_task, timeout=self._query_timeout
+                    )
+                except (asyncio.CancelledError, GeneratorExit):
+                    query_task.cancel()
+                    if query_task.done() and not query_task.cancelled():
+                        # Retrieve a real SDK failure that landed
+                        # concurrently — an unretrieved task exception
+                        # would warn at GC.
+                        _ = query_task.exception()
+                    await self._best_effort_interrupt()
+                    raise
             else:
                 verdict = await self._run_query(prompt)
 

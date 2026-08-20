@@ -429,3 +429,35 @@ class TestStructuralScanCrossRefsUnion:
 
         assert result["ok"] is True
         assert captured["files"] == ["a.py", "b.py"]
+
+
+class TestStructuralScanScopeCancel:
+    """The scan handler's cooperative-cancel pre-check must observe the
+    per-call scope (executor-side abandonment: MCP timeout, aborted parallel
+    batch) in addition to the agent-loop ESC event — a call abandoned while
+    queued returns immediately instead of entering the minutes-long loop."""
+
+    def test_scope_set_pre_check_returns_cancelled(self, tmp_path):
+        import threading
+
+        from external_llm.agent.cancel_scope import call_cancel_scope
+
+        tools = _FakeAnalysisTools(str(tmp_path), ["a.py"])
+        ev = threading.Event()
+        ev.set()
+        with call_cancel_scope(ev):
+            result = tools._tool_run_structural_scan({"scanner": "all", "path": ""})
+        assert result["ok"] is False
+        assert result["error"] == "Operation cancelled before structural scan"
+
+    def test_unset_scope_scan_runs(self, tmp_path):
+        """An installed-but-unset scope must not change scan behavior."""
+        import threading
+
+        from external_llm.agent.cancel_scope import call_cancel_scope
+
+        tools = _FakeAnalysisTools(str(tmp_path), ["main.go"])
+        with call_cancel_scope(threading.Event()):
+            result = tools._tool_run_structural_scan({"scanner": "all", "path": ""})
+        assert result["ok"] is True
+        assert "Scanned 1 file(s)." in result["content"]

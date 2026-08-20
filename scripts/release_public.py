@@ -271,23 +271,75 @@ _FAST_POLICY_TESTS: list[str] = [
 ]
 
 _VERIFY_GATE_TIMEOUT_S = 600    # structural gate cold-boots ~69s; 600 is headroom
-_VERIFY_UNIT_TIMEOUT_S = 2400   # full snapshot unit suite: ~5-6 min in CI
+_VERIFY_UNIT_TIMEOUT_S = 2400
+
+# Durations evidence: the unit steps run with ``-p no:cacheprovider`` (the
+# public tree must not grow a .pytest_cache the next release would stage), so
+# pytest's own duration cache never exists — timing was argued from total wall
+# time only. ``--durations`` is computed in-session (cache-independent) and the
+# step output is persisted as an artifact (see _write_verify_artifact).
+_VERIFY_DURATIONS_COUNT = 40
+_VERIFY_ARTIFACT_DIRNAME = ".verify_artifacts"
+_VERIFY_ARTIFACT_KEEP = 12   # full snapshot unit suite: ~5-6 min in CI
 
 
-def _run_verify_step(args: list[str], cwd: Path, timeout: float) -> tuple[bool, str]:
-    """Run one verify step. Returns (ok, output-tail) — never raises, never
-    sys.exits: the caller decides what an abort looks like."""
+def _run_verify_step(args: list[str], cwd: Path, timeout: float) -> tuple[bool, str, str]:
+    """Run one verify step. Returns (ok, output-tail, full-output) — never
+    raises, never sys.exits: the caller decides what an abort looks like.
+    The full output feeds the durations artifact; the tail is for the abort
+    message."""
     try:
         proc = subprocess.run(
             [sys.executable, *args], cwd=cwd, capture_output=True, text=True,
             timeout=timeout, check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        return False, f"timed out after {exc.timeout:.0f}s"
+        return False, f"timed out after {exc.timeout:.0f}s", ""
+    out = proc.stdout + proc.stderr
     if proc.returncode == 0:
-        return True, ""
-    tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-30:])
-    return False, f"exit {proc.returncode}\n{tail}"
+        return True, "", out
+    tail = "\n".join(out.strip().splitlines()[-30:])
+    return False, f"exit {proc.returncode}\n{tail}", out
+
+
+def _write_verify_artifact(
+    mode: str, dt: float, failed: int, total: int, chunks: list[str]
+) -> Path | None:
+    """Persist per-step output (pytest --durations) OUTSIDE the public tree.
+
+    Two placement constraints, both machine-checked in test_release_verify_mode:
+
+    * **Not in *public*** — verify runs after ``git add -A``, so any file
+      created there would be swept into the NEXT release's staging and then
+      deleted by the snapshot sync: leaking into shipped bytes or thrashing
+      the committed tree.
+    * **Gitignored in the private repo** — the clean-tree preflight reads
+      ``git status --porcelain``, which lists untracked files; an un-ignored
+      artifact dir would block the next release (the same abort-dead-end
+      class as the stash guidance fixed for the public tree).
+
+    Observability must never abort a release: any OSError degrades to None.
+    """
+    try:
+        art_dir = REPO / _VERIFY_ARTIFACT_DIRNAME
+        art_dir.mkdir(parents=True, exist_ok=True)
+        path = art_dir / f"verify-durations-{mode}-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+        status = f"{total - failed}/{total} steps green" if not failed else f"{failed}/{total} steps FAILED"
+        header = (
+            f"# asicode release --verify={mode} — {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"# {status}, {dt:.0f}s total\n"
+        )
+        path.write_text(header + "".join(chunks), encoding="utf-8")
+    except OSError:
+        return None
+    # Retention cap: `olds[:-KEEP]` is empty until the cap is exceeded, so the
+    # slice alone implements "keep newest N". Prune failure is non-fatal.
+    try:
+        for old in sorted(art_dir.glob("verify-durations-*.txt"))[:-_VERIFY_ARTIFACT_KEEP]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return path
 
 
 def _verify_release(public: Path, mode: str) -> bool:
@@ -295,30 +347,39 @@ def _verify_release(public: Path, mode: str) -> bool:
     steps: list[tuple[str, list[str], float]] = [
         (name, args, _VERIFY_GATE_TIMEOUT_S) for name, args in _VERIFY_GATES
     ]
+    durations = [f"--durations={_VERIFY_DURATIONS_COUNT}"]
     if mode == "fast":
         if _FAST_POLICY_TESTS:
             steps.append((
                 "policy-unit-subset",
-                ["-m", "pytest", "-q", "-p", "no:cacheprovider", *_FAST_POLICY_TESTS],
+                ["-m", "pytest", "-q", "-p", "no:cacheprovider", *durations,
+                 *_FAST_POLICY_TESTS],
                 _VERIFY_UNIT_TIMEOUT_S,
             ))
     else:  # full — fast gates plus the whole snapshot unit suite
         steps.append((
             "unit-suite-full",
-            ["-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/unit", "-m", "not slow"],
+            ["-m", "pytest", "-q", "-p", "no:cacheprovider", *durations,
+             "tests/unit", "-m", "not slow"],
             _VERIFY_UNIT_TIMEOUT_S,
         ))
 
     failed = 0
     t_start = time.monotonic()
+    chunks: list[str] = []
     for i, (name, args, timeout) in enumerate(steps, 1):
         print(f"verify [{i}/{len(steps)}] {name}")
         sys.stdout.flush()
-        ok, detail = _run_verify_step(args, public, timeout)
+        ok, detail, out = _run_verify_step(args, public, timeout)
+        verdict = "ok" if ok else "FAILED"
+        chunks.append(f"\n===== [{i}/{len(steps)}] {name} — {verdict} =====\n{out.rstrip()}\n")
         if not ok:
             failed += 1
             print(f"    FAILED: {detail}", file=sys.stderr)
     dt = time.monotonic() - t_start
+    artifact = _write_verify_artifact(mode, dt, failed, len(steps), chunks)
+    if artifact:
+        print(f"verify: durations artifact → {artifact}")
     if failed:
         print(f"verify: {failed}/{len(steps)} step(s) failed in {dt:.0f}s", file=sys.stderr)
         return False
@@ -468,8 +529,12 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"error: --verify={args.verify} failed — release aborted BEFORE commit/tag/push.\n"
             f"  The staged release is preserved in {public} for inspection:\n"
-            f"    git -C {public} diff --cached --stat   (what would have shipped)\n"
-            f"    git -C {public} reset                  (undo the staging)",
+            f"    git -C {public} diff --cached --stat        (what would have shipped)\n"
+            f"  To retry after fixing the failure, clean the tree first — a bare\n"
+            f"  `git reset` only unstages: the synced snapshot edits stay in the\n"
+            f"  working tree and the dirty-tree preflight blocks the next run:\n"
+            f"    git -C {public} stash push -u                (the snapshot regenerates\n"
+            f"                                                 deterministically — safe to drop)",
             file=sys.stderr,
         )
         return 1

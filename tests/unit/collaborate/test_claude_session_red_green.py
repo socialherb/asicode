@@ -65,6 +65,30 @@ class _StreamClient:
             raise self._fail_interrupt
 
 
+class _BlockingClient:
+    """Fake SDK client whose stream never completes — models a stuck agent
+    subprocess (the exact hazard query_timeout guards). Records whether the
+    stream observed cancellation and how often interrupt() ran."""
+
+    def __init__(self):
+        self.interrupt_calls = 0
+        self.stream_cancelled = False
+
+    async def query(self, prompt):
+        pass
+
+    async def receive_response(self):
+        try:
+            await asyncio.Event().wait()  # never set: stream hangs forever
+            yield None  # pragma: no cover
+        except (asyncio.CancelledError, GeneratorExit):
+            self.stream_cancelled = True
+            raise
+
+    async def interrupt(self):
+        self.interrupt_calls += 1
+
+
 class TestContextManagerLifecycle:
     """__aenter__/__aexit__: client construction, partial-message flag,
     connect failure cleanup, disconnect error tolerance."""
@@ -230,6 +254,55 @@ class TestQueryGuard:
     def test_interrupt_without_client_is_noop(self):
         s = ClaudeSession()
         _run(s.interrupt())  # _client None → no-op
+
+
+class TestOuterCancellationSealsSubprocess:
+    """Outer cancellation / timeout must not leak the SDK agent subprocess.
+
+    On 3.12+ wait_for does not clean up its inner awaitable on outer
+    cancellation, and the cancellation paths never called interrupt() —
+    only the TimeoutError branch did — so cancelling the collaboration
+    task (collaboration_orchestrator.run) left the agent subprocess
+    running in the background burning tokens/CPU. The explicit Task guard
+    must cancel the inner task and interrupt the subprocess before
+    re-raising. (The GeneratorExit leg of the guard is defensive parity
+    with push_manager's sealed keepalive-park pattern; the production
+    caller chain here is a plain task, so CancelledError is the realistic
+    delivery and what these tests seal.)"""
+
+    def test_outer_task_cancel_interrupts_subprocess(self):
+        async def scenario():
+            client = _BlockingClient()
+            s = ClaudeSession(query_timeout=30.0)
+            s._client = client
+            task = asyncio.create_task(s.query("hello"))
+            await asyncio.sleep(0.05)  # reach the blocking stream
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return client
+
+        client = _run(scenario())
+        assert client.interrupt_calls == 1
+        assert client.stream_cancelled is True
+
+    def test_timeout_path_still_interrupts_with_task_wrapper(self):
+        """The create_task refactor must not regress the TimeoutError
+        branch: wait_for(task, ...) must cancel the inner stream on timeout
+        and the branch must still interrupt the subprocess."""
+
+        async def scenario():
+            client = _BlockingClient()
+            s = ClaudeSession(query_timeout=0.05)
+            s._client = client
+            result = await s.query("hello")
+            return client, result
+
+        client, result = _run(scenario())
+        assert result.verdict.status == "failure"
+        assert "timed out" in result.error
+        assert client.interrupt_calls == 1
+        assert client.stream_cancelled is True
 
 
 class TestStreamLoopDispatch:

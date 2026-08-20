@@ -18,7 +18,6 @@ from __future__ import annotations
 import calendar
 import datetime
 import logging
-import math
 import os
 import tempfile
 import threading
@@ -35,6 +34,7 @@ from typing import (
 
 from ..common.file_lock import cross_process_flock
 from ..common.repo_files import canonical_repo_key
+from .bm25 import bm25_idf_map, bm25_tf_norm
 
 # Module-level lazy tokenizer singleton — identical pattern to
 # ``rag_searcher._TOKENIZER``. Avoids re-constructing the CodeTokenizer
@@ -977,28 +977,22 @@ def select_promotable_entries(
     n_docs = len(entries)
     if avgdl == 0:
         return []
-    _K1, _B = 1.5, 0.75  # BM25 tuning (matches rag_searcher)
     # IDF depends ONLY on the query token (+ corpus stats df/n_docs, which are
     # loop-invariant) — NOT on the entry — so precompute it once over qset
-    # (turn 13112 perf #8, symmetric to the tf_norm hoist below). Previously
-    # math.log was recomputed on every entry x every shared term.
-    idf_map = {
-        qt: math.log((n_docs - df.get(qt, 0) + 0.5) / (df.get(qt, 0) + 0.5) + 1.0)
-        for qt in qset
-    }
+    # (single-sourced in agent.bm25; previously math.log was recomputed on
+    # every entry x every shared term).
+    idf_map = bm25_idf_map(qset, df, n_docs)
     # ── Score each entry ───────────────────────────────────────────────
     scored: list[tuple[float, InsightEntry]] = []
     for entry, etoks in zip(entries, toksets, strict=True):
         shared = qset & etoks
         if not shared:
             continue
-        doc_len = len(etoks)
-        # TF normalisation depends ONLY on doc_len (not the query term), so hoist
-        # it out of the per-term loop — it was recomputed on every `qt` iteration
-        # even though doc_len/K1/B/avgdl are loop-invariant (turn 13110 perf #7).
-        tf_norm = 1.0 * (_K1 + 1) / (1.0 + _K1 * (1 - _B + _B * doc_len / avgdl))
-        # IDF is query-token-only and precomputed in idf_map above; `shared` is a
-        # subset of qset so every lookup hits. score = tf_norm * Σ IDF over shared.
+        # Entries score BINARY term presence (tf=1): the shared BM25 tf_norm
+        # evaluated at tf=1 — bit-identical to the previous inline literal
+        # (tests/unit/agent/test_bm25_core.py seals it).
+        tf_norm = bm25_tf_norm(1, len(etoks), avgdl)
+        # `shared` is a subset of qset so every idf_map lookup hits.
         score = tf_norm * sum(idf_map[qt] for qt in shared)
         if score >= min_score:
             scored.append((score, entry))

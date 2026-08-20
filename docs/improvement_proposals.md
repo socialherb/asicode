@@ -443,7 +443,7 @@ P3-1 적용 후에도 남는 genuine false positive 4건 (`operation_executor.py
 
 > 컨텍스트: P-I 재측정(`35f52561`, 2026-08-16)에서 게이트 실측 — **웜 15-18s / 콜드 ~69.3s** (`scripts/check_structural_scanners.py --gate-only`). 열거→읽기 통합(B1, `bb641142`)과 원자 쓰기(B2, `73baaf43`)가 캐시 신뢰성을 확보했으나, CI는 캐시가 **아예 없다** — 아래 제안은 그 CI 콜드 부트 비용을 다룬다.
 
-### P8-1. [제안: 채택 검토] `lint.yml` structural-scanner 스텝 `actions/cache`로 `.cache/` 재사용
+### P8-1. [✅ 완료] `lint.yml` structural-scanner 스텝 `actions/cache`로 `.cache/` 재사용
 
 **파일**: `.github/workflows/lint.yml` — "Check ZERO deterministic structural scanner candidates" 스텝(`run: python scripts/check_structural_scanners.py --gate-only`)
 
@@ -455,7 +455,7 @@ P3-1 적용 후에도 남는 genuine false positive 4건 (`operation_executor.py
 - B2(`73baaf43`) 원자 쓰기 계약: 캐시는 완전 payload 1개 (`atomic_write_json`/streaming temp+replace) — CI 복원 파일이 손상/절단돼도 **fail-open**으로 풀 재분석 (정확성 무영향).
 - `CACHE_VERSION`/`_DBX_CACHE_VERSION`/`_CRX_CACHE_VERSION` 등 버전 키가 payload에 내장 — 스캐너 로직 변경 시 자동 무효화 (수동 버전 범프 불필요).
 
-**리스크: 하** | **노력: 0.25d** | **절감: push당 ~50s** (콜드 69s → 웜 ~18s)
+**리스크: 하** | **노력: 0.25d** | **절감: push당 ~50s** (콜드 69s → 웜 ~18s) | **✅ 완료 — `cb0a7fe3`** (구현안 그대로 적용, fingerprint 보존 검증 포함)
 
 **구현안**: `unit-tests` 잡과 별개로, 같은 스텝 앞에
 
@@ -479,7 +479,7 @@ P3-1 적용 후에도 남는 genuine false positive 4건 (`operation_executor.py
 
 **대안 (기각)**: ① `.cache/` 커밋 — gitignore 계약 위반 + 매 push 100MB 업로드, 기각. ② `--gate-only` 스텝을 release.yml로 이동 — 이 잡이 유일한 push 게이트라 무의미, 기각. ③ pre-commit 훅에 캐시 워밍 — 로컬은 이미 웜이라 무의미, 기각.
 
-### P8-2. [문서: 반영] `check_structural_scanners.py` 게이트 타이밍 주석 갱신
+### P8-2. [✅ 완료] `check_structural_scanners.py` 게이트 타이밍 주석 갱신
 
 **파일**: `tests/unit/test_check_structural_scanners.py:714-715` (`~21s warm` 주석 → P-I 실측 반영)
 
@@ -487,11 +487,41 @@ P3-1 적용 후에도 남는 genuine false positive 4건 (`operation_executor.py
 
 **제안**: `scripts/check_structural_scanners.py` docstring/`--help`에 실측 추가 — `--gate-only` 콜드 ~69s (fresh repo/CI, 캐시 부재 시) / 웜 15-18s. "CI 캐시 도입 시 웜에 근접" 기대값 명시.
 
-**리스크: 없음** | **노력: 0.1d**
+**리스크: 없음** | **노력: 0.1d** | **✅ 완료 — `f249257f`** (docstring에 콜드/웜 실측 고정 + 스캐너 개수 정정 포함)
+
+---
+
+## 🟢 P9 — 2026-08-20 개선 제안 라운드 (구조 스캐너 8종 0건 이후, 실측 기반)
+
+> 컨텍스트: 구조 스캐너 8종(dead_block/contradictory/broken_contract/duplicate_definition 등) 全검색 0건 — 게이트가 트리를 청결하게 유지 중. 신규 버그 후보 없음을 전제로, **쌍둥이 drift 위험 + 실측 성능** 축으로만 제안 구성.
+
+### P9-1. [✅ 완료] BM25 5중 복제 공식 → `agent/bm25.py` 단일 소스 통합 + idf 호이스트
+
+**대상**: `rag_searcher._bm25_score`(참조 구현) ↔ `insights_manager` 인라인 idf/tf_norm ↔ `design_chat_loop` 랭킹 루프 ↔ `symbol_search`/`read_tools` 셋업 쌍둥이(_doc_tc/_df/_avgdl/_scores 블록 통째 복붙) — 탐색 과정에서 **쌍둥이 2개가 아니라 5형제**로 확인됨.
+
+**근거**: ① 쌍둥이 drift는 실증된 버그 클래스(cancel-scope 2라운드에서 call_graph↔rag_searcher 한쪽만 수정된 사례) — BM25도 이미 insights 쪽만 idf 호이스트가 적용된 불균형 상태였음("matches rag_searcher" 주석으로 수동 동기화). ② 실측: lock 보유 구간(`_index_lock`) 내 스코어 루프 **1.06→0.76 ms/query (1.39x)** — 병렬 서브에이전트 rag_search 경합 시 lock-held 시간 직접 단축.
+
+**구현**: `external_llm/agent/bm25.py` 신설(stdlib-only, agent import graph 최하층 — AST 게이트로 봉인). K1/B/idf/tf_norm/참조 score/fast-path(pairs)/bm25_rank(셋업 쌍둥이 대체) 제공. **비트 동일성 계약**: 이전 공식 전사 대비 `==` 정확 일치(isclose 아님) — 랭킹이 vector-cache/promote 순서를 먹이므로 epsilon drift도 허용 안 함. `tokenize`가 중복 토큰을 보존하므로 fast-path multiplicity 유지(전사 테스트로 봉인). `bm25_rank`는 빈 코퍼스에서 ZeroDivisionError 대신 `[]`(엄격 개선).
+
+**리스크: 하** | **노력: 0.5d** | **✅ 완료 — 신규 테스트 9건(test_bm25_core.py) + 관련 357 테스트 통과, winners 비트 동일 확인**
+
+### P9-2. [✅ 완료] improvement_proposals.md P8 상태 스테일 정리
+
+**현황**: P8-1(`cb0a7fe3`)/P8-2(`f249257f`)는 구현 완료였으나 상태가 "제안"으로 잔류 + 변경 이력 미기록.
+
+**✅ 완료 — 본 커밋에서 P9 섹션 추가와 함께 정리.**
+
+### P9-3. [제안: 데이터 대기] v0.2.27 verify durations 마이닝
+
+**현황**: `e494dee0`의 durations 아티팩트(`.verify_artifacts/verify-durations-*.txt`)가 아직 비어 있음 — full verify 미실시 때문. 첫 `--verify=full` 실행 후 top-40 느린 테스트 데이터로 xdist 워커 밸런싱/마킹 후속 라운드 구성(실측 기반으로만).
+
+**노력: 0.25d** | **리스크: 없음** | **상태: v0.2.27 릴리스 이후 착수 가능**
 
 ---
 
 ## 📊 전체 15항목 요약 테이블
+
+*(P9 라운드는 본 테이블 집계 이후 신설이므로 요약 테이블에 미포함 — 위 P9 섹션 참조)*
 
 | # | 항목 | 카테고리 | 파일/범위 | 노력 | 리스크 | **검증 상태** |
 |---|------|---------|-----------|------|--------|:----------:|
@@ -622,3 +652,4 @@ for f in ['change_spec_assertions.py', 'symbol_handlers.py', 'intent_verifier.py
 | 2026-08-02 | P6-2 REPL 블록 모듈화 (`c52891fd`, P1-1 종결) · R5 pytest-xdist 기본 병렬화 (`922e0920`) | AI agent |
 | 2026-08-02 | P6-3 write_task 하드닝 (`6ee43ed6`, P6 라운드 종결) · C1 문서 스테일 갱신 | AI agent |
 | 2026-08-16 | P8 라운드 신설 — P8-1: lint.yml structural-scanner 스텝 `.cache/` actions/cache 재사용 제안 (타당성: mtime_ns fingerprint 보존 + fail-open + 버전 내장 무효화; 리스크 하, push당 ~50s 절감) · P8-2: 게이트 콜드 부트 타이밍 문서화 제안 (근거: P-I 실측 웜 15-18s / 콜드 ~69s) | AI agent |
+| 2026-08-20 | P9 라운드 신설 — P9-1: BM25 5중 복제 공식 `agent/bm25.py` 단일 소스 통합 + idf 호이스트 완료 (lock 구간 실측 1.39x, 비트 동일성 계약 test_bm25_core 9건) · P9-2: P8-1/P8-2 상태 스테일 정리 (cb0a7fe3/f249257f 구현 완료 반영) · P9-3: v0.2.27 durations 마이닝 제안(데이터 대기) | AI agent |

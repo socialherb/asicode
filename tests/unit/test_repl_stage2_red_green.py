@@ -232,21 +232,26 @@ class TestReplPtySession:
             cwd=os.getcwd(), timeout=timeout)
 
     def _send_cmd(self, sess, text):
-        """Type a command like a human: send the text, wait for prompt_toolkit
-        to render the echo, then press Enter.
+        """Type a command like a human: send the text, wait for the echo,
+        then press Enter.
 
-        Burst-sending ``text + b"\\r"`` is racy: when the bytes arrive in one
-        read, prompt_toolkit (multiline=True) can process the trailing CR as a
-        literal newline instead of dispatching the custom 'enter' submit
-        binding, so the prompt never returns. Waiting for the echo proves the
-        app consumed the text before Enter arrives (verified 3/3 chunked vs
-        0/3 burst).
+        The trailing ``b"\\r"`` is safe to send at ANY moment — SpawnPtySession
+        clears the slave's ICRNL/INLCR/IGNCR at spawn (see
+        ``pty_driver._disable_cr_translation``), so a CR enqueued while the
+        tty sits in the inter-prompt canonical window (prompt_toolkit restores
+        the saved termios between prompts) is held in the input queue
+        untranslated and dispatches the Enter submit binding once the raw-mode
+        read drains it. The historical race — the kernel translating that CR
+        to ``\\n`` → ControlJ ("insert newline") → the prompt never returning
+        (burst RED 3/3, fixed driver 10/10, sealed in
+        ``test_burst_submit_no_echo_barrier``) — lived in the driver, not here.
+        The echo wait below is diagnostics (keeps each command's input visible
+        in failure tails), not a correctness barrier.
         """
         data = text if isinstance(text, bytes) else text.encode()
         sess.clear()
         sess.send(data)
         sess.wait_for(data, timeout=30)
-        time.sleep(0.15)
         sess.send(b"\r")
 
     def _write_insights(self, repo_root):
@@ -351,5 +356,32 @@ class TestReplPtySession:
             [sys.executable, "-c", "import sys; sys.exit(3)"], timeout=15)
         try:
             assert sess.wait(timeout=15) == 3
+        finally:
+            sess.close()
+
+    def test_burst_submit_no_echo_barrier(self, tmp_path):
+        """Burst ``text + CR`` must submit — no echo wait, no settle sleep.
+
+        RED on HEAD (3/3 hang): a CR written while the tty sits in the
+        inter-prompt canonical window is ICRNL-translated to ``\\n`` by the
+        kernel AT ENQUEUE TIME; prompt_toolkit maps ``\\x0a`` to ControlJ
+        (this REPL's "insert newline" binding), so the buffer becomes
+        ``"/status\\n"`` and the prompt never returns — the child parked in
+        ``_collect_input`` (the 8-worker full-suite ~1/run hang, SIGABRT
+        stack evidence). SpawnPtySession now clears ICRNL/INLCR/IGNCR on the
+        slave at spawn (pty_driver._disable_cr_translation): the CR waits in
+        the input queue untranslated and dispatches the Enter binding
+        (GREEN 10/10, two bursts per run). This test fires the burst right
+        after the banner — the widest canonical window — with no mitigation.
+        """
+        repo = str(tmp_path)
+        self._write_insights(repo)
+        sess = self._spawn(repo)
+        try:
+            sess.wait_for(b"asicode", timeout=60)
+            sess.send(b"/status\r")        # burst: text+CR in ONE write
+            sess.wait_for(b"model    anthropic", timeout=30)
+            sess.send(b"/helper\r")        # second burst in the next window
+            sess.wait_for(b"compression helper: (none", timeout=30)
         finally:
             sess.close()
