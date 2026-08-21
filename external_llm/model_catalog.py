@@ -124,6 +124,11 @@ KNOWN_MODELS: dict[str, list[str]] = {
         # the live id (fetch-time test pin). Context window unpublished →
         # decided in _FALLBACK_IS_CORRECT (UNVERIFIED).
         "ox-alpha-free",
+        # DeepSeek v4 Flash vision variant (served since 2026-08-21 alongside
+        # deepseek-v4-flash; vision suffix = multimodal front-end over the
+        # same v4-flash core). 1M window like deepseek-v4-flash →
+        # _FALLBACK_IS_CORRECT (UNVERIFIED).
+        "deepseek-v4-flash-vision-exp",
     ],
 }
 

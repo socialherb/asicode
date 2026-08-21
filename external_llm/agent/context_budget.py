@@ -181,6 +181,8 @@ _FALLBACK_IS_CORRECT: frozenset[str] = frozenset({
     # not published by opencode docs; live id ships as "ox-alpha-free" while
     # the docs page calls the config id "x-preview-f-free".
     "ox-alpha-free",
+    # DeepSeek v4 Flash vision variant — same 1M fallback as deepseek-v4-flash.
+    "deepseek-v4-flash-vision-exp",
 })
 
 # Models already warned about the 1M fallback (once per model per process).

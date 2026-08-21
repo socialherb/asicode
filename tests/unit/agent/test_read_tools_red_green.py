@@ -364,7 +364,7 @@ def test_get_file_outline_kind_rendering(tool_registry, monkeypatch):
     monkeypatch.setattr(tool_registry._symbol_searcher, "get_file_outline", lambda path: mixed)
     res = tool_registry.dispatch("get_file_outline", {"path": "shapes.py"})
     assert res.ok, res.error
-    assert "lines 1-20" in res.content      # class extent with end line
+    assert "lines 1–20" in res.content      # noqa: RUF001 — get_file_outline emits an EN DASH in ranges
     assert "bases: B" in res.content
     assert "methods: m1, m2" in res.content
     assert "(line 25)" in res.content       # single-line extent

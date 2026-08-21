@@ -78,6 +78,16 @@ EXCLUDE_FILES = {
     # dropped, so the scanner is right and the assertion is wrong. Measured on
     # the 0.2.19 export: 12 candidates. The gate belongs upstream of the export.
     "tests/unit/test_check_structural_scanners.py",
+    # Fourth of the family: release/export INFRASTRUCTURE gates that build a
+    # git-repo fixture and load scripts/release_public.py or export_public.py
+    # from the PRIVATE tree (REPO = parents[2]). The snapshot is not a git
+    # repository by construction, so these tests cannot run there — they
+    # belong upstream of the export, exactly like the three above.
+    "tests/unit/test_release_verify_mode.py",
+    "tests/unit/test_export_coupled_pattern.py",
+    # Fifth of the family: ghost-import gate enumerates tracked files via
+    # `git ls-files` — meaningless in the non-git snapshot.
+    "tests/unit/test_no_ghost_imports.py",
 }
 
 # Modules under these packages ship in the wheel; the release gate's import

@@ -112,7 +112,7 @@ class TestSynthesizeAndApply:
             success = True
             error = None
 
-            class Mode:
+            class mode:  # noqa: N801 — parsed.mode attribute mirror
                 value = "full_file"
 
         def _boom(*a, **k):
@@ -142,7 +142,7 @@ class TestSynthesizeAndApply:
             success = True
             error = None
 
-            class Mode:
+            class mode:  # noqa: N801 — parsed.mode attribute mirror
                 value = "full_file"
 
         class _Synth:
@@ -174,7 +174,7 @@ class TestSynthesizeAndApply:
             success = True
             error = None
 
-            class Mode:
+            class mode:  # noqa: N801 — parsed.mode attribute mirror
                 value = "full_file"
 
         monkeypatch.setattr(engine.hybrid_parser, "parse", lambda *a, **k: _Parsed())
