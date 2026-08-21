@@ -455,12 +455,18 @@ class TestPathSignatureValidation:
 
     def test_directory_scope_detects_child_add_removal(self, tmp_path):
         """Direct-child create/delete bumps the dir mtime, so a directory-
-        scoped entry (glob etc.) is dropped on structural changes."""
+        scoped entry (glob etc.) is dropped on structural changes.
+
+        tmpfs (Docker/CI containers) can serve the SAME dir mtime_ns across
+        a create+delete in one nanosecond granule, so a bare write does not
+        portably change the signature. Force the mtime change explicitly.
+        """
         cache = ToolResultCache()
         args = {"pattern": "*"}
         cache.set("glob", args, {"matches": []}, paths=frozenset({str(tmp_path)}))
         assert cache.get("glob", args) == {"matches": []}
         (tmp_path / "new.txt").write_text("x")
+        os.utime(tmp_path, (1_000_000_000, 1_000_000_000))
         assert cache.get("glob", args) is None
 
     def test_unspecified_scope_ignores_file_changes(self, tmp_path):
