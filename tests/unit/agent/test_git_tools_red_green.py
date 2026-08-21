@@ -615,14 +615,12 @@ def test_job_action_errors(tool_registry):
 
 
 def test_job_list_empty_and_output_missing(tool_registry):
-    # The global BackgroundJobManager singleton is shared across the whole
-    # test process (and workers), so a job left behind by an earlier test in
-    # ANY file would break the "No background jobs." assertion. Isolate:
-    # kill everything the singleton knows about before asserting emptiness.
-    from external_llm.agent.background_job_manager import get_global_background_job_manager
-    mgr = get_global_background_job_manager()
-    for info in mgr.list_jobs(include_completed=True):
-        mgr.kill(info.job_id)
+    # The default _get_bg_manager() resolves to the process-global singleton,
+    # which any earlier test in ANY file can pollute — "No background jobs."
+    # would then be order/flake-dependent. Inject a fresh manager so the
+    # emptiness assertion is hermetic (the tool reads self._bg_manager).
+    from external_llm.agent.background_job_manager import BackgroundJobManager
+    tool_registry._bg_manager = BackgroundJobManager(max_jobs=5)
 
     res = tool_registry.dispatch("job", {"action": "list"})
     assert res.ok
