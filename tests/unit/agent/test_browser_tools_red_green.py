@@ -365,7 +365,7 @@ def test_render_and_eval_page_close_failure_logged(pw_ready, monkeypatch):
     assert host._render_and_eval("https://x", "1") == 1
 
 
-def test_render_and_eval_hard_timeout_wedge(monkeypatch):
+def test_render_and_eval_hard_timeout_wedge(pw_ready, monkeypatch):
     from concurrent.futures import TimeoutError as _FutureTimeout
 
     class _Never:
