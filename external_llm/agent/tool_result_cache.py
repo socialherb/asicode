@@ -25,14 +25,22 @@ def _paths_overlap(a: str, b: str) -> bool:
     return b.startswith(a_dir) or a.startswith(b_dir)
 
 
-def _path_sig(path: str) -> Optional[tuple[int, int]]:
-    """``(st_mtime_ns, st_size)`` of *path*, or None if it does not exist.
+def _path_sig(path: str) -> Optional[tuple[int, int, int]]:
+    """``(st_mtime_ns, st_size, st_ino)`` of *path*, or None if it does not exist.
 
     Compared on every cache hit to detect external writers that bypass the
     registry's own invalidation (background jobs still writing, the user's
     editor, parallel agent sessions).  For a directory this only catches
     direct-child add/remove (dir mtime is not bumped by file content edits) —
     the TTL remains the bound for edits inside a directory scope.
+
+    ``st_ino`` disambiguates delete+recreate from a same-nanosecond rewrite:
+    filesystems with coarse mtime granularity (some Linux/ext4, tmpfs) can
+    hand a recreated file the same ``(mtime_ns, size)`` as the deleted one —
+    which would silently serve stale results for a brand-new file. A delete
+    always allocates a fresh inode, so including it makes the guard
+    filesystem-agnostic. (On Windows ``st_ino`` is 0 but stable per handle;
+    the tuple still changes when the file is replaced.)
     """
     try:
         st = os.stat(path)
@@ -41,7 +49,7 @@ def _path_sig(path: str) -> Optional[tuple[int, int]]:
         # this guard exists to catch (file deleted by an external writer).
         logger.debug("tool result cache: path signature unavailable: %s", path)
         return None
-    return (st.st_mtime_ns, st.st_size)
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
 
 
 @dataclass
