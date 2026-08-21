@@ -117,6 +117,13 @@ KNOWN_MODELS: dict[str, list[str]] = {
         # only the contributor variant is served now. 1M (2^20) window;
         # decision recorded in _FALLBACK_IS_CORRECT.
         "muse-spark-1.2-contributor",
+        # Ox Alpha Free (stealth model; served since 2026-08-21). Free tier,
+        # zero-retention policy, no training on user data (opencode docs). The
+        # docs page spells the config id "x-preview-f-free", but the live
+        # /zen/go/v1/models endpoint serves "ox-alpha-free" — the catalog tracks
+        # the live id (fetch-time test pin). Context window unpublished →
+        # decided in _FALLBACK_IS_CORRECT (UNVERIFIED).
+        "ox-alpha-free",
     ],
 }
 

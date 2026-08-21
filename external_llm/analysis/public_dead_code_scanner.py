@@ -63,7 +63,6 @@ __all__ = [
 ]
 
 
-
 def scan_public_dead_blocks(
     *,
     repo_root: str,

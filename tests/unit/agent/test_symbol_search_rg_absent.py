@@ -71,10 +71,25 @@ def _simulate_rg_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ss.subprocess, "run", fake_run)
 
 
+_SHARED_SEARCHER: SymbolSearcher | None = None
+
+
 @pytest.fixture
 def searcher_no_rg(monkeypatch: pytest.MonkeyPatch) -> SymbolSearcher:
+    """rg-absent SymbolSearcher, shared lazily across this file's tests.
+
+    The per-file parse cache is instance-owned, so a fresh instance per test
+    re-pays the full-repo cold walk (this file was the #1 unit heavyweight).
+    The rg-absence simulation patches per-call resolution (``ss.shutil`` /
+    ``ss.subprocess``), not instance state, so a searcher built under one
+    test's patch stays valid in the next; mtime-signature invalidation keeps
+    the warmed cache correct. The monkeypatch itself stays function-scoped.
+    """
+    global _SHARED_SEARCHER
     _simulate_rg_absent(monkeypatch)
-    return SymbolSearcher(str(REPO))
+    if _SHARED_SEARCHER is None:
+        _SHARED_SEARCHER = SymbolSearcher(str(REPO))
+    return _SHARED_SEARCHER
 
 
 def test_find_symbol_no_crash_when_rg_absent(searcher_no_rg: SymbolSearcher) -> None:

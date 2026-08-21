@@ -1019,7 +1019,13 @@ def _ts_collect_class_methods(node, code_bytes: bytes) -> list[str]:
 # insertion-ordered, a cache hit moves the entry to the MRU end
 # (_cache_get_lru), and a put evicts the oldest entry once the cap is exceeded
 # (_cache_put_lru).
-_PY_FILE_CACHE_MAX_ENTRIES = 512
+# Measured on this repo (~950 Python files): a 512 cap sat BELOW the file
+# count, so every full-repo traversal (the rg-absent find_symbol path walks
+# all files) evicted the whole cache and re-parsed everything — 1.5-2.0s per
+# call, never amortised. 2048 holds every file with warm re-lookups (~0.4s
+# per traversal). Entries average ~23KB (mtime sig + full symbol map), so the
+# worst-case bound is ~47MB; bigger monorepos still evict LRU as before.
+_PY_FILE_CACHE_MAX_ENTRIES = 2048
 _TS_FILE_CACHE_MAX_ENTRIES = 256  # TS entries carry heavier module analysis
 _GO_FILE_CACHE_MAX_ENTRIES = 512  # Go entries are light method tuples
 # _realpath_memo shares the same LRU discipline (see _cache_get_lru /

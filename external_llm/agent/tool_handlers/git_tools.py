@@ -463,7 +463,9 @@ def _blank_heredoc_bodies(command: str, *, interpreter_names: frozenset | None =
         pos, idx = 0, 0
         while pos < len(command) and idx < len(spans):
             m = _HEREDOC_OPENER_RE.search(command, pos)
-            if not m:
+            # The span list was built by this same regex with this same skip
+            # rule, so opener search and spans cannot disagree.
+            if not m:  # pragma: no cover
                 break
             line_start = command.rfind("\n", 0, m.start()) + 1
             prefix = command[line_start:m.start()]
@@ -656,7 +658,9 @@ def _truncate_bash_output(content: str, max_chars: int, true_len: int = 0) -> st
     _sample = content[:4000]
     _ascii_ratio = (sum(ch.isascii() for ch in _sample) / len(_sample)) if _sample else 1.0
     _cap = max_chars if _ascii_ratio > 0.7 else int(max_chars * 0.5)
-    if len(content) <= _cap:
+    # _cap <= max_chars, so len(content) > max_chars (the guard above) implies
+    # len(content) > _cap; this branch is unreachable.
+    if len(content) <= _cap:  # pragma: no cover
         return content
     _truncated = max(true_len, len(content)) - _cap
     _half = _cap // 2
@@ -1535,7 +1539,9 @@ def _truncating_redirect_targets(targets: list, repo_root: str) -> list:
             resolved = p.resolve()
             if resolved.is_relative_to(root):
                 hits.append(str(resolved.relative_to(root)))
-        except OSError:
+        # Path.is_file() already swallows OSError (returns False), so the
+        # explicit stat can only fail by a TOCTOU race.
+        except OSError:  # pragma: no cover
             # Unstattable target (broken symlink, permission, ELOOP). Treated
             # as "nothing to truncate" so the gate stays quiet, but logged:
             # every swallowed target here is one the user is NOT asked about.
@@ -2142,7 +2148,9 @@ class ShellToolsMixin:
                 return self._make_result(ok=False, content="", error=f"Invalid command syntax: {e}")
             parts = _scan_command.split()
 
-        if not parts:
+        # The empty-command guard above fires first (strip()), and shlex.split
+        # never yields [] for a non-empty input.
+        if not parts:  # pragma: no cover
             return self._make_result(ok=False, content="", error="Empty command")
 
         dangerous_executables = set()

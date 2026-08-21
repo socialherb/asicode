@@ -26,16 +26,66 @@ function call (which may mutate object state).
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 from dataclasses import dataclass
 from typing import Optional
 
 from external_llm.agent.config.thresholds import config as _cfg
+from external_llm.common.atomic_io import atomic_write_json
 
 from . import parse_cache
 
 logger = logging.getLogger(__name__)
+
+# ── Per-file result disk cache (A307 pattern, 2026-08-21) ────────────────────
+# The structural gate runs this scanner over the WHOLE repo on every commit
+# (fresh process), and the analysis is a pure function of file content +
+# max_dup_distance — no graph, no cross-file state.  A per-file
+# (st_mtime_ns, st_size) fingerprint cache lets a warm gate rebuild reuse the
+# previous process's verdicts instead of re-walking every file's AST
+# (measured: ~3.4s of the ~12s warm gate after the vulture save fix).
+# Fail-open by construction: any read/format/version/dup-distance mismatch or
+# a missing entry recomputes that file; a stale cache never changes verdicts,
+# only costs a re-scan.  Version is embedded so scanner-logic changes
+# invalidate the whole cache instead of serving old verdicts.
+_CONTRADICTORY_CACHE_VERSION = 1
+
+
+def _contradictory_cache_path(repo_root: str) -> str:
+    return parse_cache.cache_file_path(repo_root, f"contradictory_scan_v{_CONTRADICTORY_CACHE_VERSION}.json")
+
+
+def _load_contradictory_cache(repo_root: str) -> dict[str, dict]:
+    """Per-file candidate lists keyed by repo-relative path — fail-open."""
+    if not repo_root:
+        return {}
+    path = _contradictory_cache_path(repo_root)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if payload.get("format") != _CONTRADICTORY_CACHE_VERSION or not isinstance(payload.get("files"), dict):
+        return {}
+    return payload["files"]
+
+
+def _save_contradictory_cache(repo_root: str, files: dict[str, dict]) -> None:
+    """Atomic whole-file replace; failures logged (fail-open)."""
+    if not repo_root:
+        return
+    path = _contradictory_cache_path(repo_root)
+    try:
+        atomic_write_json(
+            path,
+            {"format": _CONTRADICTORY_CACHE_VERSION, "files": files},
+            indent=None,
+            ensure_ascii=True,
+        )
+    except (OSError, TypeError, ValueError):
+        logger.debug("[CONTRADICTORY] cache write failed", exc_info=True)
 
 # ast.TryStar (except*) exists from Python 3.11
 _TRY_TYPES = (ast.Try, ast.TryStar) if hasattr(ast, "TryStar") else (ast.Try,)
@@ -650,12 +700,36 @@ def scan_contradictory_logic(
 
     Returns:
         List of ``ContradictoryCandidate``.
+
+    Uses a per-file ``(st_mtime_ns, st_size)`` fingerprint disk cache (see the
+    module header).  A cache entry is keyed by fingerprint + the
+    ``max_dup_distance`` in effect, so a changed analysis parameter re-scans
+    instead of serving stale verdicts; a hit restores the previous verdicts
+    verbatim.  Fail-open: any mismatch just recomputes that file.
     """
     candidates: list[ContradictoryCandidate] = []
     _truncated_total = 0  # candidates dropped by max_per_file
 
+    files_cache = _load_contradictory_cache(repo_root) if repo_root else {}
+    dirty = 0
+
     for rel_path in file_paths or []:
         abs_path = rel_path if os.path.isabs(rel_path) else os.path.join(repo_root or "", rel_path)
+        pair = parse_cache.read_with_fingerprint(abs_path)
+        if pair is None:
+            continue
+        _src, fp = pair
+        rel = os.path.relpath(abs_path, repo_root) if repo_root else rel_path
+        entry = files_cache.get(rel)
+        if (
+            entry is not None
+            and tuple(entry.get("fp") or ()) == fp
+            and entry.get("dup_dist") == max_dup_distance
+        ):
+            for c in entry.get("cands", []):
+                candidates.append(ContradictoryCandidate(**c))
+            continue
+
         tree = parse_cache.parse_ast(abs_path)
         if tree is None:
             continue
@@ -672,6 +746,15 @@ def scan_contradictory_logic(
                     rel_path, max_per_file, len(file_candidates) - emitted,
                 )
                 break
+        files_cache[rel] = {
+            "fp": list(fp),
+            "dup_dist": max_dup_distance,
+            "cands": [c.to_dict() for c in file_candidates],
+        }
+        dirty += 1
+
+    if dirty:
+        _save_contradictory_cache(repo_root, files_cache)
 
     if candidates:
         kinds = {}

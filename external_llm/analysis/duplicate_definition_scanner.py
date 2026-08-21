@@ -21,12 +21,14 @@ Each name with ≥ 2 qualifying occurrences becomes a
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 from external_llm.agent.config.thresholds import config as _cfg
+from external_llm.common.atomic_io import atomic_write_json
 from external_llm.languages import LanguageId as _LanguageId
 
 from ..languages.tree_sitter_utils import (
@@ -43,9 +45,11 @@ logger = logging.getLogger(__name__)
 
 # ── Candidate model ────────────────────────────────────────────────────────────
 
+
 @dataclass
 class DuplicateDefinitionCandidate:
     """Two or more top-level definitions sharing a name in the same file."""
+
     file: str
     name: str
     symbol_kind: str  # "function" | "class" | "assignment"
@@ -82,25 +86,48 @@ _LANG_TOP_LEVEL_NODES: dict[str, set] = {
     # emitted by the AST fallback path (ast.AnnAssign) — the TS path skipping it
     # was a silent parity gap, now pinned by the node-level contract in
     # test_duplicate_definition_lang_keys_match_registry.
-    "python": {"function_definition", "async_function_definition", "class_definition",
-               "expression_statement", "assignment", "annotated_assignment"},
-    "typescript": {"function_declaration", "class_declaration", "interface_declaration",
-                   "type_alias_declaration", "enum_declaration", "lexical_declaration",
-                   "variable_declaration", "module_declaration"},
-    "javascript": {"function_declaration", "class_declaration", "lexical_declaration",
-                   "variable_declaration"},
+    "python": {
+        "function_definition",
+        "async_function_definition",
+        "class_definition",
+        "expression_statement",
+        "assignment",
+        "annotated_assignment",
+    },
+    "typescript": {
+        "function_declaration",
+        "class_declaration",
+        "interface_declaration",
+        "type_alias_declaration",
+        "enum_declaration",
+        "lexical_declaration",
+        "variable_declaration",
+        "module_declaration",
+    },
+    "javascript": {"function_declaration", "class_declaration", "lexical_declaration", "variable_declaration"},
     "go": {"function_declaration", "method_declaration", "type_declaration", "type_spec"},
     # method/field_declaration never appear at program root under the standard
     # java grammar (they live inside class bodies) but are kept for
     # grammar-variant coverage — the same reasoning as the python dual listing.
-    "java": {"class_declaration", "interface_declaration", "enum_declaration",
-             "method_declaration", "field_declaration"},
+    "java": {
+        "class_declaration",
+        "interface_declaration",
+        "enum_declaration",
+        "method_declaration",
+        "field_declaration",
+    },
     # fwcd kotlin grammar (language-pack AND standalone) emits
     # function_declaration — "fun_declaration" was a stale fork variant that
     # silently skipped every top-level kotlin function.
-    "kotlin": {"class_declaration", "object_declaration", "companion_object",
-               "interface_declaration", "enum_declaration", "function_declaration",
-               "property_declaration"},
+    "kotlin": {
+        "class_declaration",
+        "object_declaration",
+        "companion_object",
+        "interface_declaration",
+        "enum_declaration",
+        "function_declaration",
+        "property_declaration",
+    },
 }
 
 # Per-language kind derivation from node type.
@@ -149,10 +176,7 @@ def _validate_judge_maps() -> None:
     emitted = set().union(*_LANG_TOP_LEVEL_NODES.values())
     unkinded = emitted - set(_LANG_KIND_MAP)
     if unkinded:
-        raise ValueError(
-            "_LANG_KIND_MAP is missing kinds for emitted node types: "
-            f"{sorted(unkinded)}"
-        )
+        raise ValueError(f"_LANG_KIND_MAP is missing kinds for emitted node types: {sorted(unkinded)}")
     stale = set(_LANG_KIND_MAP) - emitted
     if stale:
         raise ValueError(
@@ -167,7 +191,9 @@ def _validate_judge_maps() -> None:
 _validate_judge_maps()
 
 
-def _ts_collect_top_level_definitions(source: str, language: str = "python") -> list[tuple[str, str, int, int, Optional[str]]]:
+def _ts_collect_top_level_definitions(
+    source: str, language: str = "python"
+) -> list[tuple[str, str, int, int, Optional[str]]]:
     """Tree-sitter version: collect module-level definitions only.
 
     Uses per-language ``_LANG_TOP_LEVEL_NODES`` map (supports Python,
@@ -221,7 +247,11 @@ def _ts_collect_top_level_definitions(source: str, language: str = "python") -> 
         # ── Extract name node(s) ──────────────────────────────────────
         name_nodes = []
         if ct in ("expression_statement", "assignment", "annotated_assignment"):  # Python assignment, ±wrapper
-            assign_node = node if ct in ("assignment", "annotated_assignment") else _ts_child_by_type(node, ("assignment", "annotated_assignment"))
+            assign_node = (
+                node
+                if ct in ("assignment", "annotated_assignment")
+                else _ts_child_by_type(node, ("assignment", "annotated_assignment"))
+            )
             if assign_node is None:
                 continue
             left = assign_node.child_by_field_name("left")
@@ -327,6 +357,85 @@ def _collect_top_level_definitions(tree: ast.Module) -> list[tuple[str, str, int
 
 # ── Public scan API ───────────────────────────────────────────────────────────
 
+
+# ── Per-file result disk cache (A307 pattern, 2026-08-21) ────────────────────
+# The structural gate runs this scanner over the WHOLE repo on every commit
+# (fresh process).  Tree-sitter parsing of every scanned file is the
+# scanner's dominant cost even on a warm gate (measured 1.43s / 1004 files,
+# P14-5 2026-08-21) — and unlike the AST scanners it has no shared
+# parse_cache tier, because tree_sitter_utils keeps its own parse tree cache.
+# The collection is a pure function of file content (no graph, no cross-file
+# state), so a per-file (st_mtime_ns, st_size) fingerprint cache lets a warm
+# gate reuse the previous process's definition lists instead of re-parsing
+# every file.  Fail-open by construction: any read/format/version mismatch
+# or a missing entry recomputes that file; a stale cache never changes
+# verdicts, only costs a re-scan.  Version is embedded so scanner-logic
+# changes invalidate the whole cache instead of serving old verdicts.
+_DUP_DEF_CACHE_VERSION = 1
+
+
+def _dup_def_cache_path(repo_root: str) -> str:
+    return parse_cache.cache_file_path(repo_root, f"duplicate_def_v{_DUP_DEF_CACHE_VERSION}.json")
+
+
+def _load_dup_def_cache(repo_root: str) -> tuple[dict[str, tuple], bool]:
+    """Per-file def-list cache keyed by abs path: ``{path: (fp, defs)}``.
+
+    *defs* entries are JSON-shaped ``[name, kind, lineno, end_lineno,
+    receiver]`` lists (see the JSON-round-trip contract — P14-3: the in-memory
+    form must match the on-disk form so a warm load never re-dirties).
+    Returns ``(cache, dirty=False)``; fail-open: any read/format/version
+    error yields an empty cache, and the caller recomputes everything.
+    """
+    if not repo_root:
+        return {}, False
+    path = _dup_def_cache_path(repo_root)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        logger.debug("[DUPLICATE_DEF] cache unreadable — full collection", exc_info=True)
+        return {}, False
+    if payload.get("format") != _DUP_DEF_CACHE_VERSION or not isinstance(payload.get("files"), dict):
+        return {}, False
+    cache: dict[str, tuple] = {}
+    for abs_path, entry in payload["files"].items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("fp"), list):
+            continue
+        defs = entry.get("defs")
+        if defs is None:
+            cache[abs_path] = (tuple(entry["fp"]), None)
+        elif isinstance(defs, list):
+            cache[abs_path] = (tuple(entry["fp"]), [tuple(d) for d in defs])
+    return cache, False
+
+
+def _save_dup_def_cache(repo_root: str, cache: dict[str, tuple]) -> None:
+    """Persist *cache* to disk atomically (best-effort; failure costs a re-scan).
+
+    Empty *repo_root* skips the write (unit-test convention — throwaway temp
+    files must not grow the CWD's ``.cache``).
+    """
+    if not repo_root:
+        return
+    path = _dup_def_cache_path(repo_root)
+    try:
+        files = {}
+        for abs_path, (fp, defs) in cache.items():
+            if defs is None:
+                files[abs_path] = {"fp": list(fp), "defs": None}
+            else:
+                files[abs_path] = {"fp": list(fp), "defs": [list(d) for d in defs]}
+        atomic_write_json(
+            path,
+            {"format": _DUP_DEF_CACHE_VERSION, "files": files},
+            indent=None,
+            ensure_ascii=True,
+        )
+    except (OSError, TypeError, ValueError):
+        logger.debug("[DUPLICATE_DEF] cache write failed", exc_info=True)
+
+
 def scan_duplicate_definitions(
     *,
     repo_root: str,
@@ -342,6 +451,7 @@ def scan_duplicate_definitions(
     candidates: list[DuplicateDefinitionCandidate] = []
     _truncated_total = 0  # collision groups dropped by max_per_file
 
+    _cache, _dirty = _load_dup_def_cache(repo_root or "")
     for rel_path in file_paths or []:
         abs_path = rel_path if os.path.isabs(rel_path) else os.path.join(repo_root or "", rel_path)
         src = parse_cache.read_source(abs_path)
@@ -352,17 +462,31 @@ def scan_duplicate_definitions(
         _lang_id = _LanguageId.from_path(rel_path)
         _lang = _lang_id.value if _lang_id is not None else "python"
 
-        # ── Primary: tree-sitter ──
-        if _HAS_TS:
-            defs = _ts_collect_top_level_definitions(src, language=_lang)
+        # ── Fingerprint cache: skip the tree-sitter/AST collection entirely on
+        # a (mtime_ns, size) hit (the scanner's dominant cost, P14-5).  The
+        # stat is taken BEFORE the read above served the source (B1 order
+        # contract — read_with_fingerprint) so a torn entry is unreachable.
+        _fp = parse_cache.stat_fingerprint(abs_path)
+        _cached = _cache.get(abs_path)
+        if _cached is not None and _cached[0] == _fp:
+            defs = _cached[1]
         else:
-            # ── Fallback: AST (Python only) ──
-            if _lang != "python":
-                continue
-            tree = parse_cache.parse_ast(abs_path)
-            if tree is None:
-                continue
-            defs = _collect_top_level_definitions(tree)
+            # ── Primary: tree-sitter ──
+            if _HAS_TS:
+                defs = _ts_collect_top_level_definitions(src, language=_lang)
+            else:
+                # ── Fallback: AST (Python only) ──
+                if _lang != "python":
+                    continue
+                tree = parse_cache.parse_ast(abs_path)
+                if tree is None:
+                    continue
+                defs = _collect_top_level_definitions(tree)
+            if _fp is not None:
+                _cache[abs_path] = (_fp, defs)
+                _dirty = True
+        if defs is None:
+            continue  # cached skip decision (unreadable / broken / no imports)
 
         # Group by (name, kind).  Same-name across kinds (e.g. class shadowed
         # by assignment) is rarer and reported as separate candidates.
@@ -380,20 +504,27 @@ def scan_duplicate_definitions(
             if len(occs) < 2:
                 continue
             occs_sorted = sorted(occs, key=lambda x: x[0])
-            candidates.append(DuplicateDefinitionCandidate(
-                file=rel_path,
-                name=name,
-                symbol_kind=kind,
-                occurrences=occs_sorted,
-            ))
+            candidates.append(
+                DuplicateDefinitionCandidate(
+                    file=rel_path,
+                    name=name,
+                    symbol_kind=kind,
+                    occurrences=occs_sorted,
+                )
+            )
             emitted += 1
             if emitted >= max_per_file:
                 _truncated_total += len(_collision_groups) - emitted
                 logger.warning(
                     "[DUPLICATE_DEF] %s: hit max_per_file=%d, truncating %d remaining group(s)",
-                    rel_path, max_per_file, len(_collision_groups) - emitted,
+                    rel_path,
+                    max_per_file,
+                    len(_collision_groups) - emitted,
                 )
                 break
+
+    if _dirty:
+        _save_dup_def_cache(repo_root or "", _cache)
 
     if candidates:
         logger.info(
@@ -407,4 +538,3 @@ def scan_duplicate_definitions(
         # `del` before each invocation).
         scan_duplicate_definitions._truncated = _truncated_total
     return candidates
-

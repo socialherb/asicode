@@ -54,17 +54,69 @@ extension.
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from ..common.atomic_io import atomic_write_json
 from ..languages import LanguageId
 from . import parse_cache
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["BrokenContractCandidate", "scan_broken_contracts"]
+
+# ── Per-file member-group disk cache (A307 pattern, 2026-08-21) ────────────
+# The gate runs this scanner over the whole repo on every commit (fresh
+# process) with the graph injected.  _collect_members — the ast.walk over
+# every function body plus the _state_accesses body scans — is a pure
+# function of file content and is the scanner's dominant cost (~4.0s of the
+# ~7.2s warm scan, measured 2026-08-21: 950 files).  Pair evaluation
+# (graph caller counts) still runs every time; only the member grouping is
+# cached.  A per-file (st_mtime_ns, st_size) fingerprint cache lets a warm
+# gate rebuild reuse the previous process's grouping instead of re-walking
+# every body.  Fail-open by construction: any read / format / version /
+# fingerprint mismatch or a missing entry recomputes that file; a stale cache
+# never changes verdicts, only costs a re-scan.  Version is embedded so
+# scanner-logic changes invalidate the whole cache.
+_BROKEN_CONTRACT_CACHE_VERSION = 1
+
+
+def _broken_contract_cache_path(repo_root: str) -> str:
+    return parse_cache.cache_file_path(repo_root, f"broken_contract_members_v{_BROKEN_CONTRACT_CACHE_VERSION}.json")
+
+
+def _load_broken_contract_cache(repo_root: str) -> dict[str, dict]:
+    """Per-file grouped-members maps keyed by repo-relative path — fail-open."""
+    if not repo_root:
+        return {}
+    path = _broken_contract_cache_path(repo_root)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if payload.get("format") != _BROKEN_CONTRACT_CACHE_VERSION or not isinstance(payload.get("files"), dict):
+        return {}
+    return payload["files"]
+
+
+def _save_broken_contract_cache(repo_root: str, files: dict[str, dict]) -> None:
+    """Atomic whole-file replace; failures logged (fail-open)."""
+    if not repo_root:
+        return
+    path = _broken_contract_cache_path(repo_root)
+    try:
+        atomic_write_json(
+            path,
+            {"format": _BROKEN_CONTRACT_CACHE_VERSION, "files": files},
+            indent=None,
+            ensure_ascii=True,
+        )
+    except (OSError, TypeError, ValueError):
+        logger.debug("[BROKEN_CONTRACT] cache write failed", exc_info=True)
 
 
 # Verbs stripped to derive a function's *core* name. Ordered so multi-word
@@ -104,6 +156,7 @@ class BrokenContractCandidate:
     re-wire the missing caller to it (or, if the contract was intentionally
     deleted, remove the orphan too).
     """
+
     file: str
     core_name: str
     # The two members of the pair. Each dict carries the bare name, kind,
@@ -138,7 +191,7 @@ def _strip_access_verb(name: str) -> str:
         return ""
     for verb in _ACCESS_VERBS:
         if name.startswith(verb):
-            core = name[len(verb):]
+            core = name[len(verb) :]
             # Reject single-token cores (``get_x`` → ``x``) that are too
             # generic to be meaningful, and require at least one underscore
             # so the core itself reads as a noun phrase.
@@ -233,11 +286,28 @@ def _state_accesses(body: list[ast.stmt]) -> tuple[set[str], set[str]]:
 
 # Common method names that mutate the receiver. Calling any of these on an
 # attribute is treated as a write of that attribute's location.
-_MUTATOR_METHODS: frozenset = frozenset({
-    "append", "extend", "insert", "add", "update", "pop", "popleft",
-    "remove", "discard", "setdefault", "clear", "sort", "reverse",
-    "put", "set", "write", "writelines", "seek",
-})
+_MUTATOR_METHODS: frozenset = frozenset(
+    {
+        "append",
+        "extend",
+        "insert",
+        "add",
+        "update",
+        "pop",
+        "popleft",
+        "remove",
+        "discard",
+        "setdefault",
+        "clear",
+        "sort",
+        "reverse",
+        "put",
+        "set",
+        "write",
+        "writelines",
+        "seek",
+    }
+)
 
 
 def _classify_mutator_call(call: ast.Call, writes: set[str]) -> None:
@@ -369,6 +439,7 @@ def _is_scanner_entry_point(name: str) -> bool:
     if not name.startswith("scan_"):
         return False
     from ..agent.scanner_registry import get_registry
+
     return name in get_registry().resident_entry_point_names()
 
 
@@ -405,28 +476,88 @@ def scan_broken_contracts(
         return []
 
     results: list[BrokenContractCandidate] = []
+    # Per-file member-group disk cache (see module header) — reuse previous
+    # process's grouping for unchanged files.  The graph caller-count
+    # evaluation still runs fresh every time; only the AST-walk grouping is
+    # cached.
+    files_cache = _load_broken_contract_cache(repo_root) if repo_root else {}
+    _cache_dirty = 0
+    _cache_hits = 0
     for fpath in file_paths:
         if LanguageId.from_path(fpath) is not LanguageId.PYTHON:
             continue
         abs_path = fpath if os.path.isabs(fpath) else os.path.join(repo_root, fpath)
-        tree = parse_cache.parse_ast(abs_path)
-        if tree is None:
+        pair = parse_cache.read_with_fingerprint(abs_path)
+        if pair is None:
             continue
-        per_file = _scan_module(tree, fpath, repo_graph, max_per_file)
+        _src, fp = pair
+        rel = os.path.relpath(abs_path, repo_root) if repo_root else fpath
+        entry = files_cache.get(rel)
+        if entry is not None and tuple(entry.get("fp") or ()) == fp:
+            _cache_hits += 1
+            # Restore the grouped members with sets reconstructed from lists.
+            grouped: dict[str, list[dict[str, Any]]] = {
+                core: [
+                    {
+                        "name": m["name"],
+                        "core": m["core"],
+                        "lineno": m["lineno"],
+                        "end_lineno": m["end_lineno"],
+                        "writes": set(m.get("writes", [])),
+                        "reads": set(m.get("reads", [])),
+                        # node is not needed by pair evaluation
+                    }
+                    for m in members
+                ]
+                for core, members in (entry.get("grouped") or {}).items()
+            }
+        else:
+            tree = parse_cache.parse_ast(abs_path)
+            if tree is None:
+                continue
+            grouped = _collect_members(tree)
+            # Persist the grouping for this file (fail-open; node dropped —
+            # JSON cannot carry AST nodes).
+            files_cache[rel] = {
+                "fp": list(fp),
+                "grouped": {
+                    core: [
+                        {
+                            "name": m["name"],
+                            "core": m["core"],
+                            "lineno": m["lineno"],
+                            "end_lineno": m["end_lineno"],
+                            "writes": sorted(m["writes"]),
+                            "reads": sorted(m["reads"]),
+                        }
+                        for m in members
+                    ]
+                    for core, members in grouped.items()
+                },
+            }
+            _cache_dirty += 1
+        per_file = _scan_module(None, fpath, repo_graph, max_per_file, grouped=grouped)
         results.extend(per_file)
         if len(results) >= max_per_file * max(1, len(file_paths)):
             break
+
+    if _cache_dirty:
+        _save_broken_contract_cache(repo_root, files_cache)
+        if _cache_hits:
+            logger.debug("[BROKEN_CONTRACT] members cache: %d file(s) recomputed, %d reused", _cache_dirty, _cache_hits)
     return results
 
 
-def _scan_module(
-    tree: ast.Module,
-    rel_path: str,
-    graph: Any,
-    max_per_file: int,
-) -> list[BrokenContractCandidate]:
-    """Group top-level & method defs by core name, validate pairs."""
-    # Collect every function/method def with a non-trivial core name.
+def _collect_members(tree: ast.Module) -> dict[str, list[dict[str, Any]]]:
+    """Group top-level & method defs by core name — pure function of AST.
+
+    Returns ``{core_name: [member, ...]}`` where each member carries the
+    fields used by pair evaluation plus the AST node.  This AST walk over
+    every function body (and its ``_state_accesses`` body scan) is the
+    scanner's dominant cost (~4.0s of ~7.2s over 950 files, measured
+    2026-08-21) and depends on nothing outside the file, so the result is
+    cached by file fingerprint in :func:`scan_broken_contracts`.
+    """
     grouped: dict[str, list[dict[str, Any]]] = {}
 
     for node in ast.walk(tree):
@@ -441,15 +572,31 @@ def _scan_module(
         if not core:
             continue
         writes, reads = _state_accesses(node.body)
-        grouped.setdefault(core, []).append({
-            "name": name,
-            "core": core,
-            "lineno": node.lineno,
-            "end_lineno": getattr(node, "end_lineno", node.lineno),
-            "writes": writes,
-            "reads": reads,
-            "node": node,
-        })
+        grouped.setdefault(core, []).append(
+            {
+                "name": name,
+                "core": core,
+                "lineno": node.lineno,
+                "end_lineno": getattr(node, "end_lineno", node.lineno),
+                "writes": writes,
+                "reads": reads,
+                "node": node,
+            }
+        )
+    return grouped
+
+
+def _scan_module(
+    tree: ast.Module,
+    rel_path: str,
+    graph: Any,
+    max_per_file: int,
+    grouped: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[BrokenContractCandidate]:
+    """Group top-level & method defs by core name, validate pairs."""
+    # Collect every function/method def with a non-trivial core name.
+    if grouped is None:
+        grouped = _collect_members(tree)
 
     candidates: list[BrokenContractCandidate] = []
     for core, members in grouped.items():
@@ -518,8 +665,10 @@ def _evaluate_pair(
 
 
 def _shared_state(
-    a_w: set[str], a_r: set[str],
-    b_w: set[str], b_r: set[str],
+    a_w: set[str],
+    a_r: set[str],
+    b_w: set[str],
+    b_r: set[str],
 ) -> set[str]:
     """Locations where one side writes and the other reads (or both write).
 

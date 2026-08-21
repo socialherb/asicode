@@ -47,9 +47,7 @@ SCAN_EXTS: tuple[str, ...] = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java
 # side or the other (pinned by test_scan_ext_map_boundary_is_exhaustive):
 # a NEW extension for a scanned language (say ".pyx": "PYTHON") fails that
 # test until a scan/no-scan decision is made.
-_UNSCANNED_VARIANTS: frozenset[str] = frozenset(
-    {".pyi", ".mts", ".cts", ".mjs", ".cjs", ".kts"}
-)
+_UNSCANNED_VARIANTS: frozenset[str] = frozenset({".pyi", ".mts", ".cts", ".mjs", ".cjs", ".kts"})
 
 # The language set the scanned extensions map onto — DERIVED from SCAN_EXTS
 # through _EXT_MAP (languages/models.py), the package's canonical
@@ -80,8 +78,7 @@ def _derive_scan_languages() -> frozenset[LanguageId]:
             out.add(LanguageId[name])
         except KeyError:
             raise ValueError(
-                f"_EXT_MAP[{ext!r}] = {name!r} is not a LanguageId member "
-                "(external_llm/languages/models.py)"
+                f"_EXT_MAP[{ext!r}] = {name!r} is not a LanguageId member (external_llm/languages/models.py)"
             ) from None
     return frozenset(out)
 
@@ -102,6 +99,7 @@ def _scan_should_skip_dir(d: str) -> bool:
     vendored deps pollute the structural scanners with false positives.
     """
     return _walk_should_skip_dir(d) and d != "env"
+
 
 # ── Cap semantics + scope difference vs the graph build (documented contract)
 # The walk feeds the SCANNER file lists (registry file_paths and the

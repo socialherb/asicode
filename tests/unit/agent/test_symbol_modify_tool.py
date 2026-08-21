@@ -2458,15 +2458,44 @@ def test_post_edit_syntax_ok_kotlin_treesitter_tier_rejects():
     assert _post_edit_syntax_ok(content, "x.kt", source) is False
 
 
-def test_ts_syntax_valid_validator_failure_returns_none(monkeypatch):
-    """A raising validator means 'no opinion', not a syntax error."""
+def test_ts_syntax_valid_parser_failure_returns_none(monkeypatch):
+    """A raising tree-sitter layer means 'no opinion', not a syntax error."""
+    from external_llm.languages import tree_sitter_utils as ts_utils
+
+    def _boom(*a, **k):
+        raise RuntimeError("parser unavailable")
+
+    monkeypatch.setattr(ts_utils, "find_error_nodes", _boom)
+    assert _ts_syntax_valid("x = 1", LanguageId.PYTHON) is None
+
+
+def test_ts_syntax_valid_never_routes_through_compiler_providers(monkeypatch):
+    """Tier 2 is pure tree-sitter: SyntaxValidator (which dispatches to
+    kotlinc/javac/gcc providers) must be OFF the path — a raising validator
+    cannot change the verdict in either direction."""
     from external_llm.languages.syntax_validator import SyntaxValidator
 
     def _boom(*a, **k):
-        raise RuntimeError("validator unavailable")
+        raise AssertionError("compiler-provider route reached")
 
     monkeypatch.setattr(SyntaxValidator, "validate_syntax", staticmethod(_boom))
-    assert _ts_syntax_valid("x = 1", LanguageId.PYTHON) is None
+    # clean kotlin parses clean without touching SyntaxValidator
+    assert _ts_syntax_valid("fun f() {}\n", LanguageId.KOTLIN) is True
+    # brace-balanced parse error is still caught by pure tree-sitter
+    assert _ts_syntax_valid("fun main( {\n}\n", LanguageId.KOTLIN) is False
+
+
+def test_ts_syntax_valid_semantic_errors_are_not_syntax_errors():
+    """A type/unresolved-reference error is invisible to tree-sitter — the
+    syntax gate must not reject it. Compiler-grade validation is the agent
+    validation stack's job (tool_registry / tool_safety / write mixins)."""
+    bad_types = (
+        "fun f(): Int {\n"
+        "    val x: String = undefined_thing()\n"
+        "    return x\n"
+        "}\n"
+    )
+    assert _ts_syntax_valid(bad_types, LanguageId.KOTLIN) is True
 
 
 def test_modify_symbol_empty_code_guard(tmp_path):

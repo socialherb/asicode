@@ -1,6 +1,6 @@
 [project]
 name = "asicode"
-version = "0.2.27"
+version = "0.2.28"
 description = "Autonomous Software Improvement — AST-precise code editing agent with verification gates (CLI + MCP server)"
 readme = "README.md"
 license = "MIT"
@@ -257,6 +257,15 @@ addopts = [
     # the flag and its value must be separate elements.
     "-n",
     "auto",
+    # --dist=worksteal: idle workers steal pending tests from busy workers'
+    # queues (pytest-xdist >= 3.5). The unit suite is top-heavy — stage3
+    # spawned-REPL cluster (~19 tests x 2-5s) plus 13.8s/12.6s/8.5s
+    # heavyweights (verify-durations 20260820-204549) — so round-robin
+    # ``load`` left stragglers. Measured 2026-08-20 (8 workers, full unit
+    # suite, interleaved A/B x2): load 199.1/202.1s vs worksteal
+    # 156.1/167.1s = 1.24x median. Pinned by test_pytest_dist_contract.py.
+    "--dist",
+    "worksteal",
 ]
 # Coverage measurement: `coverage run -m pytest` is WRONG under -n auto —
 # xdist workers are separate interpreters, so it records only the main

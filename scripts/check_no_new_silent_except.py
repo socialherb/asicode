@@ -464,13 +464,94 @@ def _read_index_blob(rel: str) -> str | None:
     return proc.stdout.decode("utf-8", errors="replace")
 
 
+def _read_index_blobs_batch(rels: list[str]) -> dict[str, str]:
+    """Read every staged (*rel* → content) in ONE git subprocess session.
+
+    The naive per-file ``git show :<rel>`` spawns one subprocess per file —
+    measured 4.37s (66% of a 6.6s index-only scan on 248 scoped files) purely
+    in fork/exec overhead (P13, 2026-08-21).  One ``ls-files -s`` + one
+    ``cat-file --batch`` session reads every blob with a constant subprocess
+    count, dropping that overhead to near zero.  ``cat-file`` output order
+    matches request order, so each SHA maps deterministically back to its path.
+
+    Returns ``{rel: content}`` for rels that resolved; missing blobs (empty
+    file? submodule? race) are simply absent — the caller skips them, same as
+    a per-file ``git show`` failure.
+    """
+    if not rels:
+        return {}
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO), "ls-files", "-s", "-z", "--", *rels],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    sha_by_path: dict[str, str] = {}
+    for entry in proc.stdout.split(b"\0"):
+        if not entry or b"\t" not in entry:
+            continue
+        meta, path = entry.decode("utf-8", errors="replace").split("\t", 1)
+        parts = meta.split()
+        if len(parts) >= 3 and parts[0] != "160000":  # skip gitlinks
+            sha_by_path[path] = parts[1]
+    batch_input = "".join(sha + "\n" for sha in sha_by_path.values()).encode("utf-8")
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO), "cat-file", "--batch"],
+            input=batch_input,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    sha_to_content: dict[str, str] = {}
+    buf = proc.stdout
+    idx = 0
+    n = len(buf)
+    while idx < n:
+        eol = buf.find(b"\n", idx)
+        if eol == -1:
+            break
+        hdr = buf[idx:eol].decode("utf-8", errors="replace")
+        idx = eol + 1
+        if not hdr:
+            break
+        parts = hdr.split()
+        if len(parts) != 3:
+            break
+        _sha, _typ, size_s = parts
+        try:
+            size = int(size_s)
+        except ValueError:
+            break
+        content = buf[idx : idx + size].decode("utf-8", errors="replace")
+        sha_to_content[_sha] = content
+        idx += size + 1  # trailing newline after each blob
+    out: dict[str, str] = {}
+    for path, sha in sha_by_path.items():
+        if sha in sha_to_content:
+            out[path] = sha_to_content[sha]
+    return out
+
+
 def _get_current_keys(index_only: bool = False, paths: list[str] | None = None) -> set[str]:
     keys: set[str] = set()
     if index_only:
         rels = [r for r in paths if _in_scope(r)] if paths is not None else _git_list_scope_py()
         if rels is not None:
+            # Batch: one ls-files + one cat-file session instead of N git-show
+            # forks (P13, 2026-08-21; 4.37s of the 6.6s scan was fork overhead).
+            contents = _read_index_blobs_batch(rels)
             for rel in rels:
-                src = _read_index_blob(rel)
+                src = contents.get(rel) if contents else _read_index_blob(rel)
                 if src is not None:
                     keys.update(_scan_source(src, rel))
             return keys

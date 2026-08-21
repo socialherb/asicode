@@ -349,6 +349,58 @@ def test_cross_file_usage_suppressed_in_file_paths_scope(tmp_path):
     assert "_truly_dead" in names
 
 
+def test_cross_file_value_ref_suppressed_in_file_paths_scope(tmp_path):
+    """Module-level variables consumed by VALUE from another file stay live in
+    leaf scope. Regression: the structural-scan gate (pre-commit per-file
+    mode) reports ``SCAN_LANGUAGES`` in scan_walk.py as dead — it is imported
+    by scanner_registry.py as the identity alias ``_TS_LANGUAGES =
+    SCAN_LANGUAGES``, a value reference with NO call edge, so the caller-edge
+    discovery in ``_caller_live`` cannot see it and vulture's per-file scan
+    neither. The injected ``cross_file_referenced_names`` (whole-repo set, the
+    same contract public_dead_code_scanner uses) must suppress it; a name not
+    in that set must STILL be reported."""
+    (tmp_path / "probe.py").write_text(
+        "SCAN_LANGUAGES = frozenset({'python'})\n\n"
+        "TRULY_DEAD = frozenset({'gone'})\n"
+    )
+
+    class _LeafGraph:  # get_importers → [] ⇒ file_paths_only scope
+        @staticmethod
+        def get_importers(file_path):
+            return []
+
+    cands = scan_vulture_dead_code(
+        repo_root=str(tmp_path),
+        file_paths=["probe.py"],
+        repo_graph=_LeafGraph(),
+        min_confidence=0,
+        cross_file_referenced_names={"SCAN_LANGUAGES"},
+    )
+    names = {c.name for c in cands}
+    assert "SCAN_LANGUAGES" not in names
+    assert "TRULY_DEAD" in names
+
+
+def test_cross_file_value_ref_ignored_in_full_project_scope(tmp_path):
+    """In full_project scope vulture scans every project file itself, so the
+    injected cross-file set must NOT suppress anything — a name in the set but
+    unused in the scanned corpus is genuinely dead (no double-suppression)."""
+    (tmp_path / "probe.py").write_text(
+        "SCAN_LANGUAGES = frozenset({'python'})\n\n"
+        "OTHER_DEAD = frozenset({'gone'})\n"
+    )
+    cands = scan_vulture_dead_code(
+        repo_root=str(tmp_path),
+        file_paths=["probe.py"],
+        repo_graph=None,  # no graph ⇒ full_project scope
+        min_confidence=0,
+        cross_file_referenced_names={"SCAN_LANGUAGES", "OTHER_DEAD"},
+    )
+    names = {c.name for c in cands}
+    assert "SCAN_LANGUAGES" in names
+    assert "OTHER_DEAD" in names
+
+
 # ── visitor-protocol suppression (libcst/ast dispatch hooks) ────────────────
 # libcst (CSTVisitor/CSTTransformer) and ast (NodeVisitor/NodeTransformer)
 # dispatch per-node-type hooks (visit_<Node>, leave_<Node>) and lifecycle

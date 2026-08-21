@@ -378,3 +378,63 @@ def test_main_with_explicit_paths_scopes_scan(tmp_path, monkeypatch):
     (tmp_path / "tests" / "t.py").write_text("import subprocess\nsubprocess.run(['x'])\n")
     monkeypatch.setattr(sys, "argv", ["check", str(tmp_path / "tests" / "t.py")])
     assert g.main() == 0
+
+
+# --- per-file extraction disk cache (P13, 2026-08-21) ------------------------
+# The full-repo scan re-parses every scoped file on every hook run.  The
+# (st_mtime_ns, st_size) fingerprint cache lets unchanged files skip
+# re-analysis — the same invalidation contract as the analysis gate caches.
+def test_cache_persists_and_reuses_unchanged_files(tmp_path, monkeypatch):
+    ext = tmp_path / "ext"
+    (ext / "sub").mkdir(parents=True)
+    (ext / "sub" / "mod.py").write_text(
+        "import subprocess\nsubprocess.run(['a'])\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(g, "REPO", tmp_path)
+    monkeypatch.setattr(g, "_SCAN_ROOTS", ("ext",))
+    monkeypatch.setattr(g, "BASELINE", tmp_path / "b.txt")
+
+    keys1 = g._get_current_keys()
+    cache_file = tmp_path / ".cache" / f"unguarded_keys_v{g._CACHE_VERSION}.json"
+    assert cache_file.exists(), "cache must be written on a cold run"
+    keys2 = g._get_current_keys()
+    assert keys1 == keys2
+    assert "ext/sub/mod.py::<module>::0" in keys1
+
+
+def test_cache_reanalyzes_changed_file_only(tmp_path, monkeypatch):
+    ext = tmp_path / "ext"
+    (ext / "sub").mkdir(parents=True)
+    mod = ext / "sub" / "mod.py"
+    mod.write_text("import subprocess\nsubprocess.run(['a'])\n", encoding="utf-8")
+    monkeypatch.setattr(g, "REPO", tmp_path)
+    monkeypatch.setattr(g, "_SCAN_ROOTS", ("ext",))
+    monkeypatch.setattr(g, "BASELINE", tmp_path / "b.txt")
+
+    keys1 = g._get_current_keys()
+    # Edit the file: a NEW unguarded call is added → fingerprint changes → the
+    # stale cached entry must be recomputed.
+    mod.write_text(
+        "import subprocess\nsubprocess.run(['a'])\nsubprocess.run(['b'])\n",
+        encoding="utf-8",
+    )
+    keys2 = g._get_current_keys()
+    assert "ext/sub/mod.py::<module>::0" in keys2  # 'a' still flagged
+    assert len(keys2) == len(keys1) + 1  # 'b' is a second unguarded call in scope
+
+
+def test_cache_fail_open_on_corruption(tmp_path, monkeypatch):
+    ext = tmp_path / "ext"
+    (ext / "sub").mkdir(parents=True)
+    (ext / "sub" / "mod.py").write_text(
+        "import subprocess\nsubprocess.run(['a'])\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(g, "REPO", tmp_path)
+    monkeypatch.setattr(g, "_SCAN_ROOTS", ("ext",))
+    monkeypatch.setattr(g, "BASELINE", tmp_path / "b.txt")
+
+    cache_file = tmp_path / ".cache" / f"unguarded_keys_v{g._CACHE_VERSION}.json"
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text("{not json!!", encoding="utf-8")
+    keys = g._get_current_keys()
+    assert "ext/sub/mod.py::<module>::0" in keys

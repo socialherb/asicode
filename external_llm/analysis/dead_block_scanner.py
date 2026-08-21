@@ -55,6 +55,7 @@ __all__ = [
 
 # ── Public scan API ───────────────────────────────────────────────────────────
 
+
 def scan_dead_blocks(
     *,
     repo_root: str,

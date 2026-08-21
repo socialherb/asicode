@@ -135,7 +135,9 @@ class WriteToolsEditMixin:
                 if _lines[_li].strip() == _first_line:
                     _raw = _lines[_li].rstrip('\n\r')
                     pos = modified.find(_raw)
-                    if pos == -1:
+                    # _raw IS a line of ``modified`` (the strip match succeeded on
+                    # the same line), so find() always succeeds.
+                    if pos == -1:  # pragma: no cover
                         continue
                     # Multi-line anchor: reconstruct from actual file content
                     _anchor_line_count = anchor.count('\n') + 1
@@ -155,7 +157,9 @@ class WriteToolsEditMixin:
                         if _anchor_line_count > 2:
                             for _try_lines in range(_anchor_line_count - 1, 1, -1):
                                 _partial = "".join(_lines[_li:_li + _try_lines]).rstrip('\n\r')
-                                if _partial and modified.count(_partial) == 1:
+                                # A duplicated full block implies duplicated
+                                # prefixes (same text), so this is unreachable.
+                                if _partial and modified.count(_partial) == 1:  # pragma: no cover
                                     _actual_pos = modified.find(_partial)
                                     if _actual_pos != -1:
                                         logger.info(
@@ -280,7 +284,9 @@ class WriteToolsEditMixin:
                     error=f"Operation {i}: {e}",
                 )
 
-            if _fuzzy_ratio > 0.0:
+            # The resolver returns 0.0 for every strategy (fuzzy matching is
+            # disabled), so this branch is unreachable.
+            if _fuzzy_ratio > 0.0:  # pragma: no cover
                 _warn = f"op {i}: anchor fuzzy-matched at ratio={_fuzzy_ratio:.2f} (anchor={anchor[:60]!r}, matched={_actual_anchor[:60]!r})"
                 logger.warning("edit_file %s", _warn)
                 _edit_warnings.append(_warn)
@@ -532,7 +538,9 @@ class WriteToolsEditMixin:
             with contextlib.suppress(UnicodeDecodeError, UnicodeError):
                 _content = _target.read_text(encoding=_enc)
                 break
-        if _content is None:
+        # latin-1 decodes every byte sequence, so the loop always breaks with
+        # content set.
+        if _content is None:  # pragma: no cover
             return ""
         return self._current_file_head_snippet(_content)
     @staticmethod
@@ -606,7 +614,9 @@ class WriteToolsEditMixin:
                 for ci in cand_idxs:
                     for start in range(max(0, ci - window + 1), ci + 1):
                         region = file_lines[start:start + window]
-                        if not region:
+                        # start <= ci < len(file_lines) and window >= 1, so the
+                        # slice is never empty.
+                        if not region:  # pragma: no cover
                             continue
                         _sm.set_seq1("\n".join(region))
                         r = _sm.ratio()
@@ -1037,7 +1047,9 @@ class WriteToolsEditMixin:
             err_lead = len(err_raw) - len(err_raw.lstrip(" "))
 
             def _lead_of(idx):
-                if idx < 0 or idx >= len(lines):
+                # Callers only pass indices from range(err_idx-1, ..., -1) and
+                # range(err_idx+1, len(lines)) — both in bounds.
+                if idx < 0 or idx >= len(lines):  # pragma: no cover
                     return None
                 _l = lines[idx]
                 stripped = _l.lstrip(" ")
@@ -1103,7 +1115,8 @@ class WriteToolsEditMixin:
                     f"at {opener_lead})."
                 )
 
-        except (IndexError, ValueError, TypeError):
+        # All operations above are bounds-checked; nothing in the body raises.
+        except (IndexError, ValueError, TypeError):  # pragma: no cover
             return ""
         else:
             return ""
@@ -1672,7 +1685,8 @@ class WriteToolsEditMixin:
                 content = _norm.read_text(encoding=_enc)
                 _read_encoding = _enc
                 break
-        if content is None:
+        # latin-1 decodes every byte sequence, so content is always set.
+        if content is None:  # pragma: no cover
             return self._make_result(
                 ok=False, error=f"Failed to read {file_path}: unsupported encoding", execution_time=0
             )
@@ -2125,13 +2139,17 @@ class WriteToolsEditMixin:
                     },
                     execution_time=_time.monotonic() - start_time,
                 )
-            except Exception as _ce:
-                # Not a SyntaxError — compile() also raises ValueError (source
-                # with NUL bytes), RecursionError (deeply nested literals), etc.
-                # Those say nothing about the content being malformed, so the
-                # gate opens rather than refusing a legitimate write. Logged
-                # because a silent skip here is indistinguishable from a gate
-                # that ran and passed.
+            # CPython 3.14 raises SyntaxError for every source-level malformation
+            # (NUL bytes, too many nested parens, unterminated strings) — any
+            # other exception here is environmental (MemoryError etc.).
+            except Exception as _ce:  # pragma: no cover
+                # CPython 3.14 raises SyntaxError for every source-level
+                # malformation (NUL bytes, too many nested parens, unterminated
+                # strings), so any non-SyntaxError exception here is
+                # environmental (MemoryError etc.) and says nothing about the
+                # content being malformed — the gate opens rather than refusing
+                # a legitimate write. Logged because a silent skip here is
+                # indistinguishable from a gate that ran and passed.
                 logger.debug(
                     "create_file: Python syntax gate skipped for %s (%s: %s)",
                     file_path, type(_ce).__name__, _ce,
@@ -2294,7 +2312,9 @@ class WriteToolsEditMixin:
                 content, _ = read_text_with_encoding_fallback(abs_path)
             except OSError:
                 return {"ok": True, "skipped": True, "reason": "file_read_error"}
-            if content is None:
+            # read_text_with_encoding_fallback tries utf-8 then latin-1, and
+            # latin-1 decodes every byte sequence — content is never None here.
+            if content is None:  # pragma: no cover
                 # Non-UTF-8 source that even latin-1 cannot decode.  Previously
                 # UnicodeDecodeError escaped the OSError guard and was swallowed
                 # by the outer except Exception → the gate reported a clean

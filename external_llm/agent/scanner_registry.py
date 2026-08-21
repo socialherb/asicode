@@ -705,6 +705,7 @@ def _auto_register() -> None:
                 "min_confidence": "int",
                 "exclude_patterns": "Optional[list]",
                 "exclude_kinds": "Optional[Iterable[str]]",
+                "cross_file_referenced_names": "Optional[set]",
             },
             file_filter=".py",
             supported_languages=set(_PYTHON_ONLY),

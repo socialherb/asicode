@@ -1611,19 +1611,33 @@ def _post_edit_syntax_ok(
 
 
 def _ts_syntax_valid(text: str, lid: "LanguageId") -> Optional[bool]:
-    """Whether *text* parses clean for *lid*, or None when unanswerable.
+    """Whether *text* parses clean for *lid* (pure tree-sitter), or None.
 
-    None (grammar missing, validator raised) is distinct from False and must be
+    None (grammar missing, parser raised) is distinct from False and must be
     treated as "no opinion" by callers — the same trust contract the rg
     prefilters use, so an unavailable grammar never reads as a syntax error.
+
+    Pure tree-sitter ONLY — never a language toolchain. The earlier
+    ``SyntaxValidator`` route dispatched to compiler providers (kotlinc/
+    javac/gcc, ~2s subprocess per call), which broke this tier's
+    toolchain-free contract two ways: it made the gate slow, and it made the
+    reject decision hostage to *semantic* errors — one type error anywhere
+    in the post-edit file failed the source side's "parsed clean"
+    requirement, so syntax-corrupting edits sailed through to noisy
+    post-write rollback. Tree-sitter sees the parse, not the types, which is
+    all a syntax gate should claim; compiler-grade validation stays with the
+    agent validation stack (tool_registry / tool_safety / write-tool mixins).
     """
     try:
-        from ..languages.syntax_validator import SyntaxValidator
+        from ..languages import tree_sitter_utils as ts_utils
 
-        return bool(SyntaxValidator.validate_syntax(text, lid).ok)
-    except Exception as e:  # grammar missing / validator failure -> no opinion
+        err_nodes = ts_utils.find_error_nodes(text, lid.value)
+    except Exception as e:  # parser unavailable / raised -> no opinion
         logger.debug("tree-sitter syntax tier unavailable for %s: %s", lid, e)
         return None
+    if err_nodes is None:
+        return None  # grammar unavailable -> no opinion, not "valid"
+    return not err_nodes
 
 
 # ── Public API ─────────────────────────────────────────────────────────────

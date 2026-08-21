@@ -17,12 +17,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 pytest.importorskip("faiss")
 pytest.importorskip("numpy")
 
-from unittest.mock import patch
-
 import faiss
 import numpy as np
 
 from external_llm.agent.vector_cache import VectorCacheManager
+
+
+@pytest.fixture(autouse=True)
+def _no_real_model(monkeypatch):
+    """Never load a real SentenceTransformer in these marker-logic tests.
+
+    The model resolves lazily inside ``_ensure_index_loaded`` →
+    ``_ensure_model_loaded`` — i.e. in the test body, AFTER construction — so a
+    ``with patch(...)`` scoped to ``VectorCacheManager(...)`` creation never
+    intercepted the load (real model: ~7s + network download on cache-miss
+    hosts). Function-scoped monkeypatch keeps the whole test under the stub,
+    same contract as test_vector_cache_lazy_and_migration._no_real_model.
+    """
+    import external_llm.agent.vector_cache as vc
+
+    monkeypatch.setattr(vc, "get_global_embedding_model", lambda: None)
 
 
 def _seed_cache(cache_dir, model_name, dim=384, n_docs=3):
@@ -40,9 +54,9 @@ def _seed_cache(cache_dir, model_name, dim=384, n_docs=3):
 
 
 def _manager(cache_dir):
-    # Skip the real model load; invalidation logic is independent of it.
-    with patch("external_llm.agent.vector_cache.get_global_embedding_model", lambda: None):
-        return VectorCacheManager(str(cache_dir))
+    # Model resolution is lazy (_ensure_index_loaded) and stubbed for the whole
+    # test by the _no_real_model autouse fixture — plain construction is enough.
+    return VectorCacheManager(str(cache_dir))
 
 
 def test_reuses_cache_when_model_matches(tmp_path):

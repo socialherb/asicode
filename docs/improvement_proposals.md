@@ -511,11 +511,80 @@ P3-1 적용 후에도 남는 genuine false positive 4건 (`operation_executor.py
 
 **✅ 완료 — 본 커밋에서 P9 섹션 추가와 함께 정리.**
 
-### P9-3. [제안: 데이터 대기] v0.2.27 verify durations 마이닝
+### P9-3. [데이터 확보 — 마이닝 대기] v0.2.27 verify durations 마이닝
 
-**현황**: `e494dee0`의 durations 아티팩트(`.verify_artifacts/verify-durations-*.txt`)가 아직 비어 있음 — full verify 미실시 때문. 첫 `--verify=full` 실행 후 top-40 느린 테스트 데이터로 xdist 워커 밸런싱/마킹 후속 라운드 구성(실측 기반으로만).
+**현황**: v0.2.27 릴리스(2026-08-20)에서 첫 full-verify durations 아티팩트 확보 — `.verify_artifacts/verify-durations-full-20260820-204549.txt` (16/16 게이트, 215s). top 실측: ① pty 50k 절단 테스트 13.8s (CI 플레이크 이력 보유 — v0.2.24), ② vector_cache 재사용 12.6s, ③ symbol_search rg 부재 8.5s; top-40 중 stage3 spawned REPL 군집이 18건으로 최대 블록. 후속 라운드에서 xdist 워커 밸런싱/마킹 구성(실측 기반으로만).
 
-**노력: 0.25d** | **리스크: 없음** | **상태: v0.2.27 릴리스 이후 착수 가능**
+**노력: 0.25d** | **리스크: 없음** | **✅ 완료 — P10-1으로 승계 (2026-08-20)**
+
+---
+
+## 🔬 P10 라운드 (2026-08-20) — P9-3 durations 마이닝 기반
+
+> 컨텍스트: v0.2.27 full-verify durations(20260820-204549)의 top-40 중 stage3 spawned 군집 18건 + 13.8s/12.6s/8.5s 헤비급 = **top-heavy 스위트**. 기본 라운드로빈 `--dist=load`는 워커 테일 스트레글러를 남김. 실측 A/B로 검증.
+
+### P10-1. [✅ 완료] xdist `--dist=worksteal` 전환 — 풀스위트 1.24x
+
+**근거** (8워커, 동일 트리·명령, 인터리브 A/B×2 — 병렬 세션 부하 드리프트 상쇄):
+
+| 모드 | round1 | round2 | 중앙값 |
+|---|---|---|---|
+| `load` (기본) | 199.1s | 202.1s | **200.6s** |
+| `worksteal` | 156.1s | 167.1s | **161.6s** |
+
+**→ 1.24x (−39s, −19.5%)**. worksteal(pytest-xdist ≥3.5)은 유휴 워커가 바쁜 워커의 큐에서 테스트를 훔쳐 top-heavy 테일을 자동 평준화. 최종 검증(신규 계약 테스트 6건 포함) **15623 passed / 149.9s — A/B 최속 기록 갱신**.
+
+**구현**: `pyproject.toml` addopts에 `"--dist", "worksteal"` 추가(분리 쌍 — pytest 9 verbatim 규칙). CI(lint.yml)·release verify 전부 addopts 상속으로 일괄 적용. `tests/unit/test_pytest_dist_contract.py` 신규 6건: R1 실제 addopts가 worksteal 핀(해시 아닌 tomllib 구조적 파싱) / R2 `-n` 병렬 플래그 공존(직렬 실행 시 inert 방지) / R3 dev extra `pytest-xdist>=3.6` ≥3.5(도입 버전) / 추출기 공허 가드 3건(플래그 소실·값 오류·토큰 융합 거부).
+
+**부수 관찰**: `load`에서만 2/4 라운드 실패(동일 1건, worksteal 0/2) — 요구 시 재현 안 됨(추가 2회 통과). 사전 존재하는 파일 조합 플레이 클래스(전역 매니저 오염 계열 추정)로 **본 변경과 무관하나**, worksteal 배치가 우연히 문제 조합을 해소한 것으로 기록. 정체 미식별 — 재발 시 `--dist=load` 되돌림 없이 실패 ID 캡처 권고.
+
+**리스크: 없음** | **노력: 0.25d** | **✅ 완료 — A/B 실측 + 풀스위트 GREEN + 계약 테스트 6건**
+
+---
+
+## 🛠 P11 라운드 (2026-08-20) — P9-3 헤비급 마이닝 2차 (top-3 중 2건이 낭비/버그)
+
+> 컨텍스트: 구조 스캐너 8종 0건(유사 19쌍 전부 "extraction not advised"). 수확은 전부 durations top 헤비급 실측에서 — 13.8s/12.6s/8.5s 중 2건이 테스트 자체의 결함이었다.
+
+### P11-1. [✅ 완료] vector_cache 무효화 테스트 patch 스코프 탈출 — 버그
+
+**현황**: `test_vector_cache_invalidation.py`의 `_manager()` 헬퍼가 `with patch(get_global_embedding_model→None)` **안에서 생성만 하고 반환** — 그러나 `__init__`은 모델을 lazy 로드하므로 patch는 아무것도 가로채지 않았고, 실제 로드는 테스트 본문의 `_ensure_index_loaded()`→`_ensure_model_loaded()`(patch 밖)에서 실행됨. cProfile 실측 테스트 7.05s 전부 `_ensure_model_loaded` = **실 SentenceTransformer 로드**. docstring 계약("without loading a real SentenceTransformer") 위반 + HF 캐시 미보유 환경에서 유닛 테스트가 네트워크 다운로드(CI 불안 요인).
+
+**수리**: 형제 파일(`test_vector_cache_lazy_and_migration.py`)과 동일한 autouse fixture `_no_real_model`(함수 스코프 monkeypatch)로 교체, 무의미한 `with patch` 제거. **실측: 7.05s → 1.50s(4 passed, 개별 duration <0.02s), `HF_HUB_OFFLINE=1` + 존재하지 않는 ST 홈에서도 GREEN — 모델 로드 완전 제거 확인.** 나머지 4개 vector_cache 테스트 파일은 전부 올바른 패턴 — 이 파일로 국소.
+
+**리스크: 하** | **노력: 0.1d** | **✅ 완료**
+
+### P11-2. [✅ 완료] pty 50k 절단 테스트 → bracketed paste — ~18x
+
+**현황**: 스위트 최장 테스트(단독 8.4s / in-suite 13.8s, v0.2.24 CI 플레이크 2회 이력)가 50k 바이트를 **raw per-key**로 피딩 — 인간이 타이핑 불가능한 경로로 ptk의 키별 전체 라인 재렌더를 강제(O(n²): 25k=3.51s → 50k=7.98s = 2.27x). 실사용자 대형 입력은 bracketed paste(단일 삽입)로 도착. 절단 검사는 `prompt()` 반환 텍스트 기준(`repl_impl.py:3180`)이므로 전달 경로와 무관 — **제품이 아니라 테스트가 인위적 최악 경로를 걷고 있었음 → 제품 변경 불필요, 테스트만 교체.**
+
+**수리**: `ESC[200~`+50001자+`ESC[201~`+`\r` 단일 paste로 교체. v0.2.24 플레이크 방지 계약(feeder 스레드 + `feed_done` 배리어 + 90s join) 유지. **실측: 0.46s(~18x), 3회 반복 0.63s 안정, 파일 전체 47 passed 12.59s.** 부수: P10 부수 관찰의 `load` 분포 플레이 유력 후보(최장 테스트 + 컨텐션 시 90s join 압박) 사실상 해소.
+
+**리스크: 하** | **노력: 0.25d** | **✅ 완료 — 동등 단언 유지(값 50000 + 절단 공지)**
+
+---
+
+## 🛠 P12 라운드 (2026-08-21) — P9-3 헤비급 마이닝 3차 (P11이 top-2 치운 뒤 드러난 새 top 헤비급)
+
+> 컨텍스트: 구조 스캐너 8종 0건. 수확은 durations + cProfile 귀속에서 — 둘 다 P11 정리 후 새로 노출된 헤비급이며, 하나는 제품 버그를 겸한다.
+
+### P12-1. [✅ 완료] tier-2 문법 게이트의 외부 컴파일러 유입 — 버그+성능
+
+**현황**: `symbol_modify_tool.py`의 pre-write 문법 게이트 tier-2(`_ts_syntax_valid`)는 docstring상 "toolchain-free, tree-sitter(CORE dependency)" 게이트인데, 구현은 `SyntaxValidator.validate_syntax`를 거쳐 **kotlin/java/c 프로바이더로 위임 → kotlinc/javac/gcc 서브프로세스 부팅(~2s/호출)**. cProfile 귀속: kotlin 군집 테스트 3.4~5s의 비용 전부가 이 경로. **버거 성분**: "source가 parse clean해야 reject" 전제에 컴파일러를 쓰므로 post-edit 파일 어디든 **시맨틱 에러 하나(타입/미해결 참조)면 tier-2가 통째로 무력화** — 문법 훼손 에디트가 pre-write에서 잡히지 않고 noisy post-write rollback로 회귀. 또한 로컬(kotlinc 있음)/CI(없음)가 다른 경로를 타던 비결정적 커버리지.
+
+**수리**: `_ts_syntax_valid`를 `tree_sitter_utils.find_error_nodes` 직접 호출(pure tree-sitter)로 전환 — `None`(그래마 부재)=무의견 계약 유지. 프로브로 판정 동일성 사전 검증(INVALID/CLEAN 정합, 시맨틱 에러는 CLEAN=문법 게이트의 올바른 맹점). **실측: kotlin tier 테스트 2.04s→0.02s(102x), 게이트 커버 2파일 236 passed 0.84s(최대 0.19s).** 계약 테스트 3종으로 봉인: ① parser 예외→None ② `SyntaxValidator` 라우트 부재(raise→AssertionError로 증명) ③ 시맨틱 에러는 reject하지 않음. **트레이드오프(명시)**: 컴파일러만 잡는 에러 클래스는 pre-write reject → post-write verify+rollback로 이동 — agent 검증 스택(tool_registry 3곳, tool_safety, write mixin)이 기존대로 담당.
+
+**리스크: 중간(동작 트레이드오프 문서화됨)** | **노력: 0.25d** | **✅ 완료**
+
+### P12-2. [✅ 완료] rg 부재 폴백 캐시 스래싱 — cap 512 < 레포 952파일
+
+**현황**: rg 부재(base `pip install` 기본 환경)에서 `find_symbol`이 매 호출 1.5~1.95s — `_PY_FILE_CACHE_MAX_ENTRIES=512`가 레포 Python 파일 수(~950)보다 작아 **전체 순회마다 캐시 전량 퇴거 → 재파싱, 절대 amortize 안 됨**. `test_symbol_search_rg_absent.py`(신규 #1 헤비급 8.45s)가 대표 피해자.
+
+**수리**: cap 2048(엔트리 평균 ~23KB 실측 → 최악 ~47MB bound, 초과 모노레포는 기존 LRU). + rg_absent 테스트 파일이 인스턴스별 캐시라 매 테스트 콜드 워크를 재지불하던 것을 모듈 레벨 지연 싱글턴으로 공유(patch는 함수 스코프 유지, mtime 시그니처 무효화로 정확성 보장). **실측: 5.51s→2.34s(2.4x, 직렬), 콜드 1회만 지불.** eviction 테스트(cap=2 monkeypatch, 호출 시점 상수 읽기) 무영향 — outline/dataclass/prefilter/pool/multilang 등 패밀리 182 passed.
+
+**리스크: 하** | **노력: 0.25d** | **✅ 완료**
+
+### (보류) P12-3. rg 부재용 name→files 역인덱스 — 2048파일 초과 모노레포까지 amortize하는 구조적 해법. cap 상향으로 이번 라운드 체감 충분 — 1d는 다음 기회로.
 
 ---
 
@@ -586,7 +655,7 @@ pytest: 496 passed (회귀 없음)
 | 8 | **P2-3** `EngineConfig` dataclass + `_build_engine` 리팩터 | 1d | 13 param → 1 object |
 | 9 | ~~**P4-2** Popen timeout 2건 추가~~ | 0.25d | **종결 — 실측 결과 timeout 불필요 패턴 (fire-and-forget 의도 / tracked Popen)** |
 | 10 | **P1-1** `run_repl` → 5-7개 함수 분할 | 3-5d | **✅ 완료 (P6-2, `c52891fd`)** — 모듈화로 대체 (repl_impl.py 추출) |
-| 11 | **P4-1** webapp stats async sleep | 0.25d | `asyncio.sleep(2)` |
+| 11 | **P4-1** webapp stats async sleep | 0.25d | **✅ 완료 (P7-2)** — `await asyncio.sleep(2)` 확인 (`webapp/routes/stats.py:615`) |
 | 12 | ~~**P4-3** radio.py → watchdog inotify/kqueue~~ | 2d | **종결 — 폴더 폴링 부재 (L160은 서버 재연결 대기)** |
 
 ---
@@ -653,3 +722,8 @@ for f in ['change_spec_assertions.py', 'symbol_handlers.py', 'intent_verifier.py
 | 2026-08-02 | P6-3 write_task 하드닝 (`6ee43ed6`, P6 라운드 종결) · C1 문서 스테일 갱신 | AI agent |
 | 2026-08-16 | P8 라운드 신설 — P8-1: lint.yml structural-scanner 스텝 `.cache/` actions/cache 재사용 제안 (타당성: mtime_ns fingerprint 보존 + fail-open + 버전 내장 무효화; 리스크 하, push당 ~50s 절감) · P8-2: 게이트 콜드 부트 타이밍 문서화 제안 (근거: P-I 실측 웜 15-18s / 콜드 ~69s) | AI agent |
 | 2026-08-20 | P9 라운드 신설 — P9-1: BM25 5중 복제 공식 `agent/bm25.py` 단일 소스 통합 + idf 호이스트 완료 (lock 구간 실측 1.39x, 비트 동일성 계약 test_bm25_core 9건) · P9-2: P8-1/P8-2 상태 스테일 정리 (cb0a7fe3/f249257f 구현 완료 반영) · P9-3: v0.2.27 durations 마이닝 제안(데이터 대기) | AI agent |
+| 2026-08-20 | **v0.2.27 릴리스 완료** (public 0efb9c8, 태그 v0.2.27, CI 2워크플로 success, PyPI 0.2.27 라이브). 게이트가 커밋 전에 카탈로그 drift(muse-spark-1.2 소멸, de1f6633) 적중 — 1차 verify 중단을 사전 차단. P9-3 durations 데이터 확보 | AI agent |
+| 2026-08-20 | P11 라운드 신설 — P11-1: vector_cache invalidation 테스트 patch 스코프 탈출 버그 수리(autouse fixture, 7.05s→1.50s, HF 오프라인 GREEN) · P11-2: pty 50k 절단 테스트 bracketed paste 전환(8.4s→0.46s, ~18x, 단언 동등) · P4-1 Phase 3 row 11 스테일 정리(P7-2 완료 반영) | AI agent |
+| 2026-08-21 | P12 라운드 신설 — P12-1: tier-2 문법 게이트 pure tree-sitter 전환, SyntaxValidator 경유 컴파일러(kotlinc/javac/gcc ~2s) 유입 제거(kotlin tier 2.04s→0.02s, 시맨틱 에러 무력화 버그 수리, 계약테스트 3종) · P12-2: `_PY_FILE_CACHE_MAX_ENTRIES` 512→2048(rg 부재 스래싱 해소, 5.51s→2.34s) + rg_absent 테스트 싱글턴 공유 · P12-3 보류 | AI agent |
+| 2026-08-21 | P13 라운드 신설 — P13-1: untracked gate 2종 헤비급 마이닝(unguarded 1.96s / silent_except ~5.1s / ghost-imports 2.0s, 커밋당 워커마다 dup). **unguarded에 per-file `(mtime_ns,size)` fingerprint 디스크 캐시**(`.cache/unguarded_keys_v1.json`, fail-open, A307 계약): 콜드 2.19s→웜 0.046s (**48x**) · **silent_except `--index-only` git show 248회→ `ls-files -s`+`cat-file --batch` 배치화**(cProfile 66%가 fork/exec): 5.1s→1.15s (**4.4x**, 배치==개별 전체 동일성) · P13-2: ghost-imports 3회 전체 ast.walk→모듈 픽스처 1회 공유(3x 파싱 절약). 계약테스트 5종(캐시 히트/증분/손상 fail-open + 배치 동일성/스코프) | AI agent |
+| 2026-08-21 | P14-2 완료 — `394164d0`/`b421e47a`/`6a6eab21`: 구조 스캐너 콜드 부트 진단(cProfile: `_read_ast` 미스 2,194회, 944파일 17.24MB 소스 → AST 비용 276MB > 256MiB 예산 LRU 스래싱) → `parse_cache._MAX_CACHE_BYTES` 256→384MiB: 테스트 full-scan 게이트 48.66s→10.27s (**4.7x**), misses 2,194→997, 판정 불변. docstring 수치 콜드/웜 재실측 정정(콜드 ~50s, 웜 CLI ~15s, fresh 프로세스+웜 .cache ~10s). P14-3 진행중 — 웜 게이트 그래프 재사용: vulture preprocess sync **framework 튜플vs리스트 타입 불일치 버그** 수리(웜마다 192/2956 dirty→41MB 재직렬화 10.1s 강제 → dirty 4로 스킵) + **contradictory per-file fingerprint 디스크 캐시 신설**(`.cache/contradictory_scan_v1.json`, dup_dist 키 포함, fail-open, 계약테스트 4종): 웜 게이트 19.4s→9.3s (**2.1x**) | AI agent |

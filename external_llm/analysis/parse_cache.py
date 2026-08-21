@@ -107,9 +107,15 @@ _CAPACITY_HEADROOM = 16
 # ASTs weigh ~15x their source (measured 377 MiB AST / 25.8 MiB source).
 _AST_BYTES_PER_SOURCE_BYTE = 15
 # Total byte budget: entry cost, not entry count, is the real memory bound.
-# 256 MiB keeps the shared cache under control while holding a large repo's
-# parsed set (this repo: ~810 py files ≈ 420 MB un-budgeted -> ~256 MB here).
-_MAX_CACHE_BYTES = 256 << 20
+# The budget must hold the WHOLE working set at once or the shared cache
+# thrashes: entry cost is len(src) * (1 + _AST_BYTES_PER_SOURCE_BYTE) = 16x
+# source, so a repo of ~944 py files (17.24 MB source) needs ~276 MB just
+# for one pass — the old 256 MiB budget evicted LRU entries mid-pass and
+# every later scanner re-parsed from scratch (cold gate ~49s, measured
+# P14-2 2026-08-21).  384 MiB holds this repo's full parsed set + headroom;
+# CallGraphIndexer historically paid +421 MB un-budgeted, so a bounded
+# 384 MiB still keeps the shared cache under control.
+_MAX_CACHE_BYTES = 384 << 20
 
 # Cache state.  Each entry is ``key -> (payload, cost)`` where payload is
 # ``(src, tree_or_None)``; ``cost`` is the byte weight used by the budget.

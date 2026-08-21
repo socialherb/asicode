@@ -706,16 +706,31 @@ class TestCollectInput:
         assert result == {"value": "x"}
 
     def test_truncation_over_50000_chars(self, tty):
+        """50k+ input truncation, delivered as a real terminal paste.
+
+        Huge inputs arrive as ONE bracketed paste (``ESC[200~ .. ESC[201~``),
+        which ptk inserts as a single buffer operation. The pre-P11-2 form fed
+        50k bytes as raw per-key characters — a physically-untypable path that
+        forced ptk's full-line re-render per key (quadratic: 50k raw = 2.27x the
+        time of 25k) and made this the longest test in the suite (8.4s solo,
+        13.8s in-suite, two CI flake incidents) while asserting nothing extra:
+        the truncation check runs on the prompt()'s returned text either way.
+        Bracketed paste: 0.56s, same value + same truncation notice.
+        """
         t, result = _start_prompt(tty, "x> ")
         feed_done = threading.Event()
 
         def _feed() -> None:
             try:
-                chunk = b"a" * 2048
-                for _ in range(24):  # 49152
-                    tty.send(chunk)
-                    time.sleep(0.01)
-                tty.send(b"a" * 849 + b"\r")  # +849 = 50001
+                # Single paste of 50001 chars (1 over the limit), then Enter.
+                # Chunked sends are fine: the vt100 parser accumulates paste
+                # content until the ESC[201~ terminator, so kernel-queue
+                # backpressure cannot split the paste semantics.
+                tty.send(b"\x1b[200~")
+                for i in range(0, 50001, 8192):
+                    tty.send(b"a" * min(8192, 50001 - i))
+                tty.send(b"\x1b[201~")
+                tty.send(b"\r")
             finally:
                 feed_done.set()
 

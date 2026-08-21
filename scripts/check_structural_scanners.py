@@ -81,10 +81,15 @@ until its first commit while the full-scan floor (CI) caught it — per-file mod
 must judge the same zero-candidate floor as the full scan.  No args scans the
 whole repo including report-only counts — the full picture for manual/weekly
 drift checks.  ``--gate-only`` runs the same full-repo scan but skips the
-report-only section entirely.  Wall time measured 2026-08-16 (P-I, commit
-35f52561): ~69s COLD (fresh repo/CI checkout — no .cache/, so the graph
-build + every scanner's per-file cache miss) vs 15-18s WARM (local, .cache/
-present).  lint.yml restores .cache/ via actions/cache (P8-1, cb0a7fe3), so
+report-only section entirely.  Wall time measured 2026-08-21 (P14-2,
+commit 394164d0): ~50s COLD (fresh repo/CI checkout — no .cache/, graph
+build + every scanner's per-file cache miss) vs ~15s WARM (local,
+.cache/ present).  The parse_cache byte-budget fix (256→384MiB) removed
+mid-pass LRU eviction that made every later scanner re-parse from
+scratch — the win shows in fresh PROCESSES over a warm .cache/ (test
+runs: full-scan gate test 48.66s → 10.27s); a truly cold checkout still
+pays one graph build + one vulture scan.  lint.yml restores .cache/
+via actions/cache (P8-1, cb0a7fe3), so
 CI pays the cold price only on a cache miss; a source-touching push still
 misses for the touched files (fingerprint (mtime_ns, size) mismatch) and
 self-heals on the next run.

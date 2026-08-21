@@ -973,11 +973,18 @@ def _sync_preprocess_cache(files_cache: dict, repo_root: str) -> int:
     with a matching fingerprint are updated — a file outside the scan set
     (or invalidated meanwhile) is left alone.
     """
+    # The framework convert MUST reproduce the EXACT on-disk JSON shape
+    # (``[[lineno, name], ...]`` list-of-lists): JSON loads lists, and a
+    # tuple-vs-list comparison between the rehydrated ``pre`` and the
+    # freshly computed value marks every framework cache warm entry "dirty"
+    # on every run (measured: 192/2956 → 41MB full-payload rewrite ~10s in
+    # the structural gate).  A convert that normalises to the disk shape
+    # makes a warm run compare equal and skip persistence (dirty < 5%).
     dirty = 0
     for cache, key, convert in (
         (_dispatch_names_cache, "dispatch", lambda r: sorted(r)),
         (_visitor_hooks_cache, "vhooks", lambda r: sorted(ln for _, ln in r)),
-        (_framework_live_cache, "framework", lambda r: sorted((ln, name) for ln, name in r)),
+        (_framework_live_cache, "framework", lambda r: [[ln, name] for ln, name in sorted(r)]),
     ):
         for abs_path, (fp, result) in list(cache._data.items()):
             try:
@@ -1244,6 +1251,7 @@ def scan_vulture_dead_code(
     repo_graph: object = None,
     exclude_kinds: Optional[Iterable[str]] = None,
     cancel_event: Any = None,
+    cross_file_referenced_names: Optional[set] = None,
 ) -> list[VultureCandidate]:
     """Run Vulture and return normalized dead-code candidates.
 
@@ -1267,6 +1275,16 @@ def scan_vulture_dead_code(
             as a raw vulture output size.
         repo_graph: Optional repository graph facade used for hub/leaf scope
             decision (see ``decide_vulture_scan_scope``).
+        cross_file_referenced_names: Set of names referenced from OTHER files
+            (whole-repo fact, same contract as ``public_dead_code_scanner``).
+            In ``file_paths_only`` scope, a candidate whose name is in this
+            set is consumed cross-file (value/attribute references) and must
+            not be reported — vulture's per-file scan cannot see those uses,
+            and ``_caller_live`` only covers call edges, so module-level
+            variables consumed by value (e.g. a derived alias like
+            ``_TS_LANGUAGES = SCAN_LANGUAGES``) would otherwise false-positive.
+            Ignored in ``full_project`` scope, where vulture scans every
+            project file and sees the uses itself.
         exclude_kinds: Candidate kinds to drop from results. Defaults to
             ``_PUBLIC_DEAD_CODE_OVERLAP_KINDS`` ({"function", "class"}) because
             ``public_dead_code_scanner`` already resolves those module-level
@@ -1488,6 +1506,18 @@ def scan_vulture_dead_code(
             # Suppress names with ≥1 caller edge in the repo graph (leaf-scope
             # cross-file usage — see the _caller_live seed above).
             if name in _caller_live:
+                continue
+
+            # Suppress names referenced from other files (whole-repo
+            # cross-file fact; the gate injects
+            # ``compute_cross_file_referenced_names_light`` output).  Mirrors
+            # public_dead_code_scanner's contract: a value/attribute reference
+            # (module-level alias, README-literal dispatch, property read)
+            # has no call edge, so _caller_live cannot see it, but the name is
+            # still live.  Only applied in file_paths_only scope — full_project
+            # scans every project file, so vulture's own used_names already
+            # covers these.
+            if scope == "file_paths_only" and cross_file_referenced_names and name in cross_file_referenced_names:
                 continue
 
             # Suppress framework-dispatched visitor hooks (visit_<Node>/

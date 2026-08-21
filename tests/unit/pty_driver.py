@@ -332,6 +332,8 @@ class SpawnPtySession:
         _disable_cr_translation(slave)
         child_env = dict(os.environ)
         child_env.update({"TERM": "xterm", "NO_COLOR": "1"})
+        if os.environ.get("ASICODE_PTY_DIAG"):
+            child_env["PYTHONFAULTHANDLER"] = "1"  # TEMP DIAG: child stack on SIGABRT
         if env:
             child_env.update(env)
         # `coverage run -m pytest` sets COVERAGE_PROCESS_START, which makes
@@ -412,7 +414,7 @@ class SpawnPtySession:
             time.sleep(0.02)
         raise AssertionError(
             f"timed out after {timeout or self.timeout}s waiting for {needle!r} "
-            f"in pty output; last {len(last)} bytes: {last[-400:]!r}")
+            f"in pty output; last {len(last)} bytes: {last[-4000:]!r}")
 
     def _maybe_answer_cpr(self, data: bytes) -> None:
         if b"\x1b[6n" in data:

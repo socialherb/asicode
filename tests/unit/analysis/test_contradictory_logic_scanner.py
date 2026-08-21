@@ -976,3 +976,109 @@ def test_distant_attr_condition_blocked_by_call_barrier():
     dups = [c for c in candidates if c.contradiction_kind in ("duplicate_condition", "mergeable_condition")]
     assert not dups, f"Call barrier should prevent false positive. Got: {[c.detail for c in dups]}"
     Path(src).unlink()
+
+
+# ── Per-file fingerprint disk cache (P14-3) ──────────────────────────────
+
+
+def _scan_cache_contract(tmp_path, source, **kw):
+    """Write *source* under tmp_path/"probe.py" and scan it (repo_root=tmp_path)."""
+    p = tmp_path / "probe.py"
+    p.write_text(textwrap.dedent(source), encoding="utf-8")
+    return scan_contradictory_logic(
+        repo_root=str(tmp_path),
+        file_paths=[str(p)],
+        **kw,
+    )
+
+
+def test_disk_cache_cold_warm_parity(tmp_path):
+    """A warm run reuses the cold verdicts — same candidates, no re-analysis."""
+    cold = _scan_cache_contract(
+        tmp_path,
+        """\
+        if True: pass
+        def f(x):
+            if x > 0:
+                pass
+            if x > 0:
+                pass
+    """,
+    )
+    assert cold, "probe must produce candidates"
+    # Warm run: fingerprint unchanged -> cache hit -> same verdicts
+    warm = _scan_cache_contract(
+        tmp_path,
+        """\
+        if True: pass
+        def f(x):
+            if x > 0:
+                pass
+            if x > 0:
+                pass
+    """,
+    )
+    assert [(c.contradiction_kind, c.lineno, c.confidence) for c in warm] == [
+        (c.contradiction_kind, c.lineno, c.confidence) for c in cold
+    ]
+
+
+def test_disk_cache_invalidates_on_content_change(tmp_path):
+    """Editing the file re-scans and reflects the new verdicts."""
+    _scan_cache_contract(
+        tmp_path,
+        """\
+        if True: pass
+    """,
+    )
+    # Rewrite the file with a DIFFERENT content (and mtime/size may change)
+    p = tmp_path / "probe.py"
+    p.write_text(
+        textwrap.dedent(
+            """\
+            if False: pass
+            if 0: pass
+        """
+        ),
+        encoding="utf-8",
+    )
+    changed = _scan_cache_contract(
+        tmp_path,
+        """\
+        if False: pass
+        if 0: pass
+    """,
+    )
+    kinds = {c.contradiction_kind for c in changed}
+    assert (
+        "constant_false_condition" in kinds or "constant_zero_condition" in kinds
+    ), f"expected changed verdicts, got {kinds}"
+
+
+def test_disk_cache_invalidates_on_dup_distance_change(tmp_path):
+    """A different max_dup_distance re-scans (cache key includes it)."""
+    src = """\
+        def f(x):
+            if x == 1:
+                pass
+            if x == 1:
+                pass
+    """
+    _scan_cache_contract(tmp_path, src, max_dup_distance=100)
+    # Same content, different parameter -> must NOT serve the old verdict
+    again = _scan_cache_contract(tmp_path, src, max_dup_distance=1)
+    # distance 1: the two conditions are adjacent -> still duplicate
+    # (the cache would have been equally valid here; the contract is that
+    # the parameter is part of the key, so a changed value re-scans)
+    assert again  # duplicates present
+
+
+def test_disk_cache_corrupt_fails_open(tmp_path):
+    """A corrupt cache file degrades to a full re-scan, never a wrong verdict."""
+    (tmp_path / ".cache").mkdir(exist_ok=True)
+    (tmp_path / ".cache" / "contradictory_scan_v1.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+    # Must still scan normally (no candidates for clean source)
+    clean = _scan_cache_contract(tmp_path, "x = 1\n")
+    assert not clean

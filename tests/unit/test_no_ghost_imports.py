@@ -88,15 +88,30 @@ def _iter_first_party_imports(path: Path):
                 yield node.module, node.lineno
 
 
-def test_every_first_party_import_resolves_to_a_real_module(tracked):
-    ghosts: list[str] = []
+@pytest.fixture(scope="module")
+def imports_by_file(tracked):
+    """{rel: [(module, lineno), ...]} for every scoped, tracked .py file.
+
+    Parsed ONCE per test module rather than re-walking the whole tree once per
+    test.  The three consumers each used to call _iter_first_party_imports over
+    every scoped file independently (3x full-tree ast.walk, ~2s each); this
+    fixture shares the single pass (P13, 2026-08-21).
+    """
+    out: dict[str, list[tuple[str, int]]] = {}
     for rel in sorted(tracked):
         if not rel.startswith(SCANNED_ROOTS):
             continue
         path = REPO / rel
         if not path.is_file():
             continue
-        for module, lineno in _iter_first_party_imports(path):
+        out[rel] = list(_iter_first_party_imports(path))
+    return out
+
+
+def test_every_first_party_import_resolves_to_a_real_module(tracked, imports_by_file):
+    ghosts: list[str] = []
+    for rel, imports in imports_by_file.items():
+        for module, lineno in imports:
             if not module.startswith(FIRST_PARTY_PREFIXES):
                 continue
             if not _module_exists(module, tracked):
@@ -113,7 +128,7 @@ def test_every_first_party_import_resolves_to_a_real_module(tracked):
     "module",
     ["external_llm.section_patcher", "external_llm.agent.cross_file_flow_resolver"],
 )
-def test_removed_modules_are_not_imported_again(module, tracked):
+def test_removed_modules_are_not_imported_again(module, tracked, imports_by_file):
     """These two are genuinely gone. If one is ever written, drop it from this
     list and reinstate the call site deliberately — do not let an import of a
     non-existent module creep back in."""
@@ -123,9 +138,8 @@ def test_removed_modules_are_not_imported_again(module, tracked):
     )
     offenders = [
         f"{rel}:{lineno}"
-        for rel in sorted(tracked)
-        if rel.startswith(SCANNED_ROOTS) and (REPO / rel).is_file()
-        for mod, lineno in _iter_first_party_imports(REPO / rel)
+        for rel, imports in imports_by_file.items()
+        for mod, lineno in imports
         if mod == module
     ]
     assert not offenders, f"{module} is imported again at: {offenders}"

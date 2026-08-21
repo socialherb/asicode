@@ -16,25 +16,80 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import logging
 import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+from ..common.atomic_io import atomic_write_json
 from . import parse_cache
 
 logger = logging.getLogger(__name__)
 
+# ── Per-file normalised-symbol disk cache (A307 pattern, 2026-08-21) ───────
+# The gate runs this scanner over non-test source on every commit (fresh
+# process) and over target files per cleanup request.  normalise_function is
+# a pure function of file content — the AST feature walk, skeleton, anchor
+# fingerprints (ast.dump) and texts (ast.unparse) cost ~4.9s of the ~6s warm
+# scan (measured 2026-08-21: 4,072 symbols over 315 files) and depend on
+# nothing outside the file.  A per-file (st_mtime_ns, st_size) fingerprint
+# cache lets a warm rebuild reuse the previous process's normalised symbols
+# instead of re-walking every body.  Fail-open by construction: any read /
+# format / version / fingerprint mismatch or a missing entry recomputes that
+# file; a stale cache never changes verdicts, only costs a re-scan.  Version
+# is embedded so scanner-logic changes invalidate the whole cache instead of
+# serving old normalisations.
+_AST_SIM_CACHE_VERSION = 1
+
+
+def _ast_sim_cache_path(repo_root: str) -> str:
+    return parse_cache.cache_file_path(repo_root, f"ast_sim_norm_v{_AST_SIM_CACHE_VERSION}.json")
+
+
+def _load_ast_sim_cache(repo_root: str) -> dict[str, dict]:
+    """Per-file normalised-symbol maps keyed by repo-relative path — fail-open."""
+    if not repo_root:
+        return {}
+    path = _ast_sim_cache_path(repo_root)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if payload.get("format") != _AST_SIM_CACHE_VERSION or not isinstance(payload.get("files"), dict):
+        return {}
+    return payload["files"]
+
+
+def _save_ast_sim_cache(repo_root: str, files: dict[str, dict]) -> None:
+    """Atomic whole-file replace; failures logged (fail-open)."""
+    if not repo_root:
+        return
+    path = _ast_sim_cache_path(repo_root)
+    try:
+        atomic_write_json(
+            path,
+            {"format": _AST_SIM_CACHE_VERSION, "files": files},
+            indent=None,
+            ensure_ascii=True,
+        )
+    except (OSError, TypeError, ValueError):
+        logger.debug("[AST_SCAN] cache write failed", exc_info=True)
+
+
 # ── Candidate data model ───────────────────────────────────────────────────────
+
 
 @dataclass
 class SimilarityCandidate:
     """A pair of symbols that are structurally similar."""
+
     file: str
-    symbol_a: str           # qualified name, e.g. "MyClass._foo"
+    symbol_a: str  # qualified name, e.g. "MyClass._foo"
     symbol_b: str
-    similarity: float       # 0.0-1.0
-    duplication_kind: str   # see DUPLICATION_KINDS below
+    similarity: float  # 0.0-1.0
+    duplication_kind: str  # see DUPLICATION_KINDS below
     shared_inputs: list[str] = field(default_factory=list)
     extractable: bool = False
     anchor_fingerprints: list[str] = field(default_factory=list)
@@ -49,7 +104,7 @@ class SimilarityCandidate:
     #   "forced_pair_unresolved" — forced pair but symbols missing or normalisation failed
     suggested_action: str = ""
     suggested_primary_symbol: str = ""
-    forced: bool = False    # True when pair was explicitly requested via intent_symbols
+    forced: bool = False  # True when pair was explicitly requested via intent_symbols
     # forced_reason classifies *why* a forced pair ended up in the result:
     #   ""                      — normal top-N candidate (may also be forced=True if in top-N)
     #   "scanner_limit_excluded"— computed but below min_similarity
@@ -97,10 +152,10 @@ class SimilarityCandidate:
 # fails to propagate edit_kind.  Keep the table closed: any action not listed
 # returns "" and the pair is treated as non-actionable downstream.
 _PAIRED_EDIT_KIND_BY_ACTION: dict[str, str] = {
-    "extract_shared_helper":  "helper_extraction",
-    "consolidate_b_into_a":   "delegate_common_logic",
+    "extract_shared_helper": "helper_extraction",
+    "consolidate_b_into_a": "delegate_common_logic",
     "similar_structure_only": "local_patch",
-    "analyze":                "local_patch",
+    "analyze": "local_patch",
 }
 
 
@@ -112,8 +167,6 @@ def paired_edit_kind_for(suggested_action: str) -> str:
     enforcement), so this lookup only needs the action.
     """
     return _PAIRED_EDIT_KIND_BY_ACTION.get((suggested_action or "").strip(), "")
-
-
 
 
 # ── Normalised AST repr ────────────────────────────────────────────────────────
@@ -134,11 +187,7 @@ _SIMILARITY_ACTION_PROSE: dict[str, str] = {
 
 def _similarity_reason(cand: "SimilarityCandidate") -> str:
     """One-line human summary of a similarity candidate."""
-    prose = (
-        _SIMILARITY_ACTION_PROSE.get(cand.suggested_action)
-        or cand.suggested_action
-        or "similar"
-    )
+    prose = _SIMILARITY_ACTION_PROSE.get(cand.suggested_action) or cand.suggested_action or "similar"
     extras: list[str] = []
     if cand.shared_inputs:
         extras.append(f"{len(cand.shared_inputs)} shared input(s)")
@@ -151,20 +200,61 @@ def _similarity_reason(cand: "SimilarityCandidate") -> str:
 @dataclass
 class NormalisedSymbol:
     """Normalised structural representation of a function/method body."""
+
     qualname: str
-    params: list[str]           # parameter names (positional, no self/cls)
-    skeleton: list[str]         # top-level stmt type sequence
-    stmt_seq: list[str]         # richer normalised stmt strings
-    call_shapes: list[str]      # (receiver_kind, method_tail) pairs
-    exit_shapes: list[str]      # "return", "raise", "yield"
-    guard_count: int            # leading guard-like if-stmts
-    assign_density: float       # assignments / total stmts
+    params: list[str]  # parameter names (positional, no self/cls)
+    skeleton: list[str]  # top-level stmt type sequence
+    stmt_seq: list[str]  # richer normalised stmt strings
+    call_shapes: list[str]  # (receiver_kind, method_tail) pairs
+    exit_shapes: list[str]  # "return", "raise", "yield"
+    guard_count: int  # leading guard-like if-stmts
+    assign_density: float  # assignments / total stmts
     try_present: bool
     line_count: int
-    anchor_fps: list[str]       # AST-canonical fingerprints (ast.dump hash)
-    anchor_texts: list[str]     # ast.unparse representations (verifier-ready)
+    anchor_fps: list[str]  # AST-canonical fingerprints (ast.dump hash)
+    anchor_texts: list[str]  # ast.unparse representations (verifier-ready)
     result_keys: list[str] = field(default_factory=list)  # dict param key accesses (shadow signal)
     ident_tokens: list[str] = field(default_factory=list)  # distinctive identifiers/constants (role signal)
+    trivial_body: bool = False  # stub verdict (≤1 meaningful stmt) — cache-line pure fact
+
+    def to_dict(self) -> dict:
+        return {
+            "qualname": self.qualname,
+            "params": self.params,
+            "skeleton": self.skeleton,
+            "stmt_seq": self.stmt_seq,
+            "call_shapes": self.call_shapes,
+            "exit_shapes": self.exit_shapes,
+            "guard_count": self.guard_count,
+            "assign_density": self.assign_density,
+            "try_present": self.try_present,
+            "line_count": self.line_count,
+            "anchor_fps": self.anchor_fps,
+            "anchor_texts": self.anchor_texts,
+            "result_keys": self.result_keys,
+            "ident_tokens": self.ident_tokens,
+            "trivial_body": self.trivial_body,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "NormalisedSymbol":
+        return cls(
+            qualname=d["qualname"],
+            params=d.get("params", []),
+            skeleton=d.get("skeleton", []),
+            stmt_seq=d.get("stmt_seq", []),
+            call_shapes=d.get("call_shapes", []),
+            exit_shapes=d.get("exit_shapes", []),
+            guard_count=d.get("guard_count", 0),
+            assign_density=d.get("assign_density", 0.0),
+            try_present=d.get("try_present", False),
+            line_count=d.get("line_count", 0),
+            anchor_fps=d.get("anchor_fps", []),
+            anchor_texts=d.get("anchor_texts", []),
+            result_keys=d.get("result_keys", []),
+            ident_tokens=d.get("ident_tokens", []),
+            trivial_body=d.get("trivial_body", False),
+        )
 
 
 def _param_names(node: ast.FunctionDef) -> list[str]:
@@ -174,15 +264,59 @@ def _param_names(node: ast.FunctionDef) -> list[str]:
     return [a.arg for a in all_args if a.arg not in skip]
 
 
-_BUILTINS = frozenset({
-    "len", "range", "enumerate", "zip", "map", "filter", "list", "dict",
-    "set", "tuple", "str", "int", "float", "bool", "print", "isinstance",
-    "getattr", "setattr", "hasattr", "type", "repr", "sorted", "reversed",
-    "min", "max", "sum", "any", "all", "open", "super", "next", "iter",
-    "append", "extend", "update", "pop", "get", "items", "keys", "values",
-    "format", "join", "split", "strip", "startswith", "endswith",
-    "logging", "logger", "log",
-})
+_BUILTINS = frozenset(
+    {
+        "len",
+        "range",
+        "enumerate",
+        "zip",
+        "map",
+        "filter",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "str",
+        "int",
+        "float",
+        "bool",
+        "print",
+        "isinstance",
+        "getattr",
+        "setattr",
+        "hasattr",
+        "type",
+        "repr",
+        "sorted",
+        "reversed",
+        "min",
+        "max",
+        "sum",
+        "any",
+        "all",
+        "open",
+        "super",
+        "next",
+        "iter",
+        "append",
+        "extend",
+        "update",
+        "pop",
+        "get",
+        "items",
+        "keys",
+        "values",
+        "format",
+        "join",
+        "split",
+        "strip",
+        "startswith",
+        "endswith",
+        "logging",
+        "logger",
+        "log",
+    }
+)
 
 
 def _norm_expr_str(node: ast.expr) -> str:
@@ -251,7 +385,7 @@ def _norm_stmt(node: ast.stmt) -> str:
     if isinstance(node, ast.Try):
         n_handlers = len(node.handlers)
         has_else = bool(node.orelse)
-        has_final = bool(node.finalbody) if hasattr(node, 'finalbody') else False
+        has_final = bool(node.finalbody) if hasattr(node, "finalbody") else False
         return f"try:h{n_handlers}:{'else' if has_else else ''}:{'fin' if has_final else ''}"
     if isinstance(node, ast.With):
         return f"with:{len(node.items)}"
@@ -358,13 +492,15 @@ def _walk_function_features(
                     calls.append(shape)
                 # result.get("key") pattern
                 func = node.func
-                if (isinstance(func, ast.Attribute)
-                        and isinstance(func.value, ast.Name)
-                        and func.value.id == "result"
-                        and func.attr == "get"
-                        and node.args
-                        and isinstance(node.args[0], ast.Constant)
-                        and isinstance(node.args[0].value, str)):
+                if (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "result"
+                    and func.attr == "get"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                ):
                     result_keys.add(node.args[0].value)
             elif isinstance(node, ast.Return):
                 exits.add("return")
@@ -375,9 +511,12 @@ def _walk_function_features(
             if isinstance(node, ast.Subscript):
                 # result["key"] subscript (read or assignment target)
                 value = node.value
-                if (isinstance(value, ast.Name) and value.id == "result"
-                        and isinstance(node.slice, ast.Constant)
-                        and isinstance(node.slice.value, str)):
+                if (
+                    isinstance(value, ast.Name)
+                    and value.id == "result"
+                    and isinstance(node.slice, ast.Constant)
+                    and isinstance(node.slice.value, str)
+                ):
                     result_keys.add(node.slice.value)
 
         for child in ast.iter_child_nodes(node):
@@ -417,7 +556,7 @@ def _extract_ast_anchors(body: list[ast.stmt]) -> tuple[list[str], list[str]]:
     _SKIP = (ast.Pass, ast.Import, ast.ImportFrom)
 
     def _is_docstring(node: ast.stmt) -> bool:
-        return isinstance(node, ast.Expr) and isinstance(getattr(node, 'value', None), ast.Constant)
+        return isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Constant)
 
     def _inner_stmts(wrapper: ast.stmt) -> list[ast.stmt]:
         """Return the inner statement list of a wrapping compound statement."""
@@ -480,7 +619,7 @@ def normalise_function(
     total = len(body) or 1
     guard_c = _guard_count(body)
     has_try = any(isinstance(s, ast.Try) for s in body)
-    line_count = (getattr(func_node, "end_lineno", func_node.lineno) - func_node.lineno + 1)
+    line_count = getattr(func_node, "end_lineno", func_node.lineno) - func_node.lineno + 1
     fps, texts = _extract_ast_anchors(body)
 
     return NormalisedSymbol(
@@ -498,10 +637,12 @@ def normalise_function(
         anchor_texts=texts,
         result_keys=result_keys,
         ident_tokens=ident_tokens,
+        trivial_body=_is_trivial_function_body(body),
     )
 
 
 # ── Similarity metrics ─────────────────────────────────────────────────────────
+
 
 def _sequence_similarity_upper_bound(la: int, lb: int) -> float:
     """Cheap upper bound of ``_sequence_similarity`` from lengths alone.
@@ -595,13 +736,13 @@ def _classify_duplication_kind(a: NormalisedSymbol, b: NormalisedSymbol, score: 
         return "shared_guarded_core"
     if a.assign_density >= 0.35 and b.assign_density >= 0.35 and _sequence_similarity(a.stmt_seq, b.stmt_seq) >= 0.65:
         return "shared_accumulator_pattern"
-    if (a.skeleton and b.skeleton
-            and (a.skeleton[:2] == b.skeleton[:2] or a.skeleton[-2:] == b.skeleton[-2:])):
+    if a.skeleton and b.skeleton and (a.skeleton[:2] == b.skeleton[:2] or a.skeleton[-2:] == b.skeleton[-2:]):
         return "shared_prefix_suffix"
     return "shared_control_flow"
 
 
 # ── Shared inputs ─────────────────────────────────────────────────────────────
+
 
 def _infer_shared_inputs(a: NormalisedSymbol, b: NormalisedSymbol) -> list[str]:
     return sorted(set(a.params) & set(b.params))
@@ -646,7 +787,10 @@ def _suggest_action(a: NormalisedSymbol, b: NormalisedSymbol, kind: str, score: 
             logger.debug(
                 "[AST_SCAN] call_overlap guard fired: pair=(%s, %s) sim=%.3f "
                 "call_overlap=%.3f < %.2f → similar_structure_only",
-                a.qualname, b.qualname, score, call_overlap,
+                a.qualname,
+                b.qualname,
+                score,
+                call_overlap,
                 _CALL_OVERLAP_EXTRACT_THRESHOLD,
             )
             return "similar_structure_only", a.qualname
@@ -657,7 +801,10 @@ def _suggest_action(a: NormalisedSymbol, b: NormalisedSymbol, kind: str, score: 
                 logger.debug(
                     "[AST_SCAN] call_overlap guard fired: pair=(%s, %s) sim=%.3f "
                     "call_overlap=%.3f < %.2f → similar_structure_only",
-                    a.qualname, b.qualname, score, call_overlap,
+                    a.qualname,
+                    b.qualname,
+                    score,
+                    call_overlap,
                     _CALL_OVERLAP_EXTRACT_THRESHOLD,
                 )
                 return "similar_structure_only", a.qualname
@@ -670,6 +817,7 @@ def _suggest_action(a: NormalisedSymbol, b: NormalisedSymbol, kind: str, score: 
 
 
 # ── Extractable judgment ──────────────────────────────────────────────────────
+
 
 def _is_extractable(
     na: NormalisedSymbol,
@@ -723,15 +871,16 @@ def _is_trivial_function_body(body: list[ast.stmt]) -> bool:
     These pairs have no refactoring value.
     """
     meaningful = [
-        s for s in body
-        if not (isinstance(s, ast.Expr)
-                and isinstance(getattr(s, 'value', None), ast.Constant))
+        s
+        for s in body
+        if not (isinstance(s, ast.Expr) and isinstance(getattr(s, "value", None), ast.Constant))
         and not isinstance(s, (ast.Pass, ast.Import, ast.ImportFrom))
     ]
     return len(meaningful) <= 1
 
 
 # ── Symbol collection ──────────────────────────────────────────────────────────
+
 
 @dataclass
 class _SymbolEntry:
@@ -746,11 +895,15 @@ def _collect_symbols(tree: ast.Module) -> list[_SymbolEntry]:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             entries.append(_SymbolEntry(qualname=node.name, node=node, parent_class=None))
         elif isinstance(node, ast.ClassDef):
-            entries.extend(_SymbolEntry(
-                        qualname=f"{node.name}.{child.name}",
-                        node=child,
-                        parent_class=node.name,
-                    ) for child in ast.iter_child_nodes(node) if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)))
+            entries.extend(
+                _SymbolEntry(
+                    qualname=f"{node.name}.{child.name}",
+                    node=child,
+                    parent_class=node.name,
+                )
+                for child in ast.iter_child_nodes(node)
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            )
     return entries
 
 
@@ -758,7 +911,7 @@ def _collect_symbols(tree: ast.Module) -> list[_SymbolEntry]:
 
 _MIN_LINE_COUNT = 5
 _MIN_LINE_COUNT_CROSS = 8
-_FILTER_BONUS = 0.05      # similarity bonus for filter-preferred symbols
+_FILTER_BONUS = 0.05  # similarity bonus for filter-preferred symbols
 
 
 def scan_similarity_candidates(
@@ -793,38 +946,94 @@ def scan_similarity_candidates(
     # re-read and re-parsed every file from scratch.
     _normed_cache: dict[str, dict[str, NormalisedSymbol]] = {}
 
+    # Per-file result disk cache (see module header) — reuse previous
+    # process's normalised symbols for unchanged files.
+    files_cache = _load_ast_sim_cache(repo_root) if repo_root else {}
+    _cache_dirty = 0
+    _cache_hits = 0
+
     for fpath in file_paths:
         abs_path = fpath if os.path.isabs(fpath) else os.path.join(repo_root, fpath)
-        tree = parse_cache.parse_ast(abs_path)
-        if tree is None:
-            logger.debug("[AST_SCAN] cannot read/parse %s", fpath)
+        pair = parse_cache.read_with_fingerprint(abs_path)
+        if pair is None:
             continue
-
-        all_entries = _collect_symbols(tree)
-
-        _by_name: dict[str, NormalisedSymbol] = {}
-        entries: list[_SymbolEntry] = []
-        normed: list[NormalisedSymbol] = []
-        for e in all_entries:
-            try:
-                n = normalise_function(e.node, e.qualname)
-            except Exception:
-                logger.debug("[AST_SCAN] normalise failed for %s in %s", e.qualname, fpath, exc_info=True)
-                continue
-            _by_name.setdefault(e.qualname, n)
-            _by_name.setdefault(e.qualname.split(".")[-1], n)
-            # pairwise scan skips trivially small symbols; forced pairs don't
-            if n.line_count >= _MIN_LINE_COUNT:
-                entries.append(e)
+        _src, fp = pair
+        rel = os.path.relpath(abs_path, repo_root) if repo_root else fpath
+        entry = files_cache.get(rel)
+        if entry is not None and tuple(entry.get("fp") or ()) == fp:
+            _cache_hits += 1
+            _by_name = {k: NormalisedSymbol.from_dict(v) for k, v in (entry.get("symbols") or {}).items()}
+            _normed_cache[fpath] = _by_name
+            entries: list[_SymbolEntry] = []
+            normed: list[NormalisedSymbol] = []
+            # Reconstruct the pairwise-scan inputs from the cache entries.
+            for n in _by_name.values():
                 normed.append(n)
-        _normed_cache[fpath] = _by_name
+                entries.append(
+                    _SymbolEntry(
+                        node=None,
+                        qualname=n.qualname,
+                        parent_class=n.qualname.split(".")[0] if "." in n.qualname else None,
+                    )
+                )
+            # Trim entries to the pairwise-scan population (line_count gate).
+            _kept: list[_SymbolEntry] = []
+            _knormed: list[NormalisedSymbol] = []
+            for e, n in zip(entries, normed, strict=False):
+                if n.line_count >= _MIN_LINE_COUNT:
+                    _kept.append(e)
+                    _knormed.append(n)
+            entries, normed = _kept, _knormed
+            if len(entries) < 2:
+                continue
+            # Deduplicate by qualname: cache keys include bare-name aliases.
+            _seen_q: set[str] = set()
+            _dedup_e: list[_SymbolEntry] = []
+            _dedup_n: list[NormalisedSymbol] = []
+            for e, n in zip(entries, normed, strict=False):
+                if n.qualname in _seen_q:
+                    continue
+                _seen_q.add(n.qualname)
+                _dedup_e.append(e)
+                _dedup_n.append(n)
+            entries, normed = _dedup_e, _dedup_n
+            if len(entries) < 2:
+                continue
+        else:
+            tree = parse_cache.parse_ast(abs_path)
+            if tree is None:
+                continue
 
-        if len(entries) < 2:
-            continue
+            all_entries = _collect_symbols(tree)
+
+            _by_name: dict[str, NormalisedSymbol] = {}
+            entries = []
+            normed = []
+            for e in all_entries:
+                try:
+                    n = normalise_function(e.node, e.qualname)
+                except Exception:
+                    logger.debug("[AST_SCAN] normalise failed for %s in %s", e.qualname, fpath, exc_info=True)
+                    continue
+                _by_name.setdefault(e.qualname, n)
+                _by_name.setdefault(e.qualname.split(".")[-1], n)
+                # pairwise scan skips trivially small symbols; forced pairs don't
+                if n.line_count >= _MIN_LINE_COUNT:
+                    entries.append(e)
+                    normed.append(n)
+            # Persist the normalised map for this file (fail-open).
+            files_cache[rel] = {
+                "fp": list(fp),
+                "symbols": {k: v.to_dict() for k, v in _by_name.items()},
+            }
+            _cache_dirty += 1
+            if len(entries) < 2:
+                continue
+        _normed_cache[fpath] = _by_name
 
         # Trivial-body verdicts are per-symbol facts; computing them once here
         # avoids re-walking both bodies for every O(n²) pair below.
-        trivial_bodies = [_is_trivial_function_body(e.node.body) for e in entries]
+        trivial_bodies = [n.trivial_body for n in normed]
 
         file_candidates: list[SimilarityCandidate] = []
         for i in range(len(normed)):
@@ -850,9 +1059,11 @@ def scan_similarity_candidates(
                 ident_overlap = _set_similarity(na.ident_tokens, nb.ident_tokens)
                 if ident_overlap < _IDENT_OVERLAP_MIN:
                     logger.debug(
-                        "[AST_SCAN] ident_overlap gate: pair=(%s, %s) "
-                        "ident_overlap=%.3f < %.2f → skipped",
-                        na.qualname, nb.qualname, ident_overlap, _IDENT_OVERLAP_MIN,
+                        "[AST_SCAN] ident_overlap gate: pair=(%s, %s) ident_overlap=%.3f < %.2f → skipped",
+                        na.qualname,
+                        nb.qualname,
+                        ident_overlap,
+                        _IDENT_OVERLAP_MIN,
                     )
                     continue
 
@@ -872,8 +1083,10 @@ def scan_similarity_candidates(
                 bare_a = na.qualname.split(".")[-1]
                 bare_b = nb.qualname.split(".")[-1]
                 _filter_matched = bool(_filter_set) and (
-                    na.qualname in _filter_set or nb.qualname in _filter_set
-                    or bare_a in _filter_bare or bare_b in _filter_bare
+                    na.qualname in _filter_set
+                    or nb.qualname in _filter_set
+                    or bare_a in _filter_bare
+                    or bare_b in _filter_bare
                 )
                 ranking_score = min(1.0, raw_score + _FILTER_BONUS) if _filter_matched else raw_score
 
@@ -897,8 +1110,11 @@ def scan_similarity_candidates(
                 # Fall back to larger_norm anchors as texts (best-effort display/hint)
                 # but pass cross_anchor_count as the structural gate signal.
                 fps = [fp for fp in larger_norm.anchor_fps if fp in cross_fps_set]
-                texts = [t for fp, t in zip(larger_norm.anchor_fps, larger_norm.anchor_texts, strict=False)
-                         if fp in cross_fps_set]
+                texts = [
+                    t
+                    for fp, t in zip(larger_norm.anchor_fps, larger_norm.anchor_texts, strict=False)
+                    if fp in cross_fps_set
+                ]
                 # If no cross-source anchors but each source has its own, provide
                 # the larger symbol's anchors as texts for DPB display (non-gating).
                 if not fps:
@@ -916,8 +1132,15 @@ def scan_similarity_candidates(
                     "[AST_SCAN_SHADOW] pair=(%s, %s) raw_sim=%.3f ranking_sim=%.3f action=%s "
                     "call_overlap=%.3f result_key_overlap=%.3f cross_anchors=%d exit_sim=%.3f "
                     "ident_overlap=%.3f",
-                    na.qualname, nb.qualname, raw_score, ranking_score, action,
-                    call_overlap, result_key_overlap, cross_anchor_count, exit_sim,
+                    na.qualname,
+                    nb.qualname,
+                    raw_score,
+                    ranking_score,
+                    action,
+                    call_overlap,
+                    result_key_overlap,
+                    cross_anchor_count,
+                    exit_sim,
                     ident_overlap,
                 )
 
@@ -925,7 +1148,7 @@ def scan_similarity_candidates(
                     file=fpath,
                     symbol_a=na.qualname,
                     symbol_b=nb.qualname,
-                    similarity=raw_score,          # raw score — not inflated by filter bonus
+                    similarity=raw_score,  # raw score — not inflated by filter bonus
                     duplication_kind=kind,
                     shared_inputs=shared[:6],
                     extractable=extractable,
@@ -947,7 +1170,14 @@ def scan_similarity_candidates(
                 file_candidates.append(candidate)
 
         file_candidates.sort(key=lambda c: c.shadow_overlaps.get("ranking_sim", c.similarity), reverse=True)
-        all_candidates.extend(file_candidates[:max(5, max_candidates // max(1, len(file_paths)))])
+        all_candidates.extend(file_candidates[: max(5, max_candidates // max(1, len(file_paths)))])
+
+    # Persist the per-file normalised-symbol cache (fail-open) — only when
+    # something changed, so warm rebuilds skip the whole-file rewrite.
+    if _cache_dirty:
+        _save_ast_sim_cache(repo_root, files_cache)
+        if _cache_hits:
+            logger.debug("[AST_SCAN] norm cache: %d file(s) recomputed, %d reused", _cache_dirty, _cache_hits)
 
     all_candidates.sort(key=lambda c: c.similarity, reverse=True)
     result = all_candidates[:max_candidates]
@@ -959,10 +1189,7 @@ def scan_similarity_candidates(
         # Reuse the per-file normalised symbols built in the main loop.
         _fp_normed: dict[str, dict[str, NormalisedSymbol]] = _normed_cache
 
-        _result_pairs = {
-            frozenset([c.symbol_a.split(".")[-1], c.symbol_b.split(".")[-1]])
-            for c in result
-        }
+        _result_pairs = {frozenset([c.symbol_a.split(".")[-1], c.symbol_b.split(".")[-1]]) for c in result}
 
         for bare_a, bare_b in forced_pairs:
             _pair_key = frozenset([bare_a, bare_b])
@@ -1020,8 +1247,14 @@ def scan_similarity_candidates(
                     logger.debug(
                         "[AST_SCAN_SHADOW] forced pair=(%s, %s) sim=%.3f action=%s "
                         "call_overlap=%.3f result_key_overlap=%.3f cross_anchors=%d exit_sim=%.3f",
-                        na.qualname, nb.qualname, score, action,
-                        call_overlap, result_key_overlap, _cross_count, exit_sim,
+                        na.qualname,
+                        nb.qualname,
+                        score,
+                        action,
+                        call_overlap,
+                        result_key_overlap,
+                        _cross_count,
+                        exit_sim,
                     )
 
                     _fc = SimilarityCandidate(
@@ -1039,8 +1272,7 @@ def scan_similarity_candidates(
                             "result_key_overlap": round(result_key_overlap, 3),
                             "exit_sim": round(exit_sim, 3),
                             "cross_anchor_count": _cross_count,
-                            "ident_overlap": round(
-                                _set_similarity(na.ident_tokens, nb.ident_tokens), 3),
+                            "ident_overlap": round(_set_similarity(na.ident_tokens, nb.ident_tokens), 3),
                         },
                     )
                 break
@@ -1120,14 +1352,19 @@ def scan_similarity_candidates(
             _result_pairs.add(_pair_key)
             logger.info(
                 "[AST_SCAN] forced pair (%s, %s) sim=%.3f action=%s reason=%s",
-                bare_a, bare_b, _fc.similarity, _fc.suggested_action, _fc.forced_reason,
+                bare_a,
+                bare_b,
+                _fc.similarity,
+                _fc.suggested_action,
+                _fc.forced_reason,
             )
 
     if result:
         logger.info(
-            "[AST_SCAN] %d candidate pair(s) across %d file(s) "
-            "(top=%.3f, extractable=%d)",
-            len(result), len(file_paths), result[0].similarity,
+            "[AST_SCAN] %d candidate pair(s) across %d file(s) (top=%.3f, extractable=%d)",
+            len(result),
+            len(file_paths),
+            result[0].similarity,
             sum(1 for c in result if c.extractable),
         )
     else:

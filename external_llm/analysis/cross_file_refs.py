@@ -102,8 +102,15 @@ def _add_python_import_names(tree, names: set) -> set:
     dead-code suppression must match) and Y (the local binding) are added.
     The returned set holds the file's local import bindings, used by the
     caller to find ``binding.attr`` module-attribute reads.
+
+    Single-walk with :func:`_add_module_attr_reads` (P14-5): one ``ast.walk``
+    collects imports AND defers every ``Attribute`` node to *attr_nodes*,
+    which the caller resolves against the finished bindings after the walk —
+    the same two-phase semantics as two separate walks (all bindings are
+    known before any attr read is judged), at half the traversal cost.
     """
     bindings: set = set()
+    attr_nodes: list = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -123,24 +130,28 @@ def _add_python_import_names(tree, names: set) -> set:
                 if local and local != "*":
                     bindings.add(local)
                     names.add(local)
-    return bindings
+        elif isinstance(node, ast.Attribute):
+            attr_nodes.append(node)
+    return bindings, attr_nodes
 
 
-def _add_module_attr_reads(tree, bindings: set, names: set) -> None:
-    """Add ``binding.attr`` reads to *names* for import-introduced bindings.
+def _add_module_attr_reads(attr_nodes, bindings: set, names: set) -> None:
+    """Resolve deferred ``binding.attr`` reads against *bindings* into *names*.
 
     Catches the config-flag pattern: ``import config; config.FLAG`` — FLAG
     has no call edge and no ImportFrom entry, yet it is a live reference.
     Coarse by design (any attribute on any imported binding counts), which
-    over-suppresses — the safe direction for dead-code judgement.
+    over-suppresses — the safe direction for dead-code judgement.  *attr_nodes*
+    were collected during the import walk (P14-5) so no second traversal is
+    needed; semantics are identical to checking each Attribute in tree order
+    after all bindings are known.
     """
     if not bindings:
         return
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute):
-            chain = _dotted_chain(node.value)
-            if chain and (chain in bindings or chain.split(".")[0] in bindings):
-                names.add(node.attr)
+    for node in attr_nodes:
+        chain = _dotted_chain(node.value)
+        if chain and (chain in bindings or chain.split(".")[0] in bindings):
+            names.add(node.attr)
 
 
 def extract_imported_names_for_file(abs_f: str) -> set:
@@ -161,8 +172,8 @@ def extract_imported_names_for_file(abs_f: str) -> set:
     if tree is None:
         return set()
     names = set()
-    bindings = _add_python_import_names(tree, names)
-    _add_module_attr_reads(tree, bindings, names)
+    bindings, attr_nodes = _add_python_import_names(tree, names)
+    _add_module_attr_reads(attr_nodes, bindings, names)
     return names
 
 

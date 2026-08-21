@@ -2714,7 +2714,6 @@ def _eval_ctrlc_armed(
         return (False, True)  # second Ctrl+C → raise
     return (True, False)  # first Ctrl+C → arm
 
-
 def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
     """Read user input using prompt_toolkit.
 

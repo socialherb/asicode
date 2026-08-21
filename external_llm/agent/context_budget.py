@@ -177,6 +177,10 @@ _FALLBACK_IS_CORRECT: frozenset[str] = frozenset({
     "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite",
     "gemini-3.1-pro", "gemini-3-flash",
     "qwen3.8-max",
+    # Ox Alpha Free (opencode stealth model, free tier, zero-retention). Window
+    # not published by opencode docs; live id ships as "ox-alpha-free" while
+    # the docs page calls the config id "x-preview-f-free".
+    "ox-alpha-free",
 })
 
 # Models already warned about the 1M fallback (once per model per process).

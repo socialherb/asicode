@@ -61,12 +61,76 @@ args (lint.yml CI) still scans the whole repo.  Files outside the scan scope
 """
 
 import ast
+import json
 import os
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 BASELINE = REPO / "scripts" / "unguarded_subprocess_baseline.txt"
+
+# Per-file extraction disk cache (P13, 2026-08-21): the full-repo scan
+# re-parses every scoped .py on every hook run, but detection is a pure
+# function of file content, so a (st_mtime_ns, st_size) fingerprint cache
+# reuses prior results — same invalidation contract as the analysis gates
+# (A307, 786ffcdc).  Fail-open: corruption/version-mismatch → full recompute.
+_CACHE_VERSION = 1
+
+
+def _cache_path() -> Path:
+    """Per-repo cache file (REPO is monkeypatch-able in tests, so derived dynamically)."""
+    return REPO / ".cache" / f"unguarded_keys_v{_CACHE_VERSION}.json"
+
+
+def _stat_fingerprint(path: Path) -> tuple[int, int] | None:
+    """(st_mtime_ns, st_size) for *path*, or None when it cannot be stat'd."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _load_cache() -> dict[str, tuple[tuple[int, int], list[str]]]:
+    """Load the extraction cache; ``{rel: (fingerprint, keys)}``, empty on any fault."""
+    try:
+        with open(_cache_path(), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if payload.get("version") != _CACHE_VERSION:
+        return {}
+    out: dict[str, tuple[tuple[int, int], list[str]]] = {}
+    for rel, entry in (payload.get("files") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        fp = entry.get("fp")
+        keys = entry.get("keys")
+        if (
+            isinstance(fp, list)
+            and len(fp) == 2
+            and all(isinstance(x, int) for x in fp)
+            and isinstance(keys, list)
+            and all(isinstance(k, str) for k in keys)):
+            out[rel] = (tuple(fp), keys)
+    return out
+
+
+def _save_cache(cache: dict[str, tuple[tuple[int, int], list[str]]]) -> None:
+    """Persist *cache* to disk (best-effort; failure costs a re-analysis)."""
+    try:
+        target = _cache_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        files = {rel: {"fp": list(fp), "keys": keys} for rel, (fp, keys) in cache.items()}
+        payload = {"version": _CACHE_VERSION, "files": files}
+        tmp = target.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except (OSError, ValueError, TypeError):
+        pass
 
 _SUBPROCESS_FUNCS = frozenset({
     "run", "Popen", "call", "check_call", "check_output",
@@ -295,8 +359,21 @@ def _scan_path(path: Path) -> list[str]:
 
 def _get_current_keys(paths: list[str] | None = None) -> set[str]:
     keys: set[str] = set()
+    cache = _load_cache()
+    dirty = False
     for p in _iter_repo_py(paths):
-        keys.update(_scan_path(p))
+        rel = str(p.relative_to(REPO))
+        fp = _stat_fingerprint(p)
+        if fp is not None and rel in cache and cache[rel][0] == fp:
+            keys.update(cache[rel][1])
+            continue
+        file_keys = _scan_path(p)
+        if fp is not None:
+            cache[rel] = (fp, file_keys)
+            dirty = True
+        keys.update(file_keys)
+    if dirty:
+        _save_cache(cache)
     return keys
 
 
