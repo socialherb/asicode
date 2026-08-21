@@ -1,5 +1,6 @@
 """Unit tests for tool_result_cache.py — TTL-based LRU ToolResultCache."""
 
+import os
 import time
 
 from external_llm.agent.tool_result_cache import ToolResultCache, _path_sig
@@ -430,16 +431,26 @@ class TestPathSignatureValidation:
         p.unlink()
         assert cache.get("read_file", args) is None
 
-    def test_file_recreated_with_same_signature_still_hits(self, tmp_path):
-        """Deletion+recreation is only caught when the signature changes;
-        identical bytes at a later mtime still differ by mtime_ns."""
+    def test_file_recreated_with_different_signature_misses(self, tmp_path):
+        """Deletion+recreation is caught when the signature changes.
+
+        The signature is (mtime_ns, size, ino) captured via stat. tmpfs and
+        some coarsely-timestamped filesystems can hand a recreated file the
+        IDENTICAL triple (same ns, same size, reused inode), so a bare
+        delete+recreate is not a portable miss trigger — a signature change
+        is. Bump mtime explicitly so the test is filesystem-agnostic.
+        """
         cache = ToolResultCache()
         p = tmp_path / "f.py"
         p.write_text("same")
         args = {"path": str(p)}
         cache.set("read_file", args, {"content": "old"}, paths=frozenset({str(p)}))
         p.unlink()
-        p.write_text("same")  # same size, NEW mtime → signature differs
+        p.write_text("same")
+        # Force a different signature: mtime in the past → differs from the
+        # set()-time mtime on every filesystem (even tmpfs, which reuses
+        # inodes and can reproduce the same ns for a recreate).
+        os.utime(p, (1_000_000_000, 1_000_000_000))
         assert cache.get("read_file", args) is None
 
     def test_directory_scope_detects_child_add_removal(self, tmp_path):
