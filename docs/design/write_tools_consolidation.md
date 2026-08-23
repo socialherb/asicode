@@ -81,6 +81,7 @@
 # tool_registry.py
 _TOOL_HANDLER_MAP["edit"] = "_tool_edit"
 
+
 def _tool_edit(self, args: dict) -> ToolResult:
     mode = (args or {}).get("mode")
     handler = {
@@ -92,7 +93,7 @@ def _tool_edit(self, args: dict) -> ToolResult:
     }.get(mode)
     if handler is None:
         return self._tool_error("edit", f"unknown mode {mode!r} — is required: one of ...")
-    return handler(args)   # 각 핸들러가 자체 required 검증을 이미 수행
+    return handler(args)  # 각 핸들러가 자체 required 검증을 이미 수행
 ```
 
 - 기존 핸들러 메서드는 **그대로 유지** — 단위 테스트 대부분 무변경.

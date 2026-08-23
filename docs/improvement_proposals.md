@@ -127,13 +127,15 @@ def extract_llm_content(response: dict, *, default: str = "") -> str:
 # external_llm/languages/_normalize.py
 _NORMALIZE_TABLE = str.maketrans(" -", "__")
 
+
 def normalize_key(s: str) -> str:
     """Normalize identifier: lowercase, translate spaces/dashes to underscores, strip.
-    
+
     NOTE: 기존 .strip().lower()와 달리 내부 공백/대시도 변환하므로
     동작 변경이 예상되는 사이트는 별도 마이그레이션 필요.
     """
     return s.lower().translate(_NORMALIZE_TABLE).strip()
+
 
 def strip_lower(s: str) -> str:
     """Strip whitespace and lowercase — 변이체 B 전용."""
@@ -209,6 +211,7 @@ class EngineConfig:
     temperature: float = 0.7
     # ... 14개 전부 → dataclass field
 
+
 def _build_engine(config: EngineConfig) -> LLMEngine: ...
 ```
 
@@ -260,8 +263,8 @@ P0-1/P0-2 기각으로 제외. HTTP/스레드 경로 잔여 blocking call — 20
 ```python
 from external_llm.editor._editor_core.lane.change_spec_assertions_shared import (  # noqa: F401
     _INTENTIONALLY_UNHANDLED,  # ← scanner flag (false positive)
-    _KINDS,                    # ← scanner flag
-    _TIER1_KINDS,              # ← scanner flag
+    _KINDS,  # ← scanner flag
+    _TIER1_KINDS,  # ← scanner flag
     # ... 총 22개 이름 모두 flag
 )
 ```
@@ -276,7 +279,7 @@ def _has_noqa_comment(line_text: str, codes: set[str] | None = None) -> bool:
     idx = line_text.find("#")
     if idx == -1:
         return False
-    rest = line_text[idx + 1:].strip()
+    rest = line_text[idx + 1 :].strip()
     if not rest.lower().startswith("noqa"):
         return False
     if codes is not None:

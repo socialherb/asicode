@@ -71,6 +71,14 @@ jobs:
       - name: Install package + test dependencies
         run: |
           python -m pip install --upgrade pip
+          # Pin ruff to match the local developer ruff AND lint.yml (see
+          # .pre-commit-config.yaml); the format gate in check_lint_full.py
+          # must see the same formatter as local development. Unpinned
+          # `ruff>=0.6` drifted to 0.16.4 on 2026-08-23, whose markdown
+          # formatter promoted preview → stable and flagged 3 docs/*.md files
+          # as drift, failing test_clean_repo_not_reported and blocking the
+          # v0.2.29 publish.
+          python -m pip install ruff==0.15.21
           python -m pip install -e '.[dev]'
 
       - name: Unit tests

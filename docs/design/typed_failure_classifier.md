@@ -55,27 +55,31 @@ Expand the single `FailureType` enum return into a `Classification` dataclass:
 ```python
 # vm/classification.py (new, shared by vm/ts_vm)
 
+
 class EvidenceSource(str, Enum):
-    TREE_SITTER = "tree_sitter"      # Layer A
-    ERROR_CODE = "error_code"        # Layer B
-    MESSAGE_FALLBACK = "message"     # Layer C
-    NONE = "none"                    # UNKNOWN
+    TREE_SITTER = "tree_sitter"  # Layer A
+    ERROR_CODE = "error_code"  # Layer B
+    MESSAGE_FALLBACK = "message"  # Layer C
+    NONE = "none"  # UNKNOWN
+
 
 @dataclass(frozen=True)
 class FixHint:
     """Structured hint passed to the repair strategy (optional)."""
-    kind: str                  # "insert_token" | "remove_import" | "rename" ...
-    token: Optional[str]       # e.g. ";"  (the MISSING node's expected token)
+
+    kind: str  # "insert_token" | "remove_import" | "rename" ...
+    token: Optional[str]  # e.g. ";"  (the MISSING node's expected token)
     line: Optional[int]
     column: Optional[int]
+
 
 @dataclass(frozen=True)
 class Classification:
     type: FailureType
     source: EvidenceSource
-    symbol: Optional[str] = None      # absorbs extract_symbol (single pass)
+    symbol: Optional[str] = None  # absorbs extract_symbol (single pass)
     fix_hint: Optional[FixHint] = None
-    error_index: int = 0              # which VerifyError this was classified from
+    error_index: int = 0  # which VerifyError this was classified from
 ```
 
 - Keep the `classify()` signature but add a new `classify_typed()` → existing
@@ -91,11 +95,12 @@ Add a utility to `languages/tree_sitter_utils.py` extending the existing `has_er
 ```python
 @dataclass(frozen=True)
 class SyntaxErrorNode:
-    kind: str            # "ERROR" | "MISSING"
-    missing_token: str   # expected token for a MISSING node (e.g. ";", ")")
-    line: int            # 0-based → consumer converts to 1-based
+    kind: str  # "ERROR" | "MISSING"
+    missing_token: str  # expected token for a MISSING node (e.g. ";", ")")
+    line: int  # 0-based → consumer converts to 1-based
     column: int
-    context_snippet: str # surrounding source (for repair prompts/strategies)
+    context_snippet: str  # surrounding source (for repair prompts/strategies)
+
 
 def find_error_nodes(content: str, language: str) -> Optional[list[SyntaxErrorNode]]:
     """Collect all ERROR/MISSING nodes. Returns None if tree-sitter isn't installed (fallback signal)."""
